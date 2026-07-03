@@ -10,6 +10,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,10 @@ import (
 )
 
 func TestRealDockerLifecycle(t *testing.T) {
+	// Force the first-pull path: an immediate exec after creating a
+	// freshly-pulled container must not race its startup.
+	_ = exec.Command("docker", "rmi", "-f", "alpine:3.20").Run()
+
 	runtime := &run.DockerRuntime{}
 	manager := run.NewManager(runtime, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)

@@ -66,6 +66,13 @@ func serve(args []string) error {
 		// Egress is opt-in per run; a missing bridge only blocks those runs.
 		log.Warn("egress network unavailable", "error", err)
 	}
+	// Run state is in-memory: any container we labelled that survived a
+	// previous daemon life is an unreachable orphan. Sweep before serving.
+	if swept, err := runtime.SweepOrphans(context.Background()); err != nil {
+		log.Warn("orphan sweep failed", "error", err)
+	} else if swept > 0 {
+		log.Info("swept orphaned run containers from a previous daemon life", "count", swept)
+	}
 
 	hostname, _ := os.Hostname()
 	srv := &server.Server{

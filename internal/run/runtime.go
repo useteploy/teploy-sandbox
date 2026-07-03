@@ -95,11 +95,48 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 	// must provide sh (agents need a shell regardless).
 	args = append(args, spec.Image, "sh", "-c", "mkdir -p "+WorkDir+" && exec sleep infinity")
 
-	out, err := exec.CommandContext(ctx, d.bin(), args...).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("docker run: %s", strings.TrimSpace(string(out)))
+	// Capture stdout (the container ID) separately from stderr: on a
+	// first-time image, `docker run` prints pull progress to stderr, and
+	// CombinedOutput would fold it into the ID.
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, d.bin(), args...)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		return "", fmt.Errorf("docker run: %s", detail)
 	}
-	return strings.TrimSpace(string(out)), nil
+	containerID := strings.TrimSpace(stdout.String())
+
+	// `docker run -d` returns before a freshly-pulled container is
+	// actually running; an immediate exec would race its startup. Wait
+	// for running state so the first exec after a first-time image never
+	// fails spuriously.
+	if err := d.waitRunning(ctx, containerID); err != nil {
+		_ = d.Remove(context.WithoutCancel(ctx), containerID)
+		return "", err
+	}
+	return containerID, nil
+}
+
+func (d *DockerRuntime) waitRunning(ctx context.Context, containerID string) error {
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		out, err := exec.CommandContext(ctx, d.bin(), "inspect", "-f", "{{.State.Running}}", containerID).Output()
+		if err == nil && strings.TrimSpace(string(out)) == "true" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("container %s did not reach running state", containerID)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 func (d *DockerRuntime) Exec(ctx context.Context, containerID, cmd, cwd string, timeout time.Duration, stdout, stderr io.Writer) (int, bool, error) {
@@ -162,6 +199,27 @@ func (d *DockerRuntime) Remove(ctx context.Context, containerID string) error {
 		return fmt.Errorf("docker rm: %s", strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// SweepOrphans force-removes every container this daemon labels as its
+// own. Run state is in-memory, so any labeled container found at startup
+// belongs to a previous daemon life and can never be reached again —
+// removing it is the only way those don't leak across restarts/crashes.
+// Returns the number swept.
+func (d *DockerRuntime) SweepOrphans(ctx context.Context) (int, error) {
+	out, err := exec.CommandContext(ctx, d.bin(), "ps", "-aq", "--filter", "label=teploy.sandbox=1").Output()
+	if err != nil {
+		return 0, fmt.Errorf("docker ps: %w", err)
+	}
+	ids := strings.Fields(string(out))
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	rmArgs := append([]string{"rm", "-f"}, ids...)
+	if out, err := exec.CommandContext(ctx, d.bin(), rmArgs...).CombinedOutput(); err != nil {
+		return 0, fmt.Errorf("docker rm: %s", strings.TrimSpace(string(out)))
+	}
+	return len(ids), nil
 }
 
 // shellQuote single-quotes a string for sh, escaping embedded quotes.

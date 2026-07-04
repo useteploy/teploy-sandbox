@@ -173,6 +173,42 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 	return nil
 }
 
+// SnapshotRepo is the image repository all run snapshots live under.
+const SnapshotRepo = "teploy-sbx-snap"
+
+// Snapshot commits a run's filesystem to a fresh snapshot image and
+// returns its ref. Snapshots deliberately do NOT expire with the run —
+// they exist precisely so state survives the TTL reaper (a parked agent
+// run restores from one days later). Callers own deletion.
+func (m *Manager) Snapshot(ctx context.Context, id string) (string, error) {
+	m.mu.Lock()
+	current, ok := m.runs[id]
+	m.mu.Unlock()
+	if !ok {
+		return "", ErrNotFound
+	}
+	ref := SnapshotRepo + ":" + strings.ToLower(NewULID(m.now()))
+	if err := m.runtime.Snapshot(ctx, current.ContainerID, ref); err != nil {
+		return "", err
+	}
+	m.log.Info("run snapshotted", "id", id, "image", ref)
+	return ref, nil
+}
+
+// DeleteSnapshot removes a snapshot image. Only refs under SnapshotRepo
+// are deletable through the API — the daemon must never be usable to rmi
+// arbitrary host images.
+func (m *Manager) DeleteSnapshot(ctx context.Context, ref string) error {
+	if !strings.HasPrefix(ref, SnapshotRepo+":") {
+		return fmt.Errorf("%w: not a sandbox snapshot ref: %s", ErrBadRequest, ref)
+	}
+	if err := m.runtime.RemoveImage(ctx, ref); err != nil {
+		return err
+	}
+	m.log.Info("snapshot deleted", "image", ref)
+	return nil
+}
+
 // Reap force-removes every expired run. Called by the serve ticker and
 // exposed for tests.
 func (m *Manager) Reap(ctx context.Context) int {

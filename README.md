@@ -35,3 +35,14 @@ Docker socket into a run.
 
 `go test ./...` (interface-mocked) · `go test -tags integration ./...`
 (real Docker on a disposable box).
+
+## Snapshots (M3)
+
+| Route | Does |
+|---|---|
+| `POST /v1/runs/{id}/snapshot` | Commit the run's filesystem → `{image: "teploy-sbx-snap:<ulid>"}`; a later `POST /v1/runs` with that image boots from it |
+| `DELETE /v1/snapshots?image=<ref>` | Delete a snapshot image (only `teploy-sbx-snap:*` refs are deletable) |
+
+Snapshots deliberately survive the TTL reaper — they exist so state can
+outlive a container (a parked agent run restores days later). Deletion
+is explicit and owned by the caller.

@@ -34,6 +34,10 @@ type Runtime interface {
 	WriteFile(ctx context.Context, containerID, path string, data io.Reader) error
 	ReadFile(ctx context.Context, containerID, path string) ([]byte, error)
 	Remove(ctx context.Context, containerID string) error
+	// Snapshot commits the container's filesystem to imageRef; a later
+	// Create can boot from it. RemoveImage deletes a snapshot image.
+	Snapshot(ctx context.Context, containerID, imageRef string) error
+	RemoveImage(ctx context.Context, imageRef string) error
 }
 
 // EgressNetwork is the NAT'd bridge egress-opt-in runs join. It is a
@@ -197,6 +201,29 @@ func (d *DockerRuntime) Remove(ctx context.Context, containerID string) error {
 	out, err := exec.CommandContext(ctx, d.bin(), "rm", "-f", containerID).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker rm: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// Snapshot commits a run's current filesystem to a labeled image so a
+// later run can boot from it — the property that lets an agent run
+// survive its container's TTL (park on approval, restore days later).
+func (d *DockerRuntime) Snapshot(ctx context.Context, containerID, imageRef string) error {
+	out, err := exec.CommandContext(ctx, d.bin(), "commit",
+		"--change", "LABEL teploy.sandbox.snapshot=1",
+		containerID, imageRef).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker commit: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// RemoveImage deletes a snapshot image (explicit-only — snapshots must
+// survive the TTL reaper by design, so cleanup is the caller's call).
+func (d *DockerRuntime) RemoveImage(ctx context.Context, imageRef string) error {
+	out, err := exec.CommandContext(ctx, d.bin(), "rmi", imageRef).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker rmi: %s", strings.TrimSpace(string(out)))
 	}
 	return nil
 }

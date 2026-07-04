@@ -60,6 +60,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/runs", s.auth(s.handleList))
 	mux.Handle("DELETE /v1/runs/{id}", s.auth(s.handleDestroy))
 	mux.Handle("POST /v1/runs/{id}/exec", s.auth(s.handleExec))
+	mux.Handle("POST /v1/runs/{id}/snapshot", s.auth(s.handleSnapshot))
+	mux.Handle("DELETE /v1/snapshots", s.auth(s.handleDeleteSnapshot))
 	mux.Handle("PUT /v1/runs/{id}/files/{path...}", s.auth(s.handlePutFile))
 	mux.Handle("GET /v1/runs/{id}/files/{path...}", s.auth(s.handleGetFile))
 	return mux
@@ -133,6 +135,28 @@ func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	if err := s.Manager.Destroy(r.Context(), r.PathValue("id")); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	image, err := s.Manager.Snapshot(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusCreated, map[string]any{"image": image})
+}
+
+func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
+	image := r.URL.Query().Get("image")
+	if image == "" {
+		s.writeProblem(w, problem(http.StatusBadRequest, "Provide ?image=<snapshot ref>."))
+		return
+	}
+	if err := s.Manager.DeleteSnapshot(r.Context(), image); err != nil {
 		s.writeError(w, err)
 		return
 	}

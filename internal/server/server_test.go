@@ -19,11 +19,13 @@ import (
 
 // fakeRuntime satisfies run.Runtime without Docker.
 type fakeRuntime struct {
-	mu       sync.Mutex
-	created  []run.CreateSpec
-	removed  []string
-	files    map[string][]byte
-	execFunc func(cmd string, stdout, stderr io.Writer) (int, bool)
+	mu            sync.Mutex
+	created       []run.CreateSpec
+	removed       []string
+	snapshots     []string
+	removedImages []string
+	files         map[string][]byte
+	execFunc      func(cmd string, stdout, stderr io.Writer) (int, bool)
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -71,6 +73,20 @@ func (f *fakeRuntime) Remove(_ context.Context, containerID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.removed = append(f.removed, containerID)
+	return nil
+}
+
+func (f *fakeRuntime) Snapshot(_ context.Context, containerID, imageRef string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snapshots = append(f.snapshots, containerID+"=>"+imageRef)
+	return nil
+}
+
+func (f *fakeRuntime) RemoveImage(_ context.Context, imageRef string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removedImages = append(f.removedImages, imageRef)
 	return nil
 }
 
@@ -279,6 +295,78 @@ func TestDestroyAndUnknownRun(t *testing.T) {
 	}
 	if resp := request(t, ts, "DELETE", "/v1/runs/"+id, "test-token", ""); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("double destroy: got %d", resp.StatusCode)
+	}
+}
+
+func TestSnapshotLifecycle(t *testing.T) {
+	ts, runtime, _ := newTestServer(t)
+	id := createRun(t, ts)
+
+	// snapshot an existing run
+	resp := request(t, ts, "POST", "/v1/runs/"+id+"/snapshot", "test-token", "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("snapshot: got %d", resp.StatusCode)
+	}
+	var body struct {
+		Image  string `json:"image"`
+		Server string `json:"server"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(body.Image, run.SnapshotRepo+":") {
+		t.Fatalf("snapshot ref: %q", body.Image)
+	}
+	if body.Server != "test-box" {
+		t.Fatalf("server field missing: %q", body.Server)
+	}
+	if len(runtime.snapshots) != 1 {
+		t.Fatalf("runtime snapshot not taken: %v", runtime.snapshots)
+	}
+
+	// a new run can boot from the snapshot image (plain create)
+	boot := request(t, ts, "POST", "/v1/runs", "test-token", `{"image":"`+body.Image+`"}`)
+	if boot.StatusCode != http.StatusCreated {
+		t.Fatalf("boot from snapshot: got %d", boot.StatusCode)
+	}
+	if got := runtime.created[len(runtime.created)-1].Image; got != body.Image {
+		t.Fatalf("boot image: %q", got)
+	}
+
+	// unknown run → 404
+	if resp := request(t, ts, "POST", "/v1/runs/ghost/snapshot", "test-token", ""); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("snapshot unknown run: got %d", resp.StatusCode)
+	}
+
+	// delete: only sandbox snapshot refs are deletable
+	if resp := request(t, ts, "DELETE", "/v1/snapshots?image=ubuntu:24.04", "test-token", ""); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("deleting a non-snapshot image must be rejected: got %d", resp.StatusCode)
+	}
+	if resp := request(t, ts, "DELETE", "/v1/snapshots?image="+body.Image, "test-token", ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete snapshot: got %d", resp.StatusCode)
+	}
+	if len(runtime.removedImages) != 1 || runtime.removedImages[0] != body.Image {
+		t.Fatalf("image not removed: %v", runtime.removedImages)
+	}
+	if resp := request(t, ts, "DELETE", "/v1/snapshots", "test-token", ""); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing image param: got %d", resp.StatusCode)
+	}
+}
+
+func TestSnapshotSurvivesRunDestruction(t *testing.T) {
+	ts, runtime, manager := newTestServer(t)
+	id := createRun(t, ts)
+	resp := request(t, ts, "POST", "/v1/runs/"+id+"/snapshot", "test-token", "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("snapshot: got %d", resp.StatusCode)
+	}
+	// destroying the run (or the reaper) must not touch snapshot images
+	if resp := request(t, ts, "DELETE", "/v1/runs/"+id, "test-token", ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("destroy: got %d", resp.StatusCode)
+	}
+	manager.Reap(context.Background())
+	if len(runtime.removedImages) != 0 {
+		t.Fatalf("snapshot image must survive run destruction/reaping: %v", runtime.removedImages)
 	}
 }
 

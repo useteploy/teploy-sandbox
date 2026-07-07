@@ -79,7 +79,6 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 	args := []string{
 		"run", "-d",
 		"--name", spec.Name,
-		"--workdir", WorkDir,
 		"--security-opt", "no-new-privileges",
 		"--memory", fmt.Sprintf("%dm", spec.MemoryMB),
 		"--cpus", fmt.Sprintf("%g", spec.CPUs),
@@ -96,7 +95,11 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 		args = append(args, "-e", key+"="+value)
 	}
 	// A long-lived container so state persists between execs; the image
-	// must provide sh (agents need a shell regardless).
+	// must provide sh (agents need a shell regardless). Deliberately no
+	// --workdir here: the runtime chdirs into it before this command ever
+	// runs, so on an image without a pre-existing WorkDir the container
+	// fails to start. mkdir happens first instead; every docker exec below
+	// sets --workdir explicitly, by which point the directory exists.
 	args = append(args, spec.Image, "sh", "-c", "mkdir -p "+WorkDir+" && exec sleep infinity")
 
 	// Capture stdout (the container ID) separately from stderr: on a

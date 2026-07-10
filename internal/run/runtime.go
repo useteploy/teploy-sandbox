@@ -3,9 +3,11 @@ package run
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os/exec"
 	"strings"
 	"time"
@@ -21,6 +23,10 @@ type CreateSpec struct {
 	Pids     int
 	// "none" (default) or "egress" — never the teploy app network.
 	Network string
+	// ProxyURL is the egress allowlist proxy injected as the standard
+	// proxy env vars into egress runs. The egress bridge is internal
+	// (no NAT), so this proxy is the ONLY way out.
+	ProxyURL string
 }
 
 // Runtime is the container boundary. DockerRuntime shells out to the
@@ -40,9 +46,19 @@ type Runtime interface {
 	RemoveImage(ctx context.Context, imageRef string) error
 }
 
-// EgressNetwork is the NAT'd bridge egress-opt-in runs join. It is a
-// dedicated network so runs can never reach the `teploy` app network.
+// EgressNetwork is the INTERNAL bridge egress-opt-in runs join — a
+// dedicated network (never the `teploy` app network) with no NAT and no
+// default route; the daemon's allowlist proxy on its gateway is the only
+// way out.
 const EgressNetwork = "teploy-sbx-egress"
+
+// EgressSubnet/EgressGatewayIP pin the bridge's addressing so the proxy
+// always has a deterministic address to bind (auto-allocated IPAM is
+// materialized lazily on some runtimes).
+const (
+	EgressSubnet    = "172.31.99.0/24"
+	EgressGatewayIP = "172.31.99.1"
+)
 
 // WorkDir is the working directory inside every run container; the files
 // API is confined to it.
@@ -61,18 +77,72 @@ func (d *DockerRuntime) bin() string {
 }
 
 // EnsureEgressNetwork creates the egress bridge if missing (idempotent).
+// The bridge is INTERNAL: no NAT, no default route — a run's only way
+// out is the daemon's allowlist proxy on the bridge gateway. A leftover
+// pre-allowlist (non-internal) bridge is recreated; if containers are
+// still attached the swap fails and the error surfaces to the caller.
 func (d *DockerRuntime) EnsureEgressNetwork(ctx context.Context) error {
-	check := exec.CommandContext(ctx, d.bin(), "network", "inspect", EgressNetwork)
-	check.Stdout, check.Stderr = io.Discard, io.Discard
-	if check.Run() == nil {
-		return nil
+	inspect := exec.CommandContext(ctx, d.bin(), "network", "inspect", "-f", "{{.Internal}}", EgressNetwork)
+	var internal bytes.Buffer
+	inspect.Stdout, inspect.Stderr = &internal, io.Discard
+	if inspect.Run() == nil {
+		if strings.TrimSpace(internal.String()) == "true" {
+			return nil
+		}
+		if out, err := exec.CommandContext(ctx, d.bin(), "network", "rm", EgressNetwork).CombinedOutput(); err != nil {
+			return fmt.Errorf("egress network exists WITHOUT --internal and cannot be replaced (containers attached?): %s", strings.TrimSpace(string(out)))
+		}
 	}
-	create := exec.CommandContext(ctx, d.bin(), "network", "create", "--driver", "bridge", EgressNetwork)
+	// Explicit subnet+gateway: some runtimes materialize IPAM lazily on
+	// auto-allocated networks, leaving the proxy nothing to bind.
+	create := exec.CommandContext(ctx, d.bin(), "network", "create", "--driver", "bridge", "--internal",
+		"--subnet", EgressSubnet, "--gateway", EgressGatewayIP, EgressNetwork)
 	out, err := create.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("create egress network: %s", strings.TrimSpace(string(out)))
+		// Subnet collision on this box: fall back to auto-allocation; the
+		// gateway is then discovered from inspect instead of the constant.
+		fallback := exec.CommandContext(ctx, d.bin(), "network", "create", "--driver", "bridge", "--internal", EgressNetwork)
+		if fbOut, fbErr := fallback.CombinedOutput(); fbErr != nil {
+			return fmt.Errorf("create egress network: %s / %s", strings.TrimSpace(string(out)), strings.TrimSpace(string(fbOut)))
+		}
 	}
 	return nil
+}
+
+// EgressGateway reports the egress bridge's gateway IP — the address the
+// daemon's allowlist proxy binds so egress runs can reach it. Parsed from
+// inspect JSON (templates over IPAM misbehave on some runtimes); a subnet
+// without an explicit gateway derives .1, and a fully-lazy IPAM falls
+// back to the constant the network was created with.
+func (d *DockerRuntime) EgressGateway(ctx context.Context) (string, error) {
+	out, err := exec.CommandContext(ctx, d.bin(), "network", "inspect", EgressNetwork).Output()
+	if err != nil {
+		return "", fmt.Errorf("inspect egress network: %w", err)
+	}
+	var networks []struct {
+		IPAM struct {
+			Config []struct {
+				Subnet  string `json:"Subnet"`
+				Gateway string `json:"Gateway"`
+			} `json:"Config"`
+		} `json:"IPAM"`
+	}
+	if err := json.Unmarshal(out, &networks); err != nil || len(networks) == 0 {
+		return EgressGatewayIP, nil
+	}
+	for _, config := range networks[0].IPAM.Config {
+		if config.Gateway != "" {
+			return config.Gateway, nil
+		}
+		if ip, _, err := net.ParseCIDR(config.Subnet); err == nil {
+			ip = ip.To4()
+			if ip != nil {
+				ip[3]++
+				return ip.String(), nil
+			}
+		}
+	}
+	return EgressGatewayIP, nil
 }
 
 func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, error) {
@@ -88,6 +158,15 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 	switch spec.Network {
 	case "egress":
 		args = append(args, "--network", EgressNetwork)
+		// Standard proxy env for the allowlist proxy — the internal
+		// bridge enforces; these just point cooperating tools at the
+		// one door. Caller env below may override (e.g. extra NO_PROXY).
+		if spec.ProxyURL != "" {
+			for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+				args = append(args, "-e", key+"="+spec.ProxyURL)
+			}
+			args = append(args, "-e", "NO_PROXY=localhost,127.0.0.1", "-e", "no_proxy=localhost,127.0.0.1")
+		}
 	default:
 		args = append(args, "--network", "none")
 	}

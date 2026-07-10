@@ -7,11 +7,14 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/useteploy/teploy-sandbox/internal/egress"
 	"github.com/useteploy/teploy-sandbox/internal/run"
 	"github.com/useteploy/teploy-sandbox/internal/server"
 )
@@ -51,6 +54,9 @@ func serve(args []string) error {
 	addr := flags.String("addr", "127.0.0.1:7439", "listen address (never bind publicly)")
 	tokenFile := flags.String("token-file", "/deployments/sandbox/token", "bearer token path (minted 0600 if absent)")
 	reapInterval := flags.Duration("reap-interval", 30*time.Second, "TTL reaper tick interval")
+	egressAllow := flags.String("egress-allow", os.Getenv("SBX_EGRESS_ALLOW"),
+		"extra egress allowlist entries (comma-separated host, .suffix, or host:port), appended to the built-in registries")
+	egressProxyPort := flags.String("egress-proxy-port", "7443", "allowlist proxy port on the egress bridge gateway")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -62,9 +68,38 @@ func serve(args []string) error {
 	}
 
 	runtime := &run.DockerRuntime{}
+	proxyURL := ""
 	if err := runtime.EnsureEgressNetwork(context.Background()); err != nil {
 		// Egress is opt-in per run; a missing bridge only blocks those runs.
 		log.Warn("egress network unavailable", "error", err)
+	} else {
+		// Default-deny egress: the bridge is internal, so this allowlist
+		// proxy on its gateway is a run's only path off the box.
+		gateway, err := runtime.EgressGateway(context.Background())
+		if err != nil {
+			log.Warn("egress proxy disabled", "error", err)
+		} else {
+			allow := append(egress.Allowlist{}, egress.DefaultAllowlist...)
+			allow = append(allow, egress.ParseAllowlist(*egressAllow)...)
+			proxyAddr := net.JoinHostPort(gateway, *egressProxyPort)
+			// Bind synchronously: if the gateway isn't a host interface
+			// (VM-backed Docker on dev machines), runs must not be handed
+			// a dead proxy URL — they stay fully sealed instead.
+			listener, err := net.Listen("tcp", proxyAddr)
+			if err != nil {
+				log.Warn("egress proxy disabled — egress runs are fully sealed (no allowlisted door)",
+					"addr", proxyAddr, "error", err)
+			} else {
+				proxy := &http.Server{Handler: &egress.Proxy{Allow: allow, Log: log}}
+				go func() {
+					if err := proxy.Serve(listener); err != nil && err != http.ErrServerClosed {
+						log.Error("egress proxy failed", "error", err)
+					}
+				}()
+				proxyURL = "http://" + proxyAddr
+				log.Info("egress allowlist proxy up", "addr", proxyAddr, "entries", len(allow))
+			}
+		}
 	}
 	// Run state is in-memory: any container we labelled that survived a
 	// previous daemon life is an unreachable orphan. Sweep before serving.
@@ -74,9 +109,12 @@ func serve(args []string) error {
 		log.Info("swept orphaned run containers from a previous daemon life", "count", swept)
 	}
 
+	manager := run.NewManager(runtime, log)
+	manager.ProxyURL = proxyURL
+
 	hostname, _ := os.Hostname()
 	srv := &server.Server{
-		Manager:    run.NewManager(runtime, log),
+		Manager:    manager,
 		Runtime:    runtime,
 		Token:      token,
 		Version:    version,

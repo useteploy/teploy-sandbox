@@ -55,6 +55,10 @@ type Manager struct {
 	log     *slog.Logger
 	now     func() time.Time
 
+	// ProxyURL is stamped into every egress run's CreateSpec (the
+	// allowlist proxy on the internal egress bridge's gateway).
+	ProxyURL string
+
 	mu   sync.Mutex
 	runs map[string]*Run
 }
@@ -98,6 +102,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		CPUs:     DefaultCPUs,
 		Pids:     DefaultPids,
 		Network:  network,
+		ProxyURL: m.ProxyURL,
 	}
 	if req.Limits != nil {
 		if req.Limits.MemoryMB > 0 {

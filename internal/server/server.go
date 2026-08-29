@@ -62,6 +62,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/runs/{id}/exec", s.auth(s.handleExec))
 	mux.Handle("POST /v1/runs/{id}/snapshot", s.auth(s.handleSnapshot))
 	mux.Handle("DELETE /v1/snapshots", s.auth(s.handleDeleteSnapshot))
+	mux.Handle("POST /v1/runs/{id}/warm-commit", s.auth(s.handleWarmCommit))
+	mux.Handle("GET /v1/runs/{id}/warm", s.auth(s.handleWarmInfo))
+	mux.Handle("GET /v1/warmcache/{repo...}", s.auth(s.handleWarmGet))
+	mux.Handle("DELETE /v1/warmcache/{repo...}", s.auth(s.handleWarmDrop))
 	mux.Handle("PUT /v1/runs/{id}/files/{path...}", s.auth(s.handlePutFile))
 	mux.Handle("GET /v1/runs/{id}/files/{path...}", s.auth(s.handleGetFile))
 	return mux
@@ -120,13 +124,17 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	s.writeJSON(w, http.StatusCreated, map[string]any{
+	body := map[string]any{
 		"id":        created.ID,
 		"image":     created.Image,
 		"network":   created.Network,
 		"createdAt": created.CreatedAt,
 		"expiresAt": created.ExpiresAt,
-	})
+	}
+	if created.Warm != nil {
+		body["warm"] = created.Warm
+	}
+	s.writeJSON(w, http.StatusCreated, body)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
@@ -167,6 +175,53 @@ type execRequest struct {
 	Cmd        string `json:"cmd"`
 	Cwd        string `json:"cwd,omitempty"`
 	TimeoutSec int    `json:"timeoutSec,omitempty"`
+}
+
+// handleWarmCommit publishes a run's warm volume as its repo's warm
+// template (the volume-cache analog of snapshot).
+func (s *Server) handleWarmCommit(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Repo string `json:"repo,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
+		return
+	}
+	state, err := s.Manager.CommitWarm(r.Context(), r.PathValue("id"), req.Repo)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusCreated, map[string]any{"warm": state})
+}
+
+// handleWarmInfo reports the run volume's CURRENT lockfile hash — the
+// invalidation input to compare against the template manifest after a
+// fetch/checkout.
+func (s *Server) handleWarmInfo(w http.ResponseWriter, r *http.Request) {
+	state, err := s.Manager.WarmHash(r.PathValue("id"))
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"warm": state})
+}
+
+func (s *Server) handleWarmGet(w http.ResponseWriter, r *http.Request) {
+	mf, err := s.Manager.WarmManifest(r.PathValue("repo"))
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"warm": mf})
+}
+
+func (s *Server) handleWarmDrop(w http.ResponseWriter, r *http.Request) {
+	if err := s.Manager.DropWarm(r.PathValue("repo")); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleExec streams the pinned SSE frame contract (the shape

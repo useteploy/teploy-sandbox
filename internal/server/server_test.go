@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -94,6 +96,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *fakeRuntime, *run.Manager) 
 	t.Helper()
 	runtime := newFakeRuntime()
 	manager := run.NewManager(runtime, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	manager.Cache = run.NewCacheStore(t.TempDir(), 0)
 	srv := &Server{
 		Manager:    manager,
 		Runtime:    runtime,
@@ -158,6 +161,11 @@ func TestAuthRequiredOnEverythingButHealth(t *testing.T) {
 		{"GET", "/v1/runs"},
 		{"DELETE", "/v1/runs/x"},
 		{"POST", "/v1/runs/x/exec"},
+		{"POST", "/v1/runs/x/snapshot"},
+		{"POST", "/v1/runs/x/warm-commit"},
+		{"GET", "/v1/runs/x/warm"},
+		{"GET", "/v1/warmcache/owner/name"},
+		{"DELETE", "/v1/warmcache/owner/name"},
 		{"GET", "/v1/runs/x/files/a.txt"},
 	} {
 		missing := request(t, ts, tc.method, tc.path, "", "{}")
@@ -371,9 +379,7 @@ func TestSnapshotSurvivesRunDestruction(t *testing.T) {
 }
 
 func TestReaperEnforcesTTL(t *testing.T) {
-	_, runtime, manager := func() (*httptest.Server, *fakeRuntime, *run.Manager) {
-		return newTestServer(t)
-	}()
+	_, runtime, manager := newTestServer(t)
 
 	now := time.Now()
 	manager.SetClock(func() time.Time { return now })
@@ -394,5 +400,149 @@ func TestReaperEnforcesTTL(t *testing.T) {
 	}
 	if _, err := manager.Get(created.ID); err == nil {
 		t.Fatalf("reaped run still listed")
+	}
+}
+
+func TestWarmCacheLifecycleOverHTTP(t *testing.T) {
+	ts, runtime, manager := newTestServer(t)
+
+	// cold create: no template yet
+	resp := request(t, ts, "POST", "/v1/runs", "test-token",
+		`{"image":"golang:1.23","warm":{"repo":"Tyler/Teploy"}}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("cold create: got %d", resp.StatusCode)
+	}
+	var cold struct {
+		ID   string `json:"id"`
+		Warm *struct {
+			Repo   string `json:"repo"`
+			Booted bool   `json:"booted"`
+		} `json:"warm"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&cold); err != nil {
+		t.Fatal(err)
+	}
+	if cold.Warm == nil || cold.Warm.Booted || cold.Warm.Repo != "tyler/teploy" {
+		t.Fatalf("cold warm state: %+v", cold.Warm)
+	}
+	spec := runtime.created[len(runtime.created)-1]
+	if spec.CacheHostPath == "" || spec.CachePath != run.WorkDir {
+		t.Fatalf("warm volume not mounted at the workdir: %+v", spec)
+	}
+
+	// the repo-setup flow "clones + installs" straight into the volume
+	volume := filepath.Join(manager.Cache.Root, "runs", strings.ToLower(cold.ID))
+	if err := os.MkdirAll(filepath.Join(volume, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(volume, "repo", "go.mod"), []byte("module example.com/v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// commit publishes the template
+	commit := request(t, ts, "POST", "/v1/runs/"+cold.ID+"/warm-commit", "test-token", `{}`)
+	if commit.StatusCode != http.StatusCreated {
+		t.Fatalf("warm-commit: got %d", commit.StatusCode)
+	}
+	var committed struct {
+		Warm *run.WarmState `json:"warm"`
+	}
+	if err := json.NewDecoder(commit.Body).Decode(&committed); err != nil {
+		t.Fatal(err)
+	}
+	if committed.Warm == nil || committed.Warm.LockHash == "" || committed.Warm.RepoDir != "repo" {
+		t.Fatalf("commit state: %+v", committed.Warm)
+	}
+
+	// template manifest is queryable
+	get := request(t, ts, "GET", "/v1/warmcache/tyler/teploy", "test-token", "")
+	if get.StatusCode != http.StatusOK {
+		t.Fatalf("warmcache get: got %d", get.StatusCode)
+	}
+	var manifest struct {
+		Warm *run.WarmManifest `json:"warm"`
+	}
+	if err := json.NewDecoder(get.Body).Decode(&manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Warm.LockHash != committed.Warm.LockHash {
+		t.Fatalf("manifest hash %q != commit %q", manifest.Warm.LockHash, committed.Warm.LockHash)
+	}
+
+	// warm boot: same repo now boots from the template
+	warm := request(t, ts, "POST", "/v1/runs", "test-token",
+		`{"image":"golang:1.23","warm":{"repo":"tyler/teploy","path":"/workspace"}}`)
+	if warm.StatusCode != http.StatusCreated {
+		t.Fatalf("warm create: got %d", warm.StatusCode)
+	}
+	var booted struct {
+		ID   string         `json:"id"`
+		Warm *run.WarmState `json:"warm"`
+	}
+	if err := json.NewDecoder(warm.Body).Decode(&booted); err != nil {
+		t.Fatal(err)
+	}
+	if booted.Warm == nil || !booted.Warm.Booted || booted.Warm.LockHash != committed.Warm.LockHash {
+		t.Fatalf("warm boot state: %+v", booted.Warm)
+	}
+	copied, err := os.ReadFile(filepath.Join(manager.Cache.Root, "runs", strings.ToLower(booted.ID), "repo", "go.mod"))
+	if err != nil || !bytes.Contains(copied, []byte("example.com/v1")) {
+		t.Fatalf("warm boot must carry the template contents: %q err %v", copied, err)
+	}
+	warmSpec := runtime.created[len(runtime.created)-1]
+	if warmSpec.CachePath != "/workspace" {
+		t.Fatalf("explicit warm path not honored: %+v", warmSpec)
+	}
+
+	// invalidation input: hash the run's volume as it stands now
+	info := request(t, ts, "GET", "/v1/runs/"+booted.ID+"/warm", "test-token", "")
+	if info.StatusCode != http.StatusOK {
+		t.Fatalf("warm info: got %d", info.StatusCode)
+	}
+	var current struct {
+		Warm *run.WarmState `json:"warm"`
+	}
+	if err := json.NewDecoder(info.Body).Decode(&current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Warm.LockHash != committed.Warm.LockHash {
+		t.Fatalf("unchanged lockfiles must hash equal: %q vs %q", current.Warm.LockHash, committed.Warm.LockHash)
+	}
+	if err := os.WriteFile(filepath.Join(manager.Cache.Root, "runs", strings.ToLower(booted.ID), "repo", "go.mod"),
+		[]byte("module example.com/v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info = request(t, ts, "GET", "/v1/runs/"+booted.ID+"/warm", "test-token", "")
+	var changed struct {
+		Warm *run.WarmState `json:"warm"`
+	}
+	if err := json.NewDecoder(info.Body).Decode(&changed); err != nil {
+		t.Fatal(err)
+	}
+	if changed.Warm.LockHash == committed.Warm.LockHash {
+		t.Fatal("lockfile change must change the run's hash")
+	}
+
+	// refusal paths
+	if resp := request(t, ts, "POST", "/v1/runs/ghost/warm-commit", "test-token", `{}`); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("commit unknown run: got %d", resp.StatusCode)
+	}
+	plain := createRun(t, ts)
+	if resp := request(t, ts, "POST", "/v1/runs/"+plain+"/warm-commit", "test-token", `{}`); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("commit run without warm: got %d", resp.StatusCode)
+	}
+	if resp := request(t, ts, "GET", "/v1/warmcache/tyler/missing", "test-token", ""); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown template: got %d", resp.StatusCode)
+	}
+	if resp := request(t, ts, "POST", "/v1/runs", "test-token", `{"image":"x","warm":{"repo":"nope"}}`); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad repo: got %d", resp.StatusCode)
+	}
+
+	// forced invalidation (slug normalized case-insensitively)
+	if resp := request(t, ts, "DELETE", "/v1/warmcache/Tyler/Teploy", "test-token", ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("warmcache drop: got %d", resp.StatusCode)
+	}
+	if resp := request(t, ts, "GET", "/v1/warmcache/tyler/teploy", "test-token", ""); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("template must be gone after drop: got %d", resp.StatusCode)
 	}
 }

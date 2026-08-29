@@ -25,12 +25,25 @@ var (
 
 // Run is one live sandboxed environment.
 type Run struct {
-	ID          string    `json:"id"`
-	Image       string    `json:"image"`
-	Network     string    `json:"network"`
-	ContainerID string    `json:"-"`
-	CreatedAt   time.Time `json:"createdAt"`
-	ExpiresAt   time.Time `json:"expiresAt"`
+	ID          string `json:"id"`
+	Image       string `json:"image"`
+	Network     string `json:"network"`
+	ContainerID string `json:"-"`
+	// Warm describes the run's warm-cache volume when it has one.
+	Warm      *WarmState `json:"warm,omitempty"`
+	CacheDir  string     `json:"-"`
+	CreatedAt time.Time  `json:"createdAt"`
+	ExpiresAt time.Time  `json:"expiresAt"`
+}
+
+// WarmState is the warm-cache view of a run: which repo's volume it
+// holds, whether it booted from the warm template (false = the
+// repo-setup flow must clone cold), and the template's lockfile hash.
+type WarmState struct {
+	Repo     string `json:"repo"`
+	Booted   bool   `json:"booted"`
+	LockHash string `json:"lockHash,omitempty"`
+	RepoDir  string `json:"repoDir,omitempty"`
 }
 
 // CreateRequest is the POST /v1/runs body.
@@ -40,6 +53,10 @@ type CreateRequest struct {
 	TTLSec  int               `json:"ttlSec,omitempty"`
 	Network string            `json:"network,omitempty"`
 	Limits  *Limits           `json:"limits,omitempty"`
+	// Warm gives the run a private volume for the repo, seeded from the
+	// warm template when one exists (see WarmRequest); rejected when
+	// the daemon has no cache store configured.
+	Warm *WarmRequest `json:"warm,omitempty"`
 }
 
 type Limits struct {
@@ -58,6 +75,9 @@ type Manager struct {
 	// ProxyURL is stamped into every egress run's CreateSpec (the
 	// allowlist proxy on the internal egress bridge's gateway).
 	ProxyURL string
+	// Cache is the warm per-repo volume store; nil means the `warm`
+	// create option is refused.
+	Cache *CacheStore
 
 	mu   sync.Mutex
 	runs map[string]*Run
@@ -120,8 +140,33 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	id := NewULID(now)
 	spec.Name = "teploy-sbx-" + strings.ToLower(id)
 
+	warmState := (*WarmState)(nil)
+	if req.Warm != nil {
+		if m.Cache == nil {
+			return nil, fmt.Errorf("%w: this daemon has no cache store (serve --cache-root)", ErrBadRequest)
+		}
+		slug, err := NormalizeSlug(req.Warm.Repo)
+		if err != nil {
+			return nil, err
+		}
+		path, err := ValidateWarmPath(req.Warm.Path)
+		if err != nil {
+			return nil, err
+		}
+		hostPath, mf, booted, err := m.Cache.Boot(id, slug)
+		if err != nil {
+			return nil, err
+		}
+		warmState = &WarmState{Repo: slug, Booted: booted, LockHash: mf.LockHash, RepoDir: mf.RepoDir}
+		spec.CacheHostPath = hostPath
+		spec.CachePath = path
+	}
+
 	containerID, err := m.runtime.Create(ctx, spec)
 	if err != nil {
+		if warmState != nil {
+			m.Cache.Release(id)
+		}
 		return nil, err
 	}
 
@@ -130,6 +175,8 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		Image:       req.Image,
 		Network:     network,
 		ContainerID: containerID,
+		Warm:        warmState,
+		CacheDir:    spec.CacheHostPath,
 		CreatedAt:   now,
 		ExpiresAt:   now.Add(ttl),
 	}
@@ -170,6 +217,7 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 	if !ok {
 		return ErrNotFound
 	}
+	m.releaseWarm(run)
 	if err := m.runtime.Remove(ctx, run.ContainerID); err != nil {
 		m.log.Error("remove container failed", "id", id, "error", err)
 		return err
@@ -214,8 +262,97 @@ func (m *Manager) DeleteSnapshot(ctx context.Context, ref string) error {
 	return nil
 }
 
-// Reap force-removes every expired run. Called by the serve ticker and
-// exposed for tests.
+// CommitWarm hashes the run's warm volume (the lockfile set that
+// exists in it) and publishes it as the repo's warm template — the
+// volume-cache analog of Snapshot. Like Snapshot it records nothing
+// itself: the caller's recorded step sequence is untouched. Repeated
+// commits with unchanged lockfiles republish the same hash under a new
+// generation (harmless; the old one is cleaned up). When the run was
+// destroyed mid-copy, the volume is released here instead.
+func (m *Manager) CommitWarm(ctx context.Context, id string, repo string) (*WarmState, error) {
+	if m.Cache == nil {
+		return nil, fmt.Errorf("%w: this daemon has no cache store (serve --cache-root)", ErrBadRequest)
+	}
+	current, err := m.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if current.CacheDir == "" {
+		return nil, fmt.Errorf("%w: run %s has no warm volume", ErrBadRequest, id)
+	}
+	slug := current.Warm.Repo
+	if repo != "" {
+		if slug, err = NormalizeSlug(repo); err != nil {
+			return nil, err
+		}
+	}
+	mf, err := m.Cache.Commit(id, slug)
+	if _, getErr := m.Get(id); getErr != nil {
+		// The run died while we copied from its volume; nothing can
+		// release it anymore except us.
+		m.Cache.Release(id)
+	}
+	if err != nil {
+		return nil, err
+	}
+	m.log.Info("warm cache committed", "id", id, "repo", slug, "lockHash", mf.LockHash)
+	return &WarmState{Repo: slug, Booted: current.Warm.Booted, LockHash: mf.LockHash, RepoDir: mf.RepoDir}, nil
+}
+
+// WarmHash reports the lockfile hash of the run's volume as it stands
+// now — the invalidation input to compare against the template's
+// manifest after a fetch/checkout.
+func (m *Manager) WarmHash(id string) (*WarmState, error) {
+	if m.Cache == nil {
+		return nil, fmt.Errorf("%w: this daemon has no cache store (serve --cache-root)", ErrBadRequest)
+	}
+	current, err := m.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if current.CacheDir == "" {
+		return nil, fmt.Errorf("%w: run %s has no warm volume", ErrBadRequest, id)
+	}
+	hash, repoDir, err := m.Cache.Hash(id)
+	if err != nil {
+		return nil, err
+	}
+	return &WarmState{Repo: current.Warm.Repo, Booted: current.Warm.Booted, LockHash: hash, RepoDir: repoDir}, nil
+}
+
+// WarmManifest returns a repo's current warm manifest (ErrNotFound
+// when no template exists).
+func (m *Manager) WarmManifest(slug string) (*WarmManifest, error) {
+	if m.Cache == nil {
+		return nil, fmt.Errorf("%w: this daemon has no cache store (serve --cache-root)", ErrBadRequest)
+	}
+	normalized, err := NormalizeSlug(slug)
+	if err != nil {
+		return nil, err
+	}
+	mf, err := m.Cache.Manifest(normalized)
+	if err != nil {
+		return nil, err
+	}
+	return &mf, nil
+}
+
+// DropWarm removes a repo's warm template (forced invalidation).
+func (m *Manager) DropWarm(slug string) error {
+	if m.Cache == nil {
+		return fmt.Errorf("%w: this daemon has no cache store (serve --cache-root)", ErrBadRequest)
+	}
+	normalized, err := NormalizeSlug(slug)
+	if err != nil {
+		return err
+	}
+	return m.Cache.Drop(normalized)
+}
+
+// Reap force-removes every expired run and enforces the warm-cache
+// size cap (LRU eviction runs here — the one place with a clock tick
+// that is already sweeping). Called by the serve ticker and exposed for
+// tests.
 func (m *Manager) Reap(ctx context.Context) int {
 	now := m.now()
 	m.mu.Lock()
@@ -229,13 +366,23 @@ func (m *Manager) Reap(ctx context.Context) int {
 	m.mu.Unlock()
 
 	for _, run := range expired {
+		m.releaseWarm(run)
 		if err := m.runtime.Remove(ctx, run.ContainerID); err != nil {
 			m.log.Error("reap remove failed", "id", run.ID, "error", err)
 			continue
 		}
 		m.log.Info("run reaped", "id", run.ID)
 	}
+	if m.Cache != nil {
+		m.Cache.Sweep(ctx)
+	}
 	return len(expired)
+}
+
+func (m *Manager) releaseWarm(run *Run) {
+	if run.CacheDir != "" && m.Cache != nil {
+		m.Cache.Release(run.ID)
+	}
 }
 
 // StartReaper ticks until ctx is done.

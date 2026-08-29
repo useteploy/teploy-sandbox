@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -46,6 +47,7 @@ func usage() {
 
 Usage:
   teploy-sandbox serve [--addr 127.0.0.1:7439] [--token-file /deployments/sandbox/token]
+                       [--cache-root /var/lib/teploy-sandbox/cache] [--cache-max-gb 20]
   teploy-sandbox version`)
 }
 
@@ -57,6 +59,10 @@ func serve(args []string) error {
 	egressAllow := flags.String("egress-allow", os.Getenv("SBX_EGRESS_ALLOW"),
 		"extra egress allowlist entries (comma-separated host, .suffix, or host:port), appended to the built-in registries")
 	egressProxyPort := flags.String("egress-proxy-port", "7443", "allowlist proxy port on the egress bridge gateway")
+	cacheRoot := flags.String("cache-root", envOr("SBX_CACHE_ROOT", run.DefaultWarmRoot),
+		"host directory for the warm per-repo cache (empty disables the `warm` create option)")
+	cacheMaxGB := flags.Float64("cache-max-gb", envFloat("SBX_CACHE_MAX_GB", 20),
+		"LRU cap across all cache volumes, in GB (0 = unbounded)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -111,6 +117,10 @@ func serve(args []string) error {
 
 	manager := run.NewManager(runtime, log)
 	manager.ProxyURL = proxyURL
+	if *cacheRoot != "" {
+		manager.Cache = run.NewCacheStore(*cacheRoot, int64(*cacheMaxGB*(1<<30)))
+		log.Info("per-repo cache enabled", "root", *cacheRoot, "maxGB", *cacheMaxGB)
+	}
 
 	hostname, _ := os.Hostname()
 	srv := &server.Server{
@@ -125,4 +135,20 @@ func serve(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	return server.Serve(ctx, *addr, srv, *reapInterval)
+}
+
+func envOr(name, fallback string) string {
+	if v, ok := os.LookupEnv(name); ok {
+		return v
+	}
+	return fallback
+}
+
+func envFloat(name string, fallback float64) float64 {
+	if v := os.Getenv(name); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return fallback
 }

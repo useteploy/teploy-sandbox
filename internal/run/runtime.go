@@ -27,6 +27,11 @@ type CreateSpec struct {
 	// proxy env vars into egress runs. The egress bridge is internal
 	// (no NAT), so this proxy is the ONLY way out.
 	ProxyURL string
+	// CacheHostPath, when set, is the run's private warm volume
+	// bind-mounted at CachePath (see WarmRequest for the isolation
+	// argument).
+	CacheHostPath string
+	CachePath     string
 }
 
 // Runtime is the container boundary. DockerRuntime shells out to the
@@ -172,6 +177,9 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 	}
 	for key, value := range spec.Env {
 		args = append(args, "-e", key+"="+value)
+	}
+	if spec.CacheHostPath != "" {
+		args = append(args, "-v", spec.CacheHostPath+":"+spec.CachePath)
 	}
 	// A long-lived container so state persists between execs; the image
 	// must provide sh (agents need a shell regardless). Deliberately no

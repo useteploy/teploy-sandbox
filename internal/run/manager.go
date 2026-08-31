@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/useteploy/teploy-sandbox/internal/egress"
 )
 
 const (
@@ -22,6 +24,45 @@ var (
 	ErrNotFound   = errors.New("run not found")
 	ErrBadRequest = errors.New("bad request")
 )
+
+// Network tiers. The wire accepts "egress" as an alias for
+// NetworkAllowlist — it is what every deployed caller sends today and
+// the name is only misleading now that "open" is also egress.
+const (
+	// NetworkNone: no interfaces but loopback. The default, and the
+	// only tier where a compromised run provably cannot phone home.
+	NetworkNone = "none"
+	// NetworkAllowlist: the internal bridge plus the daemon's allowlist
+	// proxy. Default-deny — see internal/egress.
+	NetworkAllowlist = "allowlist"
+	// NetworkOpen: an ordinary NAT'd bridge, no proxy, no filtering.
+	// This is not a wider allowlist, it is the absence of one: raw TCP
+	// on any port to anywhere the host can route, the box's LAN
+	// included. Reserved for runs whose code is already trusted.
+	NetworkOpen = "open"
+)
+
+// ParseNetwork resolves the wire value to a tier.
+func ParseNetwork(raw string) (string, error) {
+	switch raw {
+	case "", NetworkNone:
+		return NetworkNone, nil
+	case NetworkAllowlist, "egress":
+		return NetworkAllowlist, nil
+	case NetworkOpen:
+		return NetworkOpen, nil
+	default:
+		return "", fmt.Errorf("%w: network must be \"none\", \"allowlist\" (alias \"egress\") or \"open\", got %q", ErrBadRequest, raw)
+	}
+}
+
+// EgressProxy hands a run the proxy URL to inject, and reclaims it when
+// the run dies. Runs with no per-run entries share the deployment's
+// proxy; a run that passed egressAllow gets its own (see egress.Pool).
+type EgressProxy interface {
+	OpenFor(runID string, extra []string) (string, error)
+	Close(runID string)
+}
 
 // Run is one live sandboxed environment.
 type Run struct {
@@ -52,7 +93,12 @@ type CreateRequest struct {
 	Env     map[string]string `json:"env,omitempty"`
 	TTLSec  int               `json:"ttlSec,omitempty"`
 	Network string            `json:"network,omitempty"`
-	Limits  *Limits           `json:"limits,omitempty"`
+	// EgressAllow is EXTRA allowlist entries for this run only,
+	// appended to the daemon's list. Same grammar as SBX_EGRESS_ALLOW
+	// (host, .suffix, host:port). Meaningless on "none"/"open" and
+	// refused there rather than silently ignored.
+	EgressAllow []string `json:"egressAllow,omitempty"`
+	Limits      *Limits  `json:"limits,omitempty"`
 	// Warm gives the run a private volume for the repo, seeded from the
 	// warm template when one exists (see WarmRequest); rejected when
 	// the daemon has no cache store configured.
@@ -72,9 +118,12 @@ type Manager struct {
 	log     *slog.Logger
 	now     func() time.Time
 
-	// ProxyURL is stamped into every egress run's CreateSpec (the
-	// allowlist proxy on the internal egress bridge's gateway).
+	// ProxyURL is stamped into every allowlist run's CreateSpec (the
+	// deployment-wide proxy on the internal egress bridge's gateway).
 	ProxyURL string
+	// Egress serves per-run allowlists; nil means egressAllow is
+	// refused (the daemon has no proxy to extend).
+	Egress EgressProxy
 	// Cache is the warm per-repo volume store; nil means the `warm`
 	// create option is refused.
 	Cache *CacheStore
@@ -99,13 +148,22 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	if strings.TrimSpace(req.Image) == "" {
 		return nil, fmt.Errorf("%w: image is required", ErrBadRequest)
 	}
-	network := req.Network
-	switch network {
-	case "", "none":
-		network = "none"
-	case "egress":
-	default:
-		return nil, fmt.Errorf("%w: network must be \"none\" or \"egress\"", ErrBadRequest)
+	network, err := ParseNetwork(req.Network)
+	if err != nil {
+		return nil, err
+	}
+	// Validate before anything is created: a typo'd entry must fail the
+	// request, not produce a run that quietly cannot reach the host the
+	// caller asked for.
+	extra, err := egress.ValidateAllowlist(req.EgressAllow)
+	if err != nil {
+		return nil, fmt.Errorf("%w: egressAllow %s", ErrBadRequest, err)
+	}
+	if len(extra) > 0 && m.Egress == nil {
+		return nil, fmt.Errorf("%w: this daemon has no egress proxy, so egressAllow cannot be honoured", ErrBadRequest)
+	}
+	if len(extra) > 0 && network != NetworkAllowlist {
+		return nil, fmt.Errorf("%w: egressAllow needs network \"allowlist\" — %q has no allowlist to extend", ErrBadRequest, network)
 	}
 	ttl := DefaultTTL
 	if req.TTLSec > 0 {
@@ -122,7 +180,12 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		CPUs:     DefaultCPUs,
 		Pids:     DefaultPids,
 		Network:  network,
-		ProxyURL: m.ProxyURL,
+	}
+	if network == NetworkAllowlist {
+		// Only the allowlist tier has a proxy to point at. On "none"
+		// there is nothing to reach and on "open" a proxy env var
+		// would quietly re-impose the filter the caller opted out of.
+		spec.ProxyURL = m.ProxyURL
 	}
 	if req.Limits != nil {
 		if req.Limits.MemoryMB > 0 {
@@ -162,11 +225,27 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		spec.CachePath = path
 	}
 
+	if len(extra) > 0 {
+		// A private proxy carrying default+extra, alive only as long as
+		// this run — the entries must not leak to any other container
+		// sharing the bridge. Opened last, so nothing between here and
+		// Create can fail with a listener already bound.
+		proxyURL, err := m.Egress.OpenFor(id, extra)
+		if err != nil {
+			if warmState != nil {
+				m.Cache.Release(id)
+			}
+			return nil, fmt.Errorf("per-run egress proxy: %w", err)
+		}
+		spec.ProxyURL = proxyURL
+	}
+
 	containerID, err := m.runtime.Create(ctx, spec)
 	if err != nil {
 		if warmState != nil {
 			m.Cache.Release(id)
 		}
+		m.closeEgress(id)
 		return nil, err
 	}
 
@@ -183,7 +262,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	m.mu.Lock()
 	m.runs[id] = run
 	m.mu.Unlock()
-	m.log.Info("run created", "id", id, "image", req.Image, "network", network, "expiresAt", run.ExpiresAt)
+	m.log.Info("run created", "id", id, "image", req.Image, "network", network, "egressAllow", len(extra), "expiresAt", run.ExpiresAt)
 	return run, nil
 }
 
@@ -218,6 +297,7 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 		return ErrNotFound
 	}
 	m.releaseWarm(run)
+	m.closeEgress(id)
 	if err := m.runtime.Remove(ctx, run.ContainerID); err != nil {
 		m.log.Error("remove container failed", "id", id, "error", err)
 		return err
@@ -367,6 +447,7 @@ func (m *Manager) Reap(ctx context.Context) int {
 
 	for _, run := range expired {
 		m.releaseWarm(run)
+		m.closeEgress(run.ID)
 		if err := m.runtime.Remove(ctx, run.ContainerID); err != nil {
 			m.log.Error("reap remove failed", "id", run.ID, "error", err)
 			continue
@@ -382,6 +463,14 @@ func (m *Manager) Reap(ctx context.Context) int {
 func (m *Manager) releaseWarm(run *Run) {
 	if run.CacheDir != "" && m.Cache != nil {
 		m.Cache.Release(run.ID)
+	}
+}
+
+// closeEgress tears down a run's private allowlist proxy. Safe on runs
+// that never had one.
+func (m *Manager) closeEgress(id string) {
+	if m.Egress != nil {
+		m.Egress.Close(id)
 	}
 }
 

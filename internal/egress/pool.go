@@ -1,0 +1,107 @@
+package egress
+
+import (
+	"log/slog"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+)
+
+// Pool owns every allowlist proxy the daemon serves.
+//
+// Most runs share one listener on a fixed port (the deployment's
+// default list + SBX_EGRESS_ALLOW) — that is the pre-tier behaviour,
+// unchanged. A run that passes per-run `egressAllow` entries instead
+// gets a listener of its OWN on an ephemeral port, torn down when the
+// run dies.
+//
+// A private listener rather than a shared one keyed by source IP,
+// because the key would not hold: every allowlist run sits on the same
+// bridge, containers keep CAP_NET_RAW by default, and one run's extra
+// entries must not become another's. A run only ever learns its own
+// proxy's port (injected as HTTP_PROXY), and the port dies with it.
+type Pool struct {
+	// Base is the allowlist every run starts from.
+	Base Allowlist
+	// Bind is the address private listeners bind — the egress bridge
+	// gateway, reachable only from the bridge.
+	Bind string
+	Log  *slog.Logger
+
+	mu     sync.Mutex
+	shared string
+	perRun map[string]*http.Server
+}
+
+// Start binds the shared listener on port and serves it. The returned
+// URL is what runs without extra entries are handed.
+func (p *Pool) Start(port string) (string, error) {
+	addr := net.JoinHostPort(p.Bind, port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return "", err
+	}
+	server := &http.Server{Handler: &Proxy{Allow: p.Base, Log: p.Log}}
+	go func() {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			p.Log.Error("egress proxy failed", "addr", addr, "error", err)
+		}
+	}()
+	p.mu.Lock()
+	p.shared = "http://" + listener.Addr().String()
+	p.mu.Unlock()
+	return p.SharedURL(), nil
+}
+
+// SharedURL is the deployment-wide proxy's URL ("" before Start).
+func (p *Pool) SharedURL() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.shared
+}
+
+// OpenFor returns the proxy URL for a run. With no extra entries that
+// is the shared proxy; otherwise a private listener carrying Base plus
+// extra, registered under runID for Close. Extra entries must already
+// be validated (ValidateAllowlist) — this is the plumbing, not the gate.
+func (p *Pool) OpenFor(runID string, extra []string) (string, error) {
+	if len(extra) == 0 {
+		return p.SharedURL(), nil
+	}
+	allow := make(Allowlist, 0, len(p.Base)+len(extra))
+	allow = append(allow, p.Base...)
+	allow = append(allow, ParseAllowlist(strings.Join(extra, ","))...)
+	// Port 0: the kernel picks. Nothing but the run itself is told the
+	// number, so there is no port to reserve or collide on.
+	listener, err := net.Listen("tcp", net.JoinHostPort(p.Bind, "0"))
+	if err != nil {
+		return "", err
+	}
+	server := &http.Server{Handler: &Proxy{Allow: allow, Log: p.Log.With("run", runID)}}
+	go func() {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			p.Log.Error("per-run egress proxy failed", "run", runID, "error", err)
+		}
+	}()
+	p.mu.Lock()
+	if p.perRun == nil {
+		p.perRun = make(map[string]*http.Server)
+	}
+	p.perRun[runID] = server
+	p.mu.Unlock()
+	p.Log.Info("per-run egress proxy up", "run", runID, "addr", listener.Addr().String(), "extra", extra)
+	return "http://" + listener.Addr().String(), nil
+}
+
+// Close tears down a run's private listener, if it had one. Idempotent:
+// both Destroy and the reaper call it.
+func (p *Pool) Close(runID string) {
+	p.mu.Lock()
+	server, ok := p.perRun[runID]
+	delete(p.perRun, runID)
+	p.mu.Unlock()
+	if ok {
+		_ = server.Close()
+	}
+}

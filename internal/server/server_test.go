@@ -92,11 +92,22 @@ func (f *fakeRuntime) RemoveImage(_ context.Context, imageRef string) error {
 	return nil
 }
 
+// fakeEgressPool stands in for the real proxy pool: the HTTP surface
+// only needs a daemon that HAS one.
+type fakeEgressPool struct{}
+
+func (fakeEgressPool) OpenFor(runID string, _ []string) (string, error) {
+	return "http://172.31.99.1:40001", nil
+}
+func (fakeEgressPool) Close(string) {}
+
 func newTestServer(t *testing.T) (*httptest.Server, *fakeRuntime, *run.Manager) {
 	t.Helper()
 	runtime := newFakeRuntime()
 	manager := run.NewManager(runtime, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	manager.Cache = run.NewCacheStore(t.TempDir(), 0)
+	manager.ProxyURL = "http://172.31.99.1:7443"
+	manager.Egress = fakeEgressPool{}
 	srv := &Server{
 		Manager:    manager,
 		Runtime:    runtime,
@@ -203,9 +214,16 @@ func TestCreateValidation(t *testing.T) {
 	for body, want := range map[string]int{
 		`{}`:                                       http.StatusBadRequest, // no image
 		`{"image":"x","network":"teploy"}`:         http.StatusBadRequest, // never the app network
+		`{"image":"x","network":"host"}`:           http.StatusBadRequest, // nor the host's
 		`{"image":"x","ttlSec":999999999}`:         http.StatusBadRequest, // over max TTL
-		`{"image":"x","network":"egress"}`:         http.StatusCreated,
+		`{"image":"x","network":"egress"}`:         http.StatusCreated,    // pre-tier alias, still honoured
+		`{"image":"x","network":"allowlist"}`:      http.StatusCreated,
+		`{"image":"x","network":"open"}`:           http.StatusCreated,
 		`{"image":"x","limits":{"memoryMb":2048}}`: http.StatusCreated,
+		// egressAllow is validated at the edge, never silently dropped.
+		`{"image":"x","network":"allowlist","egressAllow":["*.hex.pm"]}`:    http.StatusBadRequest,
+		`{"image":"x","network":"none","egressAllow":["rubygems.org"]}`:     http.StatusBadRequest,
+		`{"image":"x","network":"allowlist","egressAllow":["repo.hex.pm"]}`: http.StatusCreated,
 	} {
 		resp := request(t, ts, "POST", "/v1/runs", "test-token", body)
 		if resp.StatusCode != want {

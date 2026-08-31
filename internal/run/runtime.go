@@ -21,11 +21,12 @@ type CreateSpec struct {
 	MemoryMB int
 	CPUs     float64
 	Pids     int
-	// "none" (default) or "egress" — never the teploy app network.
+	// NetworkNone (default), NetworkAllowlist or NetworkOpen — never
+	// the teploy app network.
 	Network string
-	// ProxyURL is the egress allowlist proxy injected as the standard
-	// proxy env vars into egress runs. The egress bridge is internal
-	// (no NAT), so this proxy is the ONLY way out.
+	// ProxyURL is the allowlist proxy injected as the standard proxy
+	// env vars into allowlist runs. That bridge is internal (no NAT),
+	// so this proxy is the ONLY way out. Unset on the other tiers.
 	ProxyURL string
 	// CacheHostPath, when set, is the run's private warm volume
 	// bind-mounted at CachePath (see WarmRequest for the isolation
@@ -161,7 +162,7 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 		"--label", "teploy.sandbox=1",
 	}
 	switch spec.Network {
-	case "egress":
+	case NetworkAllowlist:
 		args = append(args, "--network", EgressNetwork)
 		// Standard proxy env for the allowlist proxy — the internal
 		// bridge enforces; these just point cooperating tools at the
@@ -172,6 +173,14 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 			}
 			args = append(args, "-e", "NO_PROXY=localhost,127.0.0.1", "-e", "no_proxy=localhost,127.0.0.1")
 		}
+	case NetworkOpen:
+		// Docker's default NAT bridge: a real default route, so raw TCP
+		// and UDP on any port work — ssh:// and git:// remotes included.
+		// No proxy env is injected, because there is no proxy to point
+		// at and a stale HTTP_PROXY would silently break the tier.
+		// Deliberately the default bridge and never the `teploy` app
+		// network: a run still must not be able to name app services.
+		args = append(args, "--network", "bridge")
 	default:
 		args = append(args, "--network", "none")
 	}

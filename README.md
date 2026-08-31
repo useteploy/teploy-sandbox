@@ -13,7 +13,7 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 
 | Route | Does |
 |---|---|
-| `POST /v1/runs` | `{image, env?, ttlSec?, network?, limits?, warm?}` → `{id, server, expiresAt, warm?}` — network `none` (default) or `egress`; defaults 1 CPU / 1 GB / 256 pids, `no-new-privileges`, never the `teploy` app network; `warm: {repo, path?}` gives the run a private volume for the repo (below) |
+| `POST /v1/runs` | `{image, env?, ttlSec?, network?, egressAllow?, limits?, warm?}` → `{id, server, expiresAt, warm?}` — network `none` (default), `allowlist` or `open` (see Egress); defaults 1 CPU / 1 GB / 256 pids, `no-new-privileges`, never the `teploy` app network; `warm: {repo, path?}` gives the run a private volume for the repo (below) |
 | `POST /v1/runs/{id}/exec` | `{cmd, cwd?, timeoutSec?}` → SSE: `stdout`/`stderr` chunks, then `exit` `{exitCode, timedOut}` |
 | `PUT/GET /v1/runs/{id}/files/{path}` | Confined to `/work`; traversal rejected |
 | `DELETE /v1/runs/{id}` | Destroy now (the reaper enforces TTLs regardless, default 30 min) |
@@ -25,6 +25,90 @@ API rework.
 
 Clients: `SandboxExecutor` in `@neutron-build/agents` (the pinned wire
 contract); a Go client package follows with the Phase B agent product.
+
+## Egress
+
+Three tiers, on `POST /v1/runs`:
+
+| `network` | What a run can reach |
+|---|---|
+| `none` (default) | Nothing. No interface but loopback. |
+| `allowlist` | Only allowlisted hosts, and only through the daemon's HTTP proxy. `egress` is a still-supported alias; the response normalizes it to `allowlist`. |
+| `open` | Everything the host can route. No proxy, no filter. |
+
+`egressAllow: ["rubygems.org", ".hex.pm", "forge.example.com:49152"]`
+adds entries for ONE run, on top of the built-in list — the entries
+live on a private proxy that is created with the run and closed when it
+dies, so nothing leaks to the other runs sharing the bridge. Entry
+grammar is the same as `SBX_EGRESS_ALLOW`: `host` (ports 80/443),
+`.suffix` (the host and its subdomains, two labels minimum — `.com` is
+refused), or `host:port` (that port only). A malformed entry is a 400,
+never a silent drop. `egressAllow` on `none` or `open` is a 400 too:
+there is no allowlist there to extend.
+
+`SBX_EGRESS_ALLOW` (or `serve --egress-allow`) does the same thing
+deployment-wide, and a malformed value now refuses to start rather than
+serving a list that isn't the configured one.
+
+### What is on the default list
+
+npm/yarn/Node, PyPI, Go, cargo + rustup, RubyGems, Maven Central +
+Gradle (portal, wrapper, Adoptium, `google()`), Composer, NuGet +
+`dotnet-install`, Hex, pub.dev, Hackage + ghcup, Debian, Ubuntu
+(including `ports.ubuntu.com` for arm64), Alpine, GitHub/GitLab/
+Bitbucket/Codeberg, and anonymous pulls from Docker Hub, GHCR, Quay and
+MCR. `internal/egress/proxy.go` carries a comment per entry.
+
+Where a registry puts publishing on its own hostname, only the download
+host is listed — `crates.io`, `hex.pm`, `www.nuget.org`, `packagist.org`
+and Sonatype are all deliberately absent while their download hosts are
+present. Where it does not (RubyGems, npm, Hackage, the Gradle portal,
+every OCI registry), the entry is marked two-way in the source: allowing
+the install allows the upload, and that is a knowing trade.
+
+Three deliberate refusals worth knowing about, because they mean a
+working ecosystem is still one `egressAllow` away:
+
+- **`storage.googleapis.com`** — plain Dart works, but the **Flutter
+  SDK** fetches engine artifacts from it. A generic object store is an
+  exfiltration channel with a package manager's excuse, so it is opt-in.
+- **`registry.k8s.io`** — redirects even manifests to a regional
+  `*.pkg.dev` or a `prod-registry-k8s-io-*` S3 bucket, so there is no
+  single host to allow.
+- **`aka.ms`** — a redirector to anywhere on Microsoft's estate.
+
+### What the allowlist tier cannot do
+
+The bridge is `--internal`: no NAT, no default route. The proxy on its
+gateway is the only way out, and runs find it through `HTTP_PROXY` /
+`HTTPS_PROXY`. Everything follows from that:
+
+- **Only proxy-aware tools get out at all.** curl, git-over-https, npm,
+  pip, go, cargo, apt, gem, composer and friends read the proxy env.
+  Anything that ignores it — a raw socket, a database driver, a JVM
+  that was not given `-Dhttp.proxyHost` — has no route and fails with a
+  network error rather than a 403.
+- **SSH git remotes and `git://` can never work.** `git@github.com:...`
+  is SSH on port 22 and `git://` is port 9418; neither speaks HTTP
+  CONNECT, and neither has a route. Rewrite to https, or use `open`.
+  This is not an allowlist entry away — no entry helps.
+- **Ports: 80 and 443 only,** unless an entry names a port explicitly
+  (`forge.example.com:49152`). A port-scoped entry opens that port and
+  nothing else.
+- **Denials are 403s from the proxy,** and the body names the exact
+  `egressAllow` entry and `SBX_EGRESS_ALLOW` value that would have
+  admitted the host.
+
+### What `open` actually does
+
+`open` puts the run on Docker's default NAT bridge and injects no proxy
+env at all. A raw TCP or UDP connection to any port simply works: SSH
+remotes, `git://`, database ports, anything the host can route. That
+includes the box's LAN, its tailnet, and any other Docker network the
+host routes to — `open` is the absence of a boundary, not a wider
+allowlist. It is still never the `teploy` app network. Use it for code
+you already trust; `allowlist` is the default answer for agent runs.
+
 
 ## Never
 

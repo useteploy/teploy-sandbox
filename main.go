@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -47,6 +46,7 @@ func usage() {
 
 Usage:
   teploy-sandbox serve [--addr 127.0.0.1:7439] [--token-file /deployments/sandbox/token]
+                       [--egress-allow host,.suffix,host:port] [--egress-proxy-port 7443]
                        [--cache-root /var/lib/teploy-sandbox/cache] [--cache-max-gb 20]
   teploy-sandbox version`)
 }
@@ -57,7 +57,7 @@ func serve(args []string) error {
 	tokenFile := flags.String("token-file", "/deployments/sandbox/token", "bearer token path (minted 0600 if absent)")
 	reapInterval := flags.Duration("reap-interval", 30*time.Second, "TTL reaper tick interval")
 	egressAllow := flags.String("egress-allow", os.Getenv("SBX_EGRESS_ALLOW"),
-		"extra egress allowlist entries (comma-separated host, .suffix, or host:port), appended to the built-in registries")
+		"extra allowlist entries for EVERY run (comma-separated host, .suffix, or host:port), appended to the built-in registries; per-run extras go in the create body's egressAllow")
 	egressProxyPort := flags.String("egress-proxy-port", "7443", "allowlist proxy port on the egress bridge gateway")
 	cacheRoot := flags.String("cache-root", envOr("SBX_CACHE_ROOT", run.DefaultWarmRoot),
 		"host directory for the warm per-repo cache (empty disables the `warm` create option)")
@@ -65,6 +65,15 @@ func serve(args []string) error {
 		"LRU cap across all cache volumes, in GB (0 = unbounded)")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+
+	// Validate the deployment allowlist before anything else: a typo in
+	// SBX_EGRESS_ALLOW would otherwise present as "the allowlist ignores
+	// my host" hours later. Refuse to start instead of serving a list
+	// that silently isn't the configured one.
+	deployAllow, err := egress.ValidateAllowlist(egress.ParseAllowlist(*egressAllow))
+	if err != nil {
+		return fmt.Errorf("egress-allow: %w", err)
 	}
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -75,6 +84,7 @@ func serve(args []string) error {
 
 	runtime := &run.DockerRuntime{}
 	proxyURL := ""
+	var pool *egress.Pool
 	if err := runtime.EnsureEgressNetwork(context.Background()); err != nil {
 		// Egress is opt-in per run; a missing bridge only blocks those runs.
 		log.Warn("egress network unavailable", "error", err)
@@ -86,24 +96,19 @@ func serve(args []string) error {
 			log.Warn("egress proxy disabled", "error", err)
 		} else {
 			allow := append(egress.Allowlist{}, egress.DefaultAllowlist...)
-			allow = append(allow, egress.ParseAllowlist(*egressAllow)...)
-			proxyAddr := net.JoinHostPort(gateway, *egressProxyPort)
+			allow = append(allow, deployAllow...)
 			// Bind synchronously: if the gateway isn't a host interface
 			// (VM-backed Docker on dev machines), runs must not be handed
 			// a dead proxy URL — they stay fully sealed instead.
-			listener, err := net.Listen("tcp", proxyAddr)
+			pool = &egress.Pool{Base: allow, Bind: gateway, Log: log}
+			url, err := pool.Start(*egressProxyPort)
 			if err != nil {
-				log.Warn("egress proxy disabled — egress runs are fully sealed (no allowlisted door)",
-					"addr", proxyAddr, "error", err)
+				log.Warn("egress proxy disabled — allowlist runs are fully sealed (no allowlisted door)",
+					"addr", net.JoinHostPort(gateway, *egressProxyPort), "error", err)
+				pool = nil
 			} else {
-				proxy := &http.Server{Handler: &egress.Proxy{Allow: allow, Log: log}}
-				go func() {
-					if err := proxy.Serve(listener); err != nil && err != http.ErrServerClosed {
-						log.Error("egress proxy failed", "error", err)
-					}
-				}()
-				proxyURL = "http://" + proxyAddr
-				log.Info("egress allowlist proxy up", "addr", proxyAddr, "entries", len(allow))
+				proxyURL = url
+				log.Info("egress allowlist proxy up", "addr", url, "entries", len(allow))
 			}
 		}
 	}
@@ -117,6 +122,9 @@ func serve(args []string) error {
 
 	manager := run.NewManager(runtime, log)
 	manager.ProxyURL = proxyURL
+	if pool != nil {
+		manager.Egress = pool
+	}
 	if *cacheRoot != "" {
 		manager.Cache = run.NewCacheStore(*cacheRoot, int64(*cacheMaxGB*(1<<30)))
 		log.Info("per-repo cache enabled", "root", *cacheRoot, "maxGB", *cacheMaxGB)

@@ -12,7 +12,7 @@ import (
 )
 
 func TestAllowlistPermits(t *testing.T) {
-	list := ParseAllowlist(".npmjs.org, pypi.org,100.108.123.49:49152\n proxy.golang.org")
+	list := ParseAllowlist(".npmjs.org, pypi.org,forge.example.com:49152\n proxy.golang.org")
 	cases := []struct {
 		host string
 		want bool
@@ -24,8 +24,8 @@ func TestAllowlistPermits(t *testing.T) {
 		{"pypi.org:80", true},            // default ports
 		{"pypi.org:8443", false},         // non-default port needs explicit entry
 		{"sub.pypi.org:443", false},      // exact entry admits no subdomains
-		{"100.108.123.49:49152", true},   // explicit host:port
-		{"100.108.123.49:443", false},    // port-scoped entry opens ONLY that port
+		{"forge.example.com:49152", true}, // explicit host:port
+		{"forge.example.com:443", false},  // port-scoped entry opens ONLY that port
 		{"PROXY.GOLANG.ORG:443", true},   // case-insensitive
 		{"example.com:443", false},       // default-deny
 		{"proxy.golang.org.evil.io:443", false},

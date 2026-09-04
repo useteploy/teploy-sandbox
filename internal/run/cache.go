@@ -179,7 +179,7 @@ func (c *CacheStore) Boot(id, slug string) (string, WarmManifest, bool, error) {
 		return "", WarmManifest{}, false, fmt.Errorf("warm root: %w", err)
 	}
 	runDir := c.runDir(id)
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		mf, err := c.Manifest(slug)
 		if errors.Is(err, ErrNotFound) {
 			break
@@ -195,10 +195,13 @@ func (c *CacheStore) Boot(id, slug string) (string, WarmManifest, bool, error) {
 			touchLastUsed(c.slugDir(slug))
 			return runDir, mf, true, nil
 		}
-		if errors.Is(err, fs.ErrNotExist) && attempt == 0 {
-			// The generation vanished mid-copy (superseded and cleaned);
-			// fall through and try again — the next Manifest read either
-			// finds the newer generation or comes back cold.
+		if errors.Is(err, fs.ErrNotExist) {
+			// The generation vanished mid-copy (superseded and cleaned).
+			// Clear the partial copy and try again — the next Manifest
+			// read either finds the newer generation or comes back cold.
+			// This is a retry, never an error: the contract is
+			// complete-generation-or-cold-boot.
+			_ = os.RemoveAll(runDir)
 			continue
 		}
 		_ = os.RemoveAll(runDir)
@@ -273,6 +276,12 @@ func writeManifest(slugDir string, mf WarmManifest) error {
 // cleanGenerations removes superseded generations: everything that is
 // neither the CURRENT manifest's generation (re-read at cleanup time, so
 // a concurrently published newer generation survives) nor in use.
+//
+// Deletion is rename-then-remove: the rename takes a generation out of the
+// g-* namespace atomically, so a boot whose mark landed after this pass
+// decided to delete still copies either the complete tree or nothing at
+// all — a plain RemoveAll could unlink files mid-copy and surface as a
+// boot error or, worse, a silently incomplete run volume.
 func (c *CacheStore) cleanGenerations(slugDir string) {
 	current := ""
 	if mf, err := c.manifestFromDir(slugDir); err == nil {
@@ -283,12 +292,28 @@ func (c *CacheStore) cleanGenerations(slugDir string) {
 		return
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() || !genShape.MatchString(entry.Name()) || entry.Name() == current {
+		if !entry.IsDir() {
 			continue
 		}
-		dir := filepath.Join(slugDir, entry.Name())
-		if c.busy(dir) {
+		name := entry.Name()
+		// t-* is a previous rename-then-remove that crashed before finishing;
+		// it is never the current generation and never in use under its new
+		// name, so it is always safe to finish deleting.
+		if !genShape.MatchString(name) && !strings.HasPrefix(name, "t-g-") {
 			continue
+		}
+		dir := filepath.Join(slugDir, name)
+		if genShape.MatchString(name) {
+			if name == current || c.busy(dir) {
+				continue
+			}
+			trash := filepath.Join(slugDir, "t-"+name)
+			if err := os.Rename(dir, trash); err != nil {
+				// Lost a race with another cleaner or a boot marking it;
+				// either way it is no longer ours to delete.
+				continue
+			}
+			dir = trash
 		}
 		_ = os.RemoveAll(dir)
 	}

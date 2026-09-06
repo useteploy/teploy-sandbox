@@ -82,7 +82,10 @@ func serve(args []string) error {
 		return fmt.Errorf("token: %w", err)
 	}
 
-	runtime := &run.DockerRuntime{}
+	// SBX_RUNTIME=runsc puts gVisor between every run and the host kernel;
+	// unset means Docker's default runtime. SBX_SHM_MB sizes /dev/shm for
+	// runs that launch a headless browser (Chromium needs 512 MB or more).
+	runtime := &run.DockerRuntime{Runtime: os.Getenv("SBX_RUNTIME"), ShmMB: int(envFloat("SBX_SHM_MB", 512))}
 	proxyURL := ""
 	var pool *egress.Pool
 	if err := runtime.EnsureEgressNetwork(context.Background()); err != nil {

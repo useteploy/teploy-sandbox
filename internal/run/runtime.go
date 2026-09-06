@@ -70,7 +70,22 @@ const (
 // API is confined to it.
 const WorkDir = "/work"
 
+// Hardening applied to every run's container, on top of what the request
+// names (memory, cpus, pids, network). Drop what an agent's build never needs
+// and an escape would: raw sockets (ARP/ICMP spoofing on the bridge), device
+// nodes, audit writes. The default capability set otherwise stays, because
+// apt, npm and cargo all chown and setuid as root during installs and a
+// --cap-drop=ALL turns "tests: not run" into the common case.
+var dropCapabilities = []string{"NET_RAW", "MKNOD", "AUDIT_WRITE"}
+
 type DockerRuntime struct {
+	// Runtime is the OCI runtime handed to docker run (--runtime). Empty
+	// means Docker's default (runc). "runsc" (gVisor) puts a userspace
+	// kernel between the run and the host: SBX_RUNTIME on the daemon.
+	Runtime string
+	// ShmMB sizes /dev/shm. Docker's 64 MB default crashes Chromium; a
+	// headless browser inside a run needs 512 MB or more.
+	ShmMB int
 	// Docker binary name; "docker" unless overridden.
 	Bin string
 }
@@ -151,7 +166,9 @@ func (d *DockerRuntime) EgressGateway(ctx context.Context) (string, error) {
 	return EgressGatewayIP, nil
 }
 
-func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, error) {
+// createArgs is the docker run argument list for a spec — pure, so the
+// hardening is testable without a daemon.
+func (d *DockerRuntime) createArgs(spec CreateSpec) []string {
 	args := []string{
 		"run", "-d",
 		"--name", spec.Name,
@@ -160,6 +177,19 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 		"--cpus", fmt.Sprintf("%g", spec.CPUs),
 		"--pids-limit", fmt.Sprintf("%d", spec.Pids),
 		"--label", "teploy.sandbox=1",
+		// An init reaps the zombies a headless browser and a killed test
+		// runner leave behind; without it a long run's pid budget fills
+		// with defunct processes.
+		"--init",
+	}
+	for _, c := range dropCapabilities {
+		args = append(args, "--cap-drop", c)
+	}
+	if d.Runtime != "" {
+		args = append(args, "--runtime", d.Runtime)
+	}
+	if d.ShmMB > 0 {
+		args = append(args, "--shm-size", fmt.Sprintf("%dm", d.ShmMB))
 	}
 	switch spec.Network {
 	case NetworkAllowlist:
@@ -197,6 +227,11 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 	// fails to start. mkdir happens first instead; every docker exec below
 	// sets --workdir explicitly, by which point the directory exists.
 	args = append(args, spec.Image, "sh", "-c", "mkdir -p "+WorkDir+" && exec sleep infinity")
+	return args
+}
+
+func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, error) {
+	args := d.createArgs(spec)
 
 	// Capture stdout (the container ID) separately from stderr: on a
 	// first-time image, `docker run` prints pull progress to stderr, and

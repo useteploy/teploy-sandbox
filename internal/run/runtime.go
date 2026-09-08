@@ -277,25 +277,58 @@ func (d *DockerRuntime) waitRunning(ctx context.Context, containerID string) err
 	}
 }
 
+// execTimeoutScript bounds ONE exec from inside the container: `timeout`
+// watches the command's own tree and never signals anything outside it —
+// least of all the container's init. `$0` carries the duration, `$@` the
+// command, so nothing is re-quoted; images without coreutils `timeout`
+// degrade to an unbounded exec rather than failing to run at all.
+const execTimeoutScript = `if command -v timeout >/dev/null 2>&1; then exec timeout --kill-after=5s "$0" "$@"; else exec "$@"; fi`
+
+// How long the docker CLI outlives the in-container timeout before the
+// daemon gives up on the exec. The tree is already dead by then (TERM at
+// the deadline, KILL 5s later); this window only covers output the dead
+// tree can no longer produce and a container too wedged to reap it.
+const execCliGrace = 30 * time.Second
+
+// execArgs is the docker exec argument list — pure, so the timeout scoping
+// is testable without a daemon.
+func (d *DockerRuntime) execArgs(containerID, dir, cmd string, timeout time.Duration) []string {
+	args := []string{"exec", "--workdir", dir, containerID}
+	if timeout <= 0 {
+		return append(args, "sh", "-c", cmd)
+	}
+	secs := int(timeout.Round(time.Second).Seconds())
+	if secs < 1 {
+		secs = 1
+	}
+	return append(args, "sh", "-c", execTimeoutScript, fmt.Sprintf("%ds", secs), "sh", "-c", cmd)
+}
+
 func (d *DockerRuntime) Exec(ctx context.Context, containerID, cmd, cwd string, timeout time.Duration, stdout, stderr io.Writer) (int, bool, error) {
-	execCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	runCtx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, timeout+execCliGrace)
+		defer cancel()
+	}
 
 	dir := WorkDir
 	if cwd != "" {
 		dir = cwd
 	}
-	command := exec.CommandContext(execCtx, d.bin(), "exec", "--workdir", dir, containerID, "sh", "-c", cmd)
+	command := exec.CommandContext(runCtx, d.bin(), d.execArgs(containerID, dir, cmd, timeout)...)
 	command.Stdout = stdout
 	command.Stderr = stderr
 
 	err := command.Run()
-	if execCtx.Err() == context.DeadlineExceeded {
-		// The docker CLI was killed; make sure the in-container process
-		// dies too rather than lingering until the run is destroyed.
-		kill := exec.Command(d.bin(), "exec", containerID, "sh", "-c", "kill -9 -1 2>/dev/null || true")
-		kill.Stdout, kill.Stderr = io.Discard, io.Discard
-		_ = kill.Run()
+	if runCtx.Err() == context.DeadlineExceeded {
+		// The in-container timeout already ended the command's tree at the
+		// deadline (and KILLed it 5s later); the grace window expiring on
+		// top of that means the container is wedged, and the run is torn
+		// down by its own lifecycle. The old cleanup ran `kill -9 -1` in
+		// the container, which under gVisor reaches the container's init
+		// and STOPS the whole container — a command that merely timed out
+		// took the run with it, so nothing is killed from out here.
 		return -1, true, nil
 	}
 	if err == nil {

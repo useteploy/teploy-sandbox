@@ -208,6 +208,38 @@ func TestCreateEgressAllowRefusals(t *testing.T) {
 	}
 }
 
+// TestDestroyRetriesAfterFailedRemove is the sandbox-01 regression: Destroy
+// untracked the run before runtime.Remove, so a failed removal leaked the
+// container with nothing left that knows about it — and released the run's
+// warm volume and egress proxy on top. The run must stay tracked and its
+// resources held until the removal actually succeeds.
+func TestDestroyRetriesAfterFailedRemove(t *testing.T) {
+	manager, rt, _ := newTestManager(t)
+	created, err := manager.Create(context.Background(), CreateRequest{Image: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rt.removeErr = errors.New("docker daemon down")
+	if err := manager.Destroy(context.Background(), created.ID); err == nil {
+		t.Fatal("destroy must surface the remove failure")
+	}
+	if _, err := manager.Get(created.ID); err != nil {
+		t.Fatal("failed destroy must keep the run tracked for retry")
+	}
+
+	rt.removeErr = nil
+	if err := manager.Destroy(context.Background(), created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.removed) != 1 || rt.removed[0] != created.ContainerID {
+		t.Fatalf("the retry must remove the container, removed=%v", rt.removed)
+	}
+	if _, err := manager.Get(created.ID); err == nil {
+		t.Fatal("run must be untracked after the successful retry")
+	}
+}
+
 func TestReapClosesPerRunProxy(t *testing.T) {
 	manager, _, _ := newTestManager(t)
 	manager.ProxyURL = "http://172.31.99.1:7443"

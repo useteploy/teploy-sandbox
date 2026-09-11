@@ -16,6 +16,7 @@ import (
 // fakeRT satisfies Runtime without Docker for manager-level tests.
 type fakeRT struct {
 	createErr error
+	removeErr error
 	created   []CreateSpec
 	removed   []string
 }
@@ -39,6 +40,9 @@ func (f *fakeRT) ReadFile(_ context.Context, _ string, _ string) ([]byte, error)
 }
 
 func (f *fakeRT) Remove(_ context.Context, containerID string) error {
+	if f.removeErr != nil {
+		return f.removeErr
+	}
 	f.removed = append(f.removed, containerID)
 	return nil
 }

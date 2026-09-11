@@ -296,12 +296,19 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	m.releaseWarm(run)
-	m.closeEgress(id)
 	if err := m.runtime.Remove(ctx, run.ContainerID); err != nil {
+		// Stay tracked so a retried Destroy or the TTL reaper can retry the
+		// removal — untracking on failure (the old order) leaked the
+		// container with nothing left that knows about it. The warm volume
+		// and egress proxy are likewise released only on success.
 		m.log.Error("remove container failed", "id", id, "error", err)
+		m.mu.Lock()
+		m.runs[id] = run
+		m.mu.Unlock()
 		return err
 	}
+	m.releaseWarm(run)
+	m.closeEgress(id)
 	m.log.Info("run destroyed", "id", id)
 	return nil
 }

@@ -83,3 +83,18 @@ func TestClassifyExitWatchdogCodes(t *testing.T) {
 		}
 	}
 }
+
+// TestExecArgsFailClosedWithoutCoreutilsTimeout is the sandbox-03 regression:
+// an image without coreutils timeout used to degrade a timed exec to an
+// UNBOUNDED one — the deadline silently dropped. It must fail closed: the
+// else branch refuses to run and exits nonzero with a clear message.
+func TestExecArgsFailClosedWithoutCoreutilsTimeout(t *testing.T) {
+	args := (&DockerRuntime{}).execArgs("cid", "/work", "ls", 5*time.Second)
+	joined := strings.Join(args, "\x00")
+	if strings.Contains(joined, `else exec "$@"`) {
+		t.Errorf("a missing timeout tool must not degrade to an unbounded exec: %q", args)
+	}
+	if !strings.Contains(joined, "exit 127") || !strings.Contains(joined, "refusing an unbounded exec") {
+		t.Errorf("the no-timeout branch must exit nonzero with a clear message: %q", args)
+	}
+}

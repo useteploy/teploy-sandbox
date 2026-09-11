@@ -280,9 +280,10 @@ func (d *DockerRuntime) waitRunning(ctx context.Context, containerID string) err
 // execTimeoutScript bounds ONE exec from inside the container: `timeout`
 // watches the command's own tree and never signals anything outside it —
 // least of all the container's init. `$0` carries the duration, `$@` the
-// command, so nothing is re-quoted; images without coreutils `timeout`
-// degrade to an unbounded exec rather than failing to run at all.
-const execTimeoutScript = `if command -v timeout >/dev/null 2>&1; then exec timeout --kill-after=5s "$0" "$@"; else exec "$@"; fi`
+// command, so nothing is re-quoted. Images without coreutils `timeout` FAIL
+// CLOSED: a requested deadline is a promise, so the exec refuses to run
+// unbounded rather than silently dropping it.
+const execTimeoutScript = `if command -v timeout >/dev/null 2>&1; then exec timeout --kill-after=5s "$0" "$@"; else echo "sandbox: image has no timeout tool; refusing an unbounded exec (install coreutils)" >&2; exit 127; fi`
 
 // How long the docker CLI outlives the in-container timeout before the
 // daemon gives up on the exec. The tree is already dead by then (TERM at

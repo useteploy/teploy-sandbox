@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,6 +25,7 @@ type fakeRuntime struct {
 	mu            sync.Mutex
 	created       []run.CreateSpec
 	removed       []string
+	removeCtxErrs []error
 	snapshots     []string
 	removedImages []string
 	files         map[string][]byte
@@ -71,9 +73,15 @@ func (f *fakeRuntime) ReadFile(_ context.Context, containerID, path string) ([]b
 	return data, nil
 }
 
-func (f *fakeRuntime) Remove(_ context.Context, containerID string) error {
+func (f *fakeRuntime) Remove(ctx context.Context, containerID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Model what the real runtime does via exec.CommandContext: a dead
+	// context kills the docker CLI call before it can remove anything.
+	f.removeCtxErrs = append(f.removeCtxErrs, ctx.Err())
+	if ctx.Err() != nil {
+		return fmt.Errorf("remove %s: %w", containerID, ctx.Err())
+	}
 	f.removed = append(f.removed, containerID)
 	return nil
 }
@@ -90,6 +98,80 @@ func (f *fakeRuntime) RemoveImage(_ context.Context, imageRef string) error {
 	defer f.mu.Unlock()
 	f.removedImages = append(f.removedImages, imageRef)
 	return nil
+}
+
+// TestShutdownCleanupGetsFreshDeadline is the sandbox-04 regression: shutdown
+// cleanup reused the HTTP drain context, which long-lived SSE streams can
+// exhaust entirely — every container removal then failed instantly. Cleanup
+// must run under its own fresh deadline, so an exhausted drain still leaves
+// every tracked container with a real cleanup attempt.
+func TestShutdownCleanupGetsFreshDeadline(t *testing.T) {
+	oldDrain := shutdownDrainTimeout
+	shutdownDrainTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { shutdownDrainTimeout = oldDrain })
+
+	runtime := newFakeRuntime()
+	manager := run.NewManager(runtime, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	for i := 0; i < 2; i++ {
+		if _, err := manager.Create(context.Background(), run.CreateRequest{Image: "x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A request that outlives the drain budget: Shutdown cannot finish
+	// gracefully and burns the whole deadline.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hang", func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+	})
+	httpServer := &http.Server{Handler: mux}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = httpServer.Serve(ln) }()
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		_ = httpServer.Close()
+	})
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		_, _ = http.Get("http://" + ln.Addr().String() + "/hang")
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hanging request never reached the handler")
+	}
+
+	srv := &Server{Manager: manager, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	srv.shutdown(httpServer)
+	// Let the drained (but still-open) connection finish before unblocking
+	// assertions on it below.
+	releaseOnce.Do(func() { close(release) })
+
+	runtime.mu.Lock()
+	removed := append([]string(nil), runtime.removed...)
+	ctxErrs := append([]error(nil), runtime.removeCtxErrs...)
+	runtime.mu.Unlock()
+	if len(removed) != 2 {
+		t.Fatalf("an exhausted drain must not starve cleanup, removed=%v", removed)
+	}
+	for i, ctxErr := range ctxErrs {
+		if ctxErr != nil {
+			t.Fatalf("cleanup remove %d ran under a dead context: %v", i, ctxErr)
+		}
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hanging request never finished after release")
+	}
 }
 
 // fakeEgressPool stands in for the real proxy pool: the HTTP surface

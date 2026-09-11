@@ -363,6 +363,13 @@ func dirOf(path string) string {
 	return path[:idx]
 }
 
+// Drain and cleanup budgets for graceful shutdown. Package-level so tests
+// can shrink the drain window.
+var (
+	shutdownDrainTimeout   = 30 * time.Second
+	shutdownCleanupTimeout = 45 * time.Second
+)
+
 // Serve runs the daemon with graceful shutdown: stop accepting, let
 // in-flight execs finish, then reap every run.
 func Serve(ctx context.Context, addr string, s *Server, reapInterval time.Duration) error {
@@ -377,10 +384,27 @@ func Serve(ctx context.Context, addr string, s *Server, reapInterval time.Durati
 	case err := <-errCh:
 		return err
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = httpServer.Shutdown(shutdownCtx)
-		s.Manager.DestroyAll(shutdownCtx)
+		s.shutdown(httpServer)
 		return nil
+	}
+}
+
+// shutdown drains in-flight HTTP requests, then removes every tracked
+// container. Cleanup gets its OWN fresh deadline: the drain can consume its
+// entire budget (long-lived SSE streams), and reusing that context — the old
+// behavior — handed cleanup an already-expired deadline so every container
+// removal failed instantly. Runs whose removal still fails stay tracked and
+// are reported here; the startup sweep removes their containers later.
+func (s *Server) shutdown(httpServer *http.Server) {
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+	defer cancelDrain()
+	_ = httpServer.Shutdown(drainCtx)
+
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), shutdownCleanupTimeout)
+	defer cancelCleanup()
+	s.Manager.DestroyAll(cleanupCtx)
+	if left := len(s.Manager.List()); left > 0 {
+		s.Log.Warn("sandbox shutdown left runs behind (still tracked; the startup sweep removes their containers)",
+			"left", left)
 	}
 }

@@ -60,3 +60,26 @@ func TestExecArgsScopedTimeout(t *testing.T) {
 		t.Errorf("untimed exec must stay unwrapped: %q", plain)
 	}
 }
+
+// TestClassifyExitWatchdogCodes is the sandbox-02 regression: the in-container
+// watchdog's death exits (124 TERM / 137 KILL) surfaced as ordinary exit
+// codes and a timed-out exec was reported timedOut=false. Only classify them
+// as timeouts when a timeout was actually configured.
+func TestClassifyExitWatchdogCodes(t *testing.T) {
+	for _, tc := range []struct {
+		code    int
+		timeout time.Duration
+		wantOut bool
+	}{
+		{124, 30 * time.Second, true}, // watchdog TERM at the deadline
+		{137, 30 * time.Second, true}, // watchdog KILL after the grace
+		{124, 0, false},               // user command exiting 124, no watchdog armed
+		{137, 0, false},
+		{3, 30 * time.Second, false}, // an ordinary command exit
+		{0, 30 * time.Second, false},
+	} {
+		if _, timedOut := classifyExit(tc.code, tc.timeout); timedOut != tc.wantOut {
+			t.Errorf("classifyExit(%d, %s) timedOut=%t, want %t", tc.code, tc.timeout, timedOut, tc.wantOut)
+		}
+	}
+}

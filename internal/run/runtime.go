@@ -336,9 +336,23 @@ func (d *DockerRuntime) Exec(ctx context.Context, containerID, cmd, cwd string, 
 	}
 	var exit *exec.ExitError
 	if errors.As(err, &exit) {
-		return exit.ExitCode(), false, nil
+		code, timedOut := classifyExit(exit.ExitCode(), timeout)
+		return code, timedOut, nil
 	}
 	return -1, false, err
+}
+
+// classifyExit maps a finished docker-exec exit code to its (code, timedOut)
+// classification. The in-container watchdog (coreutils timeout) reports its
+// own kills as 124 (TERM at the deadline) or 137 (KILL after the grace);
+// with a timeout configured those ARE timeouts. Without one the watchdog
+// never ran, so a user command's plain 124 is just an exit code and must not
+// be misclassified.
+func classifyExit(code int, timeout time.Duration) (int, bool) {
+	if timeout > 0 && (code == 124 || code == 137) {
+		return code, true
+	}
+	return code, false
 }
 
 func (d *DockerRuntime) WriteFile(ctx context.Context, containerID, path string, data io.Reader) error {

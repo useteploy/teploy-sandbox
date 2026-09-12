@@ -17,17 +17,17 @@ func TestAllowlistPermits(t *testing.T) {
 		host string
 		want bool
 	}{
-		{"registry.npmjs.org:443", true}, // subdomain of dot-entry
-		{"npmjs.org:443", true},          // bare form of dot-entry
-		{"evil-npmjs.org:443", false},    // suffix must respect label boundary
-		{"pypi.org:443", true},           // exact
-		{"pypi.org:80", true},            // default ports
-		{"pypi.org:8443", false},         // non-default port needs explicit entry
-		{"sub.pypi.org:443", false},      // exact entry admits no subdomains
+		{"registry.npmjs.org:443", true},  // subdomain of dot-entry
+		{"npmjs.org:443", true},           // bare form of dot-entry
+		{"evil-npmjs.org:443", false},     // suffix must respect label boundary
+		{"pypi.org:443", true},            // exact
+		{"pypi.org:80", true},             // default ports
+		{"pypi.org:8443", false},          // non-default port needs explicit entry
+		{"sub.pypi.org:443", false},       // exact entry admits no subdomains
 		{"forge.example.com:49152", true}, // explicit host:port
 		{"forge.example.com:443", false},  // port-scoped entry opens ONLY that port
-		{"PROXY.GOLANG.ORG:443", true},   // case-insensitive
-		{"example.com:443", false},       // default-deny
+		{"PROXY.GOLANG.ORG:443", true},    // case-insensitive
+		{"example.com:443", false},        // default-deny
 		{"proxy.golang.org.evil.io:443", false},
 	}
 	for _, c := range cases {

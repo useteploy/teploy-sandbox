@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -214,6 +215,32 @@ type Proxy struct {
 	Log   *slog.Logger
 	// DialTimeout for upstream connections (default 15s).
 	DialTimeout time.Duration
+
+	// tunnels tracks every hijacked CONNECT tunnel this proxy owns.
+	// http.Server.Close explicitly excludes hijacked connections, so
+	// without this registry closing the listener leaves both sides of
+	// every established tunnel — and their copy goroutines — running
+	// until an endpoint happens to disconnect.
+	tunnels  sync.Map // net.Conn pair -> struct{}
+	closeTun sync.WaitGroup
+}
+
+// CloseTunnels closes both sides of every active tunnel and waits for
+// their copy goroutines to unwind. Closing either side unblocks both
+// io.Copy loops; the wait is bounded by the caller's context.
+func (p *Proxy) CloseTunnels() {
+	p.tunnels.Range(func(key, _ any) bool {
+		if pair, ok := key.(tunnelPair); ok {
+			pair.client.Close()
+			pair.upstream.Close()
+		}
+		return true
+	})
+	p.closeTun.Wait()
+}
+
+type tunnelPair struct {
+	client, upstream net.Conn
 }
 
 func (p *Proxy) dialTimeout() time.Duration {
@@ -287,12 +314,20 @@ func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	pair := tunnelPair{client: client, upstream: upstream}
+	p.tunnels.Store(pair, struct{}{})
+	p.closeTun.Add(1)
 	go func() {
+		defer p.closeTun.Done()
+		defer p.tunnels.Delete(pair)
 		defer upstream.Close()
 		defer client.Close()
 		_, _ = io.Copy(upstream, buffered)
 	}()
+	p.closeTun.Add(1)
 	go func() {
+		defer p.closeTun.Done()
+		defer p.tunnels.Delete(pair)
 		defer upstream.Close()
 		defer client.Close()
 		_, _ = io.Copy(client, upstream)

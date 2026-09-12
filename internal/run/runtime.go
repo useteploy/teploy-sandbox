@@ -368,15 +368,44 @@ func (d *DockerRuntime) WriteFile(ctx context.Context, containerID, path string,
 	return nil
 }
 
+// MaxFileBytes bounds files-API reads: the daemon's own memory is not
+// container-limited, so an unbounded cat would let a huge file in the
+// container exhaust the host daemon. Reads above the bound fail with a
+// clear error rather than buffering.
+const MaxFileBytes = 64 << 20
+
 func (d *DockerRuntime) ReadFile(ctx context.Context, containerID, path string) ([]byte, error) {
-	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, d.bin(), "exec", containerID, "sh", "-c", "cat "+shellQuote(path))
+	var stderr bytes.Buffer
+	// head -c one past the cap: distinguishing "file is larger than the
+	// bound" from "file is exactly the bound" keeps the limit honest.
+	cmd := exec.CommandContext(ctx, d.bin(), "exec", containerID, "sh", "-c",
+		"cat "+shellQuote(path)+" | head -c "+fmt.Sprint(MaxFileBytes+1))
+	var stdout limitedBuffer
+	stdout.limit = MaxFileBytes + 1
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("read file: %s", strings.TrimSpace(stderr.String()))
 	}
-	return stdout.Bytes(), nil
+	if stdout.truncated {
+		return nil, fmt.Errorf("read file: %s exceeds the %d MiB files-API limit", path, MaxFileBytes>>20)
+	}
+	return stdout.buf.Bytes(), nil
+}
+
+// limitedBuffer refuses bytes past its limit instead of growing forever.
+type limitedBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	if l.buf.Len()+len(p) > l.limit {
+		l.truncated = true
+		return 0, io.ErrShortWrite
+	}
+	return l.buf.Write(p)
 }
 
 func (d *DockerRuntime) Remove(ctx context.Context, containerID string) error {

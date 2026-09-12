@@ -31,7 +31,12 @@ type Pool struct {
 
 	mu     sync.Mutex
 	shared string
-	perRun map[string]*http.Server
+	// The proxies are kept alongside the servers: server.Close() does not
+	// reach hijacked tunnels, so teardown goes through the owning Proxy.
+	perRun    map[string]*http.Server
+	perRunPx  map[string]*Proxy
+	sharedSrv *http.Server
+	sharedPx  *Proxy
 }
 
 // Start binds the shared listener on port and serves it. The returned
@@ -42,7 +47,8 @@ func (p *Pool) Start(port string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	server := &http.Server{Handler: &Proxy{Allow: p.Base, Log: p.Log}}
+	proxy := &Proxy{Allow: p.Base, Log: p.Log}
+	server := &http.Server{Handler: proxy}
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			p.Log.Error("egress proxy failed", "addr", addr, "error", err)
@@ -50,6 +56,8 @@ func (p *Pool) Start(port string) (string, error) {
 	}()
 	p.mu.Lock()
 	p.shared = "http://" + listener.Addr().String()
+	p.sharedSrv = server
+	p.sharedPx = proxy
 	p.mu.Unlock()
 	return p.SharedURL(), nil
 }
@@ -78,7 +86,8 @@ func (p *Pool) OpenFor(runID string, extra []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	server := &http.Server{Handler: &Proxy{Allow: allow, Log: p.Log.With("run", runID)}}
+	proxy := &Proxy{Allow: allow, Log: p.Log.With("run", runID)}
+	server := &http.Server{Handler: proxy}
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			p.Log.Error("per-run egress proxy failed", "run", runID, "error", err)
@@ -87,21 +96,62 @@ func (p *Pool) OpenFor(runID string, extra []string) (string, error) {
 	p.mu.Lock()
 	if p.perRun == nil {
 		p.perRun = make(map[string]*http.Server)
+		p.perRunPx = make(map[string]*Proxy)
+	}
+	// Duplicate-open semantics: replace-after-closing. A second OpenFor
+	// for the same run closes the earlier listener (and its tunnels)
+	// instead of orphaning it behind an unreachable address.
+	if old, ok := p.perRun[runID]; ok {
+		if oldPx := p.perRunPx[runID]; oldPx != nil {
+			oldPx.CloseTunnels()
+		}
+		_ = old.Close()
+		p.Log.Warn("per-run egress proxy replaced by a second open", "run", runID)
 	}
 	p.perRun[runID] = server
+	p.perRunPx[runID] = proxy
 	p.mu.Unlock()
 	p.Log.Info("per-run egress proxy up", "run", runID, "addr", listener.Addr().String(), "extra", extra)
 	return "http://" + listener.Addr().String(), nil
 }
 
 // Close tears down a run's private listener, if it had one. Idempotent:
-// both Destroy and the reaper call it.
+// both Destroy and the reaper call it. Hijacked tunnels the listener's
+// proxy owns are closed and waited for too — server.Close() alone would
+// leave them running.
 func (p *Pool) Close(runID string) {
 	p.mu.Lock()
 	server, ok := p.perRun[runID]
+	proxy := p.perRunPx[runID]
 	delete(p.perRun, runID)
+	delete(p.perRunPx, runID)
 	p.mu.Unlock()
 	if ok {
+		if proxy != nil {
+			proxy.CloseTunnels()
+		}
 		_ = server.Close()
+	}
+}
+
+// Shutdown tears down the shared listener and every per-run proxy,
+// tunnels included. Call at process exit.
+func (p *Pool) Shutdown() {
+	p.mu.Lock()
+	ids := make([]string, 0, len(p.perRun))
+	for id := range p.perRun {
+		ids = append(ids, id)
+	}
+	shared := p.sharedSrv
+	sharedPx := p.sharedPx
+	p.mu.Unlock()
+	for _, id := range ids {
+		p.Close(id)
+	}
+	if sharedPx != nil {
+		sharedPx.CloseTunnels()
+	}
+	if shared != nil {
+		_ = shared.Close()
 	}
 }

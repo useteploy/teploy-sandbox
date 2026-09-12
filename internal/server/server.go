@@ -282,6 +282,10 @@ func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
+	// Upload bound: the request body is daemon-side memory/staging, not
+	// container work, so it gets its own cap regardless of container limits.
+	const maxUpload = 64 << 20
+	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
 	if err := s.Runtime.WriteFile(r.Context(), current.ContainerID, path, r.Body); err != nil {
 		s.writeError(w, err)
 		return
@@ -316,22 +320,44 @@ type sseWriter struct {
 	mu      sync.Mutex
 	w       io.Writer
 	flusher http.Flusher
+	// err holds the first write failure: a disconnected stream must not
+	// keep reporting successful output. Later frames short-circuit on it,
+	// and the channel writers surface it so the exec copy stops.
+	err error
 }
 
 func (s *sseWriter) frame(event, data string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	fmt.Fprintf(s.w, "event: %s\n", event)
-	for _, line := range strings.Split(data, "\n") {
-		fmt.Fprintf(s.w, "data: %s\n", line)
+	if s.err != nil {
+		return
 	}
-	io.WriteString(s.w, "\n")
+	if _, err := fmt.Fprintf(s.w, "event: %s\n", event); err != nil {
+		s.err = err
+		return
+	}
+	for _, line := range strings.Split(data, "\n") {
+		if _, err := fmt.Fprintf(s.w, "data: %s\n", line); err != nil {
+			s.err = err
+			return
+		}
+	}
+	if _, err := io.WriteString(s.w, "\n"); err != nil {
+		s.err = err
+		return
+	}
 	s.flusher.Flush()
 }
 
 func (s *sseWriter) channel(event string) io.Writer {
 	return writerFunc(func(p []byte) (int, error) {
 		s.frame(event, string(p))
+		s.mu.Lock()
+		err := s.err
+		s.mu.Unlock()
+		if err != nil {
+			return 0, err
+		}
 		return len(p), nil
 	})
 }

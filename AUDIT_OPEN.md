@@ -20,3 +20,14 @@ Open items: 1 P2 (1 total)
 
 - teploy-sandbox-06, -07, -08: FIXED - bounded reads/uploads (64 MiB each), tunnel registry closed by Pool.Close/Shutdown, duplicate OpenFor now replace-after-close. See audit commits.
 - teploy-sandbox-05: PARTIALLY FIXED - writer errors now propagate (a disconnected stream no longer reports successful writes). UPSTREAM: raw CR bytes and UTF-8 chunks split across frames are defined by the pinned SSE frame contract that @neutron-build/agents' SandboxExecutor consumes (it rejoins data: lines with \n); changing the encoding is a contract change owned upstream, not a unilateral fix here.
+
+## 2026-09-19 — gVisor snapshot persistence
+
+Live approval testing found that a cold gVisor run could snapshot successfully
+but restore an empty workspace. `runsc` defaults to a private rootfs overlay;
+Docker commit does not capture those writes. Explicit per-container
+`dev.gvisor.flag.overlay2=none` makes writes visible to the container layer
+without replacing gVisor or changing host Docker configuration. The integration
+suite now checks repository metadata and uncommitted file bytes after restore,
+with `SBX_TEST_RUNTIME=runsc` selecting the real boundary. Warm bind mounts are
+still not part of image snapshots; callers must retain them separately.

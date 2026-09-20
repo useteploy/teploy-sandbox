@@ -8,10 +8,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -134,5 +136,46 @@ func TestRealDockerEgressAllowlist(t *testing.T) {
 		"wget -T 10 -q -O /dev/null http://neverssl.com", "", 20*time.Second, io.Discard, io.Discard)
 	if code == 0 {
 		t.Fatalf("non-allowlisted host must be denied")
+	}
+}
+
+// Run with SBX_TEST_RUNTIME=runsc to cover the real gVisor snapshot boundary.
+// A mocked Snapshot cannot detect a successful but empty docker commit.
+func TestRealSnapshotRetainsWorkspace(t *testing.T) {
+	ctx := context.Background()
+	runtime := &run.DockerRuntime{Runtime: os.Getenv("SBX_TEST_RUNTIME")}
+	image := os.Getenv("SBX_TEST_IMAGE")
+	if image == "" {
+		image = "alpine:3.20"
+	}
+	name := fmt.Sprintf("sbx-snapshot-proof-%d", time.Now().UnixNano())
+	spec := run.CreateSpec{Name: name, Image: image, MemoryMB: 256, CPUs: 1, Pids: 128, Network: run.NetworkNone}
+	id, err := runtime.Create(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Remove(ctx, id) })
+	var output, stderr bytes.Buffer
+	code, _, err := runtime.Exec(ctx, id, "mkdir -p .git && printf 'repo-head' > .git/HEAD && printf 'uncommitted change' > proof.txt", run.WorkDir, 30*time.Second, &output, &stderr)
+	if err != nil || code != 0 {
+		t.Fatalf("write: code=%d err=%v stderr=%s", code, err, stderr.String())
+	}
+	snapshot := run.SnapshotRepo + ":" + name
+	if err := runtime.Snapshot(ctx, id, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.RemoveImage(ctx, snapshot) })
+	spec.Name += "-restored"
+	spec.Image = snapshot
+	restored, err := runtime.Create(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Remove(ctx, restored) })
+	for path, want := range map[string]string{"/work/.git/HEAD": "repo-head", "/work/proof.txt": "uncommitted change"} {
+		got, err := runtime.ReadFile(ctx, restored, path)
+		if err != nil || string(got) != want {
+			t.Fatalf("restored %s: got %q err=%v want %q", path, got, err, want)
+		}
 	}
 }

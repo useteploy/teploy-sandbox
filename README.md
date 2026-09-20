@@ -158,3 +158,17 @@ at the repo root (detected at the volume root or its single
 lockfile-bearing subdir); a lockfile-less repo hashes deterministically
 but never invalidates on lockfile change. LRU eviction runs on the
 reaper tick only — a size walk never delays a run's start.
+
+### gVisor snapshots
+
+With `SBX_RUNTIME=runsc`, each container explicitly sets
+`dev.gvisor.flag.overlay2=none`. gVisor's default private rootfs overlay is
+invisible to `docker commit`; without this setting a snapshot can report success
+while losing the repository. The per-container setting retains gVisor isolation
+and writes into Docker's container filesystem. It does not change the host's
+Docker configuration. See [gVisor filesystem configuration](https://gvisor.dev/docs/user_guide/filesystem/).
+
+Verify the actual runtime, including repository metadata and uncommitted files:
+`SBX_TEST_RUNTIME=runsc go test -tags integration -run TestRealSnapshotRetainsWorkspace .`
+Set `SBX_TEST_IMAGE` to use a preinstalled image. Bind-mounted warm volumes remain
+outside image snapshots; callers must retain those containers across a pause.

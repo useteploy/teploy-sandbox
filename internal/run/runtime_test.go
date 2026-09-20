@@ -29,6 +29,12 @@ func TestCreateArgsHardening(t *testing.T) {
 	}
 
 	gv := strings.Join((&DockerRuntime{Runtime: "runsc", ShmMB: 512}).createArgs(spec), " ")
+	if !strings.Contains(gv, "--annotation dev.gvisor.flag.overlay2=none") {
+		t.Fatalf("gVisor snapshots require visible rootfs writes: %q", gv)
+	}
+	if strings.Contains(args, "--annotation") {
+		t.Fatalf("gVisor override must not affect other runtimes: %q", args)
+	}
 	if !strings.Contains(gv, "--runtime runsc") || !strings.Contains(gv, "--shm-size 512m") {
 		t.Errorf("runtime and shm knobs not applied: %q", gv)
 	}

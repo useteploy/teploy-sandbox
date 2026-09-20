@@ -188,6 +188,13 @@ func (d *DockerRuntime) createArgs(spec CreateSpec) []string {
 	if d.Runtime != "" {
 		args = append(args, "--runtime", d.Runtime)
 	}
+	if d.Runtime == "runsc" {
+		// gVisor defaults to a private rootfs overlay. Docker commit cannot
+		// see its writes, so a successful snapshot would silently lose the
+		// workspace. Keep gVisor isolation and persist writes in Docker's
+		// container layer instead. This override applies only to this run.
+		args = append(args, "--annotation", "dev.gvisor.flag.overlay2=none")
+	}
 	if d.ShmMB > 0 {
 		args = append(args, "--shm-size", fmt.Sprintf("%dm", d.ShmMB))
 	}

@@ -479,8 +479,12 @@ func (d *DockerRuntime) Snapshot(ctx context.Context, containerID, volumePath, i
 		return fmt.Errorf("snapshot temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmp)
+	// create-only, never started: no --entrypoint and no args, because a
+	// container's explicit entrypoint/cmd overrides are CONFIG, and docker
+	// commit persists them into the image — an image that then refuses to
+	// start with the runtime's own args.
 	seed := "sbx-snapseed-" + strings.ToLower(NewULID(time.Now()))
-	createOut, err := exec.CommandContext(ctx, d.bin(), "create", "--name", seed, "--entrypoint", "/bin/sh", staging, "-c", "true").CombinedOutput()
+	createOut, err := exec.CommandContext(ctx, d.bin(), "create", "--name", seed, staging).CombinedOutput()
 	if err != nil {
 		_ = exec.CommandContext(ctx, d.bin(), "rmi", staging).Run()
 		return fmt.Errorf("snapshot seed container: %s", strings.TrimSpace(string(createOut)))
@@ -519,7 +523,7 @@ func (d *DockerRuntime) SeedVolume(ctx context.Context, containerID, imageRef, v
 	}
 	defer os.RemoveAll(tmp)
 	seed := "sbx-imgseed-" + strings.ToLower(NewULID(time.Now()))
-	createOut, err := exec.CommandContext(ctx, d.bin(), "create", "--name", seed, "--entrypoint", "/bin/sh", imageRef, "-c", "true").CombinedOutput()
+	createOut, err := exec.CommandContext(ctx, d.bin(), "create", "--name", seed, imageRef).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("seed container: %s", strings.TrimSpace(string(createOut)))
 	}

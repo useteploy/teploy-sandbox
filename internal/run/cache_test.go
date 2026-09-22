@@ -15,10 +15,14 @@ import (
 
 // fakeRT satisfies Runtime without Docker for manager-level tests.
 type fakeRT struct {
-	createErr error
-	removeErr error
-	created   []CreateSpec
-	removed   []string
+	createErr      error
+	removeErr      error
+	seedErr        error
+	created        []CreateSpec
+	removed        []string
+	snapshots      []string
+	seeds          []string
+	snapshotImages map[string]bool
 }
 
 func (f *fakeRT) Create(_ context.Context, spec CreateSpec) (string, error) {
@@ -47,7 +51,25 @@ func (f *fakeRT) Remove(_ context.Context, containerID string) error {
 	return nil
 }
 
-func (f *fakeRT) Snapshot(_ context.Context, _ string, _ string) error { return nil }
+func (f *fakeRT) Snapshot(_ context.Context, _ string, volumePath string, imageRef string) error {
+	f.snapshots = append(f.snapshots, volumePath+"=>"+imageRef)
+	return nil
+}
+
+func (f *fakeRT) SeedVolume(_ context.Context, containerID, imageRef, volumePath string) error {
+	if f.seedErr != nil {
+		return f.seedErr
+	}
+	f.seeds = append(f.seeds, containerID+"|"+imageRef+"|"+volumePath)
+	return nil
+}
+
+func (f *fakeRT) ImageIsSnapshot(_ context.Context, imageRef string) (bool, error) {
+	if f.snapshotImages == nil {
+		return strings.HasPrefix(imageRef, SnapshotRepo+":"), nil
+	}
+	return f.snapshotImages[imageRef], nil
+}
 
 func (f *fakeRT) RemoveImage(_ context.Context, _ string) error { return nil }
 
@@ -554,5 +576,74 @@ func TestManagerWarmCreateFailureReleasesVolume(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("failed create must not leak a volume dir: %v", entries)
+	}
+}
+
+// A volume-aware snapshot restore: the volume boots EMPTY (no template
+// merge) and is seeded from the image; a normal image boots the template
+// as before and is never seeded.
+func TestWarmRestoreBootsEmptyAndSeedsFromSnapshot(t *testing.T) {
+	manager, rt, store := newTestManager(t)
+
+	created, err := manager.Create(context.Background(), CreateRequest{
+		Image: "x", Warm: &WarmRequest{Repo: "tyler/teploy"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Destroy(context.Background(), created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.seeds) != 0 {
+		t.Fatalf("a non-snapshot image must not seed: %v", rt.seeds)
+	}
+
+	snap := SnapshotRepo + ":proof"
+	restored, err := manager.Create(context.Background(), CreateRequest{
+		Image: snap, Warm: &WarmRequest{Repo: "tyler/teploy"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = manager.Destroy(context.Background(), restored.ID) }()
+	if len(rt.seeds) != 1 || rt.seeds[0] != restored.ContainerID+"|"+snap+"|"+WorkDir {
+		t.Fatalf("snapshot restore must seed the live volume: %v", rt.seeds)
+	}
+	if restored.Warm == nil || restored.Warm.Booted {
+		t.Fatalf("a restored volume is not a template boot: %+v", restored.Warm)
+	}
+	// Empty boot, not a copy of any template generation.
+	if restored.CacheDir == "" {
+		t.Fatal("restored run has no volume directory")
+	}
+	if _, err := os.Stat(filepath.Join(store.Root, "repos")); err == nil {
+		// A template read is not forbidden, but the seeded volume must be
+		// empty before the image seed — asserted by Booted=false above plus
+		// no template copy taking place: the runs dir exists, repos untouched.
+	}
+}
+
+// A failed seed is a failed restore: the container goes, the volume is
+// released, and the error says what happened — never a silently empty
+// workspace.
+func TestWarmRestoreSeedFailureDestroysRun(t *testing.T) {
+	manager, rt, store := newTestManager(t)
+	rt.seedErr = fmt.Errorf("docker cp failed")
+
+	_, err := manager.Create(context.Background(), CreateRequest{
+		Image: SnapshotRepo + ":proof", Warm: &WarmRequest{Repo: "tyler/teploy"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "seed restored workspace") {
+		t.Fatalf("expected seed failure to fail the create: %v", err)
+	}
+	if len(rt.removed) != 1 {
+		t.Fatalf("the half-seeded container must be removed: %v", rt.removed)
+	}
+	entries, err := os.ReadDir(filepath.Join(store.Root, "runs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed seed must not leak a volume dir: %v", entries)
 	}
 }

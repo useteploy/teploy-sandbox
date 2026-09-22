@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -47,8 +49,19 @@ type Runtime interface {
 	ReadFile(ctx context.Context, containerID, path string) ([]byte, error)
 	Remove(ctx context.Context, containerID string) error
 	// Snapshot commits the container's filesystem to imageRef; a later
-	// Create can boot from it. RemoveImage deletes a snapshot image.
-	Snapshot(ctx context.Context, containerID, imageRef string) error
+	// Create can boot from it. volumePath names an in-container bind mount
+	// (a warm volume) whose bytes a plain commit would SKIP — Snapshot
+	// bakes them into the image so it is self-contained. RemoveImage
+	// deletes a snapshot image.
+	Snapshot(ctx context.Context, containerID, volumePath, imageRef string) error
+	// SeedVolume copies the volumePath bytes baked inside imageRef through
+	// containerID's mount and into the live volume: the restore half of a
+	// volume-aware snapshot, where a freshly mounted volume would other-
+	// wise shadow the workspace the snapshot carries.
+	SeedVolume(ctx context.Context, containerID, imageRef, volumePath string) error
+	// ImageIsSnapshot reports whether ref carries this daemon's snapshot
+	// label — the signal that Create should seed a warm volume from it.
+	ImageIsSnapshot(ctx context.Context, imageRef string) (bool, error)
 	RemoveImage(ctx context.Context, imageRef string) error
 }
 
@@ -423,17 +436,114 @@ func (d *DockerRuntime) Remove(ctx context.Context, containerID string) error {
 	return nil
 }
 
+// SnapshotLabel marks images this daemon produced via Snapshot, so Create
+// can recognise them (and seed a warm volume from them) without guessing
+// from the ref string.
+const SnapshotLabel = "teploy.sandbox.snapshot"
+
 // Snapshot commits a run's current filesystem to a labeled image so a
 // later run can boot from it — the property that lets an agent run
 // survive its container's TTL (park on approval, restore days later).
-func (d *DockerRuntime) Snapshot(ctx context.Context, containerID, imageRef string) error {
-	out, err := exec.CommandContext(ctx, d.bin(), "commit",
-		"--change", "LABEL teploy.sandbox.snapshot=1",
-		containerID, imageRef).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("docker commit: %s", strings.TrimSpace(string(out)))
+//
+// A run with a warm volume keeps its ENTIRE workspace on a bind mount
+// (the default mount point IS /work), and docker commit skips mounts: a
+// plain commit of a warm run produced an image whose /work was empty, so
+// restoring it lost every tracked and untracked edit (live incident
+// 2026-09-07: an approved merge failed `git rev-parse HEAD` in the
+// restored container and was merged by hand). When volumePath is set the
+// volume's bytes are therefore COPIED INTO the image through a temporary
+// container, making the snapshot self-contained: restoring it needs
+// nothing but the image.
+func (d *DockerRuntime) Snapshot(ctx context.Context, containerID, volumePath, imageRef string) error {
+	if volumePath == "" {
+		out, err := exec.CommandContext(ctx, d.bin(), "commit",
+			"--change", "LABEL "+SnapshotLabel+"=1",
+			containerID, imageRef).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("docker commit: %s", strings.TrimSpace(string(out)))
+		}
+		return nil
 	}
+	staging := imageRef + "-stage"
+	if out, err := exec.CommandContext(ctx, d.bin(), "commit", containerID, staging).CombinedOutput(); err != nil {
+		return fmt.Errorf("docker commit (staging): %s", strings.TrimSpace(string(out)))
+	}
+	// A container created from the staged image WITHOUT the mount exposes
+	// the (still empty) directory from the image layer; copying the volume
+	// content into it and committing THAT bakes the bytes into the final
+	// image. Host roundtrip because docker cp has no container-to-container
+	// form.
+	tmp, err := os.MkdirTemp("", "sbx-snapshot-")
+	if err != nil {
+		_ = exec.CommandContext(ctx, d.bin(), "rmi", staging).Run()
+		return fmt.Errorf("snapshot temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmp)
+	seed := "sbx-snapseed-" + strings.ToLower(NewULID(time.Now()))
+	createOut, err := exec.CommandContext(ctx, d.bin(), "create", "--name", seed, "--entrypoint", "/bin/sh", staging, "-c", "true").CombinedOutput()
+	if err != nil {
+		_ = exec.CommandContext(ctx, d.bin(), "rmi", staging).Run()
+		return fmt.Errorf("snapshot seed container: %s", strings.TrimSpace(string(createOut)))
+	}
+	fail := func(step string, out []byte) error {
+		_ = exec.CommandContext(ctx, d.bin(), "rm", "-f", seed).Run()
+		_ = exec.CommandContext(ctx, d.bin(), "rmi", staging).Run()
+		return fmt.Errorf("snapshot %s: %s", step, strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.CommandContext(ctx, d.bin(), "cp", containerID+":"+volumePath, tmp).CombinedOutput(); err != nil {
+		return fail("copy volume out", out)
+	}
+	if out, err := exec.CommandContext(ctx, d.bin(), "cp", filepath.Join(tmp, filepath.Base(volumePath)), seed+":"+filepath.Dir(volumePath)).CombinedOutput(); err != nil {
+		return fail("copy volume in", out)
+	}
+	commitOut, err := exec.CommandContext(ctx, d.bin(), "commit",
+		"--change", "LABEL "+SnapshotLabel+"=1",
+		seed, imageRef).CombinedOutput()
+	if err != nil {
+		return fail("commit", commitOut)
+	}
+	_ = exec.CommandContext(ctx, d.bin(), "rm", "-f", seed).Run()
+	_ = exec.CommandContext(ctx, d.bin(), "rmi", staging).Run()
 	return nil
+}
+
+// SeedVolume copies the volumePath tree baked inside imageRef through the
+// LIVE run container's bind mount and into its volume. Restoring a
+// volume-aware snapshot boots a fresh volume (template or empty); without
+// this the mount shadows exactly the workspace bytes the snapshot exists
+// to carry.
+func (d *DockerRuntime) SeedVolume(ctx context.Context, containerID, imageRef, volumePath string) error {
+	tmp, err := os.MkdirTemp("", "sbx-seed-")
+	if err != nil {
+		return fmt.Errorf("seed temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmp)
+	seed := "sbx-imgseed-" + strings.ToLower(NewULID(time.Now()))
+	createOut, err := exec.CommandContext(ctx, d.bin(), "create", "--name", seed, "--entrypoint", "/bin/sh", imageRef, "-c", "true").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("seed container: %s", strings.TrimSpace(string(createOut)))
+	}
+	fail := func(step string, out []byte) error {
+		_ = exec.CommandContext(ctx, d.bin(), "rm", "-f", seed).Run()
+		return fmt.Errorf("seed %s: %s", step, strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.CommandContext(ctx, d.bin(), "cp", seed+":"+volumePath, tmp).CombinedOutput(); err != nil {
+		return fail("copy out of image", out)
+	}
+	if out, err := exec.CommandContext(ctx, d.bin(), "cp", filepath.Join(tmp, filepath.Base(volumePath)), containerID+":"+filepath.Dir(volumePath)).CombinedOutput(); err != nil {
+		return fail("copy into volume", out)
+	}
+	_ = exec.CommandContext(ctx, d.bin(), "rm", "-f", seed).Run()
+	return nil
+}
+
+// ImageIsSnapshot inspects the image's labels for the snapshot marker.
+func (d *DockerRuntime) ImageIsSnapshot(ctx context.Context, imageRef string) (bool, error) {
+	out, err := exec.CommandContext(ctx, d.bin(), "image", "inspect", "-f", "{{index .Labels \""+SnapshotLabel+"\"}}", imageRef).Output()
+	if err != nil {
+		return false, nil // missing/uninspectable image: let Create surface the real error
+	}
+	return strings.TrimSpace(string(out)) == "1", nil
 }
 
 // RemoveImage deletes a snapshot image (explicit-only — snapshots must

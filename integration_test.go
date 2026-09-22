@@ -161,7 +161,7 @@ func TestRealSnapshotRetainsWorkspace(t *testing.T) {
 		t.Fatalf("write: code=%d err=%v stderr=%s", code, err, stderr.String())
 	}
 	snapshot := run.SnapshotRepo + ":" + name
-	if err := runtime.Snapshot(ctx, id, snapshot); err != nil {
+	if err := runtime.Snapshot(ctx, id, "", snapshot); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.RemoveImage(ctx, snapshot) })
@@ -178,4 +178,94 @@ func TestRealSnapshotRetainsWorkspace(t *testing.T) {
 			t.Fatalf("restored %s: got %q err=%v want %q", path, got, err, want)
 		}
 	}
+}
+
+// The warm-volume snapshot regression (live incident 2026-09-07): a run
+// whose workspace lives ON a bind mount used to snapshot to an image with
+// an EMPTY /work, because docker commit skips volumes. The full restore
+// path — Manager-level, because the volume bookkeeping (boot empty, seed
+// from image) is the manager's — must return every tracked and untracked
+// byte, and must NOT resurrect a file the run deleted before the park.
+func TestRealWarmSnapshotRoundTripsWorkspace(t *testing.T) {
+	ctx := context.Background()
+	runtime := &run.DockerRuntime{Runtime: os.Getenv("SBX_TEST_RUNTIME")}
+	image := os.Getenv("SBX_TEST_IMAGE")
+	if image == "" {
+		image = "alpine:3.20"
+	}
+	manager := run.NewManager(runtime, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	manager.Cache = run.NewCacheStore(t.TempDir(), 0)
+	warm := &run.WarmRequest{Repo: "example.com/repo"}
+
+	// 1. Publish a real warm template (contains a file the parked run will
+	// delete — if restore MERGED the template back over the volume, that
+	// file would resurrect).
+	seed, err := manager.Create(ctx, run.CreateRequest{Image: image, Network: "none", TTLSec: 300, Warm: warm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), seed.ID) })
+	if _, _, err := execRun(t, runtime, seed.ContainerID,
+		"mkdir -p /work/repo && printf 'module example.com/repo\\n' > /work/repo/go.mod && printf 'stale' > /work/repo/stale.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.CommitWarm(ctx, seed.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Destroy(ctx, seed.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. A run boots the template, edits tracked bytes, adds an untracked
+	// file, deletes one — then parks via snapshot.
+	created, err := manager.Create(ctx, run.CreateRequest{Image: image, Network: "none", TTLSec: 300, Warm: warm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), created.ID) })
+	if got, err := runtime.ReadFile(ctx, created.ContainerID, "/work/repo/stale.txt"); err != nil || string(got) != "stale" {
+		t.Fatalf("template boot: stale.txt=%q err=%v (test premise broken)", got, err)
+	}
+	if _, _, err := execRun(t, runtime, created.ContainerID,
+		"cd /work/repo && rm -f stale.txt && printf 'uncommitted edit' >> go.mod && printf 'new file' > untracked.txt"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.Snapshot(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.DeleteSnapshot(context.Background(), snapshot) })
+	if err := manager.Destroy(ctx, created.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Restore with the same warm request: byte-exact workspace, no
+	// resurrection, untracked bytes present.
+	restored, err := manager.Create(ctx, run.CreateRequest{Image: snapshot, Network: "none", TTLSec: 300, Warm: warm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), restored.ID) })
+	for path, want := range map[string]string{
+		"/work/repo/go.mod":        "module example.com/repo\nuncommitted edit",
+		"/work/repo/untracked.txt": "new file",
+	} {
+		got, err := runtime.ReadFile(ctx, restored.ContainerID, path)
+		if err != nil || string(got) != want {
+			t.Fatalf("restored %s: got %q err=%v want %q", path, got, err, want)
+		}
+	}
+	if _, err := runtime.ReadFile(ctx, restored.ContainerID, "/work/repo/stale.txt"); err == nil {
+		t.Fatal("a file deleted before the snapshot resurrected: the restore merged the template instead of replacing from the image")
+	}
+}
+
+func execRun(t *testing.T, runtime *run.DockerRuntime, containerID, cmd string) (int, string, error) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	code, _, err := runtime.Exec(context.Background(), containerID, cmd, run.WorkDir, 60*time.Second, &out, &errOut)
+	if err != nil || code != 0 {
+		return code, errOut.String(), fmt.Errorf("exec %q: code=%d err=%v stderr=%s", cmd, code, err, errOut.String())
+	}
+	return code, out.String(), nil
 }

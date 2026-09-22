@@ -71,10 +71,14 @@ type Run struct {
 	Network     string `json:"network"`
 	ContainerID string `json:"-"`
 	// Warm describes the run's warm-cache volume when it has one.
-	Warm      *WarmState `json:"warm,omitempty"`
-	CacheDir  string     `json:"-"`
-	CreatedAt time.Time  `json:"createdAt"`
-	ExpiresAt time.Time  `json:"expiresAt"`
+	Warm *WarmState `json:"warm,omitempty"`
+	// CacheDir/CachePath are the warm volume's host directory and its
+	// in-container mount point. CachePath rides along because Snapshot
+	// needs the mount point to bake volume bytes into the image.
+	CacheDir  string    `json:"-"`
+	CachePath string    `json:"-"`
+	CreatedAt time.Time `json:"createdAt"`
+	ExpiresAt time.Time `json:"expiresAt"`
 }
 
 // WarmState is the warm-cache view of a run: which repo's volume it
@@ -204,6 +208,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	spec.Name = "teploy-sbx-" + strings.ToLower(id)
 
 	warmState := (*WarmState)(nil)
+	seedFromSnapshot := false
 	if req.Warm != nil {
 		if m.Cache == nil {
 			return nil, fmt.Errorf("%w: this daemon has no cache store (serve --cache-root)", ErrBadRequest)
@@ -216,7 +221,25 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		if err != nil {
 			return nil, err
 		}
-		hostPath, mf, booted, err := m.Cache.Boot(id, slug)
+		// Restoring a volume-aware snapshot: the image carries the run's
+		// exact workspace bytes, so the volume boots EMPTY (not from the
+		// repo template — a template seed would merge trees and resurrect
+		// files the run deleted) and is seeded from the image after the
+		// container exists. An image that cannot be inspected is left to
+		// Create to fail on; only a labelled snapshot takes this path.
+		fromSnapshot, inspectErr := m.runtime.ImageIsSnapshot(ctx, req.Image)
+		if inspectErr != nil {
+			return nil, inspectErr
+		}
+		var hostPath string
+		var mf WarmManifest
+		var booted bool
+		if fromSnapshot {
+			hostPath, err = m.Cache.BootEmpty(id)
+			seedFromSnapshot = true
+		} else {
+			hostPath, mf, booted, err = m.Cache.Boot(id, slug)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -248,6 +271,22 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		m.closeEgress(id)
 		return nil, err
 	}
+	if seedFromSnapshot {
+		// The restore half of a volume-aware snapshot: without this copy
+		// the freshly mounted volume SHADOWS the workspace bytes the image
+		// carries, and the restored run boots an empty /work. A seed
+		// failure is a failed restore, not a degraded one — destroy and
+		// say so, exactly like a Create failure.
+		if err := m.runtime.SeedVolume(ctx, containerID, req.Image, spec.CachePath); err != nil {
+			_ = m.runtime.Remove(context.WithoutCancel(ctx), containerID)
+			if warmState != nil {
+				m.Cache.Release(id)
+			}
+			m.closeEgress(id)
+			return nil, fmt.Errorf("seed restored workspace: %w", err)
+		}
+		m.log.Info("warm volume seeded from snapshot", "id", id, "image", req.Image, "path", spec.CachePath)
+	}
 
 	run := &Run{
 		ID:          id,
@@ -256,6 +295,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		ContainerID: containerID,
 		Warm:        warmState,
 		CacheDir:    spec.CacheHostPath,
+		CachePath:   spec.CachePath,
 		CreatedAt:   now,
 		ExpiresAt:   now.Add(ttl),
 	}
@@ -328,10 +368,13 @@ func (m *Manager) Snapshot(ctx context.Context, id string) (string, error) {
 		return "", ErrNotFound
 	}
 	ref := SnapshotRepo + ":" + strings.ToLower(NewULID(m.now()))
-	if err := m.runtime.Snapshot(ctx, current.ContainerID, ref); err != nil {
+	// CachePath (not just CacheDir): a warm run's workspace lives ON the
+	// mounted volume, and the snapshot must bake those bytes in or the
+	// restore boots an empty workspace.
+	if err := m.runtime.Snapshot(ctx, current.ContainerID, current.CachePath, ref); err != nil {
 		return "", err
 	}
-	m.log.Info("run snapshotted", "id", id, "image", ref)
+	m.log.Info("run snapshotted", "id", id, "image", ref, "warm", current.CachePath != "")
 	return ref, nil
 }
 

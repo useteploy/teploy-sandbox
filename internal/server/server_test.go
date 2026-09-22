@@ -27,6 +27,7 @@ type fakeRuntime struct {
 	removed       []string
 	removeCtxErrs []error
 	snapshots     []string
+	seeds         []string
 	removedImages []string
 	files         map[string][]byte
 	execFunc      func(cmd string, stdout, stderr io.Writer) (int, bool)
@@ -86,11 +87,22 @@ func (f *fakeRuntime) Remove(ctx context.Context, containerID string) error {
 	return nil
 }
 
-func (f *fakeRuntime) Snapshot(_ context.Context, containerID, imageRef string) error {
+func (f *fakeRuntime) Snapshot(_ context.Context, containerID, volumePath, imageRef string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.snapshots = append(f.snapshots, containerID+"=>"+imageRef)
+	f.snapshots = append(f.snapshots, containerID+"|"+volumePath+"=>"+imageRef)
 	return nil
+}
+
+func (f *fakeRuntime) SeedVolume(_ context.Context, containerID, imageRef, volumePath string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seeds = append(f.seeds, containerID+"|"+imageRef+"|"+volumePath)
+	return nil
+}
+
+func (f *fakeRuntime) ImageIsSnapshot(_ context.Context, imageRef string) (bool, error) {
+	return strings.Contains(imageRef, run.SnapshotRepo+":"), nil
 }
 
 func (f *fakeRuntime) RemoveImage(_ context.Context, imageRef string) error {

@@ -213,6 +213,22 @@ func (c *CacheStore) Boot(id, slug string) (string, WarmManifest, bool, error) {
 	return runDir, WarmManifest{}, false, nil
 }
 
+// BootEmpty allocates the run's private volume with NO template copy.
+// Used when the run boots from a volume-aware SNAPSHOT: the image carries
+// the exact volume bytes, and seeding over a template copy would MERGE
+// trees instead of restoring them (a file the run deleted before the park
+// would resurrect). The image seed is the only writer.
+func (c *CacheStore) BootEmpty(id string) (string, error) {
+	if err := os.MkdirAll(filepath.Join(c.Root, "runs"), 0o700); err != nil {
+		return "", fmt.Errorf("warm root: %w", err)
+	}
+	runDir := c.runDir(id)
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		return "", fmt.Errorf("warm volume: %w", err)
+	}
+	return runDir, nil
+}
+
 // Commit hashes the run's volume (the lockfile set that exists) and
 // publishes it as the repo's warm template. The generation is built
 // beside the current one and the manifest swap is an atomic rename, so

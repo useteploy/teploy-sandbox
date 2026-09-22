@@ -194,7 +194,15 @@ func TestRealWarmSnapshotRoundTripsWorkspace(t *testing.T) {
 		image = "alpine:3.20"
 	}
 	manager := run.NewManager(runtime, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	manager.Cache = run.NewCacheStore(t.TempDir(), 0)
+	// SBX_TEST_CACHE: when the suite runs through a wrapper container, the
+	// cache root MUST be a path that exists at the SAME location on the
+	// docker host, or the volume bind quietly detaches from the test's
+	// filesystem and the assertions test nothing.
+	cacheRoot := os.Getenv("SBX_TEST_CACHE")
+	if cacheRoot == "" {
+		cacheRoot = t.TempDir()
+	}
+	manager.Cache = run.NewCacheStore(cacheRoot, 0)
 	warm := &run.WarmRequest{Repo: "example.com/repo"}
 
 	// 1. Publish a real warm template (contains a file the parked run will

@@ -31,3 +31,23 @@ without replacing gVisor or changing host Docker configuration. The integration
 suite now checks repository metadata and uncommitted file bytes after restore,
 with `SBX_TEST_RUNTIME=runsc` selecting the real boundary. Warm bind mounts are
 still not part of image snapshots; callers must retain them separately.
+
+## Warm-volume snapshot fix — 2026-09-22
+
+Closed: snapshots of warm runs lost the workspace (docker commit skips bind
+mounts; the default warm mount IS /work). `2a89f72`+ bake volume bytes into
+the image via a create-only staging container, and create-from-snapshot
+boots the volume EMPTY (never template-merged) and seeds it from the image
+through the live mount; a seed failure fails the create. Recognised by ref
+namespace — containerd image stores drop commit labels (measured). Proven
+byte-exact on real Docker (compute-1): tracked edits, untracked files, and
+a deleted file does not resurrect. Daemon deployed on compute-1 (bak:
+`teploy-sandbox.bak-20260922`). The 2026-09-07 Forgejo issue is fixed by
+this; verify-and-close it.
+
+Still open, found while proving: (1) `ReadFile`'s `cat | head` pipeline
+returns empty-with-no-error for a MISSING file (head eats cat's exit) —
+callers cannot distinguish missing from empty; (2) the integration suite's
+`TestRealDockerLifecycle` hardcodes alpine:3.20, whose busybox timeout
+rejects the exec wrapper's `--kill-after` (pre-existing, fails on this box
+independent of this change).

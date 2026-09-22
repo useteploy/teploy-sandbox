@@ -263,8 +263,11 @@ func TestRealWarmSnapshotRoundTripsWorkspace(t *testing.T) {
 			t.Fatalf("restored %s: got %q err=%v want %q", path, got, err, want)
 		}
 	}
-	if _, err := runtime.ReadFile(ctx, restored.ContainerID, "/work/repo/stale.txt"); err == nil {
-		t.Fatal("a file deleted before the snapshot resurrected: the restore merged the template instead of replacing from the image")
+	// NB asserted by exec, not ReadFile: the files API pipes through head,
+	// so a missing file reads as empty-with-no-error and would hide a
+	// resurrection.
+	if _, out, err := execRun(t, runtime, restored.ContainerID, "test ! -e /work/repo/stale.txt && echo absent"); err != nil || strings.TrimSpace(out) != "absent" {
+		t.Fatalf("a file deleted before the snapshot resurrected (or the check failed): out=%q err=%v", out, err)
 	}
 }
 

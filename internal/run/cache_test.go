@@ -23,6 +23,15 @@ type fakeRT struct {
 	snapshots      []string
 	seeds          []string
 	snapshotImages map[string]bool
+
+	// exec/write recording and hooks, mutex-guarded because manager
+	// tests run execs on goroutines (in-flight takeover probes).
+	mu        sync.Mutex
+	execs     []string
+	writes    []string
+	files     map[string][]byte
+	execFunc  func(cmd string, stdout, stderr io.Writer) (int, bool)
+	writeFunc func(path string) error
 }
 
 func (f *fakeRT) Create(_ context.Context, spec CreateSpec) (string, error) {
@@ -33,14 +42,45 @@ func (f *fakeRT) Create(_ context.Context, spec CreateSpec) (string, error) {
 	return "ctr-" + spec.Name, nil
 }
 
-func (f *fakeRT) Exec(_ context.Context, _ string, _ string, _ string, _ time.Duration, _, _ io.Writer) (int, bool, error) {
+func (f *fakeRT) Exec(_ context.Context, _ string, cmd, _ string, _ time.Duration, stdout, stderr io.Writer) (int, bool, error) {
+	f.mu.Lock()
+	f.execs = append(f.execs, cmd)
+	f.mu.Unlock()
+	if f.execFunc != nil {
+		code, timedOut := f.execFunc(cmd, stdout, stderr)
+		return code, timedOut, nil
+	}
 	return 0, false, nil
 }
 
-func (f *fakeRT) WriteFile(_ context.Context, _ string, _ string, _ io.Reader) error { return nil }
+func (f *fakeRT) WriteFile(_ context.Context, containerID, path string, data io.Reader) error {
+	if f.writeFunc != nil {
+		if err := f.writeFunc(path); err != nil {
+			return err
+		}
+	}
+	body, err := io.ReadAll(data)
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.writes = append(f.writes, containerID+":"+path)
+	if f.files == nil {
+		f.files = make(map[string][]byte)
+	}
+	f.files[containerID+":"+path] = body
+	return nil
+}
 
-func (f *fakeRT) ReadFile(_ context.Context, _ string, _ string) ([]byte, error) {
-	return nil, fmt.Errorf("no such file")
+func (f *fakeRT) ReadFile(_ context.Context, containerID, path string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	data, ok := f.files[containerID+":"+path]
+	if !ok {
+		return nil, fmt.Errorf("no such file")
+	}
+	return data, nil
 }
 
 func (f *fakeRT) Remove(_ context.Context, containerID string) error {

@@ -14,14 +14,43 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 | Route | Does |
 |---|---|
 | `POST /v1/runs` | `{image, env?, ttlSec?, network?, egressAllow?, limits?, warm?}` → `{id, server, expiresAt, warm?}` — network `none` (default), `allowlist` or `open` (see Egress); defaults 1 CPU / 1 GB / 256 pids, `no-new-privileges`, never the `teploy` app network; `warm: {repo, path?}` gives the run a private volume for the repo (below) |
-| `POST /v1/runs/{id}/exec` | `{cmd, cwd?, timeoutSec?}` → SSE: `stdout`/`stderr` chunks, then `exit` `{exitCode, timedOut}` |
-| `PUT/GET /v1/runs/{id}/files/{path}` | Confined to `/work`; traversal rejected |
+| `POST /v1/runs/{id}/exec` | `{cmd, cwd?, timeoutSec?, owner?, generation?}` → SSE: `stdout`/`stderr` chunks, then `exit` `{exitCode, timedOut}`; while the run holds a lease, only the holder's `owner`+`generation` may exec (409 otherwise) |
+| `PUT/GET /v1/runs/{id}/files/{path}` | Confined to `/work`; traversal rejected. PUT takes the lease credential as `?owner=&generation=` query and is fenced like exec; GET is open, lease or not |
 | `DELETE /v1/runs/{id}` | Destroy now (the reaper enforces TTLs regardless, default 30 min) |
 | `GET /v1/runs`, `GET /health` | List; `{status, version}` |
 
 Run IDs are ULIDs and every response carries a `server` field — nothing
 assumes one box, so the Tier 2 fleet scheduler fronts N daemons without
 API rework.
+
+## Writable leases
+
+A human takes exclusive writable ownership of a run while its agent is
+paused; execs and file writes by anyone else are refused with 409 until
+the lease is released or lapses. Reads stay open to everyone.
+
+| Route | Does |
+|---|---|
+| `POST /v1/runs/{id}/lease` | `{owner, ttlSec}` → `{lease: {holder, generation, expiresAt}}` — grants the lease; every grant (fresh, regrant after expiry, or re-acquire by the same owner) bumps the `generation` |
+| `POST /v1/runs/{id}/lease/renew` | `{owner, generation, ttlSec}` → extended expiry; a stale generation gets 409 `superseded` |
+| `POST /v1/runs/{id}/lease/release` | `{owner, generation}` → 204; mismatches get 409 |
+
+Semantics: the `generation` is the fencing token. Execs and writes pass
+either when no lease is held (the pre-lease path — existing callers are
+unaffected) or when they carry the active lease's exact `owner`+
+`generation`. Expiry frees the run lazily (no sweeper); the next grant
+bumps the generation, so a holder whose lease lapsed cannot renew,
+release, or write under their old credential — they learn via 409
+`superseded`. The lease is visible on the run's list JSON
+(`lease: {holder, generation, expiresAt}`) and dies with the run.
+
+Takeover safety: `acquire` is refused with 409 `busy` while any exec or
+file write is in flight — takeover happens only between execs, never
+under one. Residual limits, deliberate in this slice: a long-running
+exec delays a takeover up to its timeout (there is no mid-exec kill),
+and lease expiry does not interrupt an in-flight exec either — it only
+stops its renewal. A caller that keeps execing can therefore hold off a
+takeover indefinitely.
 
 Clients: `SandboxExecutor` in `@neutron-build/agents` (the pinned wire
 contract); a Go client package follows with the Phase B agent product.

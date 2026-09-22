@@ -204,7 +204,6 @@ func newTestServer(t *testing.T) (*httptest.Server, *fakeRuntime, *run.Manager) 
 	manager.Egress = fakeEgressPool{}
 	srv := &Server{
 		Manager:    manager,
-		Runtime:    runtime,
 		Token:      "test-token",
 		Version:    "test",
 		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -267,6 +266,9 @@ func TestAuthRequiredOnEverythingButHealth(t *testing.T) {
 		{"DELETE", "/v1/runs/x"},
 		{"POST", "/v1/runs/x/exec"},
 		{"POST", "/v1/runs/x/snapshot"},
+		{"POST", "/v1/runs/x/lease"},
+		{"POST", "/v1/runs/x/lease/renew"},
+		{"POST", "/v1/runs/x/lease/release"},
 		{"POST", "/v1/runs/x/warm-commit"},
 		{"GET", "/v1/runs/x/warm"},
 		{"GET", "/v1/warmcache/owner/name"},
@@ -400,6 +402,163 @@ func TestFilesRoundTripAndTraversalRejection(t *testing.T) {
 	// tested in the run package.
 	if resp := request(t, ts, "PUT", "/v1/runs/"+id+"/files/../escape", "test-token", "x"); resp.StatusCode == http.StatusNoContent {
 		t.Fatalf("traversal must not succeed: got %d", resp.StatusCode)
+	}
+}
+
+// The lease lifecycle over HTTP: acquire → fenced execs and writes →
+// renew → release, plus the refusal paths (wrong/no credential, unknown
+// run, bad body) and the open-read guarantee.
+func TestLeaseTakeoverOverHTTP(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+	id := createRun(t, ts)
+	const holder = "human@example.invalid"
+
+	// acquire
+	resp := request(t, ts, "POST", "/v1/runs/"+id+"/lease", "test-token",
+		`{"owner":"`+holder+`","ttlSec":600}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("lease acquire: got %d", resp.StatusCode)
+	}
+	var acquired struct {
+		Lease *run.LeaseState `json:"lease"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&acquired); err != nil {
+		t.Fatal(err)
+	}
+	if acquired.Lease == nil || acquired.Lease.Holder != holder || acquired.Lease.Generation != 1 || acquired.Lease.ExpiresAt.IsZero() {
+		t.Fatalf("acquire body: %+v", acquired.Lease)
+	}
+
+	// the lease is visible on the run list
+	list := request(t, ts, "GET", "/v1/runs", "test-token", "")
+	var listed struct {
+		Runs []*run.Run `json:"runs"`
+	}
+	if err := json.NewDecoder(list.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	var current *run.Run
+	for _, r := range listed.Runs {
+		if r.ID == id {
+			current = r
+		}
+	}
+	if current == nil || current.Lease == nil || current.Lease.Holder != holder || current.Lease.Generation != 1 {
+		t.Fatalf("listed lease state: %+v", current.Lease)
+	}
+
+	// exec without / with wrong credentials → 409 problem+json naming the holder
+	for _, body := range []string{
+		`{"cmd":"true"}`,
+		`{"cmd":"true","owner":"agent@example.invalid","generation":1}`,
+		`{"cmd":"true","owner":"` + holder + `","generation":2}`,
+	} {
+		resp := request(t, ts, "POST", "/v1/runs/"+id+"/exec", "test-token", body)
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("fenced exec %s: got %d, want 409", body, resp.StatusCode)
+		}
+		if got := resp.Header.Get("Content-Type"); got != "application/problem+json" {
+			t.Fatalf("fenced exec content-type: %q", got)
+		}
+		var p struct {
+			Detail string `json:"detail"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&p)
+		if !strings.Contains(p.Detail, holder) {
+			t.Fatalf("the refusal must name the holder, got %q", p.Detail)
+		}
+	}
+
+	// the holder execs (same SSE contract as an unfenced exec)
+	resp = request(t, ts, "POST", "/v1/runs/"+id+"/exec", "test-token",
+		`{"cmd":"echo held","owner":"`+holder+`","generation":1,"timeoutSec":30}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("holder exec: got %d", resp.StatusCode)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), "event: exit\ndata: {\"exitCode\":0,\"timedOut\":false}") {
+		t.Fatalf("holder exec must stream the exit frame:\n%s", raw)
+	}
+
+	// writes: fenced without the credential, admitted with it
+	if resp := request(t, ts, "PUT", "/v1/runs/"+id+"/files/a.txt", "test-token", "x"); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("credential-less write under a lease: got %d", resp.StatusCode)
+	}
+	if resp := request(t, ts, "PUT", "/v1/runs/"+id+"/files/a.txt?owner=agent@example.invalid&generation=1", "test-token", "x"); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("write with a wrong owner: got %d", resp.StatusCode)
+	}
+	if resp := request(t, ts, "PUT", "/v1/runs/"+id+"/files/a.txt?owner=human@example.invalid&generation=9", "test-token", "x"); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("write with a stale generation: got %d", resp.StatusCode)
+	}
+	put := request(t, ts, "PUT", "/v1/runs/"+id+"/files/a.txt?owner="+holder+"&generation=1", "test-token", "alpha")
+	if put.StatusCode != http.StatusNoContent {
+		t.Fatalf("holder write: got %d", put.StatusCode)
+	}
+	// reads stay open — no credential, lease held
+	get := request(t, ts, "GET", "/v1/runs/"+id+"/files/a.txt", "test-token", "")
+	data, _ := io.ReadAll(get.Body)
+	if get.StatusCode != http.StatusOK || string(data) != "alpha" {
+		t.Fatalf("read under a lease: %d %q", get.StatusCode, data)
+	}
+	// a malformed generation is a 400, not a silent pass
+	if resp := request(t, ts, "PUT", "/v1/runs/"+id+"/files/a.txt?owner="+holder+"&generation=abc", "test-token", "x"); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed generation: got %d", resp.StatusCode)
+	}
+
+	// renew: stale generation refused, matching extends
+	if resp := request(t, ts, "POST", "/v1/runs/"+id+"/lease/renew", "test-token",
+		`{"owner":"`+holder+`","generation":2,"ttlSec":600}`); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("stale renew: got %d", resp.StatusCode)
+	}
+	resp = request(t, ts, "POST", "/v1/runs/"+id+"/lease/renew", "test-token",
+		`{"owner":"`+holder+`","generation":1,"ttlSec":600}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("renew: got %d", resp.StatusCode)
+	}
+	var renewed struct {
+		Lease *run.LeaseState `json:"lease"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&renewed); err != nil {
+		t.Fatal(err)
+	}
+	if renewed.Lease == nil || renewed.Lease.Generation != 1 || !renewed.Lease.ExpiresAt.After(acquired.Lease.ExpiresAt) {
+		t.Fatalf("renew must extend the expiry: %+v", renewed.Lease)
+	}
+
+	// release: matching frees the run; a repeat is refused
+	if resp := request(t, ts, "POST", "/v1/runs/"+id+"/lease/release", "test-token",
+		`{"owner":"`+holder+`","generation":1}`); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("release: got %d", resp.StatusCode)
+	}
+	if resp := request(t, ts, "POST", "/v1/runs/"+id+"/lease/release", "test-token",
+		`{"owner":"`+holder+`","generation":1}`); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("double release: got %d", resp.StatusCode)
+	}
+
+	// unleased again: credential-less execs work as before
+	resp = request(t, ts, "POST", "/v1/runs/"+id+"/exec", "test-token", `{"cmd":"true"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("exec after release: got %d", resp.StatusCode)
+	}
+
+	// validation and unknown-run paths
+	for _, tc := range []struct {
+		path, body string
+		want       int
+	}{
+		{"/v1/runs/ghost/lease", `{"owner":"x@example.invalid","ttlSec":60}`, http.StatusNotFound},
+		{"/v1/runs/ghost/lease/renew", `{"owner":"x@example.invalid","generation":1,"ttlSec":60}`, http.StatusNotFound},
+		{"/v1/runs/ghost/lease/release", `{"owner":"x@example.invalid","generation":1}`, http.StatusNotFound},
+		{"/v1/runs/" + id + "/lease", `not json`, http.StatusBadRequest},
+		{"/v1/runs/" + id + "/lease", `{"ttlSec":60}`, http.StatusBadRequest},
+		{"/v1/runs/" + id + "/lease", `{"owner":"x@example.invalid"}`, http.StatusBadRequest},
+		{"/v1/runs/" + id + "/lease", `{"owner":"x@example.invalid","ttlSec":999999999}`, http.StatusBadRequest},
+		{"/v1/runs/" + id + "/lease/renew", `{"owner":"x@example.invalid","generation":1}`, http.StatusBadRequest},
+		{"/v1/runs/" + id + "/lease/release", `{"generation":1}`, http.StatusBadRequest},
+	} {
+		if resp := request(t, ts, "POST", tc.path, "test-token", tc.body); resp.StatusCode != tc.want {
+			t.Fatalf("POST %s %s: got %d, want %d", tc.path, tc.body, resp.StatusCode, tc.want)
+		}
 	}
 }
 

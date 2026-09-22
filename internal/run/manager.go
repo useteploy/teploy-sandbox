@@ -79,6 +79,18 @@ type Run struct {
 	CachePath string    `json:"-"`
 	CreatedAt time.Time `json:"createdAt"`
 	ExpiresAt time.Time `json:"expiresAt"`
+	// Lease is the run's writable-takeover lease when one is held (see
+	// lease.go). Guarded by Manager.mu and copy-on-write: the pointer is
+	// replaced, never mutated, so the copies Get/List hand out stay
+	// consistent snapshots.
+	Lease *LeaseState `json:"lease,omitempty"`
+
+	// leaseGen is the run's monotonic lease generation counter — it only
+	// grows, so credentials from any earlier lease stay dead forever.
+	// execs counts in-flight execs/writes, which fence lease takeovers.
+	// Both guarded by Manager.mu.
+	leaseGen uint64
+	execs    int
 }
 
 // WarmState is the warm-cache view of a run: which repo's volume it
@@ -306,6 +318,8 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	return run, nil
 }
 
+// Get returns a snapshot copy of the run: lease state changes replace
+// the pointer under the lock, so the copy never tears under a reader.
 func (m *Manager) Get(id string) (*Run, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -313,15 +327,18 @@ func (m *Manager) Get(id string) (*Run, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	return run, nil
+	snapshot := *run
+	return &snapshot, nil
 }
 
+// List returns snapshot copies for the same reason as Get.
 func (m *Manager) List() []*Run {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	runs := make([]*Run, 0, len(m.runs))
 	for _, run := range m.runs {
-		runs = append(runs, run)
+		snapshot := *run
+		runs = append(runs, &snapshot)
 	}
 	return runs
 }

@@ -136,7 +136,6 @@ func serve(args []string) error {
 	hostname, _ := os.Hostname()
 	srv := &server.Server{
 		Manager:    manager,
-		Runtime:    runtime,
 		Token:      token,
 		Version:    version,
 		Log:        log,

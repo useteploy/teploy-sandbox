@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,13 +39,14 @@ func problem(status int, detail string) Problem {
 		suffix, title = "unauthorized", "Unauthorized"
 	case http.StatusNotFound:
 		suffix, title = "not-found", "Not Found"
+	case http.StatusConflict:
+		suffix, title = "conflict", "Conflict"
 	}
 	return Problem{Type: "https://neutron.dev/errors/" + suffix, Title: title, Status: status, Detail: detail}
 }
 
 type Server struct {
 	Manager *run.Manager
-	Runtime run.Runtime
 	Token   string
 	Version string
 	Log     *slog.Logger
@@ -61,6 +63,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /v1/runs/{id}", s.auth(s.handleDestroy))
 	mux.Handle("POST /v1/runs/{id}/exec", s.auth(s.handleExec))
 	mux.Handle("POST /v1/runs/{id}/snapshot", s.auth(s.handleSnapshot))
+	mux.Handle("POST /v1/runs/{id}/lease", s.auth(s.handleLeaseAcquire))
+	mux.Handle("POST /v1/runs/{id}/lease/renew", s.auth(s.handleLeaseRenew))
+	mux.Handle("POST /v1/runs/{id}/lease/release", s.auth(s.handleLeaseRelease))
 	mux.Handle("DELETE /v1/snapshots", s.auth(s.handleDeleteSnapshot))
 	mux.Handle("POST /v1/runs/{id}/warm-commit", s.auth(s.handleWarmCommit))
 	mux.Handle("GET /v1/runs/{id}/warm", s.auth(s.handleWarmInfo))
@@ -95,6 +100,10 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		s.writeProblem(w, problem(http.StatusNotFound, err.Error()))
 	case errors.Is(err, run.ErrBadRequest):
 		s.writeProblem(w, problem(http.StatusBadRequest, err.Error()))
+	case errors.Is(err, run.ErrLeaseHeld),
+		errors.Is(err, run.ErrLeaseSuperseded),
+		errors.Is(err, run.ErrBusy):
+		s.writeProblem(w, problem(http.StatusConflict, err.Error()))
 	default:
 		s.Log.Error("request failed", "error", err)
 		s.writeProblem(w, problem(http.StatusInternalServerError, err.Error()))
@@ -175,6 +184,84 @@ type execRequest struct {
 	Cmd        string `json:"cmd"`
 	Cwd        string `json:"cwd,omitempty"`
 	TimeoutSec int    `json:"timeoutSec,omitempty"`
+	// Owner/Generation are the optional lease credential: accepted on
+	// every exec, required only while the run holds an active lease.
+	Owner      string `json:"owner,omitempty"`
+	Generation uint64 `json:"generation,omitempty"`
+}
+
+// leaseRequest is the body of all three lease endpoints. Generation is
+// the fencing token returned by acquire; ttlSec is required on acquire
+// and renew, ignored on release.
+type leaseRequest struct {
+	Owner      string `json:"owner"`
+	Generation uint64 `json:"generation,omitempty"`
+	TTLSec     int    `json:"ttlSec,omitempty"`
+}
+
+// handleLeaseAcquire grants the caller exclusive writable ownership of
+// the run — execs and file writes by anyone else are refused with 409
+// until release or expiry.
+func (s *Server) handleLeaseAcquire(w http.ResponseWriter, r *http.Request) {
+	var req leaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
+		return
+	}
+	generation, expiresAt, err := s.Manager.AcquireLease(r.PathValue("id"), req.Owner, time.Duration(req.TTLSec)*time.Second)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"lease": run.LeaseState{Holder: req.Owner, Generation: generation, ExpiresAt: expiresAt},
+	})
+}
+
+func (s *Server) handleLeaseRenew(w http.ResponseWriter, r *http.Request) {
+	var req leaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
+		return
+	}
+	expiresAt, err := s.Manager.RenewLease(r.PathValue("id"), req.Owner, req.Generation, time.Duration(req.TTLSec)*time.Second)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"lease": run.LeaseState{Holder: req.Owner, Generation: req.Generation, ExpiresAt: expiresAt},
+	})
+}
+
+func (s *Server) handleLeaseRelease(w http.ResponseWriter, r *http.Request) {
+	var req leaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
+		return
+	}
+	if err := s.Manager.ReleaseLease(r.PathValue("id"), req.Owner, req.Generation); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// leaseCredFromQuery reads the optional lease credential from a write
+// endpoint's query string — the files API's body is raw bytes, so JSON
+// fields are not an option there. An owner without a generation fails
+// closed at the fence (generations start at 1).
+func leaseCredFromQuery(r *http.Request) (run.LeaseCredential, error) {
+	query := r.URL.Query()
+	cred := run.LeaseCredential{Owner: query.Get("owner")}
+	if raw := query.Get("generation"); raw != "" {
+		generation, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return cred, fmt.Errorf("generation must be a number, got %q", raw)
+		}
+		cred.Generation = generation
+	}
+	return cred, nil
 }
 
 // handleWarmCommit publishes a run's warm volume as its repo's warm
@@ -257,12 +344,22 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, problem(http.StatusInternalServerError, "Streaming unsupported."))
 		return
 	}
+
+	// The lease fence decides before the stream starts: a refused exec
+	// is a 409 problem, not an SSE stream that dies mid-flight. The
+	// admission and the in-flight mark are atomic in the manager, so a
+	// lease cannot be granted under this exec either.
+	session, err := s.Manager.BeginExec(current.ID, run.LeaseCredential{Owner: req.Owner, Generation: req.Generation})
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 
 	stream := &sseWriter{w: w, flusher: flusher}
-	exitCode, timedOut, execErr := s.Runtime.Exec(r.Context(), current.ContainerID, req.Cmd, cwd, timeout,
+	exitCode, timedOut, execErr := session.Exec(r.Context(), req.Cmd, cwd, timeout,
 		stream.channel("stdout"), stream.channel("stderr"))
 	if execErr != nil {
 		stream.frame("stderr", "sandbox: "+execErr.Error())
@@ -282,11 +379,18 @@ func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
+	cred, err := leaseCredFromQuery(r)
+	if err != nil {
+		s.writeProblem(w, problem(http.StatusBadRequest, err.Error()))
+		return
+	}
 	// Upload bound: the request body is daemon-side memory/staging, not
 	// container work, so it gets its own cap regardless of container limits.
 	const maxUpload = 64 << 20
 	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
-	if err := s.Runtime.WriteFile(r.Context(), current.ContainerID, path, r.Body); err != nil {
+	// Through the manager: writes are lease-fenced and count as in-flight
+	// work that blocks lease takeover.
+	if err := s.Manager.WriteFile(r.Context(), current.ID, cred, path, r.Body); err != nil {
 		s.writeError(w, err)
 		return
 	}
@@ -304,7 +408,9 @@ func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	data, err := s.Runtime.ReadFile(r.Context(), current.ContainerID, path)
+	// Reads stay open regardless of any lease — a lease gates writable
+	// ownership, not visibility.
+	data, err := s.Manager.ReadFile(r.Context(), current.ID, path)
 	if err != nil {
 		s.writeProblem(w, problem(http.StatusNotFound, fmt.Sprintf("No such file: %s", r.PathValue("path"))))
 		return

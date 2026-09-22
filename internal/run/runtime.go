@@ -541,13 +541,14 @@ func (d *DockerRuntime) SeedVolume(ctx context.Context, containerID, imageRef, v
 	return nil
 }
 
-// ImageIsSnapshot inspects the image's labels for the snapshot marker.
-func (d *DockerRuntime) ImageIsSnapshot(ctx context.Context, imageRef string) (bool, error) {
-	out, err := exec.CommandContext(ctx, d.bin(), "image", "inspect", "-f", "{{index .Labels \""+SnapshotLabel+"\"}}", imageRef).Output()
-	if err != nil {
-		return false, nil // missing/uninspectable image: let Create surface the real error
-	}
-	return strings.TrimSpace(string(out)) == "1", nil
+// ImageIsSnapshot recognises a snapshot by its REF: everything under
+// SnapshotRepo is this daemon's namespace (the same identity DeleteSnapshot
+// already trusts). Measured on a containerd image store, commit --change
+// LABEL labels do not survive into image inspect, so a label check read a
+// snapshot as a plain image and restores quietly took the template path.
+// The commit still labels images for operators where the store keeps them.
+func (d *DockerRuntime) ImageIsSnapshot(_ context.Context, imageRef string) (bool, error) {
+	return strings.HasPrefix(imageRef, SnapshotRepo+":"), nil
 }
 
 // RemoveImage deletes a snapshot image (explicit-only — snapshots must

@@ -577,3 +577,51 @@ func ValidateWorkPath(path string) (string, error) {
 	}
 	return WorkDir + "/" + path, nil
 }
+
+// Exec env bounds: an exec body is daemon-side memory and the values ride
+// the docker CLI's environment, so both the count and the size are capped.
+const (
+	maxExecEnvVars  = 64
+	maxExecEnvBytes = 64 << 10
+)
+
+// ValidateExecEnv checks an exec's env: POSIX shell names, no NUL in a
+// value, bounded count and size. Refused rather than silently dropped — a
+// dropped variable is a command that runs with an empty value and reports
+// its own confusing failure (the defect this field closes).
+func ValidateExecEnv(env map[string]string) error {
+	if len(env) > maxExecEnvVars {
+		return fmt.Errorf("%w: env has %d variables, at most %d", ErrBadRequest, len(env), maxExecEnvVars)
+	}
+	total := 0
+	for name, value := range env {
+		if !validEnvName(name) {
+			return fmt.Errorf("%w: env name %q is not a shell variable name", ErrBadRequest, name)
+		}
+		// The env-file format carries one NAME=VALUE per line, so a value
+		// with a line break (or NUL) cannot be delivered intact: refused.
+		if strings.ContainsAny(value, "\x00\n\r") {
+			return fmt.Errorf("%w: env value for %s contains a NUL or line break", ErrBadRequest, name)
+		}
+		total += len(name) + len(value)
+	}
+	if total > maxExecEnvBytes {
+		return fmt.Errorf("%w: env is %d bytes, at most %d", ErrBadRequest, total, maxExecEnvBytes)
+	}
+	return nil
+}
+
+func validEnvName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		switch {
+		case r == '_', r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}

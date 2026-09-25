@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -43,8 +44,9 @@ type CreateSpec struct {
 type Runtime interface {
 	Create(ctx context.Context, spec CreateSpec) (containerID string, err error)
 	// Exec runs cmd via sh -c inside the container, streaming stdout and
-	// stderr to the writers. timedOut reports a timeout kill.
-	Exec(ctx context.Context, containerID, cmd, cwd string, timeout time.Duration, stdout, stderr io.Writer) (exitCode int, timedOut bool, err error)
+	// stderr to the writers. timedOut reports a timeout kill. env is set in
+	// the command's environment (validated by the caller: ValidateExecEnv).
+	Exec(ctx context.Context, containerID, cmd, cwd string, env map[string]string, timeout time.Duration, stdout, stderr io.Writer) (exitCode int, timedOut bool, err error)
 	WriteFile(ctx context.Context, containerID, path string, data io.Reader) error
 	ReadFile(ctx context.Context, containerID, path string) ([]byte, error)
 	Remove(ctx context.Context, containerID string) error
@@ -312,9 +314,16 @@ const execTimeoutScript = `if command -v timeout >/dev/null 2>&1; then exec time
 const execCliGrace = 30 * time.Second
 
 // execArgs is the docker exec argument list — pure, so the timeout scoping
-// is testable without a daemon.
-func (d *DockerRuntime) execArgs(containerID, dir, cmd string, timeout time.Duration) []string {
-	args := []string{"exec", "--workdir", dir, containerID}
+// is testable without a daemon. envFile, when set, is the exec's env as a
+// `--env-file`: values never appear in the host's process list, and they
+// never enter the docker CLI's OWN environment either — a caller-named
+// variable there (DOCKER_HOST, LD_PRELOAD) would steer the CLI itself.
+func (d *DockerRuntime) execArgs(containerID, dir, cmd string, timeout time.Duration, envFile ...string) []string {
+	args := []string{"exec", "--workdir", dir}
+	for _, file := range envFile {
+		args = append(args, "--env-file", file)
+	}
+	args = append(args, containerID)
 	if timeout <= 0 {
 		return append(args, "sh", "-c", cmd)
 	}
@@ -325,7 +334,42 @@ func (d *DockerRuntime) execArgs(containerID, dir, cmd string, timeout time.Dura
 	return append(args, "sh", "-c", execTimeoutScript, fmt.Sprintf("%ds", secs), "sh", "-c", cmd)
 }
 
-func (d *DockerRuntime) Exec(ctx context.Context, containerID, cmd, cwd string, timeout time.Duration, stdout, stderr io.Writer) (int, bool, error) {
+// execEnvFile renders an exec's env in the docker env-file format, one
+// NAME=VALUE per line, sorted for a stable file. ValidateExecEnv has already
+// refused the only values the format cannot carry (newlines, NUL).
+func execEnvFile(env map[string]string) string {
+	names := make([]string, 0, len(env))
+	for name := range env {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, name := range names {
+		b.WriteString(name + "=" + env[name] + "\n")
+	}
+	return b.String()
+}
+
+// writeExecEnvFile puts the env in a 0600 temp file for one exec; the
+// caller removes it when the exec returns.
+func writeExecEnvFile(env map[string]string) (string, error) {
+	f, err := os.CreateTemp("", "sandbox-exec-env-*")
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.WriteString(execEnvFile(env)); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
+func (d *DockerRuntime) Exec(ctx context.Context, containerID, cmd, cwd string, env map[string]string, timeout time.Duration, stdout, stderr io.Writer) (int, bool, error) {
 	runCtx := ctx
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -337,7 +381,16 @@ func (d *DockerRuntime) Exec(ctx context.Context, containerID, cmd, cwd string, 
 	if cwd != "" {
 		dir = cwd
 	}
-	command := exec.CommandContext(runCtx, d.bin(), d.execArgs(containerID, dir, cmd, timeout)...)
+	var envFile []string
+	if len(env) > 0 {
+		file, err := writeExecEnvFile(env)
+		if err != nil {
+			return -1, false, fmt.Errorf("exec env: %w", err)
+		}
+		defer os.Remove(file)
+		envFile = []string{file}
+	}
+	command := exec.CommandContext(runCtx, d.bin(), d.execArgs(containerID, dir, cmd, timeout, envFile...)...)
 	command.Stdout = stdout
 	command.Stderr = stderr
 

@@ -42,7 +42,7 @@ func (f *fakeRT) Create(_ context.Context, spec CreateSpec) (string, error) {
 	return "ctr-" + spec.Name, nil
 }
 
-func (f *fakeRT) Exec(_ context.Context, _ string, cmd, _ string, _ time.Duration, stdout, stderr io.Writer) (int, bool, error) {
+func (f *fakeRT) Exec(_ context.Context, _ string, cmd, _ string, _ map[string]string, _ time.Duration, stdout, stderr io.Writer) (int, bool, error) {
 	f.mu.Lock()
 	f.execs = append(f.execs, cmd)
 	f.mu.Unlock()

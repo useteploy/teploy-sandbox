@@ -263,7 +263,7 @@ func TestExecFencedByLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code, timedOut, err := session.Exec(context.Background(), "true", "", time.Minute, io.Discard, io.Discard); err != nil || code != 0 || timedOut {
+	if code, timedOut, err := session.Exec(context.Background(), "true", "", nil, time.Minute, io.Discard, io.Discard); err != nil || code != 0 || timedOut {
 		t.Fatalf("unleased exec: code=%d timedOut=%t err=%v", code, timedOut, err)
 	}
 
@@ -291,7 +291,7 @@ func TestExecFencedByLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code, _, err := session.Exec(context.Background(), "echo held", "", time.Minute, io.Discard, io.Discard); err != nil || code != 0 {
+	if code, _, err := session.Exec(context.Background(), "echo held", "", nil, time.Minute, io.Discard, io.Discard); err != nil || code != 0 {
 		t.Fatalf("holder exec: code=%d err=%v", code, err)
 	}
 
@@ -301,7 +301,7 @@ func TestExecFencedByLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("exec after lease expiry must pass without credentials: %v", err)
 	}
-	if _, _, err := session.Exec(context.Background(), "true", "", time.Minute, io.Discard, io.Discard); err != nil {
+	if _, _, err := session.Exec(context.Background(), "true", "", nil, time.Minute, io.Discard, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 
@@ -373,7 +373,7 @@ func TestAcquireRefusedWhileExecInFlight(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		if _, _, err := session.Exec(context.Background(), "sleep", "", time.Minute, io.Discard, io.Discard); err != nil {
+		if _, _, err := session.Exec(context.Background(), "sleep", "", nil, time.Minute, io.Discard, io.Discard); err != nil {
 			t.Error(err)
 		}
 	}()

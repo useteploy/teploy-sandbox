@@ -14,7 +14,7 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 | Route | Does |
 |---|---|
 | `POST /v1/runs` | `{image, env?, ttlSec?, network?, egressAllow?, limits?, warm?}` → `{id, server, expiresAt, warm?}` — network `none` (default), `allowlist` or `open` (see Egress); defaults 1 CPU / 1 GB / 256 pids, `no-new-privileges`, never the `teploy` app network; `warm: {repo, path?}` gives the run a private volume for the repo (below) |
-| `POST /v1/runs/{id}/exec` | `{cmd, cwd?, timeoutSec?, owner?, generation?}` → SSE: `stdout`/`stderr` chunks, then `exit` `{exitCode, timedOut}`; while the run holds a lease, only the holder's `owner`+`generation` may exec (409 otherwise) |
+| `POST /v1/runs/{id}/exec` | `{cmd, cwd?, timeoutSec?, env?, owner?, generation?}` (`env`: name → value, set in the command's environment; POSIX names, no NUL, ≤64 vars / 64 KiB, else 400; values reach the container through a private (0600, removed after) `--env-file`, never argv and never the docker CLI's own environment; so no line breaks) → SSE: `stdout`/`stderr` chunks, then `exit` `{exitCode, timedOut}`; while the run holds a lease, only the holder's `owner`+`generation` may exec (409 otherwise) |
 | `PUT/GET /v1/runs/{id}/files/{path}` | Confined to `/work`; traversal rejected. PUT takes the lease credential as `?owner=&generation=` query and is fenced like exec; GET is open, lease or not |
 | `DELETE /v1/runs/{id}` | Destroy now (the reaper enforces TTLs regardless, default 30 min) |
 | `GET /v1/runs`, `GET /health` | List; `{status, version}` |

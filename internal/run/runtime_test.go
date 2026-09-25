@@ -1,6 +1,9 @@
 package run
 
 import (
+	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -102,5 +105,46 @@ func TestExecArgsFailClosedWithoutCoreutilsTimeout(t *testing.T) {
 	}
 	if !strings.Contains(joined, "exit 127") || !strings.Contains(joined, "refusing an unbounded exec") {
 		t.Errorf("the no-timeout branch must exit nonzero with a clear message: %q", args)
+	}
+}
+
+// The exec's env rides an --env-file (before the container id): values
+// never appear in argv, and never enter the docker CLI's own environment,
+// where a caller-named DOCKER_HOST or LD_PRELOAD would steer the CLI.
+func TestExecArgsForwardEnvThroughAnEnvFile(t *testing.T) {
+	args := (&DockerRuntime{}).execArgs("cid", "/work", "true", 0, "/tmp/sandbox-exec-env-1")
+	want := []string{"exec", "--workdir", "/work", "--env-file", "/tmp/sandbox-exec-env-1", "cid", "sh", "-c", "true"}
+	if strings.Join(args, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("argv: %q, want %q", args, want)
+	}
+	if got := execEnvFile(map[string]string{"PREVIEW_URL": "http://a b'c.example/", "A_FIRST": "1"}); got != "A_FIRST=1\nPREVIEW_URL=http://a b'c.example/\n" {
+		t.Fatalf("env file: %q", got)
+	}
+	file, err := writeExecEnvFile(map[string]string{"X": "y"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(file)
+	info, err := os.Stat(file)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("env file must be private: %v %v", info.Mode(), err)
+	}
+}
+
+func TestValidateExecEnv(t *testing.T) {
+	if err := ValidateExecEnv(map[string]string{"PREVIEW_URL": "x", "_a1": ""}); err != nil {
+		t.Fatalf("valid env refused: %v", err)
+	}
+	if err := ValidateExecEnv(nil); err != nil {
+		t.Fatalf("absent env refused: %v", err)
+	}
+	many := map[string]string{}
+	for i := 0; i < 65; i++ {
+		many[fmt.Sprintf("V%d", i)] = "x"
+	}
+	for _, bad := range []map[string]string{{"9A": "x"}, {"A=B": "x"}, {"A": "a\x00b"}, {"A": "line\nbreak"}, {"A": "cr\rhere"}, many} {
+		if err := ValidateExecEnv(bad); err == nil || !errors.Is(err, ErrBadRequest) {
+			t.Fatalf("%v: want ErrBadRequest, got %v", bad, err)
+		}
 	}
 }

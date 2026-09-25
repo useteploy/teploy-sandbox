@@ -41,14 +41,21 @@ func TestRealDockerLifecycle(t *testing.T) {
 
 	// exec with state persisting between calls
 	var out bytes.Buffer
-	code, timedOut, err := runtime.Exec(ctx, created.ContainerID, "echo marker > /work/state && echo ran", "", 30*time.Second, &out, io.Discard)
+	code, timedOut, err := runtime.Exec(ctx, created.ContainerID, "echo marker > /work/state && echo ran", "", nil, 30*time.Second, &out, io.Discard)
 	if err != nil || code != 0 || timedOut {
 		t.Fatalf("exec1: code=%d timedOut=%v err=%v", code, timedOut, err)
 	}
 	out.Reset()
-	code, _, err = runtime.Exec(ctx, created.ContainerID, "cat /work/state", "", 30*time.Second, &out, io.Discard)
+	code, _, err = runtime.Exec(ctx, created.ContainerID, "cat /work/state", "", nil, 30*time.Second, &out, io.Discard)
 	if err != nil || code != 0 || !strings.Contains(out.String(), "marker") {
 		t.Fatalf("state must persist between execs: code=%d out=%q err=%v", code, out.String(), err)
+	}
+
+	// exec env reaches the command, value intact (quotes and spaces).
+	out.Reset()
+	code, _, err = runtime.Exec(ctx, created.ContainerID, `printf '%s' "$PREVIEW_URL"`, "", map[string]string{"PREVIEW_URL": "http://a b'c.example/"}, 30*time.Second, &out, io.Discard)
+	if err != nil || code != 0 || out.String() != "http://a b'c.example/" {
+		t.Fatalf("exec env: code=%d out=%q err=%v", code, out.String(), err)
 	}
 
 	// files roundtrip
@@ -61,13 +68,13 @@ func TestRealDockerLifecycle(t *testing.T) {
 	}
 
 	// no network by default
-	code, _, _ = runtime.Exec(ctx, created.ContainerID, "wget -T 3 -q -O - http://example.com", "", 15*time.Second, io.Discard, io.Discard)
+	code, _, _ = runtime.Exec(ctx, created.ContainerID, "wget -T 3 -q -O - http://example.com", "", nil, 15*time.Second, io.Discard, io.Discard)
 	if code == 0 {
 		t.Fatalf("default-network run must have no egress")
 	}
 
 	// exec timeout kills
-	_, timedOut, err = runtime.Exec(ctx, created.ContainerID, "sleep 30", "", 2*time.Second, io.Discard, io.Discard)
+	_, timedOut, err = runtime.Exec(ctx, created.ContainerID, "sleep 30", "", nil, 2*time.Second, io.Discard, io.Discard)
 	if err != nil || !timedOut {
 		t.Fatalf("timeout: timedOut=%v err=%v", timedOut, err)
 	}
@@ -117,7 +124,7 @@ func TestRealDockerEgressAllowlist(t *testing.T) {
 
 	// 1) Direct egress (ignoring the proxy) must have no route at all.
 	code, _, _ := runtime.Exec(ctx, created.ContainerID,
-		"unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY; wget -T 4 -q -O /dev/null http://example.com", "",
+		"unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY; wget -T 4 -q -O /dev/null http://example.com", "", nil,
 		20*time.Second, io.Discard, io.Discard)
 	if code == 0 {
 		t.Fatalf("internal bridge must not route direct egress")
@@ -126,14 +133,14 @@ func TestRealDockerEgressAllowlist(t *testing.T) {
 	// 2) An allowlisted host through the injected proxy env works.
 	var out bytes.Buffer
 	code, _, err = runtime.Exec(ctx, created.ContainerID,
-		"wget -T 15 -q -O - http://example.com | head -c 60", "", 30*time.Second, &out, io.Discard)
+		"wget -T 15 -q -O - http://example.com | head -c 60", "", nil, 30*time.Second, &out, io.Discard)
 	if err != nil || code != 0 || out.Len() == 0 {
 		t.Fatalf("allowed host via proxy: code=%d out=%q err=%v", code, out.String(), err)
 	}
 
 	// 3) A non-allowlisted host is refused by the proxy (403 → wget fails).
 	code, _, _ = runtime.Exec(ctx, created.ContainerID,
-		"wget -T 10 -q -O /dev/null http://neverssl.com", "", 20*time.Second, io.Discard, io.Discard)
+		"wget -T 10 -q -O /dev/null http://neverssl.com", "", nil, 20*time.Second, io.Discard, io.Discard)
 	if code == 0 {
 		t.Fatalf("non-allowlisted host must be denied")
 	}
@@ -156,7 +163,7 @@ func TestRealSnapshotRetainsWorkspace(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = runtime.Remove(ctx, id) })
 	var output, stderr bytes.Buffer
-	code, _, err := runtime.Exec(ctx, id, "mkdir -p .git && printf 'repo-head' > .git/HEAD && printf 'uncommitted change' > proof.txt", run.WorkDir, 30*time.Second, &output, &stderr)
+	code, _, err := runtime.Exec(ctx, id, "mkdir -p .git && printf 'repo-head' > .git/HEAD && printf 'uncommitted change' > proof.txt", run.WorkDir, nil, 30*time.Second, &output, &stderr)
 	if err != nil || code != 0 {
 		t.Fatalf("write: code=%d err=%v stderr=%s", code, err, stderr.String())
 	}
@@ -274,7 +281,7 @@ func TestRealWarmSnapshotRoundTripsWorkspace(t *testing.T) {
 func execRun(t *testing.T, runtime *run.DockerRuntime, containerID, cmd string) (int, string, error) {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	code, _, err := runtime.Exec(context.Background(), containerID, cmd, run.WorkDir, 60*time.Second, &out, &errOut)
+	code, _, err := runtime.Exec(context.Background(), containerID, cmd, run.WorkDir, nil, 60*time.Second, &out, &errOut)
 	if err != nil || code != 0 {
 		return code, errOut.String(), fmt.Errorf("exec %q: code=%d err=%v stderr=%s", cmd, code, err, errOut.String())
 	}

@@ -184,6 +184,10 @@ type execRequest struct {
 	Cmd        string `json:"cmd"`
 	Cwd        string `json:"cwd,omitempty"`
 	TimeoutSec int    `json:"timeoutSec,omitempty"`
+	// Env is set in the command's environment. Before this field the body
+	// had no env, so an SDK's ExecOptions.env was silently dropped and a
+	// command read an empty value (run.ValidateExecEnv bounds it).
+	Env map[string]string `json:"env,omitempty"`
 	// Owner/Generation are the optional lease credential: accepted on
 	// every exec, required only while the run holds an active lease.
 	Owner      string `json:"owner,omitempty"`
@@ -334,6 +338,10 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if err := run.ValidateExecEnv(req.Env); err != nil {
+		s.writeError(w, err)
+		return
+	}
 	timeout := 120 * time.Second
 	if req.TimeoutSec > 0 {
 		timeout = time.Duration(req.TimeoutSec) * time.Second
@@ -359,7 +367,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	stream := &sseWriter{w: w, flusher: flusher}
-	exitCode, timedOut, execErr := session.Exec(r.Context(), req.Cmd, cwd, timeout,
+	exitCode, timedOut, execErr := session.Exec(r.Context(), req.Cmd, cwd, req.Env, timeout,
 		stream.channel("stdout"), stream.channel("stderr"))
 	if execErr != nil {
 		stream.frame("stderr", "sandbox: "+execErr.Error())

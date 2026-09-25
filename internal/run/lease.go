@@ -195,8 +195,8 @@ func (m *Manager) BeginExec(runID string, cred LeaseCredential) (*ExecSession, e
 
 // Exec runs the admitted command and releases the in-flight reservation
 // when it returns.
-func (s *ExecSession) Exec(ctx context.Context, cmd, cwd string, timeout time.Duration, stdout, stderr io.Writer) (int, bool, error) {
-	code, timedOut, err := s.manager.runtime.Exec(ctx, s.containerID, cmd, cwd, timeout, stdout, stderr)
+func (s *ExecSession) Exec(ctx context.Context, cmd, cwd string, env map[string]string, timeout time.Duration, stdout, stderr io.Writer) (int, bool, error) {
+	code, timedOut, err := s.manager.runtime.Exec(ctx, s.containerID, cmd, cwd, env, timeout, stdout, stderr)
 	s.manager.finishExec(s.runID)
 	return code, timedOut, err
 }

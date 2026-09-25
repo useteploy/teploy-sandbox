@@ -31,6 +31,7 @@ type fakeRuntime struct {
 	removedImages []string
 	files         map[string][]byte
 	execFunc      func(cmd string, stdout, stderr io.Writer) (int, bool)
+	execEnvs      []map[string]string
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -44,7 +45,10 @@ func (f *fakeRuntime) Create(_ context.Context, spec run.CreateSpec) (string, er
 	return "ctr-" + spec.Name, nil
 }
 
-func (f *fakeRuntime) Exec(_ context.Context, _ string, cmd, _ string, _ time.Duration, stdout, stderr io.Writer) (int, bool, error) {
+func (f *fakeRuntime) Exec(_ context.Context, _ string, cmd, _ string, env map[string]string, _ time.Duration, stdout, stderr io.Writer) (int, bool, error) {
+	f.mu.Lock()
+	f.execEnvs = append(f.execEnvs, env)
+	f.mu.Unlock()
 	if f.execFunc != nil {
 		code, timedOut := f.execFunc(cmd, stdout, stderr)
 		return code, timedOut, nil
@@ -376,6 +380,53 @@ func TestExecValidation(t *testing.T) {
 	}
 	if resp := request(t, ts, "POST", "/v1/runs/ghost/exec", "test-token", `{"cmd":"x"}`); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown run: got %d", resp.StatusCode)
+	}
+}
+
+// An exec's env reaches the runtime. Before the field existed the body had
+// no env, so an SDK's ExecOptions.env was silently dropped and the command
+// ran with an empty value (a preview smoke curling "$PREVIEW_URL" = "").
+func TestExecForwardsEnv(t *testing.T) {
+	ts, runtime, _ := newTestServer(t)
+	id := createRun(t, ts)
+
+	resp := request(t, ts, "POST", "/v1/runs/"+id+"/exec", "test-token",
+		`{"cmd":"test -n \"$PREVIEW_URL\"","env":{"PREVIEW_URL":"http://preview.example.com/","FLOW_OUT":"a b'c"}}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("exec with env: got %d", resp.StatusCode)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if len(runtime.execEnvs) != 1 {
+		t.Fatalf("runtime saw %d execs, want 1", len(runtime.execEnvs))
+	}
+	got := runtime.execEnvs[0]
+	if got["PREVIEW_URL"] != "http://preview.example.com/" || got["FLOW_OUT"] != "a b'c" || len(got) != 2 {
+		t.Fatalf("env not forwarded intact: %#v", got)
+	}
+}
+
+// A malformed env is refused before anything runs, never dropped.
+func TestExecEnvValidation(t *testing.T) {
+	ts, runtime, _ := newTestServer(t)
+	id := createRun(t, ts)
+
+	for _, body := range []string{
+		`{"cmd":"x","env":{"1BAD":"v"}}`,
+		`{"cmd":"x","env":{"A-B":"v"}}`,
+		`{"cmd":"x","env":{"":"v"}}`,
+		`{"cmd":"x","env":{"A":"nul\u0000byte"}}`,
+		`{"cmd":"x","env":{"A":` + fmt.Sprintf("%q", strings.Repeat("x", 70<<10)) + `}}`,
+	} {
+		if resp := request(t, ts, "POST", "/v1/runs/"+id+"/exec", "test-token", body); resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%.60s: got %d, want 400", body, resp.StatusCode)
+		}
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if len(runtime.execEnvs) != 0 {
+		t.Fatalf("a refused exec reached the runtime: %d", len(runtime.execEnvs))
 	}
 }
 

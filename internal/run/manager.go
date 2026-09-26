@@ -578,8 +578,8 @@ func ValidateWorkPath(path string) (string, error) {
 	return WorkDir + "/" + path, nil
 }
 
-// Exec env bounds: an exec body is daemon-side memory and the values ride
-// the docker CLI's environment, so both the count and the size are capped.
+// Exec env bounds: an exec body is daemon-side memory and is written to a
+// private env-file, so both the count and the size are capped.
 const (
 	maxExecEnvVars  = 64
 	maxExecEnvBytes = 64 << 10

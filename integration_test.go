@@ -23,6 +23,29 @@ import (
 	"github.com/useteploy/teploy-sandbox/internal/run"
 )
 
+func TestRealExecEnvironment(t *testing.T) {
+	runtime := &run.DockerRuntime{Runtime: os.Getenv("SBX_TEST_RUNTIME")}
+	image := os.Getenv("SBX_TEST_IMAGE")
+	if image == "" {
+		image = "debian:bookworm-slim"
+	}
+	manager := run.NewManager(runtime, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	created, err := manager.Create(ctx, run.CreateRequest{Image: image, TTLSec: 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Destroy(context.Background(), created.ID)
+	var out bytes.Buffer
+	value := "http://a b'c.example/$literal#part"
+	env := map[string]string{"PREVIEW_URL": value, "DOCKER_HOST": "unix:///not-the-host-daemon.sock"}
+	code, timedOut, err := runtime.Exec(ctx, created.ContainerID, `printf '%s|%s' "$PREVIEW_URL" "$DOCKER_HOST"`, "", env, 30*time.Second, &out, io.Discard)
+	if err != nil || timedOut || code != 0 || out.String() != value+"|"+env["DOCKER_HOST"] {
+		t.Fatalf("exec env: code=%d timeout=%t output=%q err=%v", code, timedOut, out.String(), err)
+	}
+}
+
 func TestRealDockerLifecycle(t *testing.T) {
 	// Force the first-pull path: an immediate exec after creating a
 	// freshly-pulled container must not race its startup.

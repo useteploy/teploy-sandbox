@@ -14,7 +14,7 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 | Route | Does |
 |---|---|
 | `POST /v1/runs` | `{image, env?, ttlSec?, network?, egressAllow?, limits?, warm?}` → `{id, server, expiresAt, warm?}` — network `none` (default), `allowlist` or `open` (see Egress); defaults 1 CPU / 1 GB / 256 pids, `no-new-privileges`, never the `teploy` app network; `warm: {repo, path?}` gives the run a private volume for the repo (below) |
-| `POST /v1/runs/{id}/exec` | `{cmd, cwd?, timeoutSec?, env?, owner?, generation?}` (`env`: name → value, set in the command's environment; POSIX names, no NUL, ≤64 vars / 64 KiB, else 400; values reach the container through a private (0600, removed after) `--env-file`, never argv and never the docker CLI's own environment; so no line breaks) → SSE: `stdout`/`stderr` chunks, then `exit` `{exitCode, timedOut}`; while the run holds a lease, only the holder's `owner`+`generation` may exec (409 otherwise) |
+| `POST /v1/runs/{id}/exec` | `{cmd, cwd?, timeoutSec?, env?, owner?, generation?, outputEncoding?}` (`env`: name → value, set in the command's environment; POSIX names, no NUL, ≤64 vars / 64 KiB, else 400; values reach the container through a private (0600, removed after) `--env-file`, never argv and never the docker CLI's own environment; so no line breaks) → SSE: `stdout`/`stderr` chunks, then `exit` `{exitCode, timedOut}`; while the run holds a lease, only the holder's `owner`+`generation` may exec (409 otherwise) |
 | `PUT/GET /v1/runs/{id}/files/{path}` | Confined to `/work`; traversal rejected. PUT takes the lease credential as `?owner=&generation=` query and is fenced like exec; GET is open, lease or not |
 | `DELETE /v1/runs/{id}` | Destroy now (the reaper enforces TTLs regardless, default 30 min) |
 | `GET /v1/runs`, `GET /health` | List; `{status, version}` |
@@ -68,7 +68,8 @@ Three tiers, on `POST /v1/runs`:
 `egressAllow: ["rubygems.org", ".hex.pm", "forge.example.com:49152"]`
 adds entries for ONE run, on top of the built-in list — the entries
 live on a private proxy that is created with the run and closed when it
-dies, so nothing leaks to the other runs sharing the bridge. Entry
+dies. Its URL carries a random proxy credential; discovering the listener
+port grants no extra policy. Both HTTP and CONNECT require that credential. Entry
 grammar is the same as `SBX_EGRESS_ALLOW`: `host` (ports 80/443),
 `.suffix` (the host and its subdomains, two labels minimum — `.com` is
 refused), or `host:port` (that port only). A malformed entry is a 400,
@@ -108,9 +109,14 @@ working ecosystem is still one `egressAllow` away:
 
 ### What the allowlist tier cannot do
 
-The bridge is `--internal`: no NAT, no default route. The proxy on its
-gateway is the only way out, and runs find it through `HTTP_PROXY` /
-`HTTPS_PROXY`. Everything follows from that:
+The `teploy-sbx-egress-v2` bridge is internal with inter-container
+communication disabled. Linux `iptables` admits only active proxy listeners
+on its gateway and denies other host services; IPv6 is disabled in allowlist
+containers. Runs find the proxy through `HTTP_PROXY` / `HTTPS_PROXY`.
+The daemon requires permission to manage its dedicated `TEPLOY-SBX` INPUT
+chain. If it cannot enforce the firewall, allowlist creation is refused.
+Existing workloads on the older bridge keep their lifecycle; new runs use v2.
+Everything follows from that:
 
 - **Only proxy-aware tools get out at all.** curl, git-over-https, npm,
   pip, go, cargo, apt, gem, composer and friends read the proxy env.
@@ -201,3 +207,37 @@ Verify the actual runtime, including repository metadata and uncommitted files:
 `SBX_TEST_RUNTIME=runsc go test -tags integration -run TestRealSnapshotRetainsWorkspace .`
 Set `SBX_TEST_IMAGE` to use a preinstalled image. Bind-mounted warm volumes remain
 outside image snapshots; callers must retain those containers across a pause.
+
+### Capture and streaming guarantees
+
+Build with Go 1.25 or newer. The daemon uses rooted filesystem operations to
+keep cache reads inside each volume. Lockfiles are regular files of at most
+8 MiB; cache copies reject special files and cap files at 512 MiB, trees at
+8 GiB and 100,000 entries. Publication and reclamation are serialized. One
+daemon owns a cache root, and startup retains every volume still mounted by
+any Docker container while reclaiming only unowned sandbox run directories.
+
+Snapshot, warm commit and warm hash require an idle run. Concurrent exec,
+write, capture, lease takeover or destroy receives a conflict while a capture
+is active. Docker pause covers background writers during capture; the run
+resumes even if the request is canceled. Failed removals remain tracked for
+TTL retry. Temporary capture resources have a cleanup journal for restart
+recovery; final snapshot images remain caller-owned.
+
+The default SSE text protocol keeps the existing `stdout`, `stderr` and
+`exit` events. It buffers UTF-8 across pipe writes and retains raw carriage
+returns for the pinned upstream line parser; invalid UTF-8 becomes a replacement
+character. A standard EventSource parser treats CR as a line delimiter, so
+clients requiring safe carriage-return/binary delivery should set the exec
+body's `outputEncoding` to `"base64"` for byte-exact output, including carriage
+returns and binary bytes. Each stdout/stderr event then carries a base64
+string; `exit` retains its JSON schema. Consumers must explicitly request and
+decode this mode. Images used for timed execs must provide coreutils timeout.
+
+Before deployment, run `go build ./...`, `go vet ./...`, `go test ./...`,
+`go test -race ./...`, and `CGO_ENABLED=0 go test -tags integration ./...`.
+Native Linux firewall fixtures need root: build a static integration test
+binary with `CGO_ENABLED=0 go test -c -tags integration -o /tmp/sandbox-tests .`
+and run `sudo /tmp/sandbox-tests -test.v`. Native Linux
+integration covers the host firewall and the Docker peer/host/proxy boundary;
+use `SBX_TEST_RUNTIME=runsc` to also verify gVisor snapshot persistence.

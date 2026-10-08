@@ -6,6 +6,7 @@ package server
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/useteploy/teploy-sandbox/internal/run"
 )
@@ -181,9 +183,10 @@ func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 type execRequest struct {
-	Cmd        string `json:"cmd"`
-	Cwd        string `json:"cwd,omitempty"`
-	TimeoutSec int    `json:"timeoutSec,omitempty"`
+	Cmd            string `json:"cmd"`
+	Cwd            string `json:"cwd,omitempty"`
+	TimeoutSec     int    `json:"timeoutSec,omitempty"`
+	OutputEncoding string `json:"outputEncoding,omitempty"`
 	// Env is set in the command's environment. Before this field the body
 	// had no env, so an SDK's ExecOptions.env was silently dropped and a
 	// command read an empty value (run.ValidateExecEnv bounds it).
@@ -347,6 +350,10 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		timeout = time.Duration(req.TimeoutSec) * time.Second
 	}
 
+	if req.OutputEncoding != "" && req.OutputEncoding != "base64" {
+		s.writeProblem(w, problem(http.StatusBadRequest, "outputEncoding must be base64 or omitted."))
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		s.writeProblem(w, problem(http.StatusInternalServerError, "Streaming unsupported."))
@@ -366,13 +373,14 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 
-	stream := &sseWriter{w: w, flusher: flusher}
+	stream := &sseWriter{w: w, flusher: flusher, encoding: req.OutputEncoding}
 	exitCode, timedOut, execErr := session.Exec(r.Context(), req.Cmd, cwd, req.Env, timeout,
 		stream.channel("stdout"), stream.channel("stderr"))
 	if execErr != nil {
-		stream.frame("stderr", "sandbox: "+execErr.Error())
+		_, _ = stream.channel("stderr").Write([]byte("sandbox: " + execErr.Error()))
 		exitCode = -1
 	}
+	stream.finishOutput()
 	stream.frame("exit", fmt.Sprintf(`{"exitCode":%d,"timedOut":%t}`, exitCode, timedOut))
 }
 
@@ -429,7 +437,8 @@ func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 
 // sseWriter serializes concurrent stdout/stderr chunks into SSE frames.
 // Chunk bytes are split on newlines into multiple data: lines (an SSE
-// data line cannot contain \n); the client rejoins them losslessly.
+// data line cannot contain LF). Legacy CR bytes remain for the pinned
+// consumer. Incomplete UTF-8 is buffered; opt-in base64 safely preserves bytes.
 type sseWriter struct {
 	mu      sync.Mutex
 	w       io.Writer
@@ -437,12 +446,17 @@ type sseWriter struct {
 	// err holds the first write failure: a disconnected stream must not
 	// keep reporting successful output. Later frames short-circuit on it,
 	// and the channel writers surface it so the exec copy stops.
-	err error
+	err      error
+	encoding string
+	pending  map[string][]byte
 }
 
 func (s *sseWriter) frame(event, data string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.frameLocked(event, data)
+}
+func (s *sseWriter) frameLocked(event, data string) {
 	if s.err != nil {
 		return
 	}
@@ -465,15 +479,46 @@ func (s *sseWriter) frame(event, data string) {
 
 func (s *sseWriter) channel(event string) io.Writer {
 	return writerFunc(func(p []byte) (int, error) {
-		s.frame(event, string(p))
 		s.mu.Lock()
-		err := s.err
-		s.mu.Unlock()
-		if err != nil {
-			return 0, err
+		defer s.mu.Unlock()
+		if s.err != nil {
+			return 0, s.err
+		}
+		if s.encoding == "base64" {
+			s.frameLocked(event, base64.StdEncoding.EncodeToString(p))
+		} else {
+			if s.pending == nil {
+				s.pending = map[string][]byte{}
+			}
+			bytes := append(s.pending[event], p...)
+			end := 0
+			for end < len(bytes) {
+				if !utf8.FullRune(bytes[end:]) {
+					break
+				}
+				_, n := utf8.DecodeRune(bytes[end:])
+				end += n
+			}
+			s.pending[event] = append([]byte(nil), bytes[end:]...)
+			if end > 0 {
+				s.frameLocked(event, strings.ToValidUTF8(string(bytes[:end]), "�"))
+			}
+		}
+		if s.err != nil {
+			return 0, s.err
 		}
 		return len(p), nil
 	})
+}
+func (s *sseWriter) finishOutput() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, event := range []string{"stdout", "stderr"} {
+		if len(s.pending[event]) > 0 {
+			s.frameLocked(event, strings.ToValidUTF8(string(s.pending[event]), "�"))
+			delete(s.pending, event)
+		}
+	}
 }
 
 type writerFunc func(p []byte) (int, error)

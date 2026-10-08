@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -129,8 +130,9 @@ type CacheStore struct {
 	Root     string
 	MaxBytes int64
 
-	mu    sync.Mutex
-	inUse map[string]int
+	transaction sync.Mutex
+	mu          sync.Mutex
+	inUse       map[string]int
 	// sweeping serializes evictions; a sweep walks every volume and
 	// must not run concurrently with itself.
 	sweeping sync.Mutex
@@ -175,6 +177,8 @@ func (c *CacheStore) Manifest(slug string) (WarmManifest, error) {
 // between manifest read and copy degrades to a cold boot, never an
 // error.
 func (c *CacheStore) Boot(id, slug string) (string, WarmManifest, bool, error) {
+	c.transaction.Lock()
+	defer c.transaction.Unlock()
 	if err := os.MkdirAll(filepath.Join(c.Root, "runs"), 0o700); err != nil {
 		return "", WarmManifest{}, false, fmt.Errorf("warm root: %w", err)
 	}
@@ -219,6 +223,8 @@ func (c *CacheStore) Boot(id, slug string) (string, WarmManifest, bool, error) {
 // trees instead of restoring them (a file the run deleted before the park
 // would resurrect). The image seed is the only writer.
 func (c *CacheStore) BootEmpty(id string) (string, error) {
+	c.transaction.Lock()
+	defer c.transaction.Unlock()
 	if err := os.MkdirAll(filepath.Join(c.Root, "runs"), 0o700); err != nil {
 		return "", fmt.Errorf("warm root: %w", err)
 	}
@@ -234,11 +240,14 @@ func (c *CacheStore) BootEmpty(id string) (string, error) {
 // beside the current one and the manifest swap is an atomic rename, so
 // concurrent boots see either the old or the new template in full.
 func (c *CacheStore) Commit(id, slug string) (WarmManifest, error) {
+	return c.CommitContext(context.Background(), id, slug)
+}
+func (c *CacheStore) CommitContext(ctx context.Context, id, slug string) (WarmManifest, error) {
+	c.transaction.Lock()
+	defer c.transaction.Unlock()
 	runDir := c.runDir(id)
-	hash, repoDir, err := LockHash(runDir)
-	if err != nil {
-		return WarmManifest{}, err
-	}
+	var hash, repoDir string
+	var err error
 	sd := c.slugDir(slug)
 	if err := os.MkdirAll(sd, 0o700); err != nil {
 		return WarmManifest{}, fmt.Errorf("warm slug dir: %w", err)
@@ -251,7 +260,7 @@ func (c *CacheStore) Commit(id, slug string) (WarmManifest, error) {
 	// and this one is neither until writeManifest lands.
 	c.mark(genDir)
 	c.mark(runDir)
-	err = copyTree(runDir, genDir)
+	err = copyTreeContext(ctx, runDir, genDir)
 	c.unmark(runDir)
 	if err != nil {
 		c.unmark(genDir)
@@ -259,6 +268,12 @@ func (c *CacheStore) Commit(id, slug string) (WarmManifest, error) {
 		return WarmManifest{}, fmt.Errorf("warm commit copy: %w", err)
 	}
 
+	hash, repoDir, err = LockHash(genDir)
+	if err != nil {
+		c.unmark(genDir)
+		_ = os.RemoveAll(genDir)
+		return WarmManifest{}, err
+	}
 	mf := WarmManifest{Repo: slug, LockHash: hash, RepoDir: repoDir, Gen: gen, CreatedAt: time.Now()}
 	if err := writeManifest(sd, mf); err != nil {
 		c.unmark(genDir)
@@ -266,7 +281,7 @@ func (c *CacheStore) Commit(id, slug string) (WarmManifest, error) {
 		return WarmManifest{}, err
 	}
 	c.unmark(genDir)
-	c.cleanGenerations(sd)
+	c.cleanGenerationsLocked(sd)
 	touchLastUsed(sd)
 	return mf, nil
 }
@@ -299,6 +314,11 @@ func writeManifest(slugDir string, mf WarmManifest) error {
 // all — a plain RemoveAll could unlink files mid-copy and surface as a
 // boot error or, worse, a silently incomplete run volume.
 func (c *CacheStore) cleanGenerations(slugDir string) {
+	c.transaction.Lock()
+	defer c.transaction.Unlock()
+	c.cleanGenerationsLocked(slugDir)
+}
+func (c *CacheStore) cleanGenerationsLocked(slugDir string) {
 	current := ""
 	if mf, err := c.manifestFromDir(slugDir); err == nil {
 		current = mf.Gen
@@ -338,6 +358,8 @@ func (c *CacheStore) cleanGenerations(slugDir string) {
 // Drop removes a repo's warm template entirely (forced invalidation).
 // Refused while any of its generations is in use.
 func (c *CacheStore) Drop(slug string) error {
+	c.transaction.Lock()
+	defer c.transaction.Unlock()
 	sd := c.slugDir(slug)
 	if _, err := c.Manifest(slug); err != nil {
 		return err
@@ -370,6 +392,8 @@ func (c *CacheStore) Hash(id string) (string, string, error) {
 // from it (the commit's manager-side recheck removes it instead). Runs
 // under c.mu with the in-use mark so mark-vs-remove cannot interleave.
 func (c *CacheStore) Release(id string) {
+	c.transaction.Lock()
+	defer c.transaction.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	runDir := c.runDir(id)
@@ -433,6 +457,8 @@ func (c *CacheStore) manifestFromDir(slugDir string) (WarmManifest, error) {
 // Driven by the manager's reaper tick, never inline on boot/commit —
 // a size walk must not delay a run's start. Returns the slugs removed.
 func (c *CacheStore) Sweep(ctx context.Context) []string {
+	c.transaction.Lock()
+	defer c.transaction.Unlock()
 	if c.MaxBytes <= 0 {
 		return nil
 	}
@@ -502,101 +528,143 @@ func (c *CacheStore) Sweep(ctx context.Context) []string {
 // Deterministic for an empty set — lockfile-less repos never
 // invalidate on lockfile change.
 func LockHash(volumeDir string) (hash, repoDir string, err error) {
-	root, repoDir := detectRepoDir(volumeDir)
+	root, err := os.OpenRoot(volumeDir)
+	if err != nil {
+		return "", "", err
+	}
+	defer root.Close()
+	repoDir = "."
+	candidates := []string{}
+	has := func(dir string) bool {
+		for _, name := range lockfiles {
+			if _, err := root.Lstat(filepath.Join(dir, name)); err == nil {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(".") {
+		entries, err := fs.ReadDir(root.FS(), ".")
+		if err != nil {
+			return "", "", err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() && dirNameSet.MatchString(entry.Name()) && has(entry.Name()) {
+				candidates = append(candidates, entry.Name())
+			}
+		}
+		if len(candidates) == 1 {
+			repoDir = candidates[0]
+		}
+	}
 	h := sha256.New()
 	fmt.Fprintf(h, "dir %s\n", repoDir)
 	for _, name := range lockfiles {
-		data, err := os.ReadFile(filepath.Join(root, name))
+		file, err := openRegular(root, filepath.Join(repoDir, name))
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
 		if err != nil {
 			return "", "", err
 		}
-		sum := sha256.Sum256(data)
-		fmt.Fprintf(h, "%s %s\n", name, hex.EncodeToString(sum[:]))
+		sum := sha256.New()
+		n, err := io.Copy(sum, io.LimitReader(file, maxLockBytes+1))
+		file.Close()
+		if err != nil {
+			return "", "", err
+		}
+		if n > maxLockBytes {
+			return "", "", fmt.Errorf("lockfile %s exceeds size limit", name)
+		}
+		fmt.Fprintf(h, "%s %s\n", name, hex.EncodeToString(sum.Sum(nil)))
 	}
 	return hex.EncodeToString(h.Sum(nil)), repoDir, nil
 }
 
-// detectRepoDir finds where the clone lives: the volume root when it
-// has lockfiles, else the single subdirectory that has one, else the
-// root (no lockfiles anywhere shallow).
-func detectRepoDir(volumeDir string) (string, string) {
-	if hasLockfile(volumeDir) {
-		return volumeDir, "."
-	}
-	entries, err := os.ReadDir(volumeDir)
-	if err != nil {
-		return volumeDir, "."
-	}
-	var candidates []string
-	for _, entry := range entries {
-		if entry.IsDir() && dirNameSet.MatchString(entry.Name()) && hasLockfile(filepath.Join(volumeDir, entry.Name())) {
-			candidates = append(candidates, entry.Name())
-		}
-	}
-	if len(candidates) == 1 {
-		return filepath.Join(volumeDir, candidates[0]), candidates[0]
-	}
-	return volumeDir, "."
-}
+const maxLockBytes = 8 << 20
+const maxCacheFileBytes = 512 << 20
+const maxCacheTreeBytes = 8 << 30
 
-func hasLockfile(dir string) bool {
-	for _, name := range lockfiles {
-		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
-			return true
-		}
+func openRegular(root *os.Root, path string) (*os.File, error) {
+	file, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
 	}
-	return false
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		file.Close()
+		return nil, fmt.Errorf("cache path %s is not a regular file", path)
+	}
+	return file, nil
 }
 
 // copyTree duplicates a resting filesystem tree: directories with their
 // modes, regular files with content and mode, symlinks as symlinks.
 // Nothing else appears in a committed clone/deps tree.
-func copyTree(src, dst string) error {
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+func copyTree(src, dst string) error { return copyTreeContext(context.Background(), src, dst) }
+func copyTreeContext(ctx context.Context, src, dst string) error {
+	root, err := os.OpenRoot(src)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return err
+	}
+	targetRoot, err := os.OpenRoot(dst)
+	if err != nil {
+		return err
+	}
+	defer targetRoot.Close()
+	var total int64
+	count := 0
+	return fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		target := filepath.Join(dst, rel)
-		info, err := d.Info()
+		count++
+		if count > 100000 {
+			return errors.New("cache tree exceeds entry limit")
+		}
+		info, err := root.Lstat(path)
 		if err != nil {
 			return err
 		}
 		switch {
 		case info.Mode()&fs.ModeSymlink != 0:
-			link, err := os.Readlink(path)
+			link, err := root.Readlink(path)
 			if err != nil {
 				return err
 			}
-			return os.Symlink(link, target)
+			return targetRoot.Symlink(link, path)
 		case info.IsDir():
-			return os.MkdirAll(target, info.Mode().Perm())
+			return targetRoot.MkdirAll(path, info.Mode().Perm())
 		case info.Mode().IsRegular():
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			in, err := os.Open(path)
+			in, err := openRegular(root, path)
 			if err != nil {
 				return err
 			}
 			defer in.Close()
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+			out, err := targetRoot.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, info.Mode().Perm())
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(out, in); err != nil {
-				out.Close()
-				return err
+			n, err := io.Copy(out, io.LimitReader(contextReader{ctx, in}, maxCacheFileBytes+1))
+			closeErr := out.Close()
+			total += n
+			if n > maxCacheFileBytes || total > maxCacheTreeBytes {
+				return errors.New("cache tree exceeds byte limit")
 			}
-			return out.Close()
+			return errors.Join(err, closeErr)
 		default:
-			return nil
+			return fmt.Errorf("unsupported cache file type: %s", path)
 		}
 	})
 }
@@ -628,4 +696,16 @@ func touchLastUsed(slugDir string) {
 		return
 	}
 	_ = f.Close()
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
 }

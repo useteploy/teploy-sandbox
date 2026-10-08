@@ -1,9 +1,12 @@
 package egress
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 )
@@ -16,11 +19,9 @@ import (
 // gets a listener of its OWN on an ephemeral port, torn down when the
 // run dies.
 //
-// A private listener rather than a shared one keyed by source IP,
-// because the key would not hold: every allowlist run sits on the same
-// bridge, containers keep CAP_NET_RAW by default, and one run's extra
-// entries must not become another's. A run only ever learns its own
-// proxy's port (injected as HTTP_PROXY), and the port dies with it.
+// Private listeners require random per-run credentials for HTTP and CONNECT.
+// The internal bridge disables peer forwarding; the daemon's host firewall
+// admits only active proxy ports and denies other host services.
 type Pool struct {
 	// Base is the allowlist every run starts from.
 	Base Allowlist
@@ -28,6 +29,11 @@ type Pool struct {
 	// gateway, reachable only from the bridge.
 	Bind string
 	Log  *slog.Logger
+	// PermitPort admits only proxy listeners through the sandbox host firewall.
+	PermitPort func(int) error
+	RevokePort func(int) error
+	ports      map[string]int
+	sharedPort int
 
 	mu     sync.Mutex
 	shared string
@@ -47,6 +53,12 @@ func (p *Pool) Start(port string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if p.PermitPort != nil {
+		if err := p.PermitPort(listener.Addr().(*net.TCPAddr).Port); err != nil {
+			listener.Close()
+			return "", err
+		}
+	}
 	proxy := &Proxy{Allow: p.Base, Log: p.Log}
 	server := &http.Server{Handler: proxy}
 	go func() {
@@ -55,6 +67,7 @@ func (p *Pool) Start(port string) (string, error) {
 		}
 	}()
 	p.mu.Lock()
+	p.sharedPort = listener.Addr().(*net.TCPAddr).Port
 	p.shared = "http://" + listener.Addr().String()
 	p.sharedSrv = server
 	p.sharedPx = proxy
@@ -80,13 +93,25 @@ func (p *Pool) OpenFor(runID string, extra []string) (string, error) {
 	allow := make(Allowlist, 0, len(p.Base)+len(extra))
 	allow = append(allow, p.Base...)
 	allow = append(allow, ParseAllowlist(strings.Join(extra, ","))...)
-	// Port 0: the kernel picks. Nothing but the run itself is told the
-	// number, so there is no port to reserve or collide on.
+	// Port 0: the kernel picks. Authentication binds the listener to the
+	// run even if another run discovers the port.
 	listener, err := net.Listen("tcp", net.JoinHostPort(p.Bind, "0"))
 	if err != nil {
 		return "", err
 	}
-	proxy := &Proxy{Allow: allow, Log: p.Log.With("run", runID)}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		listener.Close()
+		return "", err
+	}
+	credential := hex.EncodeToString(secret)
+	if p.PermitPort != nil {
+		if err := p.PermitPort(listener.Addr().(*net.TCPAddr).Port); err != nil {
+			listener.Close()
+			return "", err
+		}
+	}
+	proxy := &Proxy{Allow: allow, Log: p.Log.With("run", runID), Credential: credential}
 	server := &http.Server{Handler: proxy}
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
@@ -96,23 +121,31 @@ func (p *Pool) OpenFor(runID string, extra []string) (string, error) {
 	p.mu.Lock()
 	if p.perRun == nil {
 		p.perRun = make(map[string]*http.Server)
+		p.ports = make(map[string]int)
 		p.perRunPx = make(map[string]*Proxy)
 	}
 	// Duplicate-open semantics: replace-after-closing. A second OpenFor
 	// for the same run closes the earlier listener (and its tunnels)
 	// instead of orphaning it behind an unreachable address.
 	if old, ok := p.perRun[runID]; ok {
+		if p.RevokePort != nil {
+			if err := p.RevokePort(p.ports[runID]); err != nil {
+				p.Log.Error("revoke proxy port", "error", err)
+			}
+		}
 		if oldPx := p.perRunPx[runID]; oldPx != nil {
 			oldPx.CloseTunnels()
 		}
 		_ = old.Close()
 		p.Log.Warn("per-run egress proxy replaced by a second open", "run", runID)
 	}
+	p.ports[runID] = listener.Addr().(*net.TCPAddr).Port
 	p.perRun[runID] = server
 	p.perRunPx[runID] = proxy
 	p.mu.Unlock()
 	p.Log.Info("per-run egress proxy up", "run", runID, "addr", listener.Addr().String(), "extra", extra)
-	return "http://" + listener.Addr().String(), nil
+	u := &url.URL{Scheme: "http", Host: listener.Addr().String(), User: url.UserPassword("run", credential)}
+	return u.String(), nil
 }
 
 // Close tears down a run's private listener, if it had one. Idempotent:
@@ -123,14 +156,21 @@ func (p *Pool) Close(runID string) {
 	p.mu.Lock()
 	server, ok := p.perRun[runID]
 	proxy := p.perRunPx[runID]
+	port := p.ports[runID]
+	delete(p.ports, runID)
 	delete(p.perRun, runID)
 	delete(p.perRunPx, runID)
 	p.mu.Unlock()
 	if ok {
+		if p.RevokePort != nil {
+			if err := p.RevokePort(port); err != nil {
+				p.Log.Error("revoke proxy port", "error", err)
+			}
+		}
+		_ = server.Close()
 		if proxy != nil {
 			proxy.CloseTunnels()
 		}
-		_ = server.Close()
 	}
 }
 
@@ -143,6 +183,7 @@ func (p *Pool) Shutdown() {
 		ids = append(ids, id)
 	}
 	shared := p.sharedSrv
+	sharedPort := p.sharedPort
 	sharedPx := p.sharedPx
 	p.mu.Unlock()
 	for _, id := range ids {
@@ -152,6 +193,11 @@ func (p *Pool) Shutdown() {
 		sharedPx.CloseTunnels()
 	}
 	if shared != nil {
+		if p.RevokePort != nil {
+			if err := p.RevokePort(sharedPort); err != nil {
+				p.Log.Error("revoke shared proxy port", "error", err)
+			}
+		}
 		_ = shared.Close()
 	}
 }

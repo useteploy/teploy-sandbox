@@ -4,12 +4,15 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -76,6 +79,26 @@ func serve(args []string) error {
 		return fmt.Errorf("egress-allow: %w", err)
 	}
 
+	tokenLock, err := run.LockDirectory(filepath.Dir(*tokenFile))
+	if err != nil {
+		return err
+	}
+	defer tokenLock.Close()
+	if *cacheRoot != "" {
+		absolute, err := filepath.Abs(*cacheRoot)
+		if err != nil {
+			return err
+		}
+		*cacheRoot = absolute
+	}
+	var cacheLock *os.File
+	if *cacheRoot != "" {
+		cacheLock, err = run.LockDirectory(*cacheRoot)
+		if err != nil {
+			return err
+		}
+		defer cacheLock.Close()
+	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	token, err := server.LoadOrMintToken(*tokenFile)
 	if err != nil {
@@ -86,6 +109,16 @@ func serve(args []string) error {
 	// unset means Docker's default runtime. SBX_SHM_MB sizes /dev/shm for
 	// runs that launch a headless browser (Chromium needs 512 MB or more).
 	runtime := &run.DockerRuntime{Runtime: os.Getenv("SBX_RUNTIME"), ShmMB: int(envFloat("SBX_SHM_MB", 512))}
+	ownerPath, err := filepath.Abs(*tokenFile)
+	if err != nil {
+		return err
+	}
+	owner := sha256.Sum256([]byte(ownerPath))
+	runtime.Owner = hex.EncodeToString(owner[:])
+	runtime.CleanupRoot = filepath.Join(filepath.Dir(*tokenFile), ".sandbox-cleanup")
+	if err := runtime.RecoverScratch(); err != nil {
+		return fmt.Errorf("recover scratch resources: %w", err)
+	}
 	proxyURL := ""
 	var pool *egress.Pool
 	if err := runtime.EnsureEgressNetwork(context.Background()); err != nil {
@@ -103,22 +136,30 @@ func serve(args []string) error {
 			// Bind synchronously: if the gateway isn't a host interface
 			// (VM-backed Docker on dev machines), runs must not be handed
 			// a dead proxy URL — they stay fully sealed instead.
-			pool = &egress.Pool{Base: allow, Bind: gateway, Log: log}
-			url, err := pool.Start(*egressProxyPort)
-			if err != nil {
-				log.Warn("egress proxy disabled — allowlist runs are fully sealed (no allowlisted door)",
-					"addr", net.JoinHostPort(gateway, *egressProxyPort), "error", err)
-				pool = nil
+			firewall := &egress.HostFirewall{Bridge: run.EgressBridge, Gateway: gateway, Chain: "TEPLOY-SBX"}
+			if err := firewall.Start(); err != nil {
+				firewall.Close()
+				log.Warn("egress proxy disabled: host firewall unavailable", "error", err)
 			} else {
-				proxyURL = url
-				log.Info("egress allowlist proxy up", "addr", url, "entries", len(allow))
+				defer firewall.Close()
+				pool = &egress.Pool{Base: allow, Bind: gateway, Log: log, PermitPort: firewall.PermitPort, RevokePort: firewall.RevokePort}
+				url, err := pool.Start(*egressProxyPort)
+				if err != nil {
+					log.Warn("egress proxy disabled — allowlist runs are fully sealed (no allowlisted door)",
+						"addr", net.JoinHostPort(gateway, *egressProxyPort), "error", err)
+					pool = nil
+				} else {
+					proxyURL = url
+					defer pool.Shutdown()
+					log.Info("egress allowlist proxy up", "addr", url, "entries", len(allow))
+				}
 			}
 		}
 	}
 	// Run state is in-memory: any container we labelled that survived a
 	// previous daemon life is an unreachable orphan. Sweep before serving.
 	if swept, err := runtime.SweepOrphans(context.Background()); err != nil {
-		log.Warn("orphan sweep failed", "error", err)
+		return fmt.Errorf("orphan sweep: %w", err)
 	} else if swept > 0 {
 		log.Info("swept orphaned run containers from a previous daemon life", "count", swept)
 	}
@@ -130,6 +171,13 @@ func serve(args []string) error {
 	}
 	if *cacheRoot != "" {
 		manager.Cache = run.NewCacheStore(*cacheRoot, int64(*cacheMaxGB*(1<<30)))
+		live, err := runtime.LiveCacheDirs(context.Background())
+		if err != nil {
+			return fmt.Errorf("inspect cache ownership: %w", err)
+		}
+		if _, err := manager.Cache.ReconcileRuns(live); err != nil {
+			return fmt.Errorf("reconcile cache volumes: %w", err)
+		}
 		log.Info("per-repo cache enabled", "root", *cacheRoot, "maxGB", *cacheMaxGB)
 	}
 

@@ -89,8 +89,11 @@ type Run struct {
 	// grows, so credentials from any earlier lease stay dead forever.
 	// execs counts in-flight execs/writes, which fence lease takeovers.
 	// Both guarded by Manager.mu.
-	leaseGen uint64
-	execs    int
+	leaseGen       uint64
+	execs          int
+	exclusive      bool
+	removing       bool
+	pendingCleanup bool
 }
 
 // WarmState is the warm-cache view of a run: which repo's volume it
@@ -198,6 +201,9 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		Network:  network,
 	}
 	if network == NetworkAllowlist {
+		if m.ProxyURL == "" && m.Egress == nil {
+			return nil, fmt.Errorf("%w: allowlist network unavailable: proxy/firewall required", ErrBadRequest)
+		}
 		// Only the allowlist tier has a proxy to point at. On "none"
 		// there is nothing to reach and on "open" a proxy env var
 		// would quietly re-impose the filter the caller opted out of.
@@ -277,7 +283,9 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 
 	containerID, err := m.runtime.Create(ctx, spec)
 	if err != nil {
-		if warmState != nil {
+		if containerID != "" {
+			m.trackRollback(id, containerID, spec, warmState)
+		} else if warmState != nil {
 			m.Cache.Release(id)
 		}
 		m.closeEgress(id)
@@ -290,12 +298,16 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		// failure is a failed restore, not a degraded one — destroy and
 		// say so, exactly like a Create failure.
 		if err := m.runtime.SeedVolume(ctx, containerID, req.Image, spec.CachePath); err != nil {
-			_ = m.runtime.Remove(context.WithoutCancel(ctx), containerID)
-			if warmState != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			cleanupErr := m.runtime.Remove(cleanupCtx, containerID)
+			cancel()
+			if cleanupErr != nil {
+				m.trackRollback(id, containerID, spec, warmState)
+			} else if warmState != nil {
 				m.Cache.Release(id)
 			}
 			m.closeEgress(id)
-			return nil, fmt.Errorf("seed restored workspace: %w", err)
+			return nil, errors.Join(fmt.Errorf("seed restored workspace: %w", err), cleanupErr)
 		}
 		m.log.Info("warm volume seeded from snapshot", "id", id, "image", req.Image, "path", spec.CachePath)
 	}
@@ -345,29 +357,66 @@ func (m *Manager) List() []*Run {
 
 func (m *Manager) Destroy(ctx context.Context, id string) error {
 	m.mu.Lock()
-	run, ok := m.runs[id]
-	if ok {
-		delete(m.runs, id)
-	}
-	m.mu.Unlock()
+	current, ok := m.runs[id]
 	if !ok {
+		m.mu.Unlock()
 		return ErrNotFound
 	}
-	if err := m.runtime.Remove(ctx, run.ContainerID); err != nil {
-		// Stay tracked so a retried Destroy or the TTL reaper can retry the
-		// removal — untracking on failure (the old order) leaked the
-		// container with nothing left that knows about it. The warm volume
-		// and egress proxy are likewise released only on success.
-		m.log.Error("remove container failed", "id", id, "error", err)
-		m.mu.Lock()
-		m.runs[id] = run
+	if current.exclusive || current.removing {
 		m.mu.Unlock()
+		return ErrBusy
+	}
+	current.removing = true
+	m.mu.Unlock()
+	// Revoke egress immediately; keep the volume/registry until removal succeeds.
+	m.closeEgress(id)
+	attempt, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	err := m.runtime.Remove(attempt, current.ContainerID)
+	m.mu.Lock()
+	if err == nil {
+		delete(m.runs, id)
+	} else {
+		current.removing = false
+	}
+	m.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	m.releaseWarm(run)
-	m.closeEgress(id)
-	m.log.Info("run destroyed", "id", id)
+	m.releaseWarm(current)
 	return nil
+}
+
+// beginCapture excludes mutable admissions, lease takeover and teardown.
+func (m *Manager) beginCapture(id string) (*Run, func(), error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.runs[id]
+	if !ok {
+		return nil, nil, ErrNotFound
+	}
+	if current.pendingCleanup || current.exclusive || current.removing || current.execs > 0 {
+		return nil, nil, ErrBusy
+	}
+	current.exclusive = true
+	snapshot := *current
+	return &snapshot, func() { m.mu.Lock(); current.exclusive = false; m.mu.Unlock() }, nil
+}
+
+type freezer interface {
+	Freeze(context.Context, string) error
+	Thaw(string) error
+}
+
+func (m *Manager) freeze(ctx context.Context, id string) (func() error, error) {
+	if f, ok := m.runtime.(freezer); ok {
+		if err := f.Freeze(ctx, id); err != nil {
+			return nil, err
+		}
+		return func() error { return f.Thaw(id) }, nil
+	}
+	// In-process test runtimes have no background processes.
+	return func() error { return nil }, nil
 }
 
 // SnapshotRepo is the image repository all run snapshots live under.
@@ -378,12 +427,11 @@ const SnapshotRepo = "teploy-sbx-snap"
 // they exist precisely so state survives the TTL reaper (a parked agent
 // run restores from one days later). Callers own deletion.
 func (m *Manager) Snapshot(ctx context.Context, id string) (string, error) {
-	m.mu.Lock()
-	current, ok := m.runs[id]
-	m.mu.Unlock()
-	if !ok {
-		return "", ErrNotFound
+	current, release, err := m.beginCapture(id)
+	if err != nil {
+		return "", err
 	}
+	defer release()
 	ref := SnapshotRepo + ":" + strings.ToLower(NewULID(m.now()))
 	// CachePath (not just CacheDir): a warm run's workspace lives ON the
 	// mounted volume, and the snapshot must bake those bytes in or the
@@ -416,14 +464,15 @@ func (m *Manager) DeleteSnapshot(ctx context.Context, ref string) error {
 // commits with unchanged lockfiles republish the same hash under a new
 // generation (harmless; the old one is cleaned up). When the run was
 // destroyed mid-copy, the volume is released here instead.
-func (m *Manager) CommitWarm(ctx context.Context, id string, repo string) (*WarmState, error) {
+func (m *Manager) CommitWarm(ctx context.Context, id string, repo string) (result *WarmState, resultErr error) {
 	if m.Cache == nil {
 		return nil, fmt.Errorf("%w: this daemon has no cache store (serve --cache-root)", ErrBadRequest)
 	}
-	current, err := m.Get(id)
+	current, release, err := m.beginCapture(id)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	if current.CacheDir == "" {
 		return nil, fmt.Errorf("%w: run %s has no warm volume", ErrBadRequest, id)
 	}
@@ -433,7 +482,12 @@ func (m *Manager) CommitWarm(ctx context.Context, id string, repo string) (*Warm
 			return nil, err
 		}
 	}
-	mf, err := m.Cache.Commit(id, slug)
+	thaw, err := m.freeze(ctx, current.ContainerID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, thaw()) }()
+	mf, err := m.Cache.CommitContext(ctx, id, slug)
 	if _, getErr := m.Get(id); getErr != nil {
 		// The run died while we copied from its volume; nothing can
 		// release it anymore except us.
@@ -449,17 +503,25 @@ func (m *Manager) CommitWarm(ctx context.Context, id string, repo string) (*Warm
 // WarmHash reports the lockfile hash of the run's volume as it stands
 // now — the invalidation input to compare against the template's
 // manifest after a fetch/checkout.
-func (m *Manager) WarmHash(id string) (*WarmState, error) {
+func (m *Manager) WarmHash(id string) (result *WarmState, resultErr error) {
 	if m.Cache == nil {
 		return nil, fmt.Errorf("%w: this daemon has no cache store (serve --cache-root)", ErrBadRequest)
 	}
-	current, err := m.Get(id)
+	current, release, err := m.beginCapture(id)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	if current.CacheDir == "" {
 		return nil, fmt.Errorf("%w: run %s has no warm volume", ErrBadRequest, id)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	thaw, err := m.freeze(ctx, current.ContainerID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, thaw()) }()
 	hash, repoDir, err := m.Cache.Hash(id)
 	if err != nil {
 		return nil, err
@@ -502,29 +564,20 @@ func (m *Manager) DropWarm(slug string) error {
 // tests.
 func (m *Manager) Reap(ctx context.Context) int {
 	now := m.now()
-	m.mu.Lock()
-	var expired []*Run
-	for id, run := range m.runs {
-		if !run.ExpiresAt.After(now) {
-			expired = append(expired, run)
-			delete(m.runs, id)
+	reaped := 0
+	for _, current := range m.List() {
+		if !current.ExpiresAt.After(now) {
+			if err := m.Destroy(ctx, current.ID); err != nil {
+				m.log.Error("reap remove failed", "id", current.ID, "error", err)
+			} else {
+				reaped++
+			}
 		}
-	}
-	m.mu.Unlock()
-
-	for _, run := range expired {
-		m.releaseWarm(run)
-		m.closeEgress(run.ID)
-		if err := m.runtime.Remove(ctx, run.ContainerID); err != nil {
-			m.log.Error("reap remove failed", "id", run.ID, "error", err)
-			continue
-		}
-		m.log.Info("run reaped", "id", run.ID)
 	}
 	if m.Cache != nil {
 		m.Cache.Sweep(ctx)
 	}
-	return len(expired)
+	return reaped
 }
 
 func (m *Manager) releaseWarm(run *Run) {
@@ -624,4 +677,10 @@ func validEnvName(name string) bool {
 		}
 	}
 	return true
+}
+
+func (m *Manager) trackRollback(id, containerID string, spec CreateSpec, warm *WarmState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.runs[id] = &Run{ID: id, Image: spec.Image, Network: spec.Network, ContainerID: containerID, Warm: warm, CacheDir: spec.CacheHostPath, CachePath: spec.CachePath, ExpiresAt: m.now(), pendingCleanup: true}
 }

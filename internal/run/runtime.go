@@ -71,7 +71,8 @@ type Runtime interface {
 // dedicated network (never the `teploy` app network) with no NAT and no
 // default route; the daemon's allowlist proxy on its gateway is the only
 // way out.
-const EgressNetwork = "teploy-sbx-egress"
+const EgressNetwork = "teploy-sbx-egress-v2"
+const EgressBridge = "teploy-sbx1"
 
 // EgressSubnet/EgressGatewayIP pin the bridge's addressing so the proxy
 // always has a deterministic address to bind (auto-allocated IPAM is
@@ -102,7 +103,9 @@ type DockerRuntime struct {
 	// headless browser inside a run needs 512 MB or more.
 	ShmMB int
 	// Docker binary name; "docker" unless overridden.
-	Bin string
+	Bin         string
+	Owner       string
+	CleanupRoot string
 }
 
 func (d *DockerRuntime) bin() string {
@@ -118,26 +121,27 @@ func (d *DockerRuntime) bin() string {
 // pre-allowlist (non-internal) bridge is recreated; if containers are
 // still attached the swap fails and the error surfaces to the caller.
 func (d *DockerRuntime) EnsureEgressNetwork(ctx context.Context) error {
-	inspect := exec.CommandContext(ctx, d.bin(), "network", "inspect", "-f", "{{.Internal}}", EgressNetwork)
-	var internal bytes.Buffer
-	inspect.Stdout, inspect.Stderr = &internal, io.Discard
-	if inspect.Run() == nil {
-		if strings.TrimSpace(internal.String()) == "true" {
-			return nil
+	inspect := exec.CommandContext(ctx, d.bin(), "network", "inspect", EgressNetwork)
+	out, err := inspect.Output()
+	if err == nil {
+		var networks []struct {
+			Internal bool
+			Options  map[string]string
 		}
-		if out, err := exec.CommandContext(ctx, d.bin(), "network", "rm", EgressNetwork).CombinedOutput(); err != nil {
-			return fmt.Errorf("egress network exists WITHOUT --internal and cannot be replaced (containers attached?): %s", strings.TrimSpace(string(out)))
+		if json.Unmarshal(out, &networks) != nil || len(networks) != 1 || !networks[0].Internal || networks[0].Options["com.docker.network.bridge.enable_icc"] != "false" || networks[0].Options["com.docker.network.bridge.name"] != EgressBridge {
+			return errors.New("existing sandbox egress network lacks isolation; migrate it after draining its workloads")
 		}
+		return nil
 	}
 	// Explicit subnet+gateway: some runtimes materialize IPAM lazily on
 	// auto-allocated networks, leaving the proxy nothing to bind.
 	create := exec.CommandContext(ctx, d.bin(), "network", "create", "--driver", "bridge", "--internal",
-		"--subnet", EgressSubnet, "--gateway", EgressGatewayIP, EgressNetwork)
-	out, err := create.CombinedOutput()
+		"--subnet", EgressSubnet, "--gateway", EgressGatewayIP, "--opt", "com.docker.network.bridge.enable_icc=false", "--opt", "com.docker.network.bridge.name="+EgressBridge, EgressNetwork)
+	out, err = create.CombinedOutput()
 	if err != nil {
 		// Subnet collision on this box: fall back to auto-allocation; the
 		// gateway is then discovered from inspect instead of the constant.
-		fallback := exec.CommandContext(ctx, d.bin(), "network", "create", "--driver", "bridge", "--internal", EgressNetwork)
+		fallback := exec.CommandContext(ctx, d.bin(), "network", "create", "--driver", "bridge", "--internal", "--opt", "com.docker.network.bridge.enable_icc=false", "--opt", "com.docker.network.bridge.name="+EgressBridge, EgressNetwork)
 		if fbOut, fbErr := fallback.CombinedOutput(); fbErr != nil {
 			return fmt.Errorf("create egress network: %s / %s", strings.TrimSpace(string(out)), strings.TrimSpace(string(fbOut)))
 		}
@@ -197,6 +201,9 @@ func (d *DockerRuntime) createArgs(spec CreateSpec) []string {
 		// with defunct processes.
 		"--init",
 	}
+	if d.Owner != "" {
+		args = append(args, "--label", "teploy.sandbox.owner="+d.Owner)
+	}
 	for _, c := range dropCapabilities {
 		args = append(args, "--cap-drop", c)
 	}
@@ -215,6 +222,7 @@ func (d *DockerRuntime) createArgs(spec CreateSpec) []string {
 	}
 	switch spec.Network {
 	case NetworkAllowlist:
+		args = append(args, "--sysctl", "net.ipv6.conf.all.disable_ipv6=1", "--sysctl", "net.ipv6.conf.default.disable_ipv6=1")
 		args = append(args, "--network", EgressNetwork)
 		// Standard proxy env for the allowlist proxy — the internal
 		// bridge enforces; these just point cooperating tools at the
@@ -266,7 +274,11 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 		if detail == "" {
 			detail = err.Error()
 		}
-		return "", fmt.Errorf("docker run: %s", detail)
+		createErr := fmt.Errorf("docker run: %s", detail)
+		if cleanupErr := d.cleanup("rm", "-f", spec.Name); cleanupErr != nil {
+			return spec.Name, errors.Join(createErr, cleanupErr)
+		}
+		return "", createErr
 	}
 	containerID := strings.TrimSpace(stdout.String())
 
@@ -275,7 +287,11 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 	// for running state so the first exec after a first-time image never
 	// fails spuriously.
 	if err := d.waitRunning(ctx, containerID); err != nil {
-		_ = d.Remove(context.WithoutCancel(ctx), containerID)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if cleanupErr := d.Remove(cleanupCtx, containerID); cleanupErr != nil {
+			return containerID, errors.Join(err, cleanupErr)
+		}
 		return "", err
 	}
 	return containerID, nil
@@ -452,7 +468,7 @@ func (d *DockerRuntime) ReadFile(ctx context.Context, containerID, path string) 
 	// head -c one past the cap: distinguishing "file is larger than the
 	// bound" from "file is exactly the bound" keeps the limit honest.
 	cmd := exec.CommandContext(ctx, d.bin(), "exec", containerID, "sh", "-c",
-		"cat "+shellQuote(path)+" | head -c "+fmt.Sprint(MaxFileBytes+1))
+		"head -c "+fmt.Sprint(MaxFileBytes+1)+" -- "+shellQuote(path))
 	var stdout limitedBuffer
 	stdout.limit = MaxFileBytes + 1
 	cmd.Stdout = &stdout
@@ -460,7 +476,7 @@ func (d *DockerRuntime) ReadFile(ctx context.Context, containerID, path string) 
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("read file: %s", strings.TrimSpace(stderr.String()))
 	}
-	if stdout.truncated {
+	if stdout.truncated || stdout.buf.Len() > MaxFileBytes {
 		return nil, fmt.Errorf("read file: %s exceeds the %d MiB files-API limit", path, MaxFileBytes>>20)
 	}
 	return stdout.buf.Bytes(), nil
@@ -507,7 +523,11 @@ const SnapshotLabel = "teploy.sandbox.snapshot"
 // volume's bytes are therefore COPIED INTO the image through a temporary
 // container, making the snapshot self-contained: restoring it needs
 // nothing but the image.
-func (d *DockerRuntime) Snapshot(ctx context.Context, containerID, volumePath, imageRef string) error {
+func (d *DockerRuntime) Snapshot(ctx context.Context, containerID, volumePath, imageRef string) (result error) {
+	if err := d.Freeze(ctx, containerID); err != nil {
+		return err
+	}
+	defer func() { result = errors.Join(result, d.Thaw(containerID)) }()
 	if volumePath == "" {
 		out, err := exec.CommandContext(ctx, d.bin(), "commit",
 			"--change", "LABEL "+SnapshotLabel+"=1",
@@ -518,6 +538,11 @@ func (d *DockerRuntime) Snapshot(ctx context.Context, containerID, volumePath, i
 		return nil
 	}
 	staging := imageRef + "-stage"
+	cleanupStage, err := d.ownScratch("rmi", staging)
+	if err != nil {
+		return err
+	}
+	defer func() { result = errors.Join(result, cleanupStage()) }()
 	if out, err := exec.CommandContext(ctx, d.bin(), "commit", containerID, staging).CombinedOutput(); err != nil {
 		return fmt.Errorf("docker commit (staging): %s", strings.TrimSpace(string(out)))
 	}
@@ -528,7 +553,6 @@ func (d *DockerRuntime) Snapshot(ctx context.Context, containerID, volumePath, i
 	// form.
 	tmp, err := os.MkdirTemp("", "sbx-snapshot-")
 	if err != nil {
-		_ = exec.CommandContext(ctx, d.bin(), "rmi", staging).Run()
 		return fmt.Errorf("snapshot temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmp)
@@ -537,14 +561,16 @@ func (d *DockerRuntime) Snapshot(ctx context.Context, containerID, volumePath, i
 	// commit persists them into the image — an image that then refuses to
 	// start with the runtime's own args.
 	seed := "sbx-snapseed-" + strings.ToLower(NewULID(time.Now()))
+	cleanupSeed, err := d.ownScratch("rm", "-f", seed)
+	if err != nil {
+		return err
+	}
+	defer func() { result = errors.Join(result, cleanupSeed()) }()
 	createOut, err := exec.CommandContext(ctx, d.bin(), "create", "--name", seed, staging).CombinedOutput()
 	if err != nil {
-		_ = exec.CommandContext(ctx, d.bin(), "rmi", staging).Run()
 		return fmt.Errorf("snapshot seed container: %s", strings.TrimSpace(string(createOut)))
 	}
 	fail := func(step string, out []byte) error {
-		_ = exec.CommandContext(ctx, d.bin(), "rm", "-f", seed).Run()
-		_ = exec.CommandContext(ctx, d.bin(), "rmi", staging).Run()
 		return fmt.Errorf("snapshot %s: %s", step, strings.TrimSpace(string(out)))
 	}
 	if out, err := exec.CommandContext(ctx, d.bin(), "cp", containerID+":"+volumePath, tmp).CombinedOutput(); err != nil {
@@ -559,8 +585,6 @@ func (d *DockerRuntime) Snapshot(ctx context.Context, containerID, volumePath, i
 	if err != nil {
 		return fail("commit", commitOut)
 	}
-	_ = exec.CommandContext(ctx, d.bin(), "rm", "-f", seed).Run()
-	_ = exec.CommandContext(ctx, d.bin(), "rmi", staging).Run()
 	return nil
 }
 
@@ -569,19 +593,27 @@ func (d *DockerRuntime) Snapshot(ctx context.Context, containerID, volumePath, i
 // volume-aware snapshot boots a fresh volume (template or empty); without
 // this the mount shadows exactly the workspace bytes the snapshot exists
 // to carry.
-func (d *DockerRuntime) SeedVolume(ctx context.Context, containerID, imageRef, volumePath string) error {
+func (d *DockerRuntime) SeedVolume(ctx context.Context, containerID, imageRef, volumePath string) (result error) {
+	if err := d.Freeze(ctx, containerID); err != nil {
+		return err
+	}
+	defer func() { result = errors.Join(result, d.Thaw(containerID)) }()
 	tmp, err := os.MkdirTemp("", "sbx-seed-")
 	if err != nil {
 		return fmt.Errorf("seed temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmp)
 	seed := "sbx-imgseed-" + strings.ToLower(NewULID(time.Now()))
+	cleanupSeed, err := d.ownScratch("rm", "-f", seed)
+	if err != nil {
+		return err
+	}
+	defer func() { result = errors.Join(result, cleanupSeed()) }()
 	createOut, err := exec.CommandContext(ctx, d.bin(), "create", "--name", seed, imageRef).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("seed container: %s", strings.TrimSpace(string(createOut)))
 	}
 	fail := func(step string, out []byte) error {
-		_ = exec.CommandContext(ctx, d.bin(), "rm", "-f", seed).Run()
 		return fmt.Errorf("seed %s: %s", step, strings.TrimSpace(string(out)))
 	}
 	if out, err := exec.CommandContext(ctx, d.bin(), "cp", seed+":"+volumePath, tmp).CombinedOutput(); err != nil {
@@ -590,7 +622,6 @@ func (d *DockerRuntime) SeedVolume(ctx context.Context, containerID, imageRef, v
 	if out, err := exec.CommandContext(ctx, d.bin(), "cp", filepath.Join(tmp, filepath.Base(volumePath)), containerID+":"+filepath.Dir(volumePath)).CombinedOutput(); err != nil {
 		return fail("copy into volume", out)
 	}
-	_ = exec.CommandContext(ctx, d.bin(), "rm", "-f", seed).Run()
 	return nil
 }
 
@@ -620,7 +651,10 @@ func (d *DockerRuntime) RemoveImage(ctx context.Context, imageRef string) error 
 // removing it is the only way those don't leak across restarts/crashes.
 // Returns the number swept.
 func (d *DockerRuntime) SweepOrphans(ctx context.Context) (int, error) {
-	out, err := exec.CommandContext(ctx, d.bin(), "ps", "-aq", "--filter", "label=teploy.sandbox=1").Output()
+	if d.Owner == "" {
+		return 0, errors.New("orphan sweep requires daemon ownership identity")
+	}
+	out, err := exec.CommandContext(ctx, d.bin(), "ps", "-aq", "--filter", "label=teploy.sandbox=1", "--filter", "label=teploy.sandbox.owner="+d.Owner).Output()
 	if err != nil {
 		return 0, fmt.Errorf("docker ps: %w", err)
 	}
@@ -638,4 +672,26 @@ func (d *DockerRuntime) SweepOrphans(ctx context.Context) (int, error) {
 // shellQuote single-quotes a string for sh, escaping embedded quotes.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// Freeze covers background writers as well as API-admitted operations.
+func (d *DockerRuntime) Freeze(ctx context.Context, id string) error {
+	out, err := exec.CommandContext(ctx, d.bin(), "pause", id).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("pause capture: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+func (d *DockerRuntime) Thaw(id string) error { return d.cleanup("unpause", id) }
+func (d *DockerRuntime) cleanup(args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, d.bin(), args...).CombinedOutput()
+	if err != nil && (strings.Contains(string(out), "No such container") || strings.Contains(string(out), "No such image")) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("docker cleanup %s: %s: %w", args[0], strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }

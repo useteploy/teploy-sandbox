@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -96,7 +97,7 @@ func (m *Manager) AcquireLease(runID, owner string, ttl time.Duration) (uint64, 
 		m.mu.Unlock()
 		return 0, time.Time{}, fmt.Errorf("%w: run %s is leased to %q until %s", ErrLeaseHeld, runID, lease.Holder, lease.ExpiresAt)
 	}
-	if current.execs > 0 {
+	if current.pendingCleanup || current.exclusive || current.removing || current.execs > 0 {
 		m.mu.Unlock()
 		return 0, time.Time{}, fmt.Errorf("%w: an exec or write is in flight on run %s; acquire after it finishes", ErrBusy, runID)
 	}
@@ -167,6 +168,7 @@ type ExecSession struct {
 	manager     *Manager
 	runID       string
 	containerID string
+	used        atomic.Bool
 }
 
 // BeginExec admits one exec under the lease fence: while the run holds
@@ -183,6 +185,10 @@ func (m *Manager) BeginExec(runID string, cred LeaseCredential) (*ExecSession, e
 		m.mu.Unlock()
 		return nil, ErrNotFound
 	}
+	if current.pendingCleanup || current.exclusive || current.removing {
+		m.mu.Unlock()
+		return nil, ErrBusy
+	}
 	if err := checkFence(current, cred, m.now()); err != nil {
 		m.mu.Unlock()
 		return nil, err
@@ -196,13 +202,20 @@ func (m *Manager) BeginExec(runID string, cred LeaseCredential) (*ExecSession, e
 // Exec runs the admitted command and releases the in-flight reservation
 // when it returns.
 func (s *ExecSession) Exec(ctx context.Context, cmd, cwd string, env map[string]string, timeout time.Duration, stdout, stderr io.Writer) (int, bool, error) {
+	if !s.used.CompareAndSwap(false, true) {
+		return -1, false, ErrBusy
+	}
+	defer s.manager.finishExec(s.runID)
 	code, timedOut, err := s.manager.runtime.Exec(ctx, s.containerID, cmd, cwd, env, timeout, stdout, stderr)
-	s.manager.finishExec(s.runID)
 	return code, timedOut, err
 }
 
 // Abandon releases the reservation without running.
-func (s *ExecSession) Abandon() { s.manager.finishExec(s.runID) }
+func (s *ExecSession) Abandon() {
+	if s.used.CompareAndSwap(false, true) {
+		s.manager.finishExec(s.runID)
+	}
+}
 
 // finishExec releases an in-flight slot. A run destroyed mid-exec took
 // its counter with it — there is nothing to release.
@@ -224,6 +237,10 @@ func (m *Manager) WriteFile(ctx context.Context, runID string, cred LeaseCredent
 	if !ok {
 		m.mu.Unlock()
 		return ErrNotFound
+	}
+	if current.pendingCleanup || current.exclusive || current.removing {
+		m.mu.Unlock()
+		return ErrBusy
 	}
 	if err := checkFence(current, cred, m.now()); err != nil {
 		m.mu.Unlock()

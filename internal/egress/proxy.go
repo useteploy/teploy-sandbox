@@ -8,6 +8,8 @@
 package egress
 
 import (
+	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -215,13 +217,16 @@ type Proxy struct {
 	Log   *slog.Logger
 	// DialTimeout for upstream connections (default 15s).
 	DialTimeout time.Duration
+	Credential  string
 
 	// tunnels tracks every hijacked CONNECT tunnel this proxy owns.
 	// http.Server.Close explicitly excludes hijacked connections, so
 	// without this registry closing the listener leaves both sides of
 	// every established tunnel — and their copy goroutines — running
 	// until an endpoint happens to disconnect.
-	tunnels  sync.Map // net.Conn pair -> struct{}
+	tunnelMu sync.Mutex
+	closing  bool
+	tunnels  map[tunnelPair]struct{}
 	closeTun sync.WaitGroup
 }
 
@@ -229,13 +234,13 @@ type Proxy struct {
 // their copy goroutines to unwind. Closing either side unblocks both
 // io.Copy loops; the wait is bounded by the caller's context.
 func (p *Proxy) CloseTunnels() {
-	p.tunnels.Range(func(key, _ any) bool {
-		if pair, ok := key.(tunnelPair); ok {
-			pair.client.Close()
-			pair.upstream.Close()
-		}
-		return true
-	})
+	p.tunnelMu.Lock()
+	p.closing = true
+	for pair := range p.tunnels {
+		pair.client.Close()
+		pair.upstream.Close()
+	}
+	p.tunnelMu.Unlock()
 	p.closeTun.Wait()
 }
 
@@ -256,6 +261,21 @@ func (p *Proxy) deny(w http.ResponseWriter, host string) {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.tunnelMu.Lock()
+	closing := p.closing
+	p.tunnelMu.Unlock()
+	if closing {
+		http.Error(w, "proxy closing", http.StatusServiceUnavailable)
+		return
+	}
+	if p.Credential != "" {
+		expected := "Basic " + base64.StdEncoding.EncodeToString([]byte("run:"+p.Credential))
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Proxy-Authorization")), []byte(expected)) != 1 {
+			w.Header().Set("Proxy-Authenticate", `Basic realm="sandbox"`)
+			http.Error(w, "proxy credential required", http.StatusProxyAuthRequired)
+			return
+		}
+	}
 	if r.Method == http.MethodConnect {
 		p.tunnel(w, r)
 		return
@@ -313,25 +333,35 @@ func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
 		upstream.Close()
 		return
 	}
-	_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	pair := tunnelPair{client: client, upstream: upstream}
-	p.tunnels.Store(pair, struct{}{})
-	p.closeTun.Add(1)
-	go func() {
-		defer p.closeTun.Done()
-		defer p.tunnels.Delete(pair)
-		defer upstream.Close()
-		defer client.Close()
-		_, _ = io.Copy(upstream, buffered)
-	}()
-	p.closeTun.Add(1)
-	go func() {
-		defer p.closeTun.Done()
-		defer p.tunnels.Delete(pair)
-		defer upstream.Close()
-		defer client.Close()
-		_, _ = io.Copy(client, upstream)
-	}()
+	p.tunnelMu.Lock()
+	if p.closing {
+		p.tunnelMu.Unlock()
+		client.Close()
+		upstream.Close()
+		return
+	}
+	if p.tunnels == nil {
+		p.tunnels = make(map[tunnelPair]struct{})
+	}
+	p.tunnels[pair] = struct{}{}
+	p.closeTun.Add(2)
+	p.tunnelMu.Unlock()
+	finish := func() {
+		client.Close()
+		upstream.Close()
+		p.tunnelMu.Lock()
+		delete(p.tunnels, pair)
+		p.tunnelMu.Unlock()
+		p.closeTun.Done()
+	}
+	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		finish()
+		finish()
+		return
+	}
+	go func() { defer finish(); _, _ = io.Copy(upstream, buffered) }()
+	go func() { defer finish(); _, _ = io.Copy(client, upstream) }()
 }
 
 // ValidateEntry checks one allowlist entry against the grammar Permits

@@ -2,9 +2,9 @@
 
 Unresolved findings for this repository from the ChatGPT-led audit series (2026-09-09 through 2026-09-11, passes 1-5; register: teploy-neutron-lullmail expanded audit). Every P0/P1 finding has been fixed and verified; the items below are the remaining P2/P3 tail plus one item needing validation. Fields are quoted from the audit register; line references point at the review commits listed per item where recorded.
 
-Open items: 1 P2 (1 total)
+Open source implementations: 0. One deliberate legacy SSE compatibility residual requires upstream consumer opt-in; deployment acceptance gates are listed below.
 
-## useteploy__teploy-sandbox-05 - P2 - Open
+## useteploy__teploy-sandbox-05 - P2 - Compatibility residual
 
 **Make SSE output encoding safe for carriage returns and split UTF-8**
 
@@ -51,3 +51,41 @@ callers cannot distinguish missing from empty; (2) the integration suite's
 `TestRealDockerLifecycle` hardcodes alpine:3.20, whose busybox timeout
 rejects the exec wrapper's `--kill-after` (pre-existing, fails on this box
 independent of this change).
+
+## 2026-10-07 source reconciliation
+
+- S-01: authenticated private proxies; v2 internal bridge with ICC disabled;
+  host INPUT denies services outside active proxy listeners. Missing firewall
+  enforcement disables allowlist creation. Proxy port grants are revoked.
+- S-02: rooted, descriptor-validated, nonblocking regular-file cache reads;
+  bounded lockfiles/copies, cancellation-aware copies and frozen capture.
+- S-03: retryable teardown preserves registry and mounted volume until Docker
+  confirms removal. Failed create/restore rollback remains tracked for reaping.
+- S-04: direct bounded file reads preserve missing-file errors and explicitly
+  reject cap+1 bytes. Exact-cap and empty files succeed.
+- S-05: closing admission synchronizes CONNECT registration and goroutine
+  ownership, including a hijack that finishes after shutdown.
+- S-06: exclusive cache-root ownership and conservative startup reconciliation
+  retain all Docker-mounted volumes and reclaim only unowned run directories.
+- S-07: captures exclude API mutation/teardown and pause background writers.
+- S-08: independent bounded cleanup, durable scratch ownership and startup
+  recovery; cancellation still attempts thaw and every owned cleanup.
+- S-09: serialized publication, boot pinning and reclamation prevent stale
+  cleaners from deleting the current generation.
+- useteploy__teploy-sandbox-05: incremental UTF-8-safe text SSE keeps its event
+  schema and raw CR bytes, propagates write failures and adds explicit opt-in
+  base64 for safely framed lossless arbitrary bytes. The default raw-CR wire
+  contract is deliberately retained. Closing the remaining CR/EventSource
+  concern requires the upstream consumer to request/decode base64.
+- The standing missing-read and Alpine lifecycle notes are implemented: direct
+  head reads preserve errors and the lifecycle fixture uses coreutils timeout.
+
+Acceptance still required before deployment: the complete Docker lifecycle,
+warm/cold capture/restore and native Docker host/peer isolation matrix on a
+healthy daemon; the gVisor matrix on a host with runsc. Source/unit/race proof
+must not be treated as completion of those runtime gates. The native host
+firewall has a separate isolated Linux namespace deny/allow/revoke fixture.
+
+Legacy unlabeled containers are retained by scoped startup cleanup. Operators
+must drain older workloads when migrating deployment; startup never sweeps
+containers belonging to another daemon identity.

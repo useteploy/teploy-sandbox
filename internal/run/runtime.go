@@ -36,7 +36,23 @@ type CreateSpec struct {
 	// argument).
 	CacheHostPath string
 	CachePath     string
+	// User is the account the container's processes run as: a non-root
+	// account name the image must define (the Ship images carry `ship`,
+	// with passwordless sudo), or "" / "root" for root. See createArgs for
+	// what each choice changes in the hardening.
+	User string
 }
+
+// IsRoot reports whether a spec's processes run as root.
+func (s CreateSpec) IsRoot() bool { return s.User == "" || s.User == RootUser }
+
+// RootUser is the spelling of the root opt-in, on the wire and in a spec.
+const RootUser = "root"
+
+// ErrNoSuchUser is Create's answer when the image defines no account by the
+// spec's User — an image built before the sandbox user existed, or a
+// project's own image. The manager falls back to root on it.
+var ErrNoSuchUser = errors.New("image has no such user")
 
 // Runtime is the container boundary. DockerRuntime shells out to the
 // docker CLI (the family's approach — no SDK dep, CGO_ENABLED=0 stays
@@ -93,6 +109,11 @@ const WorkDir = "/work"
 // apt, npm and cargo all chown and setuid as root during installs and a
 // --cap-drop=ALL turns "tests: not run" into the common case.
 var dropCapabilities = []string{"NET_RAW", "MKNOD", "AUDIT_WRITE"}
+
+// A non-root run keeps AUDIT_WRITE: sudo writes an audit record on every
+// call and, without the capability, prints "unable to send audit message"
+// to stderr each time — noise inside every test log that uses sudo.
+var dropCapabilitiesUser = []string{"NET_RAW", "MKNOD"}
 
 type DockerRuntime struct {
 	// Runtime is the OCI runtime handed to docker run (--runtime). Empty
@@ -191,7 +212,24 @@ func (d *DockerRuntime) createArgs(spec CreateSpec) []string {
 	args := []string{
 		"run", "-d",
 		"--name", spec.Name,
-		"--security-opt", "no-new-privileges",
+	}
+	drop := dropCapabilities
+	if spec.IsRoot() {
+		// Explicit even for root: a snapshot committed from a non-root run
+		// carries that user in its image config, and a root restore must
+		// not inherit it.
+		args = append(args, "--user", "0:0", "--security-opt", "no-new-privileges")
+	} else {
+		// No no-new-privileges for a non-root run: the flag is exactly what
+		// stops sudo (a setuid binary) from elevating, and passwordless sudo
+		// is the point of the account. The ceiling is unchanged from a root
+		// run — the same bounding capability set, which a root process
+		// already holds in full — so what is given up is only the guarantee
+		// that the process cannot reach root, which sudo hands over anyway.
+		args = append(args, "--user", spec.User)
+		drop = dropCapabilitiesUser
+	}
+	args = append(args,
 		"--memory", fmt.Sprintf("%dm", spec.MemoryMB),
 		"--cpus", fmt.Sprintf("%g", spec.CPUs),
 		"--pids-limit", fmt.Sprintf("%d", spec.Pids),
@@ -200,11 +238,11 @@ func (d *DockerRuntime) createArgs(spec CreateSpec) []string {
 		// runner leave behind; without it a long run's pid budget fills
 		// with defunct processes.
 		"--init",
-	}
+	)
 	if d.Owner != "" {
 		args = append(args, "--label", "teploy.sandbox.owner="+d.Owner)
 	}
-	for _, c := range dropCapabilities {
+	for _, c := range drop {
 		args = append(args, "--cap-drop", c)
 	}
 	if d.Runtime != "" {
@@ -255,9 +293,49 @@ func (d *DockerRuntime) createArgs(spec CreateSpec) []string {
 	// --workdir here: the runtime chdirs into it before this command ever
 	// runs, so on an image without a pre-existing WorkDir the container
 	// fails to start. mkdir happens first instead; every docker exec below
-	// sets --workdir explicitly, by which point the directory exists.
-	args = append(args, spec.Image, "sh", "-c", "mkdir -p "+WorkDir+" && exec sleep infinity")
+	// sets --workdir explicitly, by which point the directory exists. A
+	// non-root init may not be able to create it; Create's ownership pass
+	// (as root) does, so the mkdir is best-effort here rather than fatal.
+	args = append(args, spec.Image, "sh", "-c", "mkdir -p "+WorkDir+" 2>/dev/null; exec sleep infinity")
 	return args
+}
+
+// ownershipScript runs as root in a non-root run's container: it creates
+// the workdir and hands it, and every tree named after the user, to the
+// run's user ($1). Only entries not already owned are touched, so a warm
+// volume pays for the walk and not for rewriting every inode. Warm template
+// copies, `docker cp` seeding and snapshots taken under a root run all land
+// files as root, which is why this is needed at all.
+const ownershipScript = `u="$1"; shift; g="$(id -g "$u")" || exit 1
+mkdir -p ` + WorkDir + ` || exit 1
+for p in "$@"; do [ -d "$p" ] || continue; find "$p" -xdev \( ! -user "$u" -o ! -group "$g" \) -exec chown -h "$u:$g" {} + || exit 1; done`
+
+// ownershipArgs is the docker exec argument list for the ownership pass —
+// pure, so the root scoping is testable without a daemon. The workdir is
+// always included; a warm mount elsewhere is added to it.
+func ownershipArgs(containerID, user, path string) []string {
+	args := []string{"exec", "--user", "0:0", containerID, "sh", "-c", ownershipScript, "sh", user, WorkDir}
+	if path != "" && path != WorkDir {
+		args = append(args, path)
+	}
+	return args
+}
+
+// ensureOwnership hands the workdir (and path) to the container's configured
+// user. A root container is left alone.
+func (d *DockerRuntime) ensureOwnership(ctx context.Context, containerID, path string) error {
+	out, err := exec.CommandContext(ctx, d.bin(), "inspect", "-f", "{{.Config.User}}", containerID).Output()
+	if err != nil {
+		return fmt.Errorf("inspect container user: %w", err)
+	}
+	user := strings.TrimSpace(string(out))
+	if user == "" || user == RootUser || user == "0" || user == "0:0" {
+		return nil
+	}
+	if out, err := exec.CommandContext(ctx, d.bin(), ownershipArgs(containerID, user, path)...).CombinedOutput(); err != nil {
+		return fmt.Errorf("workspace ownership for %s: %s", user, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, error) {
@@ -275,6 +353,9 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 			detail = err.Error()
 		}
 		createErr := fmt.Errorf("docker run: %s", detail)
+		if !spec.IsRoot() && strings.Contains(detail, "unable to find user") {
+			createErr = fmt.Errorf("%w %q: %s", ErrNoSuchUser, spec.User, detail)
+		}
 		if cleanupErr := d.cleanup("rm", "-f", spec.Name); cleanupErr != nil {
 			return spec.Name, errors.Join(createErr, cleanupErr)
 		}
@@ -286,7 +367,11 @@ func (d *DockerRuntime) Create(ctx context.Context, spec CreateSpec) (string, er
 	// actually running; an immediate exec would race its startup. Wait
 	// for running state so the first exec after a first-time image never
 	// fails spuriously.
-	if err := d.waitRunning(ctx, containerID); err != nil {
+	err := d.waitRunning(ctx, containerID)
+	if err == nil && !spec.IsRoot() {
+		err = d.ensureOwnership(ctx, containerID, spec.CachePath)
+	}
+	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if cleanupErr := d.Remove(cleanupCtx, containerID); cleanupErr != nil {
@@ -593,7 +678,18 @@ func (d *DockerRuntime) Snapshot(ctx context.Context, containerID, volumePath, i
 // volume-aware snapshot boots a fresh volume (template or empty); without
 // this the mount shadows exactly the workspace bytes the snapshot exists
 // to carry.
-func (d *DockerRuntime) SeedVolume(ctx context.Context, containerID, imageRef, volumePath string) (result error) {
+//
+// docker cp lands every file as root, so once the copy is done (and the
+// container thawed — a paused container refuses exec) a non-root run is
+// handed the workspace it was restored into.
+func (d *DockerRuntime) SeedVolume(ctx context.Context, containerID, imageRef, volumePath string) error {
+	if err := d.copySeed(ctx, containerID, imageRef, volumePath); err != nil {
+		return err
+	}
+	return d.ensureOwnership(ctx, containerID, volumePath)
+}
+
+func (d *DockerRuntime) copySeed(ctx context.Context, containerID, imageRef, volumePath string) (result error) {
 	if err := d.Freeze(ctx, containerID); err != nil {
 		return err
 	}

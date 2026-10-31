@@ -239,6 +239,85 @@ func TestRealWarmSnapshotRoundTripsWorkspace(t *testing.T) {
 	}
 }
 
+// The sandbox user (SBX_TEST_USER_IMAGE: an image defining `ship` with
+// passwordless sudo, e.g. any Ship sandbox image). A default run is not
+// root, can reach root through sudo, and owns its workspace on every path
+// that lands files as root: a warm template boot (host-side copy) and a
+// warm snapshot restore (docker cp). The root opt-in is root.
+func TestRealSandboxUser(t *testing.T) {
+	image := os.Getenv("SBX_TEST_USER_IMAGE")
+	if image == "" {
+		t.Skip("SBX_TEST_USER_IMAGE unset (needs an image with the sandbox user)")
+	}
+	ctx := context.Background()
+	runtime := &run.DockerRuntime{Runtime: os.Getenv("SBX_TEST_RUNTIME")}
+	manager := run.NewManager(runtime, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cacheRoot := os.Getenv("SBX_TEST_CACHE")
+	if cacheRoot == "" {
+		cacheRoot = t.TempDir()
+	}
+	manager.Cache = run.NewCacheStore(cacheRoot, 0)
+	warm := &run.WarmRequest{Repo: "example.com/user-repo"}
+	check := func(containerID, cmd, want string) {
+		t.Helper()
+		if _, out, err := execRun(t, runtime, containerID, cmd); err != nil || strings.TrimSpace(out) != want {
+			t.Fatalf("%s: got %q err=%v want %q", cmd, strings.TrimSpace(out), err, want)
+		}
+	}
+
+	seed, err := manager.Create(ctx, run.CreateRequest{Image: image, Network: "none", TTLSec: 300, Warm: warm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), seed.ID) })
+	if seed.User != run.DefaultSandboxUser {
+		t.Fatalf("default run user: %q", seed.User)
+	}
+	check(seed.ContainerID, "id -un", run.DefaultSandboxUser)
+	check(seed.ContainerID, "sudo -n id -u", "0")
+	check(seed.ContainerID, "mkdir -p /work/repo && printf 'module x\\n' > /work/repo/go.mod && stat -c %U /work /work/repo/go.mod | sort -u", run.DefaultSandboxUser)
+	if _, err := manager.CommitWarm(ctx, seed.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Destroy(ctx, seed.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	booted, err := manager.Create(ctx, run.CreateRequest{Image: image, Network: "none", TTLSec: 300, Warm: warm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), booted.ID) })
+	if booted.Warm == nil || !booted.Warm.Booted {
+		t.Fatalf("premise: the second run must boot the template: %+v", booted.Warm)
+	}
+	check(booted.ContainerID, "find /work ! -user "+run.DefaultSandboxUser+" | wc -l", "0")
+	check(booted.ContainerID, "printf 'edit' >> /work/repo/go.mod && echo ok", "ok")
+	snapshot, err := manager.Snapshot(ctx, booted.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.DeleteSnapshot(context.Background(), snapshot) })
+
+	restored, err := manager.Create(ctx, run.CreateRequest{Image: snapshot, Network: "none", TTLSec: 300, Warm: warm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), restored.ID) })
+	check(restored.ContainerID, "find /work ! -user "+run.DefaultSandboxUser+" | wc -l", "0")
+	check(restored.ContainerID, "cat /work/repo/go.mod", "module x\nedit")
+
+	root, err := manager.Create(ctx, run.CreateRequest{Image: snapshot, Network: "none", TTLSec: 300, User: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), root.ID) })
+	if root.User != run.RootUser {
+		t.Fatalf("root opt-in user: %q", root.User)
+	}
+	check(root.ContainerID, "id -u", "0")
+}
+
 func execRun(t *testing.T, runtime *run.DockerRuntime, containerID, cmd string) (int, string, error) {
 	t.Helper()
 	var out, errOut bytes.Buffer

@@ -15,7 +15,10 @@ import (
 
 // fakeRT satisfies Runtime without Docker for manager-level tests.
 type fakeRT struct {
-	createErr      error
+	createErr error
+	// noUsers makes Create refuse every non-root spec the way docker does
+	// for an image without that account.
+	noUsers        bool
 	removeErr      error
 	seedErr        error
 	created        []CreateSpec
@@ -37,6 +40,9 @@ type fakeRT struct {
 func (f *fakeRT) Create(_ context.Context, spec CreateSpec) (string, error) {
 	if f.createErr != nil {
 		return "", f.createErr
+	}
+	if f.noUsers && !spec.IsRoot() {
+		return "", fmt.Errorf("%w %q", ErrNoSuchUser, spec.User)
 	}
 	f.created = append(f.created, spec)
 	return "ctr-" + spec.Name, nil

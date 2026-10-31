@@ -66,6 +66,8 @@ func serve(args []string) error {
 		"host directory for the warm per-repo cache (empty disables the `warm` create option)")
 	cacheMaxGB := flags.Float64("cache-max-gb", envFloat("SBX_CACHE_MAX_GB", 20),
 		"LRU cap across all cache volumes, in GB (0 = unbounded)")
+	sandboxUser := flags.String("sandbox-user", envOr("SBX_SANDBOX_USER", run.DefaultSandboxUser),
+		"non-root account runs execute as unless the create body says user \"root\"; images without it fall back to root (empty = every run as root)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -166,6 +168,7 @@ func serve(args []string) error {
 
 	manager := run.NewManager(runtime, log)
 	manager.ProxyURL = proxyURL
+	manager.SandboxUser = *sandboxUser
 	if pool != nil {
 		manager.Egress = pool
 	}

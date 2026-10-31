@@ -13,7 +13,7 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 
 | Route | Does |
 |---|---|
-| `POST /v1/runs` | `{image, env?, ttlSec?, network?, egressAllow?, limits?, warm?}` → `{id, server, expiresAt, warm?}` — network `none` (default), `allowlist` or `open` (see Egress); defaults 1 CPU / 1 GB / 256 pids, `no-new-privileges`, never the `teploy` app network; `warm: {repo, path?}` gives the run a private volume for the repo (below) |
+| `POST /v1/runs` | `{image, env?, ttlSec?, network?, egressAllow?, limits?, warm?, user?}` → `{id, server, expiresAt, user, warm?}` — network `none` (default), `allowlist` or `open` (see Egress); defaults 1 CPU / 1 GB / 256 pids, never the `teploy` app network; `user` `default` (absent) or `root` (see Run user); `warm: {repo, path?}` gives the run a private volume for the repo (below) |
 | `POST /v1/runs/{id}/exec` | `{cmd, cwd?, timeoutSec?, env?, owner?, generation?, outputEncoding?}` (`env`: name → value, set in the command's environment; POSIX names, no NUL, ≤64 vars / 64 KiB, else 400; values reach the container through a private (0600, removed after) `--env-file`, never argv and never the docker CLI's own environment; so no line breaks) → SSE: `stdout`/`stderr` chunks, then `exit` `{exitCode, timedOut}`; while the run holds a lease, only the holder's `owner`+`generation` may exec (409 otherwise) |
 | `PUT/GET /v1/runs/{id}/files/{path}` | Confined to `/work`; traversal rejected. PUT takes the lease credential as `?owner=&generation=` query and is fenced like exec; GET is open, lease or not |
 | `DELETE /v1/runs/{id}` | Destroy now (the reaper enforces TTLs regardless, default 30 min) |
@@ -145,6 +145,29 @@ allowlist. It is still never the `teploy` app network. Use it for code
 you already trust; `allowlist` is the default answer for agent runs.
 
 
+## Run user
+
+A run executes as the non-root sandbox account (`ship`, `--sandbox-user` /
+`SBX_SANDBOX_USER`; empty runs everything as root) unless the create body
+says `"user": "root"`. The Ship sandbox images define the account with uid
+1000 and passwordless sudo, which is what GitHub Actions runners and
+devcontainers do: suites whose permission tests root would ignore behave,
+and root stays one `sudo` away.
+
+- Root runs keep `no-new-privileges` and drop `NET_RAW`, `MKNOD`,
+  `AUDIT_WRITE`. Non-root runs drop `no-new-privileges` (it is what stops
+  sudo elevating) and keep `AUDIT_WRITE` (sudo warns on every call
+  without it). The bounding set is otherwise identical, so the ceiling is
+  the root run's.
+- An image without the account (older builds, a project's own image) boots
+  as root, as before; the create response and the log name the user the
+  run actually got.
+- Template copies, snapshot seeding and snapshots taken under root land
+  files as root, so a non-root run's container is handed `/work` (and a
+  warm mount) by a root exec at create and after a seed; only entries not
+  already owned are touched.
+- Exec, files PUT/GET run as the run's user.
+
 ## Never
 
 Bind the API publicly; join runs to the `teploy` network; mount the
@@ -153,7 +176,8 @@ Docker socket into a run.
 ## Testing
 
 `go test ./...` (interface-mocked) · `go test -tags integration ./...`
-(real Docker on a disposable box).
+(real Docker on a disposable box; `SBX_TEST_USER_IMAGE=<image with the
+sandbox user>` adds the run-user round trip).
 
 ## Snapshots (M3)
 

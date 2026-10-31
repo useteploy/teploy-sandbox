@@ -18,7 +18,25 @@ const (
 	DefaultCPUs     = 1.0
 	DefaultPids     = 256
 	MaxTTL          = 24 * time.Hour
+	// DefaultSandboxUser is the non-root account runs use unless the
+	// request opts into root. The Ship sandbox images define it (uid 1000,
+	// passwordless sudo); an image without it falls back to root.
+	DefaultSandboxUser = "ship"
 )
+
+// ParseUser resolves the wire value of CreateRequest.User: "" or "default"
+// is the daemon's sandbox user, "root" opts into root. Anything else is
+// refused — the request chooses between the two, it does not name accounts.
+func ParseUser(raw string) (root bool, err error) {
+	switch raw {
+	case "", "default":
+		return false, nil
+	case RootUser:
+		return true, nil
+	default:
+		return false, fmt.Errorf("%w: user must be \"default\" or \"root\", got %q", ErrBadRequest, raw)
+	}
+}
 
 var (
 	ErrNotFound   = errors.New("run not found")
@@ -66,9 +84,13 @@ type EgressProxy interface {
 
 // Run is one live sandboxed environment.
 type Run struct {
-	ID          string `json:"id"`
-	Image       string `json:"image"`
-	Network     string `json:"network"`
+	ID      string `json:"id"`
+	Image   string `json:"image"`
+	Network string `json:"network"`
+	// User is the account the run's processes actually run as: the sandbox
+	// user, or "root" (requested, or the fallback for an image without the
+	// sandbox user).
+	User        string `json:"user"`
 	ContainerID string `json:"-"`
 	// Warm describes the run's warm-cache volume when it has one.
 	Warm *WarmState `json:"warm,omitempty"`
@@ -122,6 +144,11 @@ type CreateRequest struct {
 	// warm template when one exists (see WarmRequest); rejected when
 	// the daemon has no cache store configured.
 	Warm *WarmRequest `json:"warm,omitempty"`
+	// User is "default" (or absent) for the daemon's non-root sandbox user,
+	// "root" to run as root — for a project whose suite needs it (chown in
+	// tests, binding low ports). Root stays reachable from the default
+	// through passwordless sudo.
+	User string `json:"user,omitempty"`
 }
 
 type Limits struct {
@@ -146,6 +173,10 @@ type Manager struct {
 	// Cache is the warm per-repo volume store; nil means the `warm`
 	// create option is refused.
 	Cache *CacheStore
+	// SandboxUser is the non-root account a default run uses
+	// (DefaultSandboxUser unless the operator changed it). Empty runs every
+	// run as root, the behaviour before the account existed.
+	SandboxUser string
 
 	mu   sync.Mutex
 	runs map[string]*Run
@@ -157,6 +188,8 @@ func NewManager(runtime Runtime, log *slog.Logger) *Manager {
 		log:     log,
 		now:     time.Now,
 		runs:    make(map[string]*Run),
+
+		SandboxUser: DefaultSandboxUser,
 	}
 }
 
@@ -184,6 +217,10 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	if len(extra) > 0 && network != NetworkAllowlist {
 		return nil, fmt.Errorf("%w: egressAllow needs network \"allowlist\" — %q has no allowlist to extend", ErrBadRequest, network)
 	}
+	wantRoot, err := ParseUser(req.User)
+	if err != nil {
+		return nil, err
+	}
 	ttl := DefaultTTL
 	if req.TTLSec > 0 {
 		ttl = time.Duration(req.TTLSec) * time.Second
@@ -199,6 +236,10 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		CPUs:     DefaultCPUs,
 		Pids:     DefaultPids,
 		Network:  network,
+		User:     RootUser,
+	}
+	if !wantRoot && m.SandboxUser != "" {
+		spec.User = m.SandboxUser
 	}
 	if network == NetworkAllowlist {
 		if m.ProxyURL == "" && m.Egress == nil {
@@ -282,6 +323,14 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	}
 
 	containerID, err := m.runtime.Create(ctx, spec)
+	if errors.Is(err, ErrNoSuchUser) && containerID == "" {
+		// An image without the sandbox user — built before it existed, or a
+		// project's own image. Root is what every run got before, so the
+		// run still boots; the response and the log say which user it got.
+		m.log.Warn("image has no sandbox user; running as root", "id", id, "image", req.Image, "user", spec.User)
+		spec.User = RootUser
+		containerID, err = m.runtime.Create(ctx, spec)
+	}
 	if err != nil {
 		if containerID != "" {
 			m.trackRollback(id, containerID, spec, warmState)
@@ -316,6 +365,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		ID:          id,
 		Image:       req.Image,
 		Network:     network,
+		User:        spec.User,
 		ContainerID: containerID,
 		Warm:        warmState,
 		CacheDir:    spec.CacheHostPath,
@@ -326,7 +376,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	m.mu.Lock()
 	m.runs[id] = run
 	m.mu.Unlock()
-	m.log.Info("run created", "id", id, "image", req.Image, "network", network, "egressAllow", len(extra), "expiresAt", run.ExpiresAt)
+	m.log.Info("run created", "id", id, "image", req.Image, "network", network, "user", spec.User, "egressAllow", len(extra), "expiresAt", run.ExpiresAt)
 	return run, nil
 }
 

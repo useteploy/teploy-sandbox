@@ -139,6 +139,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		"id":        created.ID,
 		"image":     created.Image,
 		"network":   created.Network,
+		"user":      created.User,
 		"createdAt": created.CreatedAt,
 		"expiresAt": created.ExpiresAt,
 	}

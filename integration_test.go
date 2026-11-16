@@ -239,6 +239,85 @@ func TestRealWarmSnapshotRoundTripsWorkspace(t *testing.T) {
 	}
 }
 
+// The sandbox user (SBX_TEST_USER_IMAGE: an image defining `ship` with
+// passwordless sudo, e.g. any Ship sandbox image). A default run is not
+// root, can reach root through sudo, and owns its workspace on every path
+// that lands files as root: a warm template boot (host-side copy) and a
+// warm snapshot restore (docker cp). The root opt-in is root.
+func TestRealSandboxUser(t *testing.T) {
+	image := os.Getenv("SBX_TEST_USER_IMAGE")
+	if image == "" {
+		t.Skip("SBX_TEST_USER_IMAGE unset (needs an image with the sandbox user)")
+	}
+	ctx := context.Background()
+	runtime := &run.DockerRuntime{Runtime: os.Getenv("SBX_TEST_RUNTIME")}
+	manager := run.NewManager(runtime, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cacheRoot := os.Getenv("SBX_TEST_CACHE")
+	if cacheRoot == "" {
+		cacheRoot = t.TempDir()
+	}
+	manager.Cache = run.NewCacheStore(cacheRoot, 0)
+	warm := &run.WarmRequest{Repo: "example.com/user-repo"}
+	check := func(containerID, cmd, want string) {
+		t.Helper()
+		if _, out, err := execRun(t, runtime, containerID, cmd); err != nil || strings.TrimSpace(out) != want {
+			t.Fatalf("%s: got %q err=%v want %q", cmd, strings.TrimSpace(out), err, want)
+		}
+	}
+
+	seed, err := manager.Create(ctx, run.CreateRequest{Image: image, Network: "none", TTLSec: 300, Warm: warm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), seed.ID) })
+	if seed.User != run.DefaultSandboxUser {
+		t.Fatalf("default run user: %q", seed.User)
+	}
+	check(seed.ContainerID, "id -un", run.DefaultSandboxUser)
+	check(seed.ContainerID, "sudo -n id -u", "0")
+	check(seed.ContainerID, "mkdir -p /work/repo && printf 'module x\\n' > /work/repo/go.mod && stat -c %U /work /work/repo/go.mod | sort -u", run.DefaultSandboxUser)
+	if _, err := manager.CommitWarm(ctx, seed.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Destroy(ctx, seed.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	booted, err := manager.Create(ctx, run.CreateRequest{Image: image, Network: "none", TTLSec: 300, Warm: warm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), booted.ID) })
+	if booted.Warm == nil || !booted.Warm.Booted {
+		t.Fatalf("premise: the second run must boot the template: %+v", booted.Warm)
+	}
+	check(booted.ContainerID, "find /work ! -user "+run.DefaultSandboxUser+" | wc -l", "0")
+	check(booted.ContainerID, "printf 'edit' >> /work/repo/go.mod && echo ok", "ok")
+	snapshot, err := manager.Snapshot(ctx, booted.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.DeleteSnapshot(context.Background(), snapshot) })
+
+	restored, err := manager.Create(ctx, run.CreateRequest{Image: snapshot, Network: "none", TTLSec: 300, Warm: warm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), restored.ID) })
+	check(restored.ContainerID, "find /work ! -user "+run.DefaultSandboxUser+" | wc -l", "0")
+	check(restored.ContainerID, "cat /work/repo/go.mod", "module x\nedit")
+
+	root, err := manager.Create(ctx, run.CreateRequest{Image: snapshot, Network: "none", TTLSec: 300, User: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), root.ID) })
+	if root.User != run.RootUser {
+		t.Fatalf("root opt-in user: %q", root.User)
+	}
+	check(root.ContainerID, "id -u", "0")
+}
+
 func execRun(t *testing.T, runtime *run.DockerRuntime, containerID, cmd string) (int, string, error) {
 	t.Helper()
 	var out, errOut bytes.Buffer
@@ -480,4 +559,220 @@ func TestNativeHostFirewallFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	probe(false)
+}
+
+// snapshotImageCount is how many images exist under the snapshot repo.
+func snapshotImageCount(t *testing.T) int {
+	t.Helper()
+	out, err := exec.Command("docker", "images", "-q", run.SnapshotRepo).Output()
+	if err != nil {
+		t.Fatalf("docker images: %v", err)
+	}
+	return len(strings.Fields(string(out)))
+}
+
+// Persistent runs against real Docker: stop a run, throw the manager away
+// (a daemon restart), load the registry file into a new one, resume under
+// the same ID and read the same bytes back. Cold keeps its workspace in
+// the container layer; warm keeps it on a bind-mounted volume that the
+// stop must bake into the snapshot and the resume must seed back — with
+// no template merged underneath. The run's env must survive too, and when
+// the run is finally destroyed no snapshot image may be left behind:
+// Docker refuses to delete an image a container was created from, so the
+// stop snapshot can only go once the resumed container has.
+func TestRealStopResumeAcrossRestart(t *testing.T) {
+	image := os.Getenv("SBX_TEST_IMAGE")
+	if image == "" {
+		image = "debian:bookworm-slim"
+	}
+	payload := []byte("line one\nline two\x00\xff binary tail")
+	for _, tc := range []struct {
+		name string
+		warm *run.WarmRequest
+	}{
+		{"cold", nil},
+		{"warm", &run.WarmRequest{Repo: "example.com/persist"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			log := slog.New(slog.NewTextHandler(io.Discard, nil))
+			stateDir := t.TempDir()
+			cacheRoot := os.Getenv("SBX_TEST_CACHE")
+			if cacheRoot == "" {
+				cacheRoot = t.TempDir()
+			}
+			imagesBefore := snapshotImageCount(t)
+
+			runtime := &run.DockerRuntime{Runtime: os.Getenv("SBX_TEST_RUNTIME")}
+			first := run.NewManager(runtime, log)
+			first.Cache = run.NewCacheStore(cacheRoot, 0)
+			if _, err := first.LoadState(ctx, stateDir); err != nil {
+				t.Fatal(err)
+			}
+			if tc.warm != nil {
+				// A template holding a file the run deletes: a resume that
+				// merged the template back would resurrect it.
+				seed, err := first.Create(ctx, run.CreateRequest{Image: image, TTLSec: 300, Warm: tc.warm})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = first.Destroy(context.Background(), seed.ID) })
+				if _, _, err := execRun(t, runtime, seed.ContainerID, "printf 'module example.com/persist\\n' > /work/go.mod && printf stale > /work/stale.txt"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := first.CommitWarm(ctx, seed.ID, ""); err != nil {
+					t.Fatal(err)
+				}
+				if err := first.Destroy(ctx, seed.ID); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = first.DropWarm(tc.warm.Repo) })
+			}
+
+			created, err := first.Create(ctx, run.CreateRequest{
+				Image: image, TTLSec: 300, Warm: tc.warm,
+				Env:    map[string]string{"PERSIST_MARK": "kept across the stop"},
+				Labels: map[string]string{"suite": "integration"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = first.Destroy(context.Background(), created.ID) })
+			if err := runtime.WriteFile(ctx, created.ContainerID, run.WorkDir+"/notes/a.bin", bytes.NewReader(payload)); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := execRun(t, runtime, created.ContainerID, "rm -f /work/stale.txt && printf untracked > /work/untracked.txt"); err != nil {
+				t.Fatal(err)
+			}
+
+			stopped, err := first.Stop(ctx, created.ID)
+			if err != nil {
+				t.Fatalf("stop: %v", err)
+			}
+			if stopped.State != run.StateStopped {
+				t.Fatalf("state after stop: %q", stopped.State)
+			}
+			if out, _ := exec.Command("docker", "ps", "-aq", "--filter", "name=teploy-sbx-"+strings.ToLower(created.ID)).Output(); strings.TrimSpace(string(out)) != "" {
+				t.Fatalf("stop left the container behind: %s", out)
+			}
+
+			// --- restart: nothing of the first manager is reused.
+			second := run.NewManager(&run.DockerRuntime{Runtime: os.Getenv("SBX_TEST_RUNTIME")}, log)
+			second.Cache = run.NewCacheStore(cacheRoot, 0)
+			loaded, err := second.LoadState(ctx, stateDir)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if loaded != 1 {
+				t.Fatalf("loaded %d stopped runs, want 1", loaded)
+			}
+			t.Cleanup(func() { _ = second.Destroy(context.Background(), created.ID) })
+
+			resumed, err := second.Resume(ctx, created.ID, 300)
+			if err != nil {
+				t.Fatalf("resume: %v", err)
+			}
+			if resumed.ID != created.ID || resumed.State != run.StateRunning || resumed.Labels["suite"] != "integration" {
+				t.Fatalf("resumed run: %+v", resumed)
+			}
+			got, err := runtime.ReadFile(ctx, resumed.ContainerID, run.WorkDir+"/notes/a.bin")
+			if err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("file bytes did not survive stop/restart/resume: %q err=%v", got, err)
+			}
+			if _, out, err := execRun(t, runtime, resumed.ContainerID, `cat /work/untracked.txt; printf '|%s' "$PERSIST_MARK"`); err != nil || out != "untracked|kept across the stop" {
+				t.Fatalf("workspace or env after resume: %q err=%v", out, err)
+			}
+			if _, out, err := execRun(t, runtime, resumed.ContainerID, "test ! -e /work/stale.txt && echo absent"); err != nil || strings.TrimSpace(out) != "absent" {
+				t.Fatalf("a file deleted before the stop came back: %q err=%v", out, err)
+			}
+
+			// A second stop/resume in the same life, then a fork: the
+			// child sees the same bytes under its own ID.
+			if _, err := second.Stop(ctx, created.ID); err != nil {
+				t.Fatalf("second stop: %v", err)
+			}
+			if _, err := second.Resume(ctx, created.ID, 300); err != nil {
+				t.Fatalf("second resume: %v", err)
+			}
+			child, err := second.Fork(ctx, created.ID, run.ForkRequest{TTLSec: 300})
+			if err != nil {
+				t.Fatalf("fork: %v", err)
+			}
+			t.Cleanup(func() { _ = second.Destroy(context.Background(), child.ID) })
+			if got, err := runtime.ReadFile(ctx, child.ContainerID, run.WorkDir+"/notes/a.bin"); err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("fork did not carry the file bytes: %q err=%v", got, err)
+			}
+
+			if err := second.Destroy(ctx, child.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := second.Destroy(ctx, created.ID); err != nil {
+				t.Fatal(err)
+			}
+			if after := snapshotImageCount(t); after != imagesBefore {
+				t.Fatalf("snapshot images leaked: %d before, %d after", imagesBefore, after)
+			}
+		})
+	}
+}
+
+// Soak: stop and resume one cold run many times. Each stop commits the
+// container on top of the image the previous resume started from, so the
+// snapshot's layer chain grows by one per cycle; this measures how far
+// that goes and what it costs. Opt-in: SBX_TEST_CYCLES=<n>.
+func TestRealStopResumeSoak(t *testing.T) {
+	cycles, _ := strconv.Atoi(os.Getenv("SBX_TEST_CYCLES"))
+	if cycles <= 0 {
+		t.Skip("SBX_TEST_CYCLES unset")
+	}
+	image := os.Getenv("SBX_TEST_IMAGE")
+	if image == "" {
+		image = "debian:bookworm-slim"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cycles)*time.Minute)
+	defer cancel()
+	runtime := &run.DockerRuntime{Runtime: os.Getenv("SBX_TEST_RUNTIME")}
+	manager := run.NewManager(runtime, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := manager.LoadState(ctx, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	imagesBefore := snapshotImageCount(t)
+	created, err := manager.Create(ctx, run.CreateRequest{Image: image, TTLSec: 3600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), created.ID) })
+	containerID := created.ContainerID
+	var slowest time.Duration
+	for i := 1; i <= cycles; i++ {
+		if _, _, err := execRun(t, runtime, containerID, fmt.Sprintf("printf %d > /work/cycle.txt", i)); err != nil {
+			t.Fatalf("cycle %d: write: %v", i, err)
+		}
+		started := time.Now()
+		if _, err := manager.Stop(ctx, created.ID); err != nil {
+			t.Fatalf("cycle %d: stop: %v", i, err)
+		}
+		resumed, err := manager.Resume(ctx, created.ID, 3600)
+		if err != nil {
+			t.Fatalf("cycle %d: resume: %v", i, err)
+		}
+		took := time.Since(started)
+		if took > slowest {
+			slowest = took
+		}
+		containerID = resumed.ContainerID
+		if _, out, err := execRun(t, runtime, containerID, "cat /work/cycle.txt"); err != nil || out != strconv.Itoa(i) {
+			t.Fatalf("cycle %d: read back %q err=%v", i, out, err)
+		}
+		if i%10 == 0 || i == cycles {
+			t.Logf("cycle %d: stop+resume %s (slowest so far %s), snapshot images %d", i, took.Round(time.Millisecond), slowest.Round(time.Millisecond), snapshotImageCount(t)-imagesBefore)
+		}
+	}
+	if err := manager.Destroy(ctx, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if after := snapshotImageCount(t); after != imagesBefore {
+		t.Fatalf("snapshot images leaked: %d before, %d after", imagesBefore, after)
+	}
 }

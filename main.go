@@ -51,6 +51,7 @@ Usage:
   teploy-sandbox serve [--addr 127.0.0.1:7439] [--token-file /deployments/sandbox/token]
                        [--egress-allow host,.suffix,host:port] [--egress-proxy-port 7443]
                        [--cache-root /var/lib/teploy-sandbox/cache] [--cache-max-gb 20]
+                       [--state-dir /var/lib/teploy-sandbox/state] [--stopped-retention 336h]
   teploy-sandbox version`)
 }
 
@@ -66,8 +67,21 @@ func serve(args []string) error {
 		"host directory for the warm per-repo cache (empty disables the `warm` create option)")
 	cacheMaxGB := flags.Float64("cache-max-gb", envFloat("SBX_CACHE_MAX_GB", 20),
 		"LRU cap across all cache volumes, in GB (0 = unbounded)")
+	sandboxUser := flags.String("sandbox-user", envOr("SBX_SANDBOX_USER", run.DefaultSandboxUser),
+		"non-root account runs execute as unless the create body says user \"root\"; images without it fall back to root (empty = every run as root)")
+	stateDir := flags.String("state-dir", envOr("SBX_STATE_DIR", run.DefaultStateDir),
+		"host directory for the durable run registry: stopped runs survive a daemon restart (empty keeps the registry in memory only)")
+	stoppedRetention := flags.String("stopped-retention", envOr("SBX_STOPPED_RETENTION", run.DefaultStoppedRetention.String()),
+		"how long a stopped run is kept before it and its snapshot are deleted (Go duration, e.g. 336h)")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+
+	// Refuse a retention that is not the configured one: a typo here would
+	// otherwise delete stopped runs early, or never.
+	retention, err := parseRetention(*stoppedRetention)
+	if err != nil {
+		return fmt.Errorf("stopped-retention: %w", err)
 	}
 
 	// Validate the deployment allowlist before anything else: a typo in
@@ -98,6 +112,49 @@ func serve(args []string) error {
 			return err
 		}
 		defer cacheLock.Close()
+	}
+	// The default state dir is new in this version. A deployment that never
+	// asked for it and cannot write there (it moved --cache-root off /var/lib
+	// for that reason) must keep starting as it did: fall back to the
+	// in-memory registry and say so. A dir the operator named is a hard
+	// requirement, and so is a registry file that exists but cannot be read.
+	stateDirDefaulted := false
+	if os.Getenv("SBX_STATE_DIR") == "" {
+		stateDirDefaulted = true
+		flags.Visit(func(f *flag.Flag) {
+			if f.Name == "state-dir" {
+				stateDirDefaulted = false
+			}
+		})
+	}
+	stateDirSkipped := ""
+	if *stateDir != "" && stateDirDefaulted {
+		if err := probeWritableDir(*stateDir); err != nil {
+			stateDirSkipped = fmt.Sprintf("%s: %v", *stateDir, err)
+			*stateDir = ""
+		}
+	}
+	if *stateDir != "" {
+		absolute, err := filepath.Abs(*stateDir)
+		if err != nil {
+			return err
+		}
+		*stateDir = absolute
+		// One daemon owns a registry file, as one daemon owns a cache
+		// root. A state dir that IS the token dir or the cache root is
+		// already locked above (a second flock from this process would
+		// refuse itself).
+		tokenDir, err := filepath.Abs(filepath.Dir(*tokenFile))
+		if err != nil {
+			return err
+		}
+		if absolute != tokenDir && absolute != *cacheRoot {
+			stateLock, err := run.LockDirectory(absolute)
+			if err != nil {
+				return err
+			}
+			defer stateLock.Close()
+		}
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	token, err := server.LoadOrMintToken(*tokenFile)
@@ -156,8 +213,10 @@ func serve(args []string) error {
 			}
 		}
 	}
-	// Run state is in-memory: any container we labelled that survived a
-	// previous daemon life is an unreachable orphan. Sweep before serving.
+	// No container outlives its daemon: any we labelled that survived a
+	// previous daemon life is an unreachable orphan (the registry file
+	// brings back stopped runs only, and those have none). Sweep before
+	// serving.
 	if swept, err := runtime.SweepOrphans(context.Background()); err != nil {
 		return fmt.Errorf("orphan sweep: %w", err)
 	} else if swept > 0 {
@@ -166,6 +225,8 @@ func serve(args []string) error {
 
 	manager := run.NewManager(runtime, log)
 	manager.ProxyURL = proxyURL
+	manager.SandboxUser = *sandboxUser
+	manager.StoppedRetention = retention
 	if pool != nil {
 		manager.Egress = pool
 	}
@@ -181,6 +242,22 @@ func serve(args []string) error {
 		log.Info("per-repo cache enabled", "root", *cacheRoot, "maxGB", *cacheMaxGB)
 	}
 
+	if *stateDir != "" {
+		// After the sweep: the images a lost running run held can only be
+		// deleted once its container is gone. A registry file that cannot
+		// be read refuses the start — an empty registry would orphan every
+		// stopped run's snapshot without a word.
+		stopped, err := manager.LoadState(context.Background(), *stateDir)
+		if err != nil {
+			return fmt.Errorf("load run registry: %w", err)
+		}
+		log.Info("durable run registry enabled", "dir", *stateDir, "stopped", stopped, "retention", retention.String())
+	} else if stateDirSkipped != "" {
+		log.Warn("default state dir is not writable: stopped runs do not survive a daemon restart (set --state-dir)", "error", stateDirSkipped)
+	} else {
+		log.Warn("no state dir: stopped runs do not survive a daemon restart")
+	}
+
 	hostname, _ := os.Hostname()
 	srv := &server.Server{
 		Manager:    manager,
@@ -188,11 +265,25 @@ func serve(args []string) error {
 		Version:    version,
 		Log:        log,
 		ServerName: hostname,
+		Runtime:    runtime.Runtime,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	return server.Serve(ctx, *addr, srv, *reapInterval)
+}
+
+// parseRetention reads --stopped-retention / SBX_STOPPED_RETENTION: a
+// positive Go duration, nothing else.
+func parseRetention(raw string) (time.Duration, error) {
+	retention, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a duration (use Go syntax, e.g. 336h)", raw)
+	}
+	if retention <= 0 {
+		return 0, fmt.Errorf("%q must be positive", raw)
+	}
+	return retention, nil
 }
 
 func envOr(name, fallback string) string {
@@ -209,4 +300,18 @@ func envFloat(name string, fallback float64) float64 {
 		}
 	}
 	return fallback
+}
+
+// probeWritableDir reports whether dir can be created and written.
+func probeWritableDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	probe, err := os.CreateTemp(dir, ".probe-*")
+	if err != nil {
+		return err
+	}
+	name := probe.Name()
+	probe.Close()
+	return os.Remove(name)
 }

@@ -148,3 +148,55 @@ func TestValidateExecEnv(t *testing.T) {
 		}
 	}
 }
+
+// Root keeps the full hardening; the non-root sandbox user gives up exactly
+// no-new-privileges (which is what blocks sudo) and the AUDIT_WRITE drop
+// (sudo prints an audit warning on every call without it), nothing else.
+func TestCreateArgsUser(t *testing.T) {
+	base := CreateSpec{Name: "r1", Image: "img", MemoryMB: 1024, CPUs: 1, Pids: 256, Network: NetworkNone}
+	for _, user := range []string{"", RootUser} {
+		spec := base
+		spec.User = user
+		args := strings.Join((&DockerRuntime{}).createArgs(spec), " ")
+		for _, want := range []string{"--user 0:0", "--security-opt no-new-privileges", "--cap-drop AUDIT_WRITE"} {
+			if !strings.Contains(args, want) {
+				t.Errorf("user %q: missing %q in %q", user, want, args)
+			}
+		}
+	}
+
+	spec := base
+	spec.User = "ship"
+	args := strings.Join((&DockerRuntime{}).createArgs(spec), " ")
+	for _, want := range []string{"--user ship", "--cap-drop NET_RAW", "--cap-drop MKNOD", "--init", "--network none"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("non-root: missing %q in %q", want, args)
+		}
+	}
+	for _, bad := range []string{"no-new-privileges", "--cap-drop AUDIT_WRITE", "--user 0:0", "--privileged"} {
+		if strings.Contains(args, bad) {
+			t.Errorf("non-root: %q must not appear: %q", bad, args)
+		}
+	}
+	// The init's mkdir cannot be fatal: a non-root init may not be allowed
+	// to create the workdir, and the ownership pass (as root) does it.
+	if !strings.Contains(args, "mkdir -p /work 2>/dev/null; exec sleep infinity") {
+		t.Errorf("non-root init must tolerate a missing workdir: %q", args)
+	}
+}
+
+// The ownership pass is the one exec that must run as root, and it always
+// covers the workdir; a warm mount elsewhere is added, never substituted.
+func TestOwnershipArgs(t *testing.T) {
+	args := ownershipArgs("cid", "ship", "")
+	want := []string{"exec", "--user", "0:0", "cid", "sh", "-c", ownershipScript, "sh", "ship", WorkDir}
+	if strings.Join(args, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("ownership args: %q", args)
+	}
+	if got := ownershipArgs("cid", "ship", WorkDir); len(got) != len(want) {
+		t.Fatalf("the workdir must not be walked twice: %q", got)
+	}
+	if got := ownershipArgs("cid", "ship", "/cache"); got[len(got)-1] != "/cache" || got[len(got)-2] != WorkDir {
+		t.Fatalf("a warm mount outside the workdir must be added: %q", got)
+	}
+}

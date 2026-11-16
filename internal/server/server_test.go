@@ -270,6 +270,10 @@ func TestAuthRequiredOnEverythingButHealth(t *testing.T) {
 		{"DELETE", "/v1/runs/x"},
 		{"POST", "/v1/runs/x/exec"},
 		{"POST", "/v1/runs/x/snapshot"},
+		{"POST", "/v1/runs/x/stop"},
+		{"POST", "/v1/runs/x/resume"},
+		{"POST", "/v1/runs/x/fork"},
+		{"GET", "/v1/capacity"},
 		{"POST", "/v1/runs/x/lease"},
 		{"POST", "/v1/runs/x/lease/renew"},
 		{"POST", "/v1/runs/x/lease/release"},
@@ -307,6 +311,31 @@ func TestCreateAppliesDefaultsAndIsolation(t *testing.T) {
 	if !strings.HasPrefix(spec.Name, "teploy-sbx-") {
 		t.Fatalf("container name: %q", spec.Name)
 	}
+	if spec.User != run.DefaultSandboxUser {
+		t.Fatalf("default runs are non-root: %q", spec.User)
+	}
+}
+
+// The create response names the user the run actually got, so a caller can
+// tell a requested root from an image that fell back to it.
+func TestCreateReportsUser(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+	for body, want := range map[string]string{
+		`{"image":"x"}`:               run.DefaultSandboxUser,
+		`{"image":"x","user":"root"}`: run.RootUser,
+	} {
+		resp := request(t, ts, "POST", "/v1/runs", "test-token", body)
+		var created struct {
+			User string `json:"user"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if created.User != want {
+			t.Fatalf("create %s: user %q, want %q", body, created.User, want)
+		}
+	}
 }
 
 func TestCreateValidation(t *testing.T) {
@@ -324,6 +353,16 @@ func TestCreateValidation(t *testing.T) {
 		`{"image":"x","network":"allowlist","egressAllow":["*.hex.pm"]}`:    http.StatusBadRequest,
 		`{"image":"x","network":"none","egressAllow":["rubygems.org"]}`:     http.StatusBadRequest,
 		`{"image":"x","network":"allowlist","egressAllow":["repo.hex.pm"]}`: http.StatusCreated,
+		// user chooses between the sandbox account and root; it names nothing else.
+		`{"image":"x","user":"default"}`: http.StatusCreated,
+		`{"image":"x","user":"root"}`:    http.StatusCreated,
+		`{"image":"x","user":"ship"}`:    http.StatusBadRequest,
+		// labels and onExpire: validated, never silently dropped.
+		`{"image":"x","labels":{"task":"t-1"},"onExpire":"stop"}`: http.StatusCreated,
+		`{"image":"x","onExpire":"destroy"}`:                      http.StatusCreated,
+		`{"image":"x","onExpire":"pause"}`:                        http.StatusBadRequest,
+		`{"image":"x","labels":{"Task":"t-1"}}`:                   http.StatusBadRequest,
+		`{"image":"x","labels":{"task":"a\nb"}}`:                  http.StatusBadRequest,
 	} {
 		resp := request(t, ts, "POST", "/v1/runs", "test-token", body)
 		if resp.StatusCode != want {

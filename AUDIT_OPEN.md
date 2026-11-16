@@ -89,3 +89,72 @@ firewall has a separate isolated Linux namespace deny/allow/revoke fixture.
 Legacy unlabeled containers are retained by scoped startup cleanup. Operators
 must drain older workloads when migrating deployment; startup never sweeps
 containers belonging to another daemon identity.
+
+## 2026-11-15 — persistent runs (stop / resume / fork, durable registry)
+
+Added, all additive on the wire (no existing field, status or default
+changed for a caller that does not use them):
+
+- Run `state` (`running`/`stopped`), `labels`, `onExpire`
+  (`destroy`/`stop`), `usage.runningSec`, `stoppedAt`, `retainUntil`,
+  `forkedFrom`.
+- `POST /v1/runs/{id}/stop`, `/resume`, `/fork`; `GET /v1/capacity`.
+  Create, resume and fork share one boot path.
+- Reaper: stops instead of destroying when `onExpire` is `stop` (a failed
+  stop is retried for one hour past the deadline, then the run is
+  destroyed); deletes a stopped run at
+  `retainUntil` (`--stopped-retention`, default 14 days).
+- Durable registry (`--state-dir`): stopped runs survive a restart; a
+  corrupt or unreadable file refuses the start; graceful shutdown stops
+  `onExpire: stop` runs instead of destroying them. An unwritable
+  DEFAULT state dir falls back to memory with a warning, so an existing
+  deployment's flags keep working; a named one refuses the start.
+
+Review of the branch (same day) fixed two state-losing defects: the
+reaper acting on a stale copy of a run that was resumed or stopped
+during its pass, and a stop discarding its capture when the client
+disconnected before the container was removed.
+
+Left open by that review:
+
+- Each stop commits on top of the previous snapshot, so the snapshot's
+  layer chain grows by one per cycle. Measured with
+  `SBX_TEST_CYCLES=150 go test -tags integration -run TestRealStopResumeSoak .`
+  on Docker 29.5 with the containerd image store (`overlayfs`): 150 cycles
+  pass, one snapshot image held at a time, none leaked; a stop plus resume
+  takes about 0.6 s at first and about 1.1 s by cycle 150. Not measured on
+  the older `overlay2` storage driver, which caps an image at about 125
+  layers; run the soak there before relying on long-lived runs.
+- A crash between a capture and the registry write leaks one image, and
+  registry-owned and caller-owned snapshots share the `teploy-sbx-snap:`
+  namespace, so nothing can garbage-collect them safely yet.
+- Stop answers 200 when the registry write fails (logged, retried on the
+  next tick); a restart inside that window loses the run.
+- Shutdown stops share the 45-second cleanup budget.
+
+**Run against real Docker 2026-11-15** (Docker 29.5, arm64, `runc`,
+Linux 6.8, as root): the whole integration suite passes, including
+`TestRealStopResumeAcrossRestart` cold and warm and the host firewall
+fixtures. CI runs the same suite as root on an x86-64 runner and passes.
+Still unverified: `SBX_TEST_RUNTIME=runsc`, and `TestRealSandboxUser`
+(skipped without `SBX_TEST_USER_IMAGE`).
+The three assumptions only a real daemon could confirm held on that image
+store: an image a container was created from cannot be deleted until the
+container is gone, while a snapshot a later one was committed on top of
+can; a container can be recreated under the same name straight after
+`docker rm -f`; and a warm run's volume directory can be released and
+seeded again under the same path.
+
+Known limits, deliberate in this slice:
+
+- A crash between a capture and the registry write leaks that one image:
+  nothing on disk names it yet.
+- Deleting a stopped run removes the record even when the image delete
+  fails (logged with the ref). The alternative is a record that can
+  never be deleted once its image is gone.
+- Shutdown stops runs one after another inside the existing 45 s cleanup
+  budget. Runs it does not reach are lost with their containers, exactly
+  as on a crash.
+- A run with `onExpire: stop` that has an exec in flight at every reaper
+  tick is never stopped and so outlives its deadline.
+- The registry file holds env values in the clear (0600, 0700 dir).

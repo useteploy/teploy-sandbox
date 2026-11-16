@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,6 +56,9 @@ type Server struct {
 	// Server identity carried in every response (Tier-2 constraint:
 	// nothing assumes "this box").
 	ServerName string
+	// Runtime is the OCI runtime runs use (SBX_RUNTIME); empty is
+	// Docker's default. Reported by GET /v1/capacity.
+	Runtime string
 }
 
 func (s *Server) Handler() http.Handler {
@@ -65,6 +69,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /v1/runs/{id}", s.auth(s.handleDestroy))
 	mux.Handle("POST /v1/runs/{id}/exec", s.auth(s.handleExec))
 	mux.Handle("POST /v1/runs/{id}/snapshot", s.auth(s.handleSnapshot))
+	mux.Handle("POST /v1/runs/{id}/stop", s.auth(s.handleStop))
+	mux.Handle("POST /v1/runs/{id}/resume", s.auth(s.handleResume))
+	mux.Handle("POST /v1/runs/{id}/fork", s.auth(s.handleFork))
+	mux.Handle("GET /v1/capacity", s.auth(s.handleCapacity))
 	mux.Handle("POST /v1/runs/{id}/lease", s.auth(s.handleLeaseAcquire))
 	mux.Handle("POST /v1/runs/{id}/lease/renew", s.auth(s.handleLeaseRenew))
 	mux.Handle("POST /v1/runs/{id}/lease/release", s.auth(s.handleLeaseRelease))
@@ -104,7 +112,9 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		s.writeProblem(w, problem(http.StatusBadRequest, err.Error()))
 	case errors.Is(err, run.ErrLeaseHeld),
 		errors.Is(err, run.ErrLeaseSuperseded),
-		errors.Is(err, run.ErrBusy):
+		errors.Is(err, run.ErrBusy),
+		errors.Is(err, run.ErrStopped),
+		errors.Is(err, run.ErrRunning):
 		s.writeProblem(w, problem(http.StatusConflict, err.Error()))
 	default:
 		s.Log.Error("request failed", "error", err)
@@ -135,17 +145,85 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	body := map[string]any{
-		"id":        created.ID,
-		"image":     created.Image,
-		"network":   created.Network,
-		"createdAt": created.CreatedAt,
-		"expiresAt": created.ExpiresAt,
+	s.writeRun(w, http.StatusCreated, created)
+}
+
+// writeRun answers with the run object — the same JSON a run has in the
+// list, so a caller sees one shape everywhere.
+func (s *Server) writeRun(w http.ResponseWriter, status int, current *run.Run) {
+	encoded, err := json.Marshal(current)
+	body := map[string]any{}
+	if err == nil {
+		err = json.Unmarshal(encoded, &body)
 	}
-	if created.Warm != nil {
-		body["warm"] = created.Warm
+	if err != nil {
+		s.writeError(w, err)
+		return
 	}
-	s.writeJSON(w, http.StatusCreated, body)
+	s.writeJSON(w, status, body)
+}
+
+// handleStop captures the run and removes its container; the run stays in
+// the registry as "stopped" until it is resumed, deleted or its retention
+// passes.
+func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
+	stopped, err := s.Manager.Stop(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeRun(w, http.StatusOK, stopped)
+}
+
+func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TTLSec int `json:"ttlSec,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
+		return
+	}
+	resumed, err := s.Manager.Resume(r.Context(), r.PathValue("id"), req.TTLSec)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeRun(w, http.StatusOK, resumed)
+}
+
+func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
+	var req run.ForkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
+		return
+	}
+	forked, err := s.Manager.Fork(r.Context(), r.PathValue("id"), req)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeRun(w, http.StatusCreated, forked)
+}
+
+// handleCapacity reports what the box has and what its runs are entitled
+// to — the numbers a scheduler placing runs across daemons needs.
+func (s *Server) handleCapacity(w http.ResponseWriter, _ *http.Request) {
+	load := s.Manager.Capacity()
+	runtimeName := s.Runtime
+	if runtimeName == "" {
+		runtimeName = "default"
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"driver":   "docker",
+		"runtime":  runtimeName,
+		"cpus":     runtime.NumCPU(),
+		"memoryMb": hostMemoryMB(),
+		"runs":     map[string]int{"running": load.Running, "stopped": load.Stopped},
+		"allocated": map[string]any{
+			"cpus":     load.CPUs,
+			"memoryMb": load.MemoryMB,
+		},
+	})
 }
 
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
@@ -324,7 +402,7 @@ func (s *Server) handleWarmDrop(w http.ResponseWriter, r *http.Request) {
 //	event: stdout|stderr   data: <utf8 chunk>
 //	event: exit            data: {"exitCode":n,"timedOut":bool}
 func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
-	current, err := s.Manager.Get(r.PathValue("id"))
+	current, err := s.Manager.GetLive(r.PathValue("id"))
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -385,7 +463,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
-	current, err := s.Manager.Get(r.PathValue("id"))
+	current, err := s.Manager.GetLive(r.PathValue("id"))
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -414,7 +492,7 @@ func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
-	current, err := s.Manager.Get(r.PathValue("id"))
+	current, err := s.Manager.GetLive(r.PathValue("id"))
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -427,6 +505,11 @@ func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 	// Reads stay open regardless of any lease — a lease gates writable
 	// ownership, not visibility.
 	data, err := s.Manager.ReadFile(r.Context(), current.ID, path)
+	if errors.Is(err, run.ErrStopped) {
+		// Stopped between the look above and the read.
+		s.writeError(w, err)
+		return
+	}
 	if err != nil {
 		s.writeProblem(w, problem(http.StatusNotFound, fmt.Sprintf("No such file: %s", r.PathValue("path"))))
 		return
@@ -575,7 +658,8 @@ func Serve(ctx context.Context, addr string, s *Server, reapInterval time.Durati
 }
 
 // shutdown drains in-flight HTTP requests, then removes every tracked
-// container. Cleanup gets its OWN fresh deadline: the drain can consume its
+// container — stopping, rather than destroying, the runs that asked for
+// onExpire "stop". Cleanup gets its OWN fresh deadline: the drain can consume its
 // entire budget (long-lived SSE streams), and reusing that context — the old
 // behavior — handed cleanup an already-expired deadline so every container
 // removal failed instantly. Runs whose removal still fails stay tracked and
@@ -587,8 +671,14 @@ func (s *Server) shutdown(httpServer *http.Server) {
 
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), shutdownCleanupTimeout)
 	defer cancelCleanup()
-	s.Manager.DestroyAll(cleanupCtx)
-	if left := len(s.Manager.List()); left > 0 {
+	s.Manager.Shutdown(cleanupCtx)
+	left := 0
+	for _, current := range s.Manager.List() {
+		if current.State != run.StateStopped {
+			left++
+		}
+	}
+	if left > 0 {
 		s.Log.Warn("sandbox shutdown left runs behind (still tracked; the startup sweep removes their containers)",
 			"left", left)
 	}

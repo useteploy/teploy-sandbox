@@ -262,3 +262,55 @@ func TestReapClosesPerRunProxy(t *testing.T) {
 		t.Fatalf("the reaper must close the run's proxy too, closed=%v", pool.closed)
 	}
 }
+
+func TestCreateUser(t *testing.T) {
+	ctx := context.Background()
+	rt := &fakeRT{}
+	m := NewManager(rt, testLogger())
+
+	def, err := m.Create(ctx, CreateRequest{Image: "img"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rt.created[0].User != DefaultSandboxUser || def.User != DefaultSandboxUser {
+		t.Fatalf("a default run must use the sandbox user: spec %q run %q", rt.created[0].User, def.User)
+	}
+	explicit, err := m.Create(ctx, CreateRequest{Image: "img", User: "default"})
+	if err != nil || explicit.User != DefaultSandboxUser {
+		t.Fatalf("\"default\" is the sandbox user: %+v %v", explicit, err)
+	}
+	root, err := m.Create(ctx, CreateRequest{Image: "img", User: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rt.created[2].User != RootUser || root.User != RootUser {
+		t.Fatalf("the root opt-in must run as root: spec %q run %q", rt.created[2].User, root.User)
+	}
+	if _, err := m.Create(ctx, CreateRequest{Image: "img", User: "nobody"}); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("an account name is not a valid user value: %v", err)
+	}
+	if len(rt.created) != 3 {
+		t.Fatalf("a refused request must create nothing: %d", len(rt.created))
+	}
+
+	// The operator can turn the account off for the whole daemon.
+	m.SandboxUser = ""
+	off, err := m.Create(ctx, CreateRequest{Image: "img"})
+	if err != nil || off.User != RootUser {
+		t.Fatalf("no sandbox user configured means root: %+v %v", off, err)
+	}
+}
+
+// An image built before the sandbox user existed (or a project's own image)
+// still boots — as root, as every run did before — and says so.
+func TestCreateFallsBackToRootWithoutUser(t *testing.T) {
+	rt := &fakeRT{noUsers: true}
+	m := NewManager(rt, testLogger())
+	created, err := m.Create(context.Background(), CreateRequest{Image: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.User != RootUser || len(rt.created) != 1 || rt.created[0].User != RootUser {
+		t.Fatalf("fallback must create one root container: run %q specs %+v", created.User, rt.created)
+	}
+}

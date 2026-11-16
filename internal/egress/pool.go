@@ -29,6 +29,11 @@ type Pool struct {
 	// gateway, reachable only from the bridge.
 	Bind string
 	Log  *slog.Logger
+	// Private gives every run a listener and a credential of its own, with
+	// or without extra entries, and no shared listener is needed. It is for
+	// a driver whose runs are not on one bridge: each is admitted to its own
+	// port alone.
+	Private bool
 	// PermitPort admits only proxy listeners through the sandbox host firewall.
 	PermitPort func(int) error
 	RevokePort func(int) error
@@ -87,7 +92,7 @@ func (p *Pool) SharedURL() string {
 // extra, registered under runID for Close. Extra entries must already
 // be validated (ValidateAllowlist) — this is the plumbing, not the gate.
 func (p *Pool) OpenFor(runID string, extra []string) (string, error) {
-	if len(extra) == 0 {
+	if len(extra) == 0 && !p.Private {
 		return p.SharedURL(), nil
 	}
 	allow := make(Allowlist, 0, len(p.Base)+len(extra))

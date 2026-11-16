@@ -314,3 +314,43 @@ func TestCreateFallsBackToRootWithoutUser(t *testing.T) {
 		t.Fatalf("fallback must create one root container: run %q specs %+v", created.User, rt.created)
 	}
 }
+
+// A daemon with per-run proxies and no shared one gives every allowlist
+// run a proxy of its own, with or without egressAllow. A daemon with a
+// shared proxy keeps handing that to runs without entries, as before.
+func TestAllowlistRunsGetAPrivateProxyWhenThereIsNoSharedOne(t *testing.T) {
+	manager, rt, _ := newTestManager(t)
+	pool := newFakeEgress()
+	manager.Egress = pool
+	created, err := manager.Create(context.Background(), CreateRequest{Image: "alpine:3.20", Network: "allowlist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if extra, opened := pool.opened[created.ID]; !opened || len(extra) != 0 || rt.created[0].ProxyURL != "http://172.31.99.1:40001" {
+		t.Fatalf("opened=%v proxy=%q", pool.opened, rt.created[0].ProxyURL)
+	}
+	if err := manager.Destroy(context.Background(), created.ID); err != nil || len(pool.closed) == 0 {
+		t.Fatalf("destroy: %v, closed=%v", err, pool.closed)
+	}
+	// Open and none never get one.
+	for _, network := range []string{"open", "none"} {
+		other, err := manager.Create(context.Background(), CreateRequest{Image: "alpine:3.20", Network: network})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, opened := pool.opened[other.ID]; opened {
+			t.Fatalf("a run on %q was given a proxy", network)
+		}
+	}
+
+	shared, sharedRT, _ := newTestManager(t)
+	shared.ProxyURL = "http://172.31.99.1:7443"
+	sharedPool := newFakeEgress()
+	shared.Egress = sharedPool
+	if _, err := shared.Create(context.Background(), CreateRequest{Image: "alpine:3.20", Network: "allowlist"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sharedPool.opened) != 0 || sharedRT.created[0].ProxyURL != shared.ProxyURL {
+		t.Fatalf("with a shared proxy: opened=%v proxy=%q", sharedPool.opened, sharedRT.created[0].ProxyURL)
+	}
+}

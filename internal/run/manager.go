@@ -484,7 +484,9 @@ func (m *Manager) boot(ctx context.Context, b bootRequest) (res bootResult, left
 		}
 	}
 
-	if len(b.extra) > 0 {
+	// A daemon with per-run proxies and no shared one (the VM driver's)
+	// gives every allowlist run a proxy of its own, extra entries or not.
+	if len(b.extra) > 0 || (b.network == NetworkAllowlist && m.ProxyURL == "" && m.Egress != nil) {
 		// A private proxy carrying default+extra, alive only as long as
 		// this run — the entries must not leak to any other container
 		// sharing the bridge. Opened last, so nothing between here and

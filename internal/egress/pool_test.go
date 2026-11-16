@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -89,4 +90,59 @@ func TestPoolScopesExtraEntriesToOneRun(t *testing.T) {
 		t.Fatalf("per-run proxy still listening on %s after Close", addr)
 	}
 	pool.Close("run-a") // idempotent: Destroy and the reaper both call it
+}
+
+// A private pool (the VM driver's) has no shared listener: every run gets
+// a listener and a credential of its own, with or without extra entries,
+// and one run's credential is worth nothing at another's.
+func TestPrivatePoolGivesEveryRunItsOwnAuthenticatedProxy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("reached"))
+	}))
+	defer upstream.Close()
+	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
+
+	pool := &Pool{Base: Allowlist{upstreamHost}, Bind: "127.0.0.1", Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Private: true}
+	defer pool.Shutdown()
+	first, err := pool.OpenFor("run-a", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := pool.OpenFor("run-b", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := url.Parse(first)
+	b, _ := url.Parse(second)
+	credentialA, _ := a.User.Password()
+	credentialB, _ := b.User.Password()
+	if a.Host == b.Host || len(credentialA) != 64 || credentialA == credentialB {
+		t.Fatalf("two runs share a listener or a credential: %s %s", first, second)
+	}
+	status := func(proxyURL string) int {
+		t.Helper()
+		resp, err := proxyClient(t, proxyURL).Get(upstream.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := status(first); got != http.StatusOK {
+		t.Fatalf("a run through its own proxy: %d", got)
+	}
+	if got := status("http://" + a.Host); got != http.StatusProxyAuthRequired {
+		t.Fatalf("without the credential: %d", got)
+	}
+	if got := status("http://run:" + credentialB + "@" + a.Host); got != http.StatusProxyAuthRequired {
+		t.Fatalf("with another run's credential: %d", got)
+	}
+	pool.Close("run-a")
+	if conn, err := net.Dial("tcp", a.Host); err == nil {
+		conn.Close()
+		t.Fatal("the proxy still listens after its run was closed")
+	}
+	if got := status(second); got != http.StatusOK {
+		t.Fatalf("closing one run's proxy took another's: %d", got)
+	}
 }

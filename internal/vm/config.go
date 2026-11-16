@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,6 +70,16 @@ type Config struct {
 	// BootTimeout bounds the wait for a new VM's agent; zero means
 	// DefaultBootTimeout.
 	BootTimeout time.Duration
+	// Subnet is the IPv4 range guests are addressed from, in CIDR form;
+	// empty means DefaultSubnet. Nothing else on the host may use it.
+	Subnet string
+	// DNS is the resolvers an open run's guest is given; empty means the
+	// host's own, where those are not on the host itself.
+	DNS []string
+	// OpenPrivate lets an open run reach private address ranges (the
+	// host's LAN, an overlay network), as the Docker driver's open tier
+	// does. Off, an open run reaches the public internet only.
+	OpenPrivate bool
 }
 
 // host is what Preflight asks of the machine; a struct of functions so the
@@ -97,6 +108,14 @@ type host struct {
 	waitDevice    func(ctx context.Context, path string) error
 	// udevProbes reports whether udev probes a scratch device.
 	udevProbes func(ctx context.Context, device string) (bool, error)
+	// ipForward reports whether the kernel routes IPv4 between interfaces.
+	ipForward func() (bool, error)
+	// openTun proves the daemon can create tap devices.
+	openTun func() error
+	// addresses is the addresses on the host's interfaces, by interface.
+	addresses func() (map[string][]netip.Prefix, error)
+	// resolvers is the IPv4 resolvers the host itself uses.
+	resolvers func() []netip.Addr
 }
 
 func realHost() host {
@@ -130,8 +149,15 @@ func realHost() host {
 			}
 			return kvm.Close()
 		},
-		lookPath: exec.LookPath,
-		stat:     os.Stat,
+		ipForward: func() (bool, error) {
+			raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
+			return strings.TrimSpace(string(raw)) == "1", err
+		},
+		openTun:   tunAvailable,
+		addresses: hostAddresses,
+		resolvers: func() []netip.Addr { return hostResolvers(os.ReadFile) },
+		lookPath:  exec.LookPath,
+		stat:      os.Stat,
 		mkdirAll: func(path string, mode os.FileMode) error {
 			if err := os.MkdirAll(path, mode); err != nil {
 				return err
@@ -167,6 +193,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.DevDir == "" {
 		c.DevDir = DefaultDevDir
+	}
+	if c.Subnet == "" {
+		c.Subnet = DefaultSubnet
 	}
 	return c
 }
@@ -441,10 +470,65 @@ func preflight(ctx context.Context, config Config, zfs ZFS, host host) error {
 		}
 	}
 
+	if _, err := networkPlan(config, host, miss); err != nil {
+		miss("%v", err)
+	}
+
 	if len(missing) == 0 {
 		return nil
 	}
 	return errors.New("the vm driver cannot start; missing: " + strings.Join(missing, "; "))
+}
+
+// networkPlan checks what guest networking needs of the host and resolves
+// the network configuration. Each thing the host lacks is reported through
+// miss; an error is a configuration that cannot be used at all.
+func networkPlan(config Config, host host, miss func(format string, args ...any)) (netPlan, error) {
+	for tool, why := range map[string]string{
+		"ip":        "iproute2: taps, routes and neighbour entries for guests",
+		"nft":       "nftables: the firewall between guests, the host and the network",
+		"conntrack": "conntrack-tools: forgetting a VM's connections when its address is given up",
+	} {
+		if _, err := host.lookPath(tool); err != nil {
+			miss("the %q command (%s)", tool, why)
+		}
+	}
+	if err := host.openTun(); err != nil {
+		miss("/dev/net/tun, to create each guest's network device (%v; `modprobe tun`)", err)
+	}
+	if on, err := host.ipForward(); err != nil {
+		miss("the net.ipv4.ip_forward setting: %v", err)
+	} else if !on {
+		miss("IPv4 forwarding, which carries the traffic of runs with network \"open\" (run `sysctl -w net.ipv4.ip_forward=1` and make it permanent in /etc/sysctl.d; scripts/install-host.sh does both)")
+	}
+	addresses, err := host.addresses()
+	if err != nil {
+		miss("the host's interface addresses, to check the guest subnet against: %v", err)
+	}
+	var local []netip.Addr
+	for _, prefixes := range addresses {
+		for _, prefix := range prefixes {
+			local = append(local, prefix.Addr())
+		}
+	}
+	plan, err := planNetwork(config, host.resolvers(), local)
+	if err != nil {
+		return plan, fmt.Errorf("a usable guest subnet and resolvers (--vm-subnet / SBX_VM_SUBNET, --vm-dns / SBX_VM_DNS): %w", err)
+	}
+	for name, prefixes := range addresses {
+		if name == plan.gatewayDev || strings.HasPrefix(name, plan.tapPrefix) {
+			continue
+		}
+		for _, prefix := range prefixes {
+			if prefix.Addr().Is4() && prefix.Masked().Overlaps(plan.subnet) {
+				miss("a guest subnet nothing else on the host uses: %s overlaps %s on %s (choose another with --vm-subnet / SBX_VM_SUBNET)", plan.subnet, prefix, name)
+			}
+		}
+	}
+	if len(plan.dns) == 0 {
+		miss("an IPv4 DNS resolver that is not on this host, for the guests of runs with network \"open\" (name up to three with --vm-dns / SBX_VM_DNS)")
+	}
+	return plan, nil
 }
 
 // New builds the driver for a host and checks the host first: a daemon
@@ -470,11 +554,20 @@ func New(ctx context.Context, config Config, log *slog.Logger) (*Driver, error) 
 		devDir:  config.devDir(),
 		sys:     realConfineSys(),
 	}
+	plan, err := networkPlan(config, realHost(), func(string, ...any) {})
+	if err != nil {
+		return nil, err
+	}
+	network := newHostNetwork(plan, realNetSys(), log)
+	if err := network.start(ctx); err != nil {
+		return nil, fmt.Errorf("the vm driver cannot start; missing: a working guest network: %w", err)
+	}
 	driver := NewDriver(
 		&CloudHypervisor{Bin: hypervisor, Kernel: config.Kernel, Cmdline: config.Cmdline, RunDir: config.ownerDir(), confine: confine},
 		NewVolumes(zfs, config.Pool, config.Golden, config.Owner, log),
 		log,
 	)
+	driver.network = network
 	if config.BootTimeout > 0 {
 		driver.BootTimeout = config.BootTimeout
 	}

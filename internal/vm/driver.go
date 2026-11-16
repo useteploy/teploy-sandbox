@@ -10,9 +10,9 @@
 //	snapshot flush the guest, pause the VM, snapshot its volume, resume
 //	remove   kill the VM, destroy its volume
 //
-// This is the first slice. There is no guest networking, so only the
-// "none" network tier is accepted, and there is no warm repo cache; see
-// AdmitCreate for everything that is refused.
+// A run on the "allowlist" or "open" tier gets a network device (see
+// network.go); a run on "none" gets none at all. There is no warm repo
+// cache; see AdmitCreate for everything that is refused.
 package vm
 
 import (
@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,7 +55,10 @@ const (
 type Driver struct {
 	hypervisor Hypervisor
 	volumes    *Volumes
-	log        *slog.Logger
+	// network gives VMs their network devices; nil is a driver that can
+	// only run the "none" tier.
+	network Network
+	log     *slog.Logger
 	// BootTimeout bounds the wait for a new VM's agent.
 	BootTimeout time.Duration
 
@@ -98,11 +103,8 @@ func (d *Driver) AdmitCreate(req run.CreateRequest) error {
 	if err != nil {
 		return err
 	}
-	if network != run.NetworkNone {
-		return unsupported("has no guest networking yet: only network \"none\" is available, got %q", network)
-	}
-	if len(req.EgressAllow) > 0 {
-		return unsupported("has no guest networking yet, so egressAllow cannot be honoured")
+	if network != run.NetworkNone && d.network == nil {
+		return unsupported("has no guest networking on this daemon: only network \"none\" is available, got %q", network)
 	}
 	if req.Warm != nil {
 		return unsupported("has no warm repo cache yet")
@@ -153,9 +155,13 @@ func vcpus(limit float64) int {
 // is the spec's name; a non-empty ID alongside an error means something
 // of that name could not be cleaned up (the Runtime contract).
 func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error) {
+	networked := spec.Network != "" && spec.Network != run.NetworkNone
+	proxyPort := 0
 	switch {
-	case spec.Network != "" && spec.Network != run.NetworkNone:
-		return "", unsupported("has no guest networking yet: only network \"none\" is available, got %q", spec.Network)
+	case networked && d.network == nil:
+		return "", unsupported("has no guest networking on this daemon: only network \"none\" is available, got %q", spec.Network)
+	case networked && spec.Network != run.NetworkAllowlist && spec.Network != run.NetworkOpen:
+		return "", unsupported("has no network tier %q", spec.Network)
 	case spec.CacheHostPath != "" || spec.CachePath != "":
 		return "", unsupported("has no warm repo cache yet")
 	case !spec.IsRoot():
@@ -179,6 +185,15 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 		return "", fmt.Errorf("a vm named %s already exists", spec.Name)
 	}
 
+	if spec.Network == run.NetworkAllowlist {
+		// The proxy is the tier: without one there is nothing to admit
+		// the run to, and it would be a run on "none" that says otherwise.
+		var err error
+		if proxyPort, err = d.proxyPort(spec.ProxyURL); err != nil {
+			return "", err
+		}
+	}
+
 	device, err := d.volumes.CreateRun(ctx, spec.Name, ref)
 	if errors.Is(err, ErrNoSnapshot) {
 		return "", fmt.Errorf("%w: %v", run.ErrBadRequest, err)
@@ -186,20 +201,56 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 	if err != nil {
 		return "", err
 	}
-	machine, err := d.hypervisor.Start(ctx, MachineConfig{Name: spec.Name, Disk: device, CPUs: vcpus(spec.CPUs), MemoryMB: spec.MemoryMB})
+	// Rollbacks run under a fresh deadline: the request's may be what
+	// just expired.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	config := MachineConfig{Name: spec.Name, Disk: device, CPUs: vcpus(spec.CPUs), MemoryMB: spec.MemoryMB}
+	var guestNet *GuestNetwork
+	var attachTook, guestTook time.Duration
+	if networked {
+		start := time.Now()
+		guestNet, err = d.network.Attach(ctx, spec.Name, spec.Network, proxyPort)
+		attachTook = time.Since(start)
+		if err != nil {
+			err = fmt.Errorf("network device for %s: %w", spec.Name, err)
+			cleanupErr := d.network.Detach(cleanupCtx, spec.Name)
+			if cleanupErr == nil {
+				cleanupErr = d.volumes.RemoveRun(cleanupCtx, spec.Name)
+			}
+			if cleanupErr != nil {
+				return spec.Name, errors.Join(err, cleanupErr)
+			}
+			return "", err
+		}
+		config.Net = &NetDevice{Tap: guestNet.Tap, MAC: guestNet.MAC}
+	}
+	machine, err := d.hypervisor.Start(ctx, config)
+	if guestNet != nil {
+		// The hypervisor has its own copy now, or was never started. The
+		// tap lives exactly as long as a process holds it, and the
+		// daemon must not be one of them.
+		_ = guestNet.Tap.Close()
+	}
 	if err == nil {
 		if err = d.waitReady(ctx, machine); err != nil {
 			err = fmt.Errorf("vm %s did not come up: %w", spec.Name, err)
 		}
 	}
+	if err == nil {
+		start := time.Now()
+		if err = prepareGuest(ctx, machine, guestNet); err != nil {
+			err = fmt.Errorf("vm %s: %w", spec.Name, err)
+		}
+		guestTook = time.Since(start)
+	}
 	if err != nil {
-		// Roll back under a fresh deadline: the request's may be what
-		// just expired.
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
 		var cleanupErr error
 		if machine != nil {
 			cleanupErr = machine.Kill(cleanupCtx)
+		}
+		if cleanupErr == nil && d.network != nil {
+			cleanupErr = d.network.Detach(cleanupCtx, spec.Name)
 		}
 		if cleanupErr == nil {
 			cleanupErr = d.volumes.RemoveRun(cleanupCtx, spec.Name)
@@ -215,10 +266,85 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 		}
 		return "", err
 	}
+	env := maps.Clone(spec.Env)
+	if spec.Network == run.NetworkAllowlist {
+		// Under the caller's own, which may override it, as with Docker.
+		env = proxyEnv(spec.ProxyURL)
+		maps.Copy(env, spec.Env)
+	}
+	if guestNet != nil {
+		d.log.Info("vm network device ready", "name", spec.Name, "tier", spec.Network, "address", guestNet.Address.String(),
+			"hostSetup", attachTook.String(), "guestSetup", guestTook.String())
+	}
 	d.mu.Lock()
-	d.machines[spec.Name] = &instance{machine: machine, env: maps.Clone(spec.Env)}
+	d.machines[spec.Name] = &instance{machine: machine, env: env}
 	d.mu.Unlock()
 	return spec.Name, nil
+}
+
+// proxyPort is the port of an allowlist run's proxy, which must listen on
+// the address guests reach the host at.
+func (d *Driver) proxyPort(proxyURL string) (int, error) {
+	if proxyURL == "" {
+		return 0, unsupported("has no egress proxy on this daemon, so network \"allowlist\" is unavailable")
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return 0, fmt.Errorf("egress proxy URL: %w", err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return 0, errors.New("the egress proxy URL names no port")
+	}
+	if gateway := d.network.Gateway().String(); parsed.Hostname() != gateway {
+		return 0, fmt.Errorf("the egress proxy listens on %s, which no guest can reach (guests reach the host at %s)", parsed.Hostname(), gateway)
+	}
+	return port, nil
+}
+
+// guestSetupTimeout bounds the guest's own setup.
+const guestSetupTimeout = 30 * time.Second
+
+// guestSetupMark is the first line of the script every guest runs once
+// its agent answers.
+const guestSetupMark = "# teploy-sandbox guest setup"
+
+// guestSetupScript is what a guest runs, as root, before it is handed to
+// its run: set the clock, and bring up its network device if it has one.
+func guestSetupScript(now time.Time, network *GuestNetwork) string {
+	// A guest has no clock of its own to read at boot (and a resumed one
+	// would be as old as its snapshot); with the wrong date no TLS
+	// certificate verifies. Best effort: a guest without a working `date`
+	// keeps the clock it has.
+	script := fmt.Sprintf("%s\ndate -u -s @%d >/dev/null 2>&1 || true\n", guestSetupMark, now.Unix())
+	if network != nil {
+		script += guestNetScript(network)
+	}
+	return script
+}
+
+// prepareGuest runs the guest's setup. The network part must succeed: a
+// run is not handed over with a device its guest could not bring up. The
+// host does not depend on it either way: what a guest may send is decided
+// at its tap, whatever it configures.
+func prepareGuest(ctx context.Context, machine Machine, network *GuestNetwork) error {
+	ctx, cancel := context.WithTimeout(ctx, guestSetupTimeout+execGrace)
+	defer cancel()
+	var stdout, stderr strings.Builder
+	code, timedOut, err := machine.Agent().Exec(ctx, guestSetupScript(time.Now(), network), "/", nil, guestSetupTimeout, &stdout, &stderr)
+	switch {
+	case err != nil:
+		return fmt.Errorf("guest setup: %w", err)
+	case timedOut:
+		return errors.New("guest setup: the guest did not finish in time")
+	case code != 0:
+		detail := strings.TrimSpace(stderr.String())
+		if len(detail) > 512 {
+			detail = detail[len(detail)-512:]
+		}
+		return fmt.Errorf("configure the guest's network device (the image needs iproute2): exit %d: %s", code, detail)
+	}
+	return nil
 }
 
 // waitReady pings the agent until it answers, the VM dies or the boot
@@ -308,6 +434,11 @@ func (d *Driver) Remove(ctx context.Context, containerID string) error {
 	if current != nil {
 		if err := current.machine.Kill(ctx); err != nil {
 			return err
+		}
+	}
+	if d.network != nil {
+		if err := d.network.Detach(ctx, containerID); err != nil {
+			return fmt.Errorf("remove network device of %s: %w", containerID, err)
 		}
 	}
 	if err := d.volumes.RemoveRun(ctx, containerID); err != nil {
@@ -405,13 +536,41 @@ func (d *Driver) RemoveImage(ctx context.Context, imageRef string) error {
 // Sweep is the startup cleanup: every VM process and every run volume
 // this daemon identity owns is a leftover of a previous daemon life —
 // running runs do not survive a restart, and stopped ones have neither.
-// Processes go first; a volume cannot be destroyed while one has it open.
+// Processes go first; a volume cannot be destroyed while one has it open,
+// and a tap is only removed once the VM behind it is dead.
 func (d *Driver) Sweep(ctx context.Context) (processes, volumes int, err error) {
 	if processes, err = d.hypervisor.Sweep(ctx); err != nil {
 		return processes, 0, fmt.Errorf("sweep vm processes: %w", err)
+	}
+	if d.network != nil {
+		taps, err := d.network.Sweep(ctx)
+		if err != nil {
+			return processes, 0, fmt.Errorf("sweep vm network devices: %w", err)
+		}
+		if taps > 0 {
+			d.log.Info("removed leftover vm network devices", "count", taps)
+		}
 	}
 	if volumes, err = d.volumes.Sweep(ctx); err != nil {
 		return processes, volumes, fmt.Errorf("sweep vm volumes: %w", err)
 	}
 	return processes, volumes, nil
+}
+
+// Gateway is the address guests reach the host at: where the daemon's
+// per-run proxies must listen. False when the driver has no networking.
+func (d *Driver) Gateway() (string, bool) {
+	if d.network == nil {
+		return "", false
+	}
+	return d.network.Gateway().String(), true
+}
+
+// Close stops the driver's upkeep of the host's network and removes its
+// firewall tables when no VM is left. It does not touch VMs.
+func (d *Driver) Close(ctx context.Context) error {
+	if d.network == nil {
+		return nil
+	}
+	return d.network.Close(ctx)
 }

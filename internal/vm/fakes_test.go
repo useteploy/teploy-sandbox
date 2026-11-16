@@ -364,6 +364,8 @@ type fakeHypervisor struct {
 	dieOnBoot bool
 	swept     int
 	sweepErr  error
+	// onStart is called with each new machine before it is returned.
+	onStart func(*fakeMachine)
 	// zfsCallsAtSweep is how many zfs mutations had happened when the
 	// process sweep ran.
 	zfsCallsAtSweep int
@@ -390,6 +392,9 @@ func (h *fakeHypervisor) Start(_ context.Context, config MachineConfig) (Machine
 		machine.dead = true
 	}
 	h.bootErr, h.dieOnBoot = nil, false
+	if h.onStart != nil {
+		h.onStart(machine)
+	}
 	h.machines[config.Name] = machine
 	return machine, nil
 }
@@ -442,10 +447,14 @@ type fakeMachine struct {
 	syncErr    error
 	// events is the order of sync, pause, resume and kill calls.
 	events []string
-	// execs records each exec's merged environment.
-	execs []map[string]string
+	// execs records each exec's merged environment; setups is the guest
+	// setup scripts the driver ran, which are not a run's execs.
+	execs  []map[string]string
+	setups []string
 	// execFunc answers an exec; nil echoes the command.
 	execFunc func(cmd, cwd string, env map[string]string, timeout time.Duration, stdout, stderr io.Writer) (int, bool, error)
+	// setupFunc answers the guest setup script; nil succeeds.
+	setupFunc func(script string, stderr io.Writer) (int, bool, error)
 }
 
 func (m *fakeMachine) Agent() Agent            { return (*fakeAgent)(m) }
@@ -543,9 +552,20 @@ func (a *fakeAgent) Exec(_ context.Context, cmd, cwd string, env map[string]stri
 		return -1, false, err
 	}
 	a.mu.Lock()
-	a.execs = append(a.execs, maps.Clone(env))
+	setup := strings.HasPrefix(cmd, guestSetupMark)
+	if setup {
+		a.setups = append(a.setups, cmd)
+	} else {
+		a.execs = append(a.execs, maps.Clone(env))
+	}
 	execFunc := a.execFunc
 	a.mu.Unlock()
+	if setup && a.setupFunc != nil {
+		return a.setupFunc(cmd, stderr)
+	}
+	if setup {
+		return 0, false, nil
+	}
 	if execFunc != nil {
 		return execFunc(cmd, cwd, env, timeout, stdout, stderr)
 	}

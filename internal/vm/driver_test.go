@@ -171,10 +171,10 @@ func TestCreateRefusesWhatThisSliceCannotDo(t *testing.T) {
 	rig := newRig(t, nil)
 	rig.manager.ProxyURL = "http://proxy.example:7443" // even with a proxy configured
 	for name, req := range map[string]run.CreateRequest{
+		// This rig's driver was given no network.
 		"allowlist network":     {Image: GoldenImage, Network: "allowlist"},
 		"egress alias":          {Image: GoldenImage, Network: "egress"},
 		"open network":          {Image: GoldenImage, Network: "open"},
-		"egressAllow":           {Image: GoldenImage, EgressAllow: []string{"example.com"}},
 		"warm cache":            {Image: GoldenImage, Warm: &run.WarmRequest{Repo: "example/repo"}},
 		"pids limit":            {Image: GoldenImage, Limits: &run.Limits{Pids: 100}},
 		"an OCI image":          {Image: "debian:bookworm-slim"},

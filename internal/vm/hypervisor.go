@@ -39,7 +39,20 @@ type MachineConfig struct {
 	Disk     string
 	CPUs     int
 	MemoryMB int
+	// Net is the VM's network device; nil is a VM with none.
+	Net *NetDevice
 }
+
+// NetDevice is a tap the daemon made for a VM, handed over open.
+type NetDevice struct {
+	Tap *os.File
+	// MAC is the address the guest's device is given.
+	MAC string
+}
+
+// tapFD is the descriptor number the tap has in the hypervisor process:
+// the first after stdin, stdout and stderr.
+const tapFD = 3
 
 // Machine is a started VM.
 type Machine interface {
@@ -133,6 +146,17 @@ func (h *CloudHypervisor) machineDir(name string) string { return filepath.Join(
 // machineArgs is the cloud-hypervisor command line for a VM — pure, so it
 // is testable without a hypervisor.
 func (h *CloudHypervisor) machineArgs(config MachineConfig, dir string, cid uint32) []string {
+	args := h.baseArgs(config, dir, cid)
+	if config.Net != nil {
+		// The tap as an inherited descriptor, never by name: the
+		// hypervisor is in a network namespace that has no interfaces,
+		// and it neither creates nor configures one.
+		args = append(args, "--net", fmt.Sprintf("fd=%d,mac=%s", tapFD, config.Net.MAC))
+	}
+	return args
+}
+
+func (h *CloudHypervisor) baseArgs(config MachineConfig, dir string, cid uint32) []string {
 	return []string{
 		"--kernel", h.Kernel,
 		"--cmdline", h.Cmdline,
@@ -195,6 +219,9 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 	cmd := exec.Command(h.Bin, h.machineArgs(config, dir, cid)...)
 	serial, output := &tailBuffer{limit: outputTail}, &tailBuffer{limit: outputTail}
 	cmd.Stdout, cmd.Stderr = serial, output
+	if config.Net != nil {
+		cmd.ExtraFiles = []*os.File{config.Net.Tap}
+	}
 	// Nothing of the daemon's: not its environment, which may hold
 	// secrets, and not its working directory.
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"net/netip"
 	"os"
 	"strings"
 	"testing"
@@ -42,6 +43,12 @@ func goodHost() host {
 		prepareDevDir: func(string) error { return nil },
 		waitDevice:    func(context.Context, string) error { return nil },
 		udevProbes:    func(context.Context, string) (bool, error) { return false, nil },
+		ipForward:     func() (bool, error) { return true, nil },
+		openTun:       func() error { return nil },
+		addresses: func() (map[string][]netip.Prefix, error) {
+			return map[string][]netip.Prefix{"lo": {netip.MustParsePrefix("127.0.0.1/8")}, "eth0": {netip.MustParsePrefix("192.0.2.10/24")}}, nil
+		},
+		resolvers: func() []netip.Addr { return []netip.Addr{netip.MustParseAddr("192.0.2.53")} },
 	}
 }
 
@@ -136,6 +143,37 @@ func TestPreflightNamesEachMissingPiece(t *testing.T) {
 		},
 		"`KERNEL==\"zd*\", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}=\"1\"` in /etc/udev/rules.d/59-teploy-zvol-noprobe.rules and run `udevadm control --reload && udevadm trigger": func(_ *Config, h *host) {
 			h.udevProbes = func(context.Context, string) (bool, error) { return true, nil }
+		},
+		`the "nft" command (nftables`: func(_ *Config, h *host) {
+			h.lookPath = func(name string) (string, error) {
+				if name == "nft" {
+					return "", errors.New("not found")
+				}
+				return name, nil
+			}
+		},
+		`the "conntrack" command (conntrack-tools`: func(_ *Config, h *host) {
+			h.lookPath = func(name string) (string, error) {
+				if name == "conntrack" {
+					return "", errors.New("not found")
+				}
+				return name, nil
+			}
+		},
+		"/dev/net/tun, to create each guest's network device": func(_ *Config, h *host) { h.openTun = func() error { return fs.ErrNotExist } },
+		"IPv4 forwarding, which carries the traffic of runs with network \"open\" (run `sysctl -w net.ipv4.ip_forward=1`": func(_ *Config, h *host) {
+			h.ipForward = func() (bool, error) { return false, nil }
+		},
+		"a guest subnet nothing else on the host uses: 192.0.2.0/24 overlaps 192.0.2.10/24 on eth0 (choose another with --vm-subnet": func(c *Config, _ *host) {
+			c.Subnet = "192.0.2.0/24"
+		},
+		`"10.209.0.1/16" has host bits set; did you mean 10.209.0.0/16?`: func(c *Config, _ *host) { c.Subnet = "10.209.0.1/16" },
+		`"fd00::/64" is not an IPv4 subnet`:                              func(c *Config, _ *host) { c.Subnet = "fd00::/64" },
+		`DNS resolver "resolver.example" is not an IPv4 address`:         func(c *Config, _ *host) { c.DNS = []string{"resolver.example"} },
+		"an IPv4 DNS resolver that is not on this host": func(_ *Config, h *host) {
+			// The host resolves through a stub of its own, or through
+			// itself: nothing a guest could be pointed at.
+			h.resolvers = func() []netip.Addr { return []netip.Addr{netip.MustParseAddr("192.0.2.10")} }
 		},
 		"a check that udev does not probe ZFS volumes: udevadm: not found": func(_ *Config, h *host) {
 			h.udevProbes = func(context.Context, string) (bool, error) { return false, errors.New("udevadm: not found") }

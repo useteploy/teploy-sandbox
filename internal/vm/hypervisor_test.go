@@ -50,10 +50,18 @@ func TestMachineArgsAreTheProvenCommandLine(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("args:\n%q\nwant:\n%q", got, want)
 	}
-	// No network device of any kind: this slice's "none" tier is the
-	// absence of one, not a firewall in front of one.
+	// No network device of any kind: the "none" tier is the absence of
+	// one, not a firewall in front of one.
 	if joined := strings.Join(got, " "); strings.Contains(joined, "--net") {
 		t.Fatalf("a VM was given a network device: %s", joined)
+	}
+	// A networked VM is the same command line with the tap as an inherited
+	// descriptor: never an interface name, which would have the hypervisor
+	// open (or create) a device itself.
+	networked := h.machineArgs(MachineConfig{Name: "teploy-sbx-x", Disk: "/dev/zvol/tank/teploy-sbx-x", CPUs: 2, MemoryMB: 2048,
+		Net: &NetDevice{MAC: "02:54:0a:d1:00:02"}}, "/run/sbx/abc/teploy-sbx-x", 7)
+	if !slices.Equal(networked, append(slices.Clone(want), "--net", "fd=3,mac=02:54:0a:d1:00:02")) {
+		t.Fatalf("networked args: %q", networked)
 	}
 }
 

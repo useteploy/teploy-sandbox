@@ -270,6 +270,10 @@ func TestAuthRequiredOnEverythingButHealth(t *testing.T) {
 		{"DELETE", "/v1/runs/x"},
 		{"POST", "/v1/runs/x/exec"},
 		{"POST", "/v1/runs/x/snapshot"},
+		{"POST", "/v1/runs/x/stop"},
+		{"POST", "/v1/runs/x/resume"},
+		{"POST", "/v1/runs/x/fork"},
+		{"GET", "/v1/capacity"},
 		{"POST", "/v1/runs/x/lease"},
 		{"POST", "/v1/runs/x/lease/renew"},
 		{"POST", "/v1/runs/x/lease/release"},
@@ -353,6 +357,12 @@ func TestCreateValidation(t *testing.T) {
 		`{"image":"x","user":"default"}`: http.StatusCreated,
 		`{"image":"x","user":"root"}`:    http.StatusCreated,
 		`{"image":"x","user":"ship"}`:    http.StatusBadRequest,
+		// labels and onExpire: validated, never silently dropped.
+		`{"image":"x","labels":{"task":"t-1"},"onExpire":"stop"}`: http.StatusCreated,
+		`{"image":"x","onExpire":"destroy"}`:                      http.StatusCreated,
+		`{"image":"x","onExpire":"pause"}`:                        http.StatusBadRequest,
+		`{"image":"x","labels":{"Task":"t-1"}}`:                   http.StatusBadRequest,
+		`{"image":"x","labels":{"task":"a\nb"}}`:                  http.StatusBadRequest,
 	} {
 		resp := request(t, ts, "POST", "/v1/runs", "test-token", body)
 		if resp.StatusCode != want {

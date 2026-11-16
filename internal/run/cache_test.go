@@ -27,6 +27,17 @@ type fakeRT struct {
 	seeds          []string
 	snapshotImages map[string]bool
 
+	// Lifecycle hooks. createLeak makes a failing Create report a
+	// container it could not remove. strictImages models Docker's classic
+	// image store: an image a live container was created from cannot be
+	// deleted. live maps each container to its image.
+	createLeak     bool
+	snapshotErr    error
+	removeImageErr error
+	strictImages   bool
+	live           map[string]string
+	removedImages  []string
+
 	// exec/write recording and hooks, mutex-guarded because manager
 	// tests run execs on goroutines (in-flight takeover probes).
 	mu        sync.Mutex
@@ -39,13 +50,27 @@ type fakeRT struct {
 
 func (f *fakeRT) Create(_ context.Context, spec CreateSpec) (string, error) {
 	if f.createErr != nil {
+		if f.createLeak {
+			f.track("ctr-"+spec.Name, spec.Image)
+			return "ctr-" + spec.Name, f.createErr
+		}
 		return "", f.createErr
 	}
 	if f.noUsers && !spec.IsRoot() {
 		return "", fmt.Errorf("%w %q", ErrNoSuchUser, spec.User)
 	}
 	f.created = append(f.created, spec)
+	f.track("ctr-"+spec.Name, spec.Image)
 	return "ctr-" + spec.Name, nil
+}
+
+func (f *fakeRT) track(containerID, image string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.live == nil {
+		f.live = make(map[string]string)
+	}
+	f.live[containerID] = image
 }
 
 func (f *fakeRT) Exec(_ context.Context, _ string, cmd, _ string, _ map[string]string, _ time.Duration, stdout, stderr io.Writer) (int, bool, error) {
@@ -94,10 +119,16 @@ func (f *fakeRT) Remove(_ context.Context, containerID string) error {
 		return f.removeErr
 	}
 	f.removed = append(f.removed, containerID)
+	f.mu.Lock()
+	delete(f.live, containerID)
+	f.mu.Unlock()
 	return nil
 }
 
 func (f *fakeRT) Snapshot(_ context.Context, _ string, volumePath string, imageRef string) error {
+	if f.snapshotErr != nil {
+		return f.snapshotErr
+	}
 	f.snapshots = append(f.snapshots, volumePath+"=>"+imageRef)
 	return nil
 }
@@ -117,7 +148,22 @@ func (f *fakeRT) ImageIsSnapshot(_ context.Context, imageRef string) (bool, erro
 	return f.snapshotImages[imageRef], nil
 }
 
-func (f *fakeRT) RemoveImage(_ context.Context, _ string) error { return nil }
+func (f *fakeRT) RemoveImage(_ context.Context, imageRef string) error {
+	if f.removeImageErr != nil {
+		return f.removeImageErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.strictImages {
+		for containerID, image := range f.live {
+			if image == imageRef {
+				return fmt.Errorf("conflict: container %s is using image %s", containerID, imageRef)
+			}
+		}
+	}
+	f.removedImages = append(f.removedImages, imageRef)
+	return nil
+}
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))

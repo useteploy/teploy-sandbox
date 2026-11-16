@@ -187,9 +187,21 @@ func (v *Volumes) liveRef(ctx context.Context, ref string) (bool, error) {
 	return false, nil
 }
 
+// captureTimeout bounds the storage half of a capture, and
+// captureCleanupTimeout the rollback of one that failed.
+const (
+	captureTimeout        = 2 * time.Minute
+	captureCleanupTimeout = 30 * time.Second
+)
+
 // Capture snapshots a run's volume into ref. quiesce is called right
 // before the snapshot is taken and returns the function that undoes it;
 // the run is only held still for the snapshot itself.
+//
+// Once the run has been quiesced the capture no longer follows the
+// caller's context: it is a handful of short commands, and a caller that
+// leaves between two of them would otherwise strand a snapshot on the
+// run's volume, or a holder that was cloned and never promoted.
 func (v *Volumes) Capture(ctx context.Context, name, ref string, quiesce func() (resume func() error, err error)) (result error) {
 	if !v.OwnsRef(ref) {
 		return fmt.Errorf("refusing to capture into %q: not a reference minted by this driver", ref)
@@ -206,6 +218,8 @@ func (v *Volumes) Capture(ctx context.Context, name, ref string, quiesce func() 
 	if err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), captureTimeout)
+	defer cancel()
 	// The device flush is what makes "the bytes at this instant" true: the
 	// hypervisor writes through the host's page cache, and a snapshot only
 	// holds what has reached the volume.
@@ -218,23 +232,52 @@ func (v *Volumes) Capture(ctx context.Context, name, ref string, quiesce func() 
 		err = errors.Join(err, resumeErr)
 	}
 	if err != nil {
-		if exists, _ := v.zfs.Exists(ctx, temporary); exists {
-			err = errors.Join(err, v.zfs.Destroy(ctx, temporary))
-		}
-		return fmt.Errorf("snapshot %s: %w", volume, err)
+		return errors.Join(fmt.Errorf("snapshot %s: %w", volume, err), v.abandonCapture(ctx, volume, ref))
 	}
 	if err := v.zfs.Clone(ctx, temporary, holder, v.props(kindSnapshot)); err != nil {
-		return errors.Join(fmt.Errorf("snapshot holder %s: %w", holder, err), v.zfs.Destroy(ctx, temporary))
+		return errors.Join(fmt.Errorf("snapshot holder %s: %w", holder, err), v.abandonCapture(ctx, volume, ref))
 	}
 	if err := v.zfs.Promote(ctx, holder); err != nil {
-		cleanup := errors.Join(v.zfs.Destroy(ctx, holder), v.zfs.Destroy(ctx, temporary))
-		return errors.Join(fmt.Errorf("promote %s: %w", holder, err), cleanup)
+		return errors.Join(fmt.Errorf("promote %s: %w", holder, err), v.abandonCapture(ctx, volume, ref))
 	}
 	// The promote also moved whatever dead snapshots the run's volume was
 	// still holding (pinned by a clone, or left by an interrupted capture);
 	// let them go if nothing needs them.
 	v.collectLogged(ctx, holder)
 	return nil
+}
+
+// abandonCapture undoes a capture that failed at any step. It goes by
+// what is in the pool rather than by which step reported the failure: a
+// zfs command that was killed at a deadline can have taken effect. A
+// reference that came to exist is retired like a deleted one, which hands
+// its snapshot back to the run's volume; a holder that was only cloned is
+// garbage; and the snapshot on the run's volume goes once nothing is
+// cloned from it.
+func (v *Volumes) abandonCapture(ctx context.Context, volume, ref string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), captureCleanupTimeout)
+	defer cancel()
+	holder := datasetOf(ref)
+	dataset, err := v.zfs.Dataset(ctx, holder)
+	switch {
+	case errors.Is(err, ErrNoDataset):
+	case err != nil:
+		return err
+	case v.mine(dataset) && dataset.Kind == kindSnapshot:
+		exists, err := v.zfs.Exists(ctx, ref)
+		if err != nil {
+			return err
+		}
+		if exists {
+			if err := v.zfs.SetProperty(ctx, ref, propDead, "on"); err != nil {
+				return err
+			}
+		}
+		if err := v.collect(ctx, holder, false); err != nil {
+			return err
+		}
+	}
+	return v.collect(ctx, volume, false)
 }
 
 // RemoveRun destroys a run's volume. A volume that does not exist is

@@ -586,3 +586,127 @@ func TestVolumesHideGuestPartitionsFromTheHost(t *testing.T) {
 		}
 	}
 }
+
+// cliZFS is the fake pool behaving like the zfs command under a context:
+// a context that is already done starts no command at all, and a command
+// that was killed as its context ended may have taken effect anyway
+// (lands). after runs once a named call has returned.
+type cliZFS struct {
+	*fakeZFS
+	after map[string]func()
+	lands map[string]error
+}
+
+func (z *cliZFS) run(ctx context.Context, call string, do func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := do()
+	if hook, ok := z.after[call]; ok {
+		delete(z.after, call)
+		hook()
+	}
+	if landed, ok := z.lands[call]; ok && err == nil {
+		delete(z.lands, call)
+		return landed
+	}
+	return err
+}
+
+func (z *cliZFS) Dataset(ctx context.Context, name string) (Dataset, error) {
+	if err := ctx.Err(); err != nil {
+		return Dataset{}, err
+	}
+	return z.fakeZFS.Dataset(ctx, name)
+}
+
+func (z *cliZFS) Snapshots(ctx context.Context, dataset string) ([]SnapshotInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return z.fakeZFS.Snapshots(ctx, dataset)
+}
+
+func (z *cliZFS) Exists(ctx context.Context, name string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return z.fakeZFS.Exists(ctx, name)
+}
+
+func (z *cliZFS) Clone(ctx context.Context, snapshot, dataset string, props map[string]string) error {
+	return z.run(ctx, "clone "+dataset, func() error { return z.fakeZFS.Clone(ctx, snapshot, dataset, props) })
+}
+
+func (z *cliZFS) Snapshot(ctx context.Context, name string) error {
+	return z.run(ctx, "snapshot "+name, func() error { return z.fakeZFS.Snapshot(ctx, name) })
+}
+
+func (z *cliZFS) Promote(ctx context.Context, dataset string) error {
+	return z.run(ctx, "promote "+dataset, func() error { return z.fakeZFS.Promote(ctx, dataset) })
+}
+
+func (z *cliZFS) Destroy(ctx context.Context, name string) error {
+	return z.run(ctx, "destroy "+name, func() error { return z.fakeZFS.Destroy(ctx, name) })
+}
+
+func (z *cliZFS) SetProperty(ctx context.Context, name, key, value string) error {
+	return z.run(ctx, "set "+name, func() error { return z.fakeZFS.SetProperty(ctx, name, key, value) })
+}
+
+// A caller that leaves while its capture is under way must not leave half
+// of one: a snapshot on the run's volume, a holder that was cloned but
+// never promoted, or a promoted holder nobody was told about. Once the
+// run has been held still for it the capture is carried through.
+func TestACaptureIsNotLeftHalfDoneWhenItsCallerLeaves(t *testing.T) {
+	volume := testPool + "/" + runName(1)
+	for _, step := range []string{"snapshot " + volume + "@" + refID(1), "clone " + testPool + "/" + snapshotPrefix + refID(1)} {
+		fake := newFakeZFS()
+		z := &cliZFS{fakeZFS: fake, after: map[string]func(){}}
+		v := newTestVolumes(fake)
+		v.zfs = z
+		mustCreate(t, v, runName(1), "")
+		ctx, cancel := context.WithCancel(bg)
+		z.after[step] = cancel
+		ref := v.NewRef(refID(1))
+		if err := v.Capture(ctx, runName(1), ref, noQuiesce); err != nil {
+			t.Fatalf("caller left after %q: %v", step, err)
+		}
+		cancel()
+		assertPool(t, fake, append([]string{volume, datasetOf(ref), ref}, pristine...)...)
+		if fake.originOf(volume) != ref {
+			t.Fatalf("after %q the run volume's origin is %q", step, fake.originOf(volume))
+		}
+		// And the reference is a usable one.
+		mustCreate(t, v, runName(2), ref)
+	}
+}
+
+// A zfs command killed at its deadline can have done its work and still
+// report failure. The rollback has to find out what is there rather than
+// assume the failed step did nothing.
+func TestCaptureRollsBackAStepThatFailedAfterTakingEffect(t *testing.T) {
+	volume := testPool + "/" + runName(1)
+	holder := testPool + "/" + snapshotPrefix + refID(1)
+	for _, step := range []string{"snapshot " + volume + "@" + refID(1), "clone " + holder, "promote " + holder} {
+		fake := newFakeZFS()
+		z := &cliZFS{fakeZFS: fake, lands: map[string]error{step: errors.New("signal: killed")}}
+		v := newTestVolumes(fake)
+		v.zfs = z
+		mustCreate(t, v, runName(1), "")
+		resumed := 0
+		err := v.Capture(bg, runName(1), v.NewRef(refID(1)), func() (func() error, error) {
+			return func() error { resumed++; return nil }, nil
+		})
+		if err == nil {
+			t.Fatalf("%s: capture reported success", step)
+		}
+		if resumed != 1 {
+			t.Errorf("%s: resumed %d times", step, resumed)
+		}
+		assertPool(t, fake, append([]string{volume}, pristine...)...)
+		if fake.originOf(volume) != testGolden {
+			t.Errorf("%s: run volume origin changed to %q", step, fake.originOf(volume))
+		}
+	}
+}

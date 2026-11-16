@@ -40,6 +40,8 @@ func goodHost() host {
 		mappedUIDs:    func(uint32, uint32) (bool, error) { return true, nil },
 		prepareCgroup: func(string, string) error { return nil },
 		prepareDevDir: func(string) error { return nil },
+		waitDevice:    func(context.Context, string) error { return nil },
+		udevProbes:    func(context.Context, string) (bool, error) { return false, nil },
 	}
 }
 
@@ -128,6 +130,16 @@ func TestPreflightNamesEachMissingPiece(t *testing.T) {
 				return fileInfo{mode: 0o755}, nil
 			}
 		},
+		// The exact rule and the command that loads it.
+		"udev probing of ZFS volumes turned off": func(_ *Config, h *host) {
+			h.udevProbes = func(context.Context, string) (bool, error) { return true, nil }
+		},
+		"`KERNEL==\"zd*\", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}=\"1\"` in /etc/udev/rules.d/59-teploy-zvol-noprobe.rules and run `udevadm control --reload && udevadm trigger": func(_ *Config, h *host) {
+			h.udevProbes = func(context.Context, string) (bool, error) { return true, nil }
+		},
+		"a check that udev does not probe ZFS volumes: udevadm: not found": func(_ *Config, h *host) {
+			h.udevProbes = func(context.Context, string) (bool, error) { return false, errors.New("udevadm: not found") }
+		},
 	} {
 		config, h := goodConfig(), goodHost()
 		breakIt(&config, &h)
@@ -198,6 +210,7 @@ func TestPreflightWithoutRootTouchesNothing(t *testing.T) {
 	touched := false
 	h.prepareCgroup = func(string, string) error { touched = true; return nil }
 	h.prepareDevDir = func(string) error { touched = true; return nil }
+	h.udevProbes = func(context.Context, string) (bool, error) { touched = true; return false, nil }
 	zfs := newFakeZFS()
 	err := preflight(context.Background(), goodConfig(), zfs, h)
 	if err == nil || strings.Count(err.Error(), ";") != 1 {
@@ -205,6 +218,27 @@ func TestPreflightWithoutRootTouchesNothing(t *testing.T) {
 	}
 	if touched || len(zfs.calls) != 0 {
 		t.Fatalf("the host was changed by a daemon that cannot run: touched=%v zfs=%v", touched, zfs.calls)
+	}
+}
+
+// The udev check writes to the pool; it runs only once the pool is known
+// to be usable, and leaves nothing in it.
+func TestPreflightChecksUdevOnAScratchVolume(t *testing.T) {
+	zfs := newFakeZFS()
+	if err := preflight(context.Background(), goodConfig(), zfs, goodHost()); err != nil {
+		t.Fatal(err)
+	}
+	scratch := testPool + "/" + probePrefix + testOwner[:16]
+	if calls := zfs.callsTouching(scratch); len(calls) != 2 {
+		t.Fatalf("scratch volume calls: %v", calls)
+	}
+	assertPool(t, zfs, testPool+"/golden", testGolden)
+
+	zfs = newFakeZFS()
+	zfs.poolProps[propVolmode] = "default"
+	_ = preflight(context.Background(), goodConfig(), zfs, goodHost())
+	if len(zfs.calls) != 0 {
+		t.Fatalf("a pool that is refused was written to: %v", zfs.calls)
 	}
 }
 

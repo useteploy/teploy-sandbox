@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -66,6 +67,9 @@ const (
 
 	kindRun      = "run"
 	kindSnapshot = "snapshot"
+	// kindProbe is the scratch volume Preflight tests the host's udev
+	// with; it exists only while that check runs.
+	kindProbe = "probe"
 )
 
 // Dataset is a volume as the driver needs to see it.
@@ -103,6 +107,8 @@ type ZFS interface {
 	// Clone creates dataset as a clone of snapshot with the given user
 	// properties.
 	Clone(ctx context.Context, snapshot, dataset string, props map[string]string) error
+	// CreateVolume creates an empty sparse volume of the given size.
+	CreateVolume(ctx context.Context, name string, bytes int64, props map[string]string) error
 	Snapshot(ctx context.Context, name string) error
 	// Promote makes a clone the owner of its origin's history: the origin
 	// snapshot and every older one move to it, and its old parent becomes
@@ -247,6 +253,15 @@ func (z *zfsCLI) Clone(ctx context.Context, snapshot, dataset string, props map[
 		args = append(args, "-o", key+"="+props[key])
 	}
 	_, err := z.run(ctx, append(args, snapshot, dataset)...)
+	return err
+}
+
+func (z *zfsCLI) CreateVolume(ctx context.Context, name string, bytes int64, props map[string]string) error {
+	args := []string{"create", "-s", "-V", strconv.FormatInt(bytes, 10)}
+	for _, key := range slices.Sorted(maps.Keys(props)) {
+		args = append(args, "-o", key+"="+props[key])
+	}
+	_, err := z.run(ctx, append(args, name)...)
 	return err
 }
 

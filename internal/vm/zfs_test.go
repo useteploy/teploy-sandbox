@@ -19,6 +19,7 @@ func TestZFSCLIBuildsTheCommandsItPromises(t *testing.T) {
 	_ = z.Destroy(ctx, "p/b@t")
 	_ = z.SetProperty(ctx, "p/b@t", propDead, "on")
 	_, _ = z.Property(ctx, "p", propVolmode)
+	_ = z.CreateVolume(ctx, "p/scratch", 1<<20, map[string]string{propOwner: "me", propKind: kindProbe})
 	want := []string{
 		"zfs clone -o teploy:kind=run -o teploy:owner=me p/a@s p/b",
 		"zfs snapshot p/b@t",
@@ -26,6 +27,7 @@ func TestZFSCLIBuildsTheCommandsItPromises(t *testing.T) {
 		"zfs destroy p/b@t",
 		"zfs set teploy:dead=on p/b@t",
 		"zfs get -H -p -o value volmode p",
+		"zfs create -s -V 1048576 -o teploy:kind=probe -o teploy:owner=me p/scratch",
 	}
 	if !slices.Equal(cmd.calls, want) {
 		t.Fatalf("commands:\n%s\nwant:\n%s", strings.Join(cmd.calls, "\n"), strings.Join(want, "\n"))

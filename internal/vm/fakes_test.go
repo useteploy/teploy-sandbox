@@ -164,6 +164,19 @@ func (z *fakeZFS) Clone(_ context.Context, snapshot, dataset string, props map[s
 	return nil
 }
 
+func (z *fakeZFS) CreateVolume(_ context.Context, name string, _ int64, props map[string]string) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	if err := z.record("create " + name); err != nil {
+		return err
+	}
+	if _, exists := z.datasets[name]; exists {
+		return fmt.Errorf("cannot create '%s': dataset already exists", name)
+	}
+	z.datasets[name] = &fakeDataset{props: maps.Clone(props), files: map[string][]byte{}}
+	return nil
+}
+
 func (z *fakeZFS) Snapshot(_ context.Context, name string) error {
 	z.mu.Lock()
 	defer z.mu.Unlock()

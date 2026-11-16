@@ -94,6 +94,9 @@ type host struct {
 	// prepareDevDir makes the device node dir and proves a device node
 	// in it can be opened.
 	prepareDevDir func(dir string) error
+	waitDevice    func(ctx context.Context, path string) error
+	// udevProbes reports whether udev probes a scratch device.
+	udevProbes func(ctx context.Context, device string) (bool, error)
 }
 
 func realHost() host {
@@ -116,6 +119,10 @@ func realHost() host {
 		mappedUIDs:    uidsMapped,
 		prepareCgroup: func(root, dir string) error { return newCgroups(root, dir).prepare() },
 		prepareDevDir: prepareDevDir,
+		waitDevice:    waitForPath,
+		udevProbes: func(ctx context.Context, device string) (bool, error) {
+			return udevProbes(ctx, device, execCommander{})
+		},
 		openKVM: func() error {
 			kvm, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
 			if err != nil {
@@ -396,6 +403,13 @@ func preflight(ctx context.Context, config Config, zfs ZFS, host host) error {
 			// Set on the volumes alone it is not enough: see Volumes.props.
 			miss("volmode=dev on %q, where every volume under it inherits it (it is %q; run `zfs set volmode=dev %s`): without it the host scans guest disks for partitions",
 				config.Pool, mode, config.Pool)
+		} else if !root || config.Owner == "" {
+			// The udev check writes to a volume of its own.
+		} else if err := checkUdev(ctx, config, zfs, host); errors.Is(err, errUdevProbes) {
+			miss("udev probing of ZFS volumes turned off: this host's udev read a filesystem label off a scratch volume, so a guest can put names of its choosing in /dev/disk/by-label. Put the line `%s` in %s and run `%s` (scripts/install-host.sh does both)",
+				UdevRule, UdevRuleFile, UdevReload)
+		} else if err != nil {
+			miss("a check that udev does not probe ZFS volumes: %v", err)
 		}
 		switch {
 		case !strings.Contains(config.Golden, "@"):

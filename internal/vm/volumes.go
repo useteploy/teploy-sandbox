@@ -116,8 +116,15 @@ func (v *Volumes) live(dataset Dataset, snapshot SnapshotInfo) bool {
 	return dataset.Kind == kindSnapshot && !snapshot.Dead && v.OwnsRef(snapshot.Name) && datasetOf(snapshot.Name) == dataset.Name
 }
 
+// props are set on every volume the driver creates. volmode=dev keeps the
+// host kernel from scanning a guest disk's partition table: without it the
+// host exposes each guest partition as its own block device, where a
+// label- or UUID-based mount on the host can pick a guest's filesystem
+// (seen: a host mounting a run's EFI partition as its own /boot/efi, which
+// then pinned the volume), and where the host parses filesystem metadata a
+// guest controls.
 func (v *Volumes) props(kind string) map[string]string {
-	return map[string]string{propOwner: v.owner, propKind: kind}
+	return map[string]string{propOwner: v.owner, propKind: kind, "volmode": "dev"}
 }
 
 // ErrNoSnapshot is CreateRun's answer for a reference that is not (or no

@@ -158,3 +158,52 @@ Known limits, deliberate in this slice:
 - A run with `onExpire: stop` that has an exec in flight at every reaper
   tick is never stopped and so outlives its deadline.
 - The registry file holds env values in the clear (0600, 0700 dir).
+
+## 2026-11-16 — VM driver, first slice (experimental, off by default)
+
+Added: `--driver vm`, `internal/vm` (Cloud Hypervisor on ZFS volumes),
+`internal/guest` and `cmd/teploy-guestd` (the in-guest agent),
+`scripts/build-golden.sh`. `Runtime` itself did not change: two optional
+interfaces let a driver own its snapshot references (`SnapshotNamer`) and
+refuse creates it cannot honour (`CreateAdmitter`). `GET /v1/capacity`
+gained `driver` and `nestedVirt`. The Docker driver's behaviour and tests
+are unchanged.
+
+Run against a real hypervisor 2026-11-16 (`-tags vmintegration`, as
+root; Cloud Hypervisor v54.1, ZFS 2.2, Linux 6.8, arm64, inside a VM
+with nested KVM): create, exec, 1 MiB file round trip byte-exact, stop,
+a new manager loading the registry, resume, fork of a running run,
+destroy, with no VM process, volume or snapshot left behind. In that
+nested setup a cold boot to agent-ready took 7 to 10 s, an exec round
+trip about 10 ms, a stop 0.35 s.
+
+Found by that run and fixed: volumes were created with the default
+`volmode`, so the host exposed every guest partition as a block device
+and mounted one run's EFI partition as its own `/boot/efi` by label.
+Volumes are now `volmode=dev`.
+
+Not verified:
+
+- An x86-64 host, and bare metal. Boot time and density figures from the
+  nested arm64 setup say nothing about either.
+- More than two VMs at once, memory pressure, a host out of pool space.
+- The first attempt at the live suite ended with the test host itself
+  unresponsive. The cause was not established (the `/boot/efi` mix-up
+  above was present at the time; the run after the fix was clean). Treat
+  host stability under this driver as unproven.
+- The code in `internal/vm` and `internal/guest` has had no independent
+  review.
+
+Deliberately missing: guest networking and the egress tiers, the warm
+repo cache, a pool of pre-booted VMs, nested virtualisation inside a
+run, memory reclaim policy, and resource accounting beyond what the
+Docker driver reports.
+
+Known limits:
+
+- A snapshot volume left by a crash between a capture and the registry
+  write is not swept at start (the same gap as the Docker driver's
+  image leak); the startup sweep removes only run volumes and VM
+  processes the registry does not name.
+- The golden image is trusted: the daemon boots whatever
+  `--vm-golden` names.

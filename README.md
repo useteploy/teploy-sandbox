@@ -115,6 +115,46 @@ callers put tokens. One daemon owns a state directory.
   fork still work; nothing stopped survives a restart, and the snapshots
   are left behind for the operator.
 
+## VM driver (experimental)
+
+`serve --driver vm` (`SBX_DRIVER=vm`) runs each run as a virtual machine
+with its own kernel instead of a container: Cloud Hypervisor on KVM, one
+ZFS volume per run cloned from a golden image, and an in-guest agent
+(`teploy-guestd`) reached over vsock, so exec and file transfer need no
+guest networking. The default driver is still `docker`, and nothing about
+it changed.
+
+What works, through the same HTTP API: create, exec (stdout, stderr, exit
+code, env, cwd, timeout), file write and read, snapshot, stop, resume
+after a daemon restart, fork of a running run, destroy.
+
+What is refused with a 400 rather than faked, in this first slice:
+
+- any `network` other than `none`, and `egressAllow` (a VM has no guest
+  network yet);
+- `warm` (no warm repo cache);
+- `limits.pids` (a VM is bounded by its memory and CPUs);
+- an `image` that is neither `golden` nor a snapshot this driver took.
+
+Also not built yet: a pool of pre-booted VMs (every create is a cold
+boot), nested virtualisation inside a run, and memory reclaim policy.
+
+Host requirements, checked at start; the daemon refuses to start and
+names what is missing: `/dev/kvm`, the `cloud-hypervisor` binary
+(`--vm-hypervisor`), an uncompressed guest kernel (`--vm-kernel`), a ZFS
+pool (`--vm-pool`) and a golden snapshot (`--vm-golden`). Build the
+golden with `scripts/build-golden.sh` from a volume holding a bootable
+systemd root filesystem. `GET /v1/capacity` reports `driver` and
+`nestedVirt`.
+
+Every volume the driver creates has `volmode=dev`, so the host never
+sees a guest's partitions as block devices and never mounts or parses a
+guest filesystem.
+
+Test against a real hypervisor (needs root, KVM and ZFS; CI has neither
+and only vets it):
+`CGO_ENABLED=0 go test -c -tags vmintegration -o vm.test . && sudo ./vm.test -test.run TestVM -test.v`
+
 ## Writable leases
 
 A human takes exclusive writable ownership of a run while its agent is

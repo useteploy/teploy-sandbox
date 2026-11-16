@@ -575,3 +575,14 @@ func TestRandomLifecyclesNeverLoseAReferenceOrLeakAVolume(t *testing.T) {
 		assertPool(t, z, pristine...)
 	}
 }
+
+// A guest disk's partitions must never become block devices on the host:
+// every volume the driver creates is marked volmode=dev.
+func TestVolumesHideGuestPartitionsFromTheHost(t *testing.T) {
+	v := &Volumes{owner: "owner"}
+	for _, kind := range []string{kindRun, kindSnapshot} {
+		if got := v.props(kind)["volmode"]; got != "dev" {
+			t.Fatalf("%s volume: volmode=%q, want dev", kind, got)
+		}
+	}
+}

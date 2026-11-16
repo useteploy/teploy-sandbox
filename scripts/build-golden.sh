@@ -106,5 +106,8 @@ umount "$mnt"
 rmdir "$mnt"
 mnt=""
 
+# The image is finished: hide its partitions from the host again, so the
+# host never mounts or parses a guest filesystem by label or UUID.
+zfs set volmode=dev "$volume"
 zfs snapshot "$to"
 echo "build-golden: $to is ready (serve --driver vm --vm-golden $to)"

@@ -420,7 +420,8 @@ func TestVMConfinement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("udevadm info: %v", err)
 	}
-	if strings.Contains(string(properties), "ID_FS_") || !strings.Contains(string(properties), "UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG=1") {
+	if strings.Contains(string(properties), "ID_FS_") || !strings.Contains(string(properties), "UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG=1") ||
+		!strings.Contains(string(properties), "DM_UDEV_DISABLE_OTHER_RULES_FLAG=1") {
 		t.Errorf("udev probed the guest's disk:\n%s", properties)
 	}
 	if _, err := os.Stat(first.zvol); err != nil {

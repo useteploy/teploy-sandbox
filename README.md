@@ -335,15 +335,21 @@ The whole disk is still a block device on the host for as long as the
 volume exists, and udev would probe it like any other disk: a guest that
 writes a filesystem signature over the start of its disk would get a
 `/dev/disk/by-label` or `by-uuid` link on the host with a label of its
-choosing. The host must turn that off, with
+choosing. The rule files that storage tools install (bcache, LVM,
+kpartx, udisks) look at block devices too, and one that finds its own
+signature on a disk hands the disk to the host's kernel driver for it.
+The host must turn both off, with
 `/etc/udev/rules.d/59-teploy-zvol-noprobe.rules` containing
-`KERNEL=="zd*", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}="1"`
+`KERNEL=="zd*", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}="1", ENV{DM_UDEV_DISABLE_OTHER_RULES_FLAG}="1"`
 (`scripts/install-host.sh` installs it; it applies to every ZFS volume
 on the host, and the `/dev/zvol` links stay). The daemon does not take
 the rule file's word for it: at start it creates a 1 MiB scratch volume,
 writes a labelled filesystem signature to it as a guest could, lets udev
-handle the device and refuses to start if udev recorded a filesystem or
-made a link. The scratch volume is destroyed either way.
+handle the device and refuses to start if udev recorded a filesystem,
+made a link, or handled the device without both flags. The scratch
+volume is destroyed either way. A rule file that honours neither flag is
+not covered: check what `udevadm test /sys/class/block/zdN` runs on your
+host if it has storage tools beyond a stock install.
 
 A VM's console and its hypervisor's output are kept in the daemon's
 memory, the last 64 KiB of each; nothing a guest can make grow is written

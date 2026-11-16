@@ -141,7 +141,7 @@ func TestPreflightNamesEachMissingPiece(t *testing.T) {
 		"udev probing of ZFS volumes turned off": func(_ *Config, h *host) {
 			h.udevProbes = func(context.Context, string) (bool, error) { return true, nil }
 		},
-		"`KERNEL==\"zd*\", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}=\"1\"` in /etc/udev/rules.d/59-teploy-zvol-noprobe.rules and run `udevadm control --reload && udevadm trigger": func(_ *Config, h *host) {
+		"`KERNEL==\"zd*\", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}=\"1\", ENV{DM_UDEV_DISABLE_OTHER_RULES_FLAG}=\"1\"` in /etc/udev/rules.d/59-teploy-zvol-noprobe.rules and run `udevadm control --reload && udevadm trigger": func(_ *Config, h *host) {
 			h.udevProbes = func(context.Context, string) (bool, error) { return true, nil }
 		},
 		`the "nft" command (nftables`: func(_ *Config, h *host) {

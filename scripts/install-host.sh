@@ -13,7 +13,9 @@
 #   1. A udev rule that stops udev probing ZFS volumes for filesystems.
 #      A run's disk is a block device on the host; without the rule a
 #      guest that writes a filesystem signature to its disk gets links
-#      under /dev/disk/by-label and by-uuid with names it chose.
+#      under /dev/disk/by-label and by-uuid with names it chose. The
+#      same rule keeps the rule files of storage tools (bcache, LVM)
+#      from reading a guest's disk and acting on what they find.
 #   2. /dev/kvm openable by a group (kvm) rather than by root alone.
 #      Every VM's hypervisor runs under a UID of its own from a reserved
 #      range (default 1879048192 and the 4095 after it, --vm-uid-base)
@@ -77,8 +79,9 @@ else
     # Sorts before 60-persistent-storage.rules, which honours the flag.
     # /dev/zvol links come from 60-zvol.rules and are not affected.
     if write_file "$RULE_FILE" "# Installed by teploy-sandbox scripts/install-host.sh. Do not probe ZFS
-# volumes for filesystems: they are guests' disks.
-KERNEL==\"zd*\", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}=\"1\""; then
+# volumes for filesystems, and keep the storage tools' rule files (bcache,
+# LVM, kpartx, udisks) away from them: they are guests' disks.
+KERNEL==\"zd*\", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}=\"1\", ENV{DM_UDEV_DISABLE_OTHER_RULES_FLAG}=\"1\""; then
         did "wrote $RULE_FILE"
         udevadm control --reload
         # Volumes that exist already keep the links they have until udev

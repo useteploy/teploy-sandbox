@@ -27,12 +27,21 @@ const (
 	// rule file the flag turns off. The /dev/zvol links come from another
 	// file and stay.
 	UdevRuleFile = "/etc/udev/rules.d/59-teploy-zvol-noprobe.rules"
-	UdevRule     = `KERNEL=="zd*", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}="1"`
+	// Two flags. The first turns off the rule file that probes every
+	// block device for a filesystem and makes the /dev/disk/by-* links.
+	// The second is the one the rule files of storage tools look for
+	// before they do anything with a device (bcache, LVM, kpartx,
+	// udisks): without it those still read a disk whose filesystem type
+	// udev did not record, which is every guest's disk once the first
+	// flag is set, and a tool that finds its own signature there hands
+	// the disk to the host's kernel driver for it.
+	UdevRule = `KERNEL=="zd*", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}="1", ENV{DM_UDEV_DISABLE_OTHER_RULES_FLAG}="1"`
 	// UdevReload makes a running udev read the rule and apply it to the
 	// volumes that already exist.
 	UdevReload = "udevadm control --reload && udevadm trigger --subsystem-match=block --sysname-match='zd*' --action=change"
 
-	udevDisableFlag = "UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG=1"
+	udevDisableFlag      = "UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG=1"
+	udevDisableOtherFlag = "DM_UDEV_DISABLE_OTHER_RULES_FLAG=1"
 
 	probePrefix     = "teploy-probe-"
 	probeVolumeSize = 1 << 20
@@ -59,17 +68,18 @@ func ext2Signature(label string) []byte {
 
 // udevProbed reads udev's verdict on a device from its database entry and
 // the label link: probed when udev recorded a filesystem or made the
-// link, settled as not probed once the entry carries the flag that turns
+// link, settled as not probed once the entry carries both flags that turn
 // the probing rules off.
 func udevProbed(database string, link bool) (probed, settled bool) {
 	if link || strings.Contains(database, "E:ID_FS_") {
 		return true, true
 	}
-	return false, strings.Contains(database, "E:"+udevDisableFlag)
+	return false, strings.Contains(database, "E:"+udevDisableFlag+"\n") && strings.Contains(database, "E:"+udevDisableOtherFlag+"\n")
 }
 
 // udevProbes reports whether the host's udev probes the block device at
-// path for filesystems, by writing a signature with a label of its own to
+// path: whether it reads a filesystem off it, or handles it without the
+// flags that keep its rule files away from it. It checks by writing a signature with a label of its own to
 // it and waiting for udev to have handled the device. The device must be
 // one nobody needs: its first two kilobytes are overwritten.
 func udevProbes(ctx context.Context, device string, commands Commander) (bool, error) {
@@ -123,8 +133,14 @@ func udevProbes(ctx context.Context, device string, commands Commander) (bool, e
 		raw, _ := os.ReadFile(database)
 		_, linkErr := os.Lstat(link)
 		probed, settled := udevProbed(string(raw), linkErr == nil)
-		if settled || time.Now().After(deadline) {
+		if settled {
 			return probed, nil
+		}
+		if time.Now().After(deadline) {
+			// udev has handled the device and its entry does not carry
+			// the flags: nothing recorded a filesystem this time, but
+			// the rule files that look at disks are not turned off.
+			return true, nil
 		}
 		select {
 		case <-ctx.Done():

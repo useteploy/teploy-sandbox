@@ -36,13 +36,17 @@ func TestUdevVerdict(t *testing.T) {
 		link            bool
 		probed, settled bool
 	}{
-		"probed, recorded":      {database: "S:disk/by-label/x\nE:ID_FS_TYPE=ext2\n", probed: true, settled: true},
-		"probed, link only":     {link: true, probed: true, settled: true},
-		"rule on":               {database: "E:DEVTYPE=disk\nE:UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG=1\n", settled: true},
-		"not handled yet":       {database: "E:DEVTYPE=disk\n"},
-		"no entry":              {},
-		"rule on but probed":    {database: "E:UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG=1\nE:ID_FS_LABEL=x\n", probed: true, settled: true},
-		"flag set to something": {database: "E:UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG=0\n"},
+		"probed, recorded":  {database: "S:disk/by-label/x\nE:ID_FS_TYPE=ext2\n", probed: true, settled: true},
+		"probed, link only": {link: true, probed: true, settled: true},
+		"rule on":           {database: "E:DEVTYPE=disk\nE:UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG=1\nE:DM_UDEV_DISABLE_OTHER_RULES_FLAG=1\n", settled: true},
+		// The rule as it was first installed: filesystem probing is off,
+		// the storage tools' own rule files still read the disk.
+		"storage tools still look": {database: "E:DEVTYPE=disk\nE:UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG=1\n"},
+		"only storage tools off":   {database: "E:DM_UDEV_DISABLE_OTHER_RULES_FLAG=1\n"},
+		"not handled yet":          {database: "E:DEVTYPE=disk\n"},
+		"no entry":                 {},
+		"rule on but probed":       {database: "E:UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG=1\nE:DM_UDEV_DISABLE_OTHER_RULES_FLAG=1\nE:ID_FS_LABEL=x\n", probed: true, settled: true},
+		"flag set to something":    {database: "E:UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG=0\nE:DM_UDEV_DISABLE_OTHER_RULES_FLAG=10\n"},
 	} {
 		if probed, settled := udevProbed(tc.database, tc.link); probed != tc.probed || settled != tc.settled {
 			t.Errorf("%s: probed=%v settled=%v", name, probed, settled)
@@ -116,5 +120,18 @@ func TestCheckUdevReportsAScratchVolumeItCouldNotRemove(t *testing.T) {
 	h, _ := udevHost(false, nil)
 	if err := checkUdev(context.Background(), goodConfig(), zfs, h); err == nil || !strings.Contains(err.Error(), "scratch volume") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// The rule the daemon names and the flags it looks for are the same.
+func TestUdevRuleSetsEveryFlagTheCheckLooksFor(t *testing.T) {
+	for _, flag := range []string{udevDisableFlag, udevDisableOtherFlag} {
+		name, value, _ := strings.Cut(flag, "=")
+		if !strings.Contains(UdevRule, `ENV{`+name+`}="`+value+`"`) {
+			t.Errorf("the rule does not set %s: %s", flag, UdevRule)
+		}
+	}
+	if !strings.HasPrefix(UdevRule, `KERNEL=="zd*", `) {
+		t.Errorf("the rule is not limited to ZFS volumes: %s", UdevRule)
 	}
 }

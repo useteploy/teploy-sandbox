@@ -435,7 +435,7 @@ func preflight(ctx context.Context, config Config, zfs ZFS, host host) error {
 		} else if !root || config.Owner == "" {
 			// The udev check writes to a volume of its own.
 		} else if err := checkUdev(ctx, config, zfs, host); errors.Is(err, errUdevProbes) {
-			miss("udev probing of ZFS volumes turned off: this host's udev read a filesystem label off a scratch volume, so a guest can put names of its choosing in /dev/disk/by-label. Put the line `%s` in %s and run `%s` (scripts/install-host.sh does both)",
+			miss("udev probing of ZFS volumes turned off: this host's udev read a filesystem label off a scratch volume, or handled it without the flags that keep its rule files (filesystem probing; bcache, LVM and other storage tools) away from guests' disks. Put the line `%s` in %s and run `%s` (scripts/install-host.sh does both)",
 				UdevRule, UdevRuleFile, UdevReload)
 		} else if err != nil {
 			miss("a check that udev does not probe ZFS volumes: %v", err)

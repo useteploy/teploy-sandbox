@@ -203,7 +203,14 @@ The layers are independent; each is checked by the live suite.
   outside the hypervisor's list kills it) and `--landlock`, which limits
   the process to the paths on its command line: the kernel image, its
   disk node, its two sockets and `/dev/kvm`. A file its UID owns
-  elsewhere is refused.
+  elsewhere is refused. What Landlock does not judge is a connect to a
+  unix socket by path: the hypervisor is in the host's mount namespace,
+  and the host's sockets that anyone may connect to (the system D-Bus,
+  journald, a local resolver) are kept from it by its seccomp filter
+  alone. See AUDIT_OPEN.md.
+- **Its sockets are not trusted by path.** The runtime dir is the VM's
+  own, so the daemon checks, on every connection, that the VM's UID is
+  what listens there before it sends anything.
 - **Its own cgroup**, entered at the moment the process is created:
   `memory.max` is the guest's size plus 64 MiB plus 8 MiB per GiB of
   guest (`memory.swap.max` 0), `pids.max` is 128 plus 4 per vCPU, and

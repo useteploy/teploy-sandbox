@@ -316,7 +316,8 @@ Not verified, or not done:
   `/dev/kvm` open and the host kernel's system call surface that the
   filter allows. It shares the host's mount and PID namespaces: it
   sees the host's file tree (Landlock is what stops it opening any of
-  it) and the host's process list.
+  it) and the host's process list. Landlock does not cover connecting
+  to a unix socket by path: see the review entry below.
 - The VM UID range is checked against `/etc/passwd` only; accounts
   that exist only in a directory service are not seen. Two daemons on
   one host may share a range (a UID that owns a live process is never
@@ -491,3 +492,102 @@ Not done, not verified, or known to be weak:
   seen.
 - The guest's setup time was measured, not explained.
 - This change has had no independent review.
+
+
+## 2026-11-16 — VM driver: independent review of the hardening and networking
+
+A second reader went through the confinement, the udev check, the host
+script, the per-run proxy mode and guest networking (the twelve commits
+after the first slice), against a guest that is assumed to have taken
+over its hypervisor process. Same host as above (Cloud Hypervisor
+v54.1, Linux 6.8, arm64, nested KVM).
+
+Found and fixed:
+
+- **The daemon followed whatever was at a VM's socket paths, as root.**
+  A VM's runtime dir belongs to the VM's UID, and Cloud Hypervisor's
+  Landlock rules give that directory the rights to remove files and
+  make links (seen with strace: the rule for the vsock socket's
+  directory carries `REMOVE_FILE` and `MAKE_SYM`). A hypervisor that a
+  guest took over could therefore replace its own `vsock.sock` or
+  `api.sock` with a link to another run's. Shown on the unfixed daemon,
+  with the link made by hand under the VM's UID: an exec addressed to
+  run A ran in run B and returned B's file. A stop of A would have
+  flushed and paused B. The daemon now reads who listens on the socket
+  it reached (`SO_PEERCRED`) and closes the connection before writing
+  anything unless it is that VM's UID. With the fix the same exec and
+  the same stop are refused and name both UIDs.
+- **The udev rule left the storage tools' rule files on.** The rule set
+  the flag that turns off udev's filesystem probing. A stock Ubuntu
+  server also ships `69-bcache.rules`, which probes every block device
+  whose filesystem type udev did not record (every guest disk, once
+  the first flag is set) and registers a match with the host kernel's
+  bcache driver; the LVM, kpartx and udisks rule files are gated by the
+  same second flag (`DM_UDEV_DISABLE_OTHER_RULES_FLAG`), not the first.
+  Found by reading the host's rule files; no disk was made to trigger
+  it. The rule now sets both flags and the start check refuses a host
+  whose udev handled the scratch volume without both (checked: the new
+  daemon refused this host with the old rule and started after
+  `install-host.sh`, whose second run changed nothing).
+- **A guest could make the daemon log two errors every two seconds.** A
+  guest that powers off takes its tap along, the kernel removes the
+  tap's ingress chain with it, and the watch took that for a filter
+  something else had removed, for as long as the run existed. Seen on
+  the unfixed daemon; the watch now leaves a tap that is gone alone.
+
+Looked at and found sound: nothing of the daemon's is open in a
+hypervisor (its descriptors are its own pipes, the tap, `/dev/kvm`, its
+disk node and its sockets); the cgroup's files
+are root's; a UID is given back only after its cgroup is empty; the
+`/proc/PID` owner the UID pool reads is the effective UID even for a
+process that made itself undumpable (tried); the generated ruleset as
+`nft list ruleset` prints it matches the description, including the
+drop of everything that is not IPv4; the Docker driver takes the same
+path through the proxy pool as before (a pool exists there only with a
+shared proxy URL, which is the condition the new branch excludes).
+
+Open, and what closing each would take:
+
+- **No private file tree for the hypervisor.** It runs in the host's
+  mount namespace. Its UID, its supplementary group and its empty
+  network namespace do not stop it connecting to the host's unix
+  sockets that anyone may connect to: tried from a process with a VM's
+  identity in an empty network namespace, the system D-Bus, journald's
+  sockets and the resolver's socket all accepted. Landlock as this
+  kernel has it does not judge a connect to a socket by path, so the
+  hypervisor's seccomp filter is the only layer between a taken-over
+  hypervisor and those services, and the resolver is a way to send
+  names out of a run on network `none`. The same holds for device nodes
+  the `/dev/kvm` group can open on a stock host (`/dev/vhost-net`,
+  `/dev/vhost-vsock`, `/dev/udmabuf`), where Landlock is the only layer.
+  Closing it needs a jailer step: the hypervisor started in mount and
+  PID namespaces of its own, with a root that holds only its binary,
+  the kernel image, its disk node, `/dev/kvm` and its socket directory.
+- **The firewall fails open.** Admitted above for a removed table (two
+  seconds, or for as long as the daemon is dead). Also: the watch looks
+  for the tables and the per-tap chains, not their contents, so a table
+  that was flushed rather than deleted is not put back. While the
+  tables are gone an allowlist guest reaches every service on the host
+  (its tap's forwarding switch keeps it from being routed, nothing
+  keeps it from the host's own addresses) and an open guest is routed
+  to private and link-local addresses. A design that fails closed needs
+  the taps out of the host's main routing: a network namespace or a VRF
+  for guests, so that without the rules there is no route to the host's
+  services at all.
+- **A destroy closes the run's proxy before its VM is gone.** For up to
+  the removal's 15 seconds (longer if it has to be retried) the guest
+  is still admitted to its old port on the gateway, which the kernel may
+  have given to another run's proxy. That proxy asks for its own
+  credential, which is all that stands there.
+- **A rule file that honours neither udev flag** would still run on a
+  guest's disk; the start check sees a filesystem record, a label link
+  or a missing flag, nothing else.
+- Leftovers that are not swept: the per-identity directories themselves
+  (the cgroup, the device node dir and the runtime dir of a daemon
+  identity that is never started again stay, empty).
+- The VM UID range is not checked against `/etc/subuid` either.
+- A hypervisor's resource limits are the daemon's: nothing sets its
+  core dump limit (0 where this was run, from the shell that started
+  the daemon; a service manager may set it otherwise, and a core of a
+  hypervisor is its guest's memory handed to the host's dump handler).
+

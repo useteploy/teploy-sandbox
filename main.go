@@ -61,6 +61,8 @@ Usage:
                        [--driver docker|vm]
                        [--vm-hypervisor cloud-hypervisor] [--vm-kernel /var/lib/teploy-sandbox/vm/Image]
                        [--vm-pool sbx] [--vm-golden sbx/golden-guestd@v1] [--vm-run-dir /run/teploy-sandbox/vm]
+                       [--vm-uid-base 1879048192] [--vm-cgroup /sys/fs/cgroup/teploy-sandbox-vm]
+                       [--vm-dev-dir /dev/teploy-sandbox]
   teploy-sandbox version`)
 }
 
@@ -96,6 +98,12 @@ func serve(args []string) error {
 		"vm driver: the golden snapshot runs are cloned from (default <vm-pool>/golden-guestd@v1; see scripts/build-golden.sh)")
 	vmRunDir := flags.String("vm-run-dir", envOr("SBX_VM_RUN_DIR", vm.DefaultRunDir),
 		"vm driver: directory for each VM's sockets")
+	vmUIDBase := flags.Uint("vm-uid-base", uint(envFloat("SBX_VM_UID_BASE", vm.DefaultUIDBase)),
+		fmt.Sprintf("vm driver: the first of the %d UIDs VM processes run under, one per VM; no account may have one of them", vm.UIDCount))
+	vmCgroup := flags.String("vm-cgroup", envOr("SBX_VM_CGROUP", vm.DefaultCgroup),
+		"vm driver: the cgroup v2 directory each VM gets a group in, with the cpu, memory and pids controllers")
+	vmDevDir := flags.String("vm-dev-dir", envOr("SBX_VM_DEV_DIR", vm.DefaultDevDir),
+		"vm driver: directory for each VM's private disk device node; must allow device nodes (not /run)")
 	vmBootTimeout := flags.Duration("vm-boot-timeout", envDuration("SBX_VM_BOOT_TIMEOUT", vm.DefaultBootTimeout),
 		"vm driver: how long a new VM may take to answer")
 	if err := flags.Parse(args); err != nil {
@@ -108,6 +116,9 @@ func serve(args []string) error {
 		*vmGolden = *vmPool + "/golden-guestd@v1"
 	}
 	warmUnavailable := false
+	if *vmUIDBase > 1<<31 {
+		return fmt.Errorf("vm-uid-base: %d is not a usable UID", *vmUIDBase)
+	}
 	if *driverName == driverVM && *cacheRoot != "" {
 		// The warm repo cache is bind-mounted host directories, which a VM
 		// has no way to mount yet: the store is not opened at all, so a
@@ -227,6 +238,9 @@ func serve(args []string) error {
 			Golden:      *vmGolden,
 			RunDir:      *vmRunDir,
 			Owner:       ownerID,
+			UIDBase:     uint32(*vmUIDBase),
+			Cgroup:      *vmCgroup,
+			DevDir:      *vmDevDir,
 			BootTimeout: *vmBootTimeout,
 		}, log)
 		if err != nil {

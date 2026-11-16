@@ -36,7 +36,7 @@ func TestMachineArgsAreTheProvenCommandLine(t *testing.T) {
 	want := []string{
 		"--kernel", "/boot/Image",
 		"--cmdline", "root=/dev/vda1 rw console=ttyAMA0 quiet",
-		"--disk", "path=/dev/zvol/tank/teploy-sbx-x,image_type=raw",
+		"--disk", "path=/dev/zvol/tank/teploy-sbx-x,image_type=raw,direct=on",
 		"--cpus", "boot=2",
 		"--memory", "size=2048M",
 		"--vsock", "cid=7,socket=/run/sbx/abc/teploy-sbx-x/vsock.sock",
@@ -44,6 +44,8 @@ func TestMachineArgsAreTheProvenCommandLine(t *testing.T) {
 		"--serial", "tty",
 		"--console", "off",
 		"--api-socket", "/run/sbx/abc/teploy-sbx-x/api.sock",
+		"--seccomp", "true",
+		"--landlock",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("args:\n%q\nwant:\n%q", got, want)
@@ -79,8 +81,15 @@ func TestSweepOnlyKillsVMsOfThisDaemonIdentity(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var killed []int
+	confine, _, tree := newTestConfinement(t, root)
+	leftover, err := confine.cgroups.create(context.Background(), "teploy-sbx-1", limitsFor(MachineConfig{CPUs: 1, MemoryMB: 64}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree.procs[leftover] = []int{10}
 	h := &CloudHypervisor{
-		RunDir: mine,
+		RunDir:  mine,
+		confine: confine,
 		processes: func() ([]Process, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -105,6 +114,11 @@ func TestSweepOnlyKillsVMsOfThisDaemonIdentity(t *testing.T) {
 	if entries, _ := os.ReadDir(mine); len(entries) != 0 {
 		t.Fatalf("stale runtime dirs left: %v", entries)
 	}
+	// The leftover VM's cgroup went with it, killed rather than trusted
+	// to be empty.
+	if _, err := os.Stat(leftover); !os.IsNotExist(err) || !slices.Equal(tree.kills, []string{leftover}) {
+		t.Fatalf("leftover cgroup: %v, killed %v", err, tree.kills)
+	}
 	if _, err := os.Stat(filepath.Join(theirs, "teploy-sbx-2")); err != nil {
 		t.Fatalf("another daemon's runtime dir was removed: %v", err)
 	}
@@ -116,8 +130,10 @@ func TestSweepFailsRatherThanLeaveALiveProcessBehind(t *testing.T) {
 		t.Fatal(err)
 	}
 	process := Process{PID: 10, Args: []string{"cloud-hypervisor", "--api-socket", filepath.Join(root, "teploy-sbx-1", "api.sock")}}
+	confine, _, _ := newTestConfinement(t, root)
 	h := &CloudHypervisor{
 		RunDir:    root,
+		confine:   confine,
 		processes: func() ([]Process, error) { return []Process{process}, nil },
 		kill:      func(int) error { return syscall.EPERM },
 	}
@@ -131,8 +147,11 @@ func TestSweepFailsRatherThanLeaveALiveProcessBehind(t *testing.T) {
 	if _, err := h.Sweep(context.Background()); err == nil {
 		t.Fatal("an unreadable process table must fail the sweep, not pass as empty")
 	}
-	if _, err := (&CloudHypervisor{}).Sweep(context.Background()); err == nil {
+	if _, err := (&CloudHypervisor{confine: confine}).Sweep(context.Background()); err == nil {
 		t.Fatal("a sweep with no runtime dir must refuse")
+	}
+	if _, err := (&CloudHypervisor{RunDir: root}).Sweep(context.Background()); err == nil {
+		t.Fatal("a sweep that cannot clean up cgroups must refuse")
 	}
 }
 
@@ -243,24 +262,42 @@ func TestMachinePausesAndResumesThroughTheAPISocket(t *testing.T) {
 func TestStartAndKillManageTheProcessAndItsRuntimeDir(t *testing.T) {
 	root := shortDir(t)
 	script := filepath.Join(root, "fake-hypervisor")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\necho started \"$@\"\nexec sleep 300\n"), 0o755); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho started \"$@\"\necho \"secret=[$SBX_TEST_SECRET] cwd=$(pwd) env-end\"\nexec sleep 300\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	h := &CloudHypervisor{Bin: script, Kernel: "/k", Cmdline: "c", RunDir: filepath.Join(root, "run")}
+	confine, confined, _ := newTestConfinement(t, root)
+	h := &CloudHypervisor{Bin: script, Kernel: "/k", Cmdline: "c", RunDir: filepath.Join(root, "run"), confine: confine}
+	t.Setenv("SBX_TEST_SECRET", "not-for-the-hypervisor")
 	machine, err := h.Start(context.Background(), MachineConfig{Name: "teploy-sbx-a", Disk: "/dev/null", CPUs: 1, MemoryMB: 64})
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(root, "run", "teploy-sbx-a")
+	node, group := filepath.Join(root, "dev", "teploy-sbx-a"), confine.cgroups.path("teploy-sbx-a")
+	// Started as the VM's own user, in the VM's own cgroup, on the VM's
+	// own device node rather than the shared one it was created from.
+	if want := "uid=70000 gid=70000 groups=[993] cgroup=" + group; !slices.Equal(confined.started, []string{want}) {
+		t.Fatalf("started as %v, want %s", confined.started, want)
+	}
+	if _, err := os.Stat(node); err != nil {
+		t.Fatalf("private device node: %v", err)
+	}
 	if info, err := os.Stat(dir); err != nil || info.Mode().Perm() != 0o700 {
 		t.Fatalf("runtime dir: %v %v", info, err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(machine.Diagnostics(), "--api-socket "+filepath.Join(dir, apiSocketName)) {
+	for !strings.Contains(machine.Diagnostics(), "--api-socket "+filepath.Join(dir, apiSocketName)) || !strings.Contains(machine.Diagnostics(), "env-end") {
 		if time.Now().After(deadline) {
 			t.Fatalf("hypervisor output not captured: %q", machine.Diagnostics())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	diagnostics := machine.Diagnostics()
+	if !strings.Contains(diagnostics, "path="+node+",") || strings.Contains(diagnostics, "path=/dev/null") {
+		t.Fatalf("the hypervisor was not given its private node: %q", diagnostics)
+	}
+	if !strings.Contains(diagnostics, "secret=[] cwd=/ ") {
+		t.Fatalf("the hypervisor inherited the daemon's environment or directory: %q", diagnostics)
 	}
 	select {
 	case <-machine.Exited():
@@ -277,17 +314,39 @@ func TestStartAndKillManageTheProcessAndItsRuntimeDir(t *testing.T) {
 	default:
 		t.Fatal("Kill returned before the process was gone")
 	}
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("runtime dir left behind: %v", err)
+	for _, gone := range []string{dir, node, group} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Fatalf("%s left behind: %v", gone, err)
+		}
+	}
+	if len(confine.uids.held) != 0 {
+		t.Fatalf("the VM's UID was not returned: %v", confine.uids.held)
 	}
 	if err := machine.Kill(ctx); err != nil {
 		t.Fatalf("killing a dead machine: %v", err)
 	}
 
-	if _, err := (&CloudHypervisor{Bin: filepath.Join(root, "missing"), RunDir: filepath.Join(root, "run")}).Start(ctx, MachineConfig{Name: "teploy-sbx-b"}); err == nil {
+	if _, err := (&CloudHypervisor{Bin: filepath.Join(root, "missing"), RunDir: filepath.Join(root, "run"), confine: confine}).Start(ctx, MachineConfig{Name: "teploy-sbx-b"}); err == nil {
 		t.Fatal("a missing hypervisor binary must fail Start")
 	}
-	long := &CloudHypervisor{Bin: script, RunDir: filepath.Join(root, strings.Repeat("d", 100))}
+	// A VM that was never started holds nothing: no cgroup, no node, no UID.
+	if groups, _ := confine.cgroups.fs.children(confine.cgroups.dir); len(groups) != 0 || len(confine.uids.held) != 0 {
+		t.Fatalf("a failed start left a cgroup or a UID: %v %v", groups, confine.uids.held)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(root, "dev")); len(entries) != 0 {
+		t.Fatalf("a failed start left a device node: %v", entries)
+	}
+	// There is no unconfined mode, and no start without the means to
+	// drop privileges.
+	if _, err := (&CloudHypervisor{Bin: script, RunDir: filepath.Join(root, "run")}).Start(ctx, MachineConfig{Name: "teploy-sbx-d"}); err == nil || !strings.Contains(err.Error(), "unconfined") {
+		t.Fatalf("a hypervisor without confinement: %v", err)
+	}
+	confined.fail["procAttr"] = errors.New("cannot drop privileges")
+	if _, err := h.Start(ctx, MachineConfig{Name: "teploy-sbx-e", Disk: "/dev/null", CPUs: 1, MemoryMB: 64}); err == nil || len(confine.uids.held) != 0 {
+		t.Fatalf("a start that cannot be confined: %v (held %v)", err, confine.uids.held)
+	}
+	delete(confined.fail, "procAttr")
+	long := &CloudHypervisor{Bin: script, RunDir: filepath.Join(root, strings.Repeat("d", 100)), confine: confine}
 	if _, err := long.Start(ctx, MachineConfig{Name: "teploy-sbx-c"}); err == nil || !strings.Contains(err.Error(), "too long") {
 		t.Fatalf("a runtime dir too long for a socket path: %v", err)
 	}
@@ -311,7 +370,8 @@ func TestAGuestsConsoleOutputIsBoundedOnTheHost(t *testing.T) {
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	h = &CloudHypervisor{Bin: script, Kernel: "/k", Cmdline: "c", RunDir: filepath.Join(root, "run")}
+	confine, _, _ := newTestConfinement(t, root)
+	h = &CloudHypervisor{Bin: script, Kernel: "/k", Cmdline: "c", RunDir: filepath.Join(root, "run"), confine: confine}
 	started, err := h.Start(context.Background(), MachineConfig{Name: "teploy-sbx-a", Disk: "/dev/null", CPUs: 1, MemoryMB: 64})
 	if err != nil {
 		t.Fatal(err)

@@ -86,6 +86,10 @@ type CloudHypervisor struct {
 	// RunDir is this daemon identity's own runtime directory.
 	RunDir string
 
+	// confine is how every VM process is confined. Start refuses to run
+	// without it: there is no unconfined mode.
+	confine *confinement
+
 	// processes lists the host's processes for Sweep; kill signals one.
 	// Nil means the real /proc and SIGKILL.
 	processes func() ([]Process, error)
@@ -134,7 +138,12 @@ func (h *CloudHypervisor) machineArgs(config MachineConfig, dir string, cid uint
 		"--cmdline", h.Cmdline,
 		// image_type=raw is mandatory: without it the hypervisor probes the
 		// image format, and it refuses to guess for a writable disk.
-		"--disk", "path=" + config.Disk + ",image_type=raw",
+		//
+		// direct=on keeps the guest's disk out of the host's page cache.
+		// The guest has a page cache of its own; a second copy on the
+		// host would be charged to the VM's cgroup and reclaimed under
+		// its limit, at the guest's expense and for nothing.
+		"--disk", "path=" + config.Disk + ",image_type=raw,direct=on",
 		"--cpus", fmt.Sprintf("boot=%d", config.CPUs),
 		"--memory", fmt.Sprintf("size=%dM", config.MemoryMB),
 		"--vsock", fmt.Sprintf("cid=%d,socket=%s", cid, filepath.Join(dir, vsockSocketName)),
@@ -147,10 +156,20 @@ func (h *CloudHypervisor) machineArgs(config MachineConfig, dir string, cid uint
 		"--serial", "tty",
 		"--console", "off",
 		"--api-socket", filepath.Join(dir, apiSocketName),
+		// The hypervisor's own sandbox. The seccomp filter is its default
+		// and is named so that a changed default cannot remove it: a
+		// thread that makes a system call outside its list is killed.
+		// Landlock then limits the whole process to the files named
+		// above (and /dev/kvm), whatever its UID could otherwise open.
+		"--seccomp", "true",
+		"--landlock",
 	}
 }
 
-func (h *CloudHypervisor) Start(_ context.Context, config MachineConfig) (Machine, error) {
+func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Machine, error) {
+	if h.confine == nil {
+		return nil, errors.New("refusing to start an unconfined hypervisor")
+	}
 	dir := h.machineDir(config.Name)
 	if len(filepath.Join(dir, vsockSocketName)) > maxSocketPath {
 		return nil, fmt.Errorf("runtime dir %s is too long for a unix socket path", dir)
@@ -160,9 +179,14 @@ func (h *CloudHypervisor) Start(_ context.Context, config MachineConfig) (Machin
 	if err := os.RemoveAll(dir); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
+	// Cleanup must not depend on the request that asked for the VM.
+	cleanupCtx := context.WithoutCancel(ctx)
+	confined, err := h.confine.enter(cleanupCtx, config, dir)
+	if err != nil {
+		return nil, fmt.Errorf("confine hypervisor: %w", err)
 	}
+	// From here on the VM's disk is its private device node.
+	config.Disk = confined.disk
 	// Guest CIDs start at 3. The hypervisor's vsock is a userspace device
 	// behind its own unix socket, so the number only has to be valid; one
 	// per VM keeps logs unambiguous.
@@ -171,18 +195,23 @@ func (h *CloudHypervisor) Start(_ context.Context, config MachineConfig) (Machin
 	cmd := exec.Command(h.Bin, h.machineArgs(config, dir, cid)...)
 	serial, output := &tailBuffer{limit: outputTail}, &tailBuffer{limit: outputTail}
 	cmd.Stdout, cmd.Stderr = serial, output
+	// Nothing of the daemon's: not its environment, which may hold
+	// secrets, and not its working directory.
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	cmd.Dir = "/"
 	// Should anything else ever hold the output pipes open, the process
 	// exiting still counts as the VM being gone.
 	cmd.WaitDelay = 5 * time.Second
-	// Its own session: a signal aimed at the daemon's process group (a
-	// terminal's ^C) must not take every run with it.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("start hypervisor: %w", err)
+	if cmd.SysProcAttr, err = confined.procAttr(); err == nil {
+		err = cmd.Start()
+	}
+	confined.started()
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("start hypervisor: %w", err), confined.release(cleanupCtx))
 	}
 	machine := &chMachine{
 		dir:     dir,
+		cell:    confined,
 		process: cmd.Process,
 		exited:  make(chan struct{}),
 		serial:  serial,
@@ -206,7 +235,9 @@ func (h *CloudHypervisor) Start(_ context.Context, config MachineConfig) (Machin
 }
 
 type chMachine struct {
-	dir     string
+	dir string
+	// cell is the VM's confinement, released once the process is gone.
+	cell    *cell
 	process *os.Process
 	exited  chan struct{}
 	agent   *guest.Client
@@ -245,9 +276,10 @@ func (m *chMachine) Kill(ctx context.Context) error {
 	m.killOnce.Do(func() { _ = m.process.Kill() })
 	select {
 	case <-m.exited:
-		// The sockets and logs are of no use once the VM is gone.
-		_ = os.RemoveAll(m.dir)
-		return nil
+		// The sockets are of no use once the VM is gone, and its cgroup,
+		// device node and UID are free for the next one. Repeated on a
+		// retry if it fails: the run is not removed until it succeeds.
+		return m.cell.release(ctx)
 	case <-ctx.Done():
 		return fmt.Errorf("hypervisor process %d did not exit: %w", m.process.Pid, ctx.Err())
 	}
@@ -325,8 +357,8 @@ func (h *CloudHypervisor) owns(process Process) bool {
 }
 
 func (h *CloudHypervisor) Sweep(ctx context.Context) (int, error) {
-	if h.RunDir == "" {
-		return 0, errors.New("hypervisor sweep requires a runtime dir")
+	if h.RunDir == "" || h.confine == nil {
+		return 0, errors.New("hypervisor sweep requires a runtime dir and the confinement it cleans up")
 	}
 	list, kill := h.processes, h.kill
 	if list == nil {
@@ -373,6 +405,13 @@ func (h *CloudHypervisor) Sweep(ctx context.Context) (int, error) {
 			return killed, ctx.Err()
 		case <-time.After(50 * time.Millisecond):
 		}
+	}
+	// The command line is what a process says about itself, and a
+	// hypervisor that a guest took over can rewrite its own. The cgroups
+	// are the kernel's record: whatever is still in one of ours dies with
+	// it, and the device nodes go too.
+	if _, err := h.confine.sweep(ctx); err != nil {
+		return killed, fmt.Errorf("sweep cgroups: %w", err)
 	}
 	// Only now: with no process left, every dir in here is stale.
 	entries, err := os.ReadDir(h.RunDir)

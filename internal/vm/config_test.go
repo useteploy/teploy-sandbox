@@ -28,11 +28,18 @@ func goodConfig() Config {
 
 func goodHost() host {
 	return host{
-		goos:     "linux",
-		openKVM:  func() error { return nil },
-		lookPath: func(name string) (string, error) { return "/usr/bin/" + name, nil },
-		stat:     func(string) (os.FileInfo, error) { return fileInfo{}, nil },
-		mkdirAll: func(string, os.FileMode) error { return nil },
+		goos:          "linux",
+		euid:          func() int { return 0 },
+		openKVM:       func() error { return nil },
+		lookPath:      func(name string) (string, error) { return "/usr/bin/" + name, nil },
+		stat:          func(string) (os.FileInfo, error) { return fileInfo{mode: 0o755}, nil },
+		mkdirAll:      func(string, os.FileMode) error { return nil },
+		kvmGroup:      func() (uint32, os.FileMode, error) { return 993, 0o660, nil },
+		landlockABI:   func() (int, error) { return 4, nil },
+		accountUIDs:   func() ([]uint32, error) { return []uint32{0, 1000, 65534}, nil },
+		mappedUIDs:    func(uint32, uint32) (bool, error) { return true, nil },
+		prepareCgroup: func(string, string) error { return nil },
+		prepareDevDir: func(string) error { return nil },
 	}
 }
 
@@ -72,6 +79,55 @@ func TestPreflightNamesEachMissingPiece(t *testing.T) {
 		"a writable runtime dir":                                              func(_ *Config, h *host) { h.mkdirAll = func(string, os.FileMode) error { return fs.ErrPermission } },
 		"a shorter runtime dir":                                               func(c *Config, _ *host) { c.RunDir = "/run/" + strings.Repeat("x", 60) },
 		"a daemon identity":                                                   func(c *Config, _ *host) { c.Owner = "" },
+
+		// Confinement: each layer is required, none is optional.
+		"root: the daemon starts each VM under a UID of its own": func(_ *Config, h *host) { h.euid = func() int { return 1000 } },
+		"/dev/kvm that an unprivileged VM process can open: its mode is 0600": func(_ *Config, h *host) {
+			h.kvmGroup = func() (uint32, os.FileMode, error) { return 993, 0o600, nil }
+		},
+		"/dev/kvm that an unprivileged VM process can open: it belongs to group root": func(_ *Config, h *host) {
+			h.kvmGroup = func() (uint32, os.FileMode, error) { return 0, 0o660, nil }
+		},
+		"Landlock in the host kernel": func(_ *Config, h *host) {
+			h.landlockABI = func() (int, error) { return 0, errors.New("operation not supported") }
+		},
+		"a VM UID range above every account's": func(c *Config, _ *host) { c.UIDBase = 1000 },
+		"uid 1879048200 is an account": func(_ *Config, h *host) {
+			h.accountUIDs = func() ([]uint32, error) { return []uint32{0, 1879048200}, nil }
+		},
+		"in a container that does not map them": func(_ *Config, h *host) {
+			h.mappedUIDs = func(uint32, uint32) (bool, error) { return false, nil }
+		},
+		"a cgroup v2 group for VMs with the cpu, memory and pids controllers (--vm-cgroup / SBX_VM_CGROUP): no memory controller": func(_ *Config, h *host) {
+			h.prepareCgroup = func(string, string) error { return errors.New("no memory controller") }
+		},
+		"a directory for VM device nodes (--vm-dev-dir / SBX_VM_DEV_DIR): nodev": func(_ *Config, h *host) {
+			h.prepareDevDir = func(string) error { return errors.New("nodev") }
+		},
+		"a guest kernel image that an unprivileged VM process can read": func(_ *Config, h *host) {
+			h.stat = func(path string) (os.FileInfo, error) {
+				if path == "/boot/Image" {
+					return fileInfo{mode: 0o600}, nil
+				}
+				return fileInfo{mode: 0o755}, nil
+			}
+		},
+		"a hypervisor binary that an unprivileged VM process can run": func(_ *Config, h *host) {
+			h.stat = func(path string) (os.FileInfo, error) {
+				if path == "/usr/bin" {
+					return fileInfo{mode: fs.ModeDir | 0o750}, nil
+				}
+				return fileInfo{mode: 0o755}, nil
+			}
+		},
+		"a runtime dir that an unprivileged VM process can reach": func(_ *Config, h *host) {
+			h.stat = func(path string) (os.FileInfo, error) {
+				if path == "/run/teploy-sandbox" {
+					return fileInfo{mode: fs.ModeDir | 0o700}, nil
+				}
+				return fileInfo{mode: 0o755}, nil
+			}
+		},
 	} {
 		config, h := goodConfig(), goodHost()
 		breakIt(&config, &h)
@@ -101,7 +157,7 @@ func TestPreflightReportsEverythingAtOnce(t *testing.T) {
 
 func TestPreflightAKernelThatIsADirectoryIsMissing(t *testing.T) {
 	h := goodHost()
-	h.stat = func(string) (os.FileInfo, error) { return fileInfo{mode: fs.ModeDir}, nil }
+	h.stat = func(string) (os.FileInfo, error) { return fileInfo{mode: fs.ModeDir | 0o755}, nil }
 	if err := preflight(context.Background(), goodConfig(), newFakeZFS(), h); err == nil || !strings.Contains(err.Error(), "kernel image") {
 		t.Fatalf("got %v", err)
 	}
@@ -131,5 +187,75 @@ func TestPreflightRequiresThePoolToHideGuestPartitions(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "zfs set volmode=dev "+testPool) {
 			t.Errorf("pool volmode %q: %v", mode, err)
 		}
+	}
+}
+
+// A daemon that is not root is told that, once: not also about the
+// cgroup, the device nodes and the scratch volume it could not have made.
+func TestPreflightWithoutRootTouchesNothing(t *testing.T) {
+	h := goodHost()
+	h.euid = func() int { return 1000 }
+	touched := false
+	h.prepareCgroup = func(string, string) error { touched = true; return nil }
+	h.prepareDevDir = func(string) error { touched = true; return nil }
+	zfs := newFakeZFS()
+	err := preflight(context.Background(), goodConfig(), zfs, h)
+	if err == nil || strings.Count(err.Error(), ";") != 1 {
+		t.Fatalf("want exactly one finding, got: %v", err)
+	}
+	if touched || len(zfs.calls) != 0 {
+		t.Fatalf("the host was changed by a daemon that cannot run: touched=%v zfs=%v", touched, zfs.calls)
+	}
+}
+
+func TestKVMGroups(t *testing.T) {
+	h := goodHost()
+	if groups, err := kvmGroups(h); err != nil || len(groups) != 1 || groups[0] != 993 {
+		t.Fatalf("group-only /dev/kvm: %v %v", groups, err)
+	}
+	// Where anyone may open it, a VM process is given no group at all.
+	h.kvmGroup = func() (uint32, os.FileMode, error) { return 0, 0o666, nil }
+	if groups, err := kvmGroups(h); err != nil || len(groups) != 0 {
+		t.Fatalf("world-accessible /dev/kvm: %v %v", groups, err)
+	}
+}
+
+func TestReachableNeedsEveryDirectoryOnTheWay(t *testing.T) {
+	modes := map[string]fs.FileMode{"/": 0o755, "/opt": 0o755, "/opt/sbx": 0o711, "/opt/sbx/Image": 0o644}
+	stat := func(path string) (os.FileInfo, error) {
+		mode, ok := modes[path]
+		if !ok {
+			return nil, fs.ErrNotExist
+		}
+		return fileInfo{mode: mode}, nil
+	}
+	if err := reachable(stat, "/opt/sbx/Image", 0o004); err != nil {
+		t.Fatal(err)
+	}
+	if err := reachable(stat, "/opt/sbx/Image", 0o005); err == nil {
+		t.Fatal("a file that is not executable passed as one")
+	}
+	modes["/opt"] = 0o750
+	if err := reachable(stat, "/opt/sbx/Image", 0o004); err == nil || !strings.Contains(err.Error(), "/opt is not searchable") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestConfigDefaultsAndLayout(t *testing.T) {
+	config := Config{RunDir: "/run/x", Owner: testOwner}
+	if got := config.MachineCgroup("teploy-sbx-a"); got != DefaultCgroup+"/"+testOwner[:16]+"/teploy-sbx-a" {
+		t.Fatalf("cgroup %q", got)
+	}
+	if got := config.MachineRunDir("teploy-sbx-a"); got != "/run/x/"+testOwner[:16]+"/teploy-sbx-a" {
+		t.Fatalf("run dir %q", got)
+	}
+	filled := config.withDefaults()
+	if filled.UIDBase != DefaultUIDBase || filled.DevDir != DefaultDevDir || filled.devDir() != DefaultDevDir+"/"+testOwner[:16] {
+		t.Fatalf("defaults: %+v", filled)
+	}
+	// The default range is clear of what distributions and container
+	// runtimes allocate, and fits in a signed 32-bit id.
+	if DefaultUIDBase < 600100000+65536 || uint64(DefaultUIDBase)+UIDCount > 1<<31 {
+		t.Fatalf("default UID base %d", DefaultUIDBase)
 	}
 }

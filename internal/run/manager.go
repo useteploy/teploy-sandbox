@@ -269,6 +269,13 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	if strings.TrimSpace(req.Image) == "" {
 		return nil, fmt.Errorf("%w: image is required", ErrBadRequest)
 	}
+	// A driver that cannot honour every create says so first, in its own
+	// words, rather than through whichever later check happens to trip.
+	if admitter, ok := m.runtime.(CreateAdmitter); ok {
+		if err := admitter.AdmitCreate(req); err != nil {
+			return nil, err
+		}
+	}
 	network, err := ParseNetwork(req.Network)
 	if err != nil {
 		return nil, err
@@ -711,8 +718,26 @@ func (m *Manager) freeze(ctx context.Context, id string) (func() error, error) {
 	return func() error { return nil }, nil
 }
 
-// SnapshotRepo is the image repository all run snapshots live under.
+// SnapshotRepo is the image repository all of the Docker driver's run
+// snapshots live under. Other drivers name their own (SnapshotNamer).
 const SnapshotRepo = "teploy-sbx-snap"
+
+// newSnapshotRef asks the driver for the reference of a snapshot about to
+// be taken; ownsSnapshotRef asks it whether a reference is one of its own.
+// A runtime that is not a SnapshotNamer gets Docker's references.
+func (m *Manager) newSnapshotRef() string {
+	if namer, ok := m.runtime.(SnapshotNamer); ok {
+		return namer.NewSnapshotRef(m.now())
+	}
+	return dockerSnapshotRef(m.now())
+}
+
+func (m *Manager) ownsSnapshotRef(ref string) bool {
+	if namer, ok := m.runtime.(SnapshotNamer); ok {
+		return namer.OwnsSnapshotRef(ref)
+	}
+	return ownsDockerSnapshotRef(ref)
+}
 
 // Snapshot commits a run's filesystem to a fresh snapshot image and
 // returns its ref. Snapshots deliberately do NOT expire with the run —
@@ -735,7 +760,7 @@ func (m *Manager) Snapshot(ctx context.Context, id string) (string, error) {
 // capture commits current's filesystem to a fresh snapshot ref. The
 // caller holds the run's capture exclusivity (beginCapture).
 func (m *Manager) capture(ctx context.Context, current *Run) (string, error) {
-	ref := SnapshotRepo + ":" + strings.ToLower(NewULID(m.now()))
+	ref := m.newSnapshotRef()
 	// CachePath (not just CacheDir): a warm run's workspace lives ON the
 	// mounted volume, and the snapshot must bake those bytes in or the
 	// restore boots an empty workspace.
@@ -745,11 +770,11 @@ func (m *Manager) capture(ctx context.Context, current *Run) (string, error) {
 	return ref, nil
 }
 
-// DeleteSnapshot removes a snapshot image. Only refs under SnapshotRepo
-// are deletable through the API — the daemon must never be usable to rmi
-// arbitrary host images.
+// DeleteSnapshot removes a snapshot. Only refs in the driver's own
+// snapshot namespace are deletable through the API — the daemon must never
+// be usable to remove arbitrary host images or volumes.
 func (m *Manager) DeleteSnapshot(ctx context.Context, ref string) error {
-	if !strings.HasPrefix(ref, SnapshotRepo+":") {
+	if !m.ownsSnapshotRef(ref) {
 		return fmt.Errorf("%w: not a sandbox snapshot ref: %s", ErrBadRequest, ref)
 	}
 	// A snapshot the registry itself holds (a stopped run's filesystem, or

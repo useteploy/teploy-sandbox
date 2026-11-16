@@ -98,10 +98,10 @@ func (m *Manager) LoadState(ctx context.Context, dir string) (int, error) {
 	case err != nil:
 		return 0, fmt.Errorf("state file %s: %w; refusing to start with an empty registry", path, err)
 	default:
-		stopped, orphaned, err = decodeState(data)
+		stopped, orphaned, err = decodeState(data, m.ownsSnapshotRef)
 	}
 	if err != nil {
-		return 0, fmt.Errorf("state file %s is corrupt (%w); refusing to start with an empty registry — repair or remove it by hand, then delete any %s images it referenced", path, err, SnapshotRepo)
+		return 0, fmt.Errorf("state file %s is corrupt (%w); refusing to start with an empty registry — repair or remove it by hand, then delete any snapshots it referenced (a registry written under another --driver is refused the same way: give each driver its own --state-dir)", path, err)
 	}
 
 	m.mu.Lock()
@@ -130,8 +130,10 @@ func (m *Manager) LoadState(ctx context.Context, dir string) (int, error) {
 
 // decodeState parses a registry file into its stopped runs and the image
 // refs its running records held. Anything that does not look exactly
-// like a file this daemon wrote is an error.
-func decodeState(data []byte) (stopped []*Run, orphaned []string, err error) {
+// like a file this daemon wrote is an error — including a snapshot ref the
+// driver does not own (owns), which is what a registry written under
+// another driver looks like.
+func decodeState(data []byte, owns func(ref string) bool) (stopped []*Run, orphaned []string, err error) {
 	var file stateFile
 	if err := json.Unmarshal(data, &file); err != nil {
 		return nil, nil, err
@@ -146,15 +148,15 @@ func decodeState(data []byte) (stopped []*Run, orphaned []string, err error) {
 		}
 		seen[rec.ID] = true
 		for _, ref := range rec.Images {
-			if !strings.HasPrefix(ref, SnapshotRepo+":") {
-				return nil, nil, fmt.Errorf("run %s holds %q, which is not a sandbox snapshot ref", rec.ID, ref)
+			if !owns(ref) {
+				return nil, nil, fmt.Errorf("run %s holds %q, which is not a sandbox snapshot ref of this daemon's driver", rec.ID, ref)
 			}
 		}
 		switch rec.State {
 		case StateRunning:
 			orphaned = append(orphaned, rec.Images...)
 		case StateStopped:
-			run, err := rec.stoppedRun()
+			run, err := rec.stoppedRun(owns)
 			if err != nil {
 				return nil, nil, fmt.Errorf("run %s: %w", rec.ID, err)
 			}
@@ -170,9 +172,9 @@ func validULID(id string) bool {
 	return len(id) == 26 && strings.Trim(id, ulidAlphabet) == ""
 }
 
-func (rec stateRun) stoppedRun() (*Run, error) {
-	if !strings.HasPrefix(rec.Snapshot, SnapshotRepo+":") {
-		return nil, fmt.Errorf("stop snapshot %q is not a sandbox snapshot ref", rec.Snapshot)
+func (rec stateRun) stoppedRun(owns func(ref string) bool) (*Run, error) {
+	if !owns(rec.Snapshot) {
+		return nil, fmt.Errorf("stop snapshot %q is not a sandbox snapshot ref of this daemon's driver", rec.Snapshot)
 	}
 	if rec.StoppedAt == nil || rec.RetainUntil == nil {
 		return nil, errors.New("stopped without stoppedAt/retainUntil")

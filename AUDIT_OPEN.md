@@ -101,11 +101,31 @@ changed for a caller that does not use them):
 - `POST /v1/runs/{id}/stop`, `/resume`, `/fork`; `GET /v1/capacity`.
   Create, resume and fork share one boot path.
 - Reaper: stops instead of destroying when `onExpire` is `stop` (a failed
-  stop is retried, never turned into a destroy); deletes a stopped run at
+  stop is retried for one hour past the deadline, then the run is
+  destroyed); deletes a stopped run at
   `retainUntil` (`--stopped-retention`, default 14 days).
 - Durable registry (`--state-dir`): stopped runs survive a restart; a
   corrupt or unreadable file refuses the start; graceful shutdown stops
-  `onExpire: stop` runs instead of destroying them.
+  `onExpire: stop` runs instead of destroying them. An unwritable
+  DEFAULT state dir falls back to memory with a warning, so an existing
+  deployment's flags keep working; a named one refuses the start.
+
+Review of the branch (same day) fixed two state-losing defects: the
+reaper acting on a stale copy of a run that was resumed or stopped
+during its pass, and a stop discarding its capture when the client
+disconnected before the container was removed.
+
+Left open by that review:
+
+- Each stop commits on top of the previous snapshot, so one run stopped
+  and resumed about a hundred times may reach the storage driver's layer
+  limit and stop failing. Unmeasured.
+- A crash between a capture and the registry write leaks one image, and
+  registry-owned and caller-owned snapshots share the `teploy-sbx-snap:`
+  namespace, so nothing can garbage-collect them safely yet.
+- Stop answers 200 when the registry write fails (logged, retried on the
+  next tick); a restart inside that window loses the run.
+- Shutdown stops share the 45-second cleanup budget.
 
 **Not yet run against real Docker.** Everything above is proven only
 against the in-process fake runtime (`go test`, `go test -race`). The

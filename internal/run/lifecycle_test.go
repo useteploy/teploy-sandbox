@@ -1053,6 +1053,34 @@ func TestReaperStopsRunsThatAskedForIt(t *testing.T) {
 	}
 }
 
+// A stop that keeps failing does not keep the container forever: past
+// StopGrace the run is destroyed like any other expired run.
+func TestReaperDestroysStopOnExpireRunAfterGrace(t *testing.T) {
+	m, rt, _ := newTestManager(t)
+	clock := newTestClock(m)
+	keep := mustCreate(t, m, CreateRequest{TTLSec: 60, OnExpire: "stop"})
+	rt.snapshotErr = errors.New("docker commit failed")
+
+	clock.advance(time.Minute + StopGrace - time.Second)
+	if reaped := m.Reap(context.Background()); reaped != 0 {
+		t.Fatalf("inside the grace period the stop is only retried: %d", reaped)
+	}
+	if got, _ := m.Get(keep.ID); got == nil || got.State != StateRunning {
+		t.Fatal("the run must survive until the grace period ends")
+	}
+
+	clock.advance(2 * time.Second)
+	if reaped := m.Reap(context.Background()); reaped != 1 {
+		t.Fatalf("past the grace period the run is destroyed: %d", reaped)
+	}
+	if _, err := m.Get(keep.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the run must be gone: %v", err)
+	}
+	if !slices.Contains(rt.removed, keep.ContainerID) {
+		t.Fatal("its container must be removed")
+	}
+}
+
 // A stopped run is not reaped at its old deadline; it is deleted, record
 // and snapshot, when its retention passes.
 func TestReaperRetentionDeletesStoppedRuns(t *testing.T) {

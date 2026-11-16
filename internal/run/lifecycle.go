@@ -32,6 +32,13 @@ const (
 
 	// DefaultStoppedRetention is how long a stopped run is kept.
 	DefaultStoppedRetention = 14 * 24 * time.Hour
+
+	// StopGrace bounds how long past its deadline a stop-on-expire run may
+	// keep running while its stop keeps failing (an exec in flight at every
+	// tick, a capture that cannot complete). After it the run is destroyed:
+	// every run dies, and a container that can never be captured must not
+	// hold a host forever.
+	StopGrace = time.Hour
 )
 
 // ParseOnExpire resolves the wire value of onExpire; absent is "destroy",

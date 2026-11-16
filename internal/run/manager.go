@@ -898,9 +898,11 @@ func (m *Manager) Reap(ctx context.Context) int {
 				reaped++
 			}
 		case current.ExpiresAt.After(now):
-		case current.OnExpire == OnExpireStop && !current.pendingCleanup:
-			// Never destroyed on a failed stop: the run asked to keep its
-			// state, so it waits for a tick where the stop succeeds.
+		case current.OnExpire == OnExpireStop && !current.pendingCleanup && now.Before(current.ExpiresAt.Add(StopGrace)):
+			// A failed stop is retried, not turned into a destroy: the run
+			// asked to keep its state, so it waits for a tick where the
+			// stop succeeds — until StopGrace, when the default case below
+			// destroys it like any other expired run.
 			_, err := m.stopIf(ctx, current.ID, func(live *Run) bool { return !live.ExpiresAt.After(now) })
 			switch {
 			case errors.Is(err, errNotDue), errors.Is(err, ErrStopped):
@@ -920,6 +922,9 @@ func (m *Manager) Reap(ctx context.Context) int {
 			case err != nil:
 				m.log.Error("reap remove failed", "id", current.ID, "error", err)
 			default:
+				if current.OnExpire == OnExpireStop {
+					m.log.Error("stop-on-expire run could not be stopped within the grace period and was destroyed", "id", current.ID, "grace", StopGrace.String())
+				}
 				reaped++
 			}
 		}

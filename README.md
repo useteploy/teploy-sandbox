@@ -79,8 +79,10 @@ deletes it at `retainUntil`, which is stop time plus
 `--stopped-retention` / `SBX_STOPPED_RETENTION` (a Go duration, default
 `336h`; a malformed or non-positive value refuses to start). A run with
 `onExpire: "stop"` whose stop fails at the deadline is retried on every
-reaper tick and is never destroyed in its place — so a run that is busy
-at every tick outlives its deadline until one finds it idle.
+reaper tick for one hour — so a run that is busy at every tick outlives
+its deadline until one finds it idle. After that hour it is destroyed
+like any other expired run: a container that can never be captured does
+not hold the host forever.
 
 The images behind all this belong to the daemon, not the caller: they
 are not returned, `DELETE /v1/snapshots` refuses them with a 409, and
@@ -106,6 +108,9 @@ callers put tokens. One daemon owns a state directory.
   stops nothing — a running run's state is lost with its container.
 - A state file that cannot be read or parsed refuses the start. Starting
   empty would orphan every stopped run's snapshot without a word.
+- A state dir you name (flag or env) must be usable or the daemon
+  refuses to start. The default one is tried: if it cannot be created or
+  written, the daemon starts with the registry in memory and logs why.
 - An empty `--state-dir` keeps the registry in memory. Stop, resume and
   fork still work; nothing stopped survives a restart, and the snapshots
   are left behind for the operator.

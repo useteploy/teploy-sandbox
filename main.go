@@ -113,6 +113,27 @@ func serve(args []string) error {
 		}
 		defer cacheLock.Close()
 	}
+	// The default state dir is new in this version. A deployment that never
+	// asked for it and cannot write there (it moved --cache-root off /var/lib
+	// for that reason) must keep starting as it did: fall back to the
+	// in-memory registry and say so. A dir the operator named is a hard
+	// requirement, and so is a registry file that exists but cannot be read.
+	stateDirDefaulted := false
+	if os.Getenv("SBX_STATE_DIR") == "" {
+		stateDirDefaulted = true
+		flags.Visit(func(f *flag.Flag) {
+			if f.Name == "state-dir" {
+				stateDirDefaulted = false
+			}
+		})
+	}
+	stateDirSkipped := ""
+	if *stateDir != "" && stateDirDefaulted {
+		if err := probeWritableDir(*stateDir); err != nil {
+			stateDirSkipped = fmt.Sprintf("%s: %v", *stateDir, err)
+			*stateDir = ""
+		}
+	}
 	if *stateDir != "" {
 		absolute, err := filepath.Abs(*stateDir)
 		if err != nil {
@@ -231,6 +252,8 @@ func serve(args []string) error {
 			return fmt.Errorf("load run registry: %w", err)
 		}
 		log.Info("durable run registry enabled", "dir", *stateDir, "stopped", stopped, "retention", retention.String())
+	} else if stateDirSkipped != "" {
+		log.Warn("default state dir is not writable: stopped runs do not survive a daemon restart (set --state-dir)", "error", stateDirSkipped)
 	} else {
 		log.Warn("no state dir: stopped runs do not survive a daemon restart")
 	}
@@ -277,4 +300,18 @@ func envFloat(name string, fallback float64) float64 {
 		}
 	}
 	return fallback
+}
+
+// probeWritableDir reports whether dir can be created and written.
+func probeWritableDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	probe, err := os.CreateTemp(dir, ".probe-*")
+	if err != nil {
+		return err
+	}
+	name := probe.Name()
+	probe.Close()
+	return os.Remove(name)
 }

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -31,5 +33,22 @@ func TestParseRetention(t *testing.T) {
 	got, err := parseRetention(run.DefaultStoppedRetention.String())
 	if err != nil || got != 14*24*time.Hour {
 		t.Fatalf("default retention: %v %v", got, err)
+	}
+}
+
+func TestProbeWritableDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested", "state")
+	if err := probeWritableDir(dir); err != nil {
+		t.Fatalf("a creatable dir must pass: %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("the probe must leave nothing behind: %v", entries)
+	}
+	file := filepath.Join(t.TempDir(), "plain")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := probeWritableDir(filepath.Join(file, "state")); err == nil {
+		t.Fatal("a dir that cannot be created must fail")
 	}
 }

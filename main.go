@@ -63,6 +63,7 @@ Usage:
                        [--vm-pool sbx] [--vm-golden sbx/golden-guestd@v1] [--vm-run-dir /run/teploy-sandbox/vm]
                        [--vm-uid-base 1879048192] [--vm-cgroup /sys/fs/cgroup/teploy-sandbox-vm]
                        [--vm-dev-dir /dev/teploy-sandbox]
+                       [--vm-subnet 10.209.0.0/16] [--vm-dns 192.0.2.53,...] [--vm-open-private]
   teploy-sandbox version`)
 }
 
@@ -104,6 +105,12 @@ func serve(args []string) error {
 		"vm driver: the cgroup v2 directory each VM gets a group in, with the cpu, memory and pids controllers")
 	vmDevDir := flags.String("vm-dev-dir", envOr("SBX_VM_DEV_DIR", vm.DefaultDevDir),
 		"vm driver: directory for each VM's private disk device node; must allow device nodes (not /run)")
+	vmSubnet := flags.String("vm-subnet", envOr("SBX_VM_SUBNET", vm.DefaultSubnet),
+		"vm driver: the IPv4 range guests are addressed from; nothing else on the host may use it")
+	vmDNS := flags.String("vm-dns", envOr("SBX_VM_DNS", ""),
+		"vm driver: up to three IPv4 resolvers for the guests of runs with network \"open\" (comma-separated; default: the host's own, where they are not on the host itself)")
+	vmOpenPrivate := flags.Bool("vm-open-private", envOr("SBX_VM_OPEN_PRIVATE", "") == "true",
+		"vm driver: let runs with network \"open\" reach private address ranges (the host's LAN, an overlay network), as the docker driver's open tier does; off, they reach the public internet only")
 	vmBootTimeout := flags.Duration("vm-boot-timeout", envDuration("SBX_VM_BOOT_TIMEOUT", vm.DefaultBootTimeout),
 		"vm driver: how long a new VM may take to answer")
 	if err := flags.Parse(args); err != nil {
@@ -242,10 +249,22 @@ func serve(args []string) error {
 			Cgroup:      *vmCgroup,
 			DevDir:      *vmDevDir,
 			BootTimeout: *vmBootTimeout,
+			Subnet:      *vmSubnet,
+			DNS:         egress.ParseAllowlist(*vmDNS),
+			OpenPrivate: *vmOpenPrivate,
 		}, log)
 		if err != nil {
 			return err
 		}
+		defer func() {
+			// After every run is gone: with no VM left, the firewall
+			// tables and the gateway device go too.
+			closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := driver.Close(closeCtx); err != nil {
+				log.Warn("vm network teardown", "error", err)
+			}
+		}()
 		// No VM outlives its daemon, exactly as no container does: every
 		// VM process and run volume carrying this daemon's mark belongs to
 		// a previous life and is unreachable. Stopped runs have neither —
@@ -257,10 +276,19 @@ func serve(args []string) error {
 		if processes > 0 || volumes > 0 {
 			log.Info("swept orphaned run VMs from a previous daemon life", "processes", processes, "volumes", volumes)
 		}
+		// Every allowlist run gets a proxy and a credential of its own, on
+		// the address guests reach the host at. There is no shared
+		// listener: a guest is admitted to its own run's port and no other.
+		if gateway, ok := driver.Gateway(); ok {
+			allow := append(egress.Allowlist{}, egress.DefaultAllowlist...)
+			allow = append(allow, deployAllow...)
+			pool = &egress.Pool{Base: allow, Bind: gateway, Log: log, Private: true}
+			defer pool.Shutdown()
+		}
 		backend = driver
 		runtimeName = "cloud-hypervisor"
-		log.Warn("vm driver is experimental: runs have no network, run as root in the guest, and warm caches are unavailable",
-			"pool", *vmPool, "golden", *vmGolden, "kernel", *vmKernel)
+		log.Warn("vm driver is experimental: runs run as root in the guest, and warm caches are unavailable",
+			"pool", *vmPool, "golden", *vmGolden, "kernel", *vmKernel, "subnet", *vmSubnet, "openPrivate", *vmOpenPrivate)
 		if warmUnavailable {
 			log.Info("warm repo cache is not available under the vm driver; --cache-root is ignored")
 		}

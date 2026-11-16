@@ -135,8 +135,9 @@ Left open by that review:
 **Run against real Docker 2026-11-15** (Docker 29.5, arm64, `runc`,
 Linux 6.8, as root): the whole integration suite passes, including
 `TestRealStopResumeAcrossRestart` cold and warm and the host firewall
-fixtures. Still unverified: `SBX_TEST_RUNTIME=runsc`, an x86-64 host, and
-`TestRealSandboxUser` (skipped without `SBX_TEST_USER_IMAGE`).
+fixtures. CI runs the same suite as root on an x86-64 runner and passes.
+Still unverified: `SBX_TEST_RUNTIME=runsc`, and `TestRealSandboxUser`
+(skipped without `SBX_TEST_USER_IMAGE`).
 The three assumptions only a real daemon could confirm held on that image
 store: an image a container was created from cannot be deleted until the
 container is gone, while a snapshot a later one was committed on top of

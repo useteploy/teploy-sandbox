@@ -560,3 +560,159 @@ func TestNativeHostFirewallFixture(t *testing.T) {
 	}
 	probe(false)
 }
+
+// snapshotImageCount is how many images exist under the snapshot repo.
+func snapshotImageCount(t *testing.T) int {
+	t.Helper()
+	out, err := exec.Command("docker", "images", "-q", run.SnapshotRepo).Output()
+	if err != nil {
+		t.Fatalf("docker images: %v", err)
+	}
+	return len(strings.Fields(string(out)))
+}
+
+// Persistent runs against real Docker: stop a run, throw the manager away
+// (a daemon restart), load the registry file into a new one, resume under
+// the same ID and read the same bytes back. Cold keeps its workspace in
+// the container layer; warm keeps it on a bind-mounted volume that the
+// stop must bake into the snapshot and the resume must seed back — with
+// no template merged underneath. The run's env must survive too, and when
+// the run is finally destroyed no snapshot image may be left behind:
+// Docker refuses to delete an image a container was created from, so the
+// stop snapshot can only go once the resumed container has.
+func TestRealStopResumeAcrossRestart(t *testing.T) {
+	image := os.Getenv("SBX_TEST_IMAGE")
+	if image == "" {
+		image = "debian:bookworm-slim"
+	}
+	payload := []byte("line one\nline two\x00\xff binary tail")
+	for _, tc := range []struct {
+		name string
+		warm *run.WarmRequest
+	}{
+		{"cold", nil},
+		{"warm", &run.WarmRequest{Repo: "example.com/persist"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			log := slog.New(slog.NewTextHandler(io.Discard, nil))
+			stateDir := t.TempDir()
+			cacheRoot := os.Getenv("SBX_TEST_CACHE")
+			if cacheRoot == "" {
+				cacheRoot = t.TempDir()
+			}
+			imagesBefore := snapshotImageCount(t)
+
+			runtime := &run.DockerRuntime{Runtime: os.Getenv("SBX_TEST_RUNTIME")}
+			first := run.NewManager(runtime, log)
+			first.Cache = run.NewCacheStore(cacheRoot, 0)
+			if _, err := first.LoadState(ctx, stateDir); err != nil {
+				t.Fatal(err)
+			}
+			if tc.warm != nil {
+				// A template holding a file the run deletes: a resume that
+				// merged the template back would resurrect it.
+				seed, err := first.Create(ctx, run.CreateRequest{Image: image, TTLSec: 300, Warm: tc.warm})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = first.Destroy(context.Background(), seed.ID) })
+				if _, _, err := execRun(t, runtime, seed.ContainerID, "printf 'module example.com/persist\\n' > /work/go.mod && printf stale > /work/stale.txt"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := first.CommitWarm(ctx, seed.ID, ""); err != nil {
+					t.Fatal(err)
+				}
+				if err := first.Destroy(ctx, seed.ID); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = first.DropWarm(tc.warm.Repo) })
+			}
+
+			created, err := first.Create(ctx, run.CreateRequest{
+				Image: image, TTLSec: 300, Warm: tc.warm,
+				Env:    map[string]string{"PERSIST_MARK": "kept across the stop"},
+				Labels: map[string]string{"suite": "integration"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = first.Destroy(context.Background(), created.ID) })
+			if err := runtime.WriteFile(ctx, created.ContainerID, run.WorkDir+"/notes/a.bin", bytes.NewReader(payload)); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := execRun(t, runtime, created.ContainerID, "rm -f /work/stale.txt && printf untracked > /work/untracked.txt"); err != nil {
+				t.Fatal(err)
+			}
+
+			stopped, err := first.Stop(ctx, created.ID)
+			if err != nil {
+				t.Fatalf("stop: %v", err)
+			}
+			if stopped.State != run.StateStopped {
+				t.Fatalf("state after stop: %q", stopped.State)
+			}
+			if out, _ := exec.Command("docker", "ps", "-aq", "--filter", "name=teploy-sbx-"+strings.ToLower(created.ID)).Output(); strings.TrimSpace(string(out)) != "" {
+				t.Fatalf("stop left the container behind: %s", out)
+			}
+
+			// --- restart: nothing of the first manager is reused.
+			second := run.NewManager(&run.DockerRuntime{Runtime: os.Getenv("SBX_TEST_RUNTIME")}, log)
+			second.Cache = run.NewCacheStore(cacheRoot, 0)
+			loaded, err := second.LoadState(ctx, stateDir)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if loaded != 1 {
+				t.Fatalf("loaded %d stopped runs, want 1", loaded)
+			}
+			t.Cleanup(func() { _ = second.Destroy(context.Background(), created.ID) })
+
+			resumed, err := second.Resume(ctx, created.ID, 300)
+			if err != nil {
+				t.Fatalf("resume: %v", err)
+			}
+			if resumed.ID != created.ID || resumed.State != run.StateRunning || resumed.Labels["suite"] != "integration" {
+				t.Fatalf("resumed run: %+v", resumed)
+			}
+			got, err := runtime.ReadFile(ctx, resumed.ContainerID, run.WorkDir+"/notes/a.bin")
+			if err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("file bytes did not survive stop/restart/resume: %q err=%v", got, err)
+			}
+			if _, out, err := execRun(t, runtime, resumed.ContainerID, `cat /work/untracked.txt; printf '|%s' "$PERSIST_MARK"`); err != nil || out != "untracked|kept across the stop" {
+				t.Fatalf("workspace or env after resume: %q err=%v", out, err)
+			}
+			if _, out, err := execRun(t, runtime, resumed.ContainerID, "test ! -e /work/stale.txt && echo absent"); err != nil || strings.TrimSpace(out) != "absent" {
+				t.Fatalf("a file deleted before the stop came back: %q err=%v", out, err)
+			}
+
+			// A second stop/resume in the same life, then a fork: the
+			// child sees the same bytes under its own ID.
+			if _, err := second.Stop(ctx, created.ID); err != nil {
+				t.Fatalf("second stop: %v", err)
+			}
+			if _, err := second.Resume(ctx, created.ID, 300); err != nil {
+				t.Fatalf("second resume: %v", err)
+			}
+			child, err := second.Fork(ctx, created.ID, run.ForkRequest{TTLSec: 300})
+			if err != nil {
+				t.Fatalf("fork: %v", err)
+			}
+			t.Cleanup(func() { _ = second.Destroy(context.Background(), child.ID) })
+			if got, err := runtime.ReadFile(ctx, child.ContainerID, run.WorkDir+"/notes/a.bin"); err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("fork did not carry the file bytes: %q err=%v", got, err)
+			}
+
+			if err := second.Destroy(ctx, child.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := second.Destroy(ctx, created.ID); err != nil {
+				t.Fatal(err)
+			}
+			if after := snapshotImageCount(t); after != imagesBefore {
+				t.Fatalf("snapshot images leaked: %d before, %d after", imagesBefore, after)
+			}
+		})
+	}
+}

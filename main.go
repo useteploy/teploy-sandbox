@@ -109,7 +109,7 @@ func serve(args []string) error {
 		"vm driver: the IPv4 range guests are addressed from; nothing else on the host may use it")
 	vmDNS := flags.String("vm-dns", envOr("SBX_VM_DNS", ""),
 		"vm driver: up to three IPv4 resolvers for the guests of runs with network \"open\" (comma-separated; default: the host's own, where they are not on the host itself)")
-	vmOpenPrivate := flags.Bool("vm-open-private", envOr("SBX_VM_OPEN_PRIVATE", "") == "true",
+	vmOpenPrivate := flags.Bool("vm-open-private", envBool("SBX_VM_OPEN_PRIVATE"),
 		"vm driver: let runs with network \"open\" reach private address ranges (the host's LAN, an overlay network), as the docker driver's open tier does; off, they reach the public internet only")
 	vmBootTimeout := flags.Duration("vm-boot-timeout", envDuration("SBX_VM_BOOT_TIMEOUT", vm.DefaultBootTimeout),
 		"vm driver: how long a new VM may take to answer")
@@ -439,6 +439,13 @@ func envFloat(name string, fallback float64) float64 {
 		}
 	}
 	return fallback
+}
+
+// envBool reads a boolean setting; anything strconv does not read as true
+// is false, so a typo never widens what a run can reach.
+func envBool(name string) bool {
+	value, err := strconv.ParseBool(os.Getenv(name))
+	return err == nil && value
 }
 
 func envDuration(name string, fallback time.Duration) time.Duration {

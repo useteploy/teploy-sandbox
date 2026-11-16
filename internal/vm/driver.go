@@ -326,16 +326,32 @@ func (d *Driver) Remove(ctx context.Context, containerID string) error {
 // paused only for the instant the snapshot is taken, so what is captured
 // is the disk as of one moment — what a power cut at that moment would
 // leave, with everything written before the flush guaranteed to be there.
+//
+// A run whose VM is gone (the guest powered off, the hypervisor crashed,
+// or a Remove killed it and then could not destroy the volume) still has
+// its disk, and that disk is captured as it is: nothing writes to it any
+// more, so there is nothing to flush or pause. Without this a stop that
+// failed half way could never be retried, and the run could only be
+// destroyed.
 func (d *Driver) Snapshot(ctx context.Context, containerID, volumePath, imageRef string) error {
 	if volumePath != "" {
 		return unsupported("has no warm volumes to capture")
 	}
-	current, err := d.instance(containerID)
-	if err != nil {
-		return err
+	d.mu.Lock()
+	current, ok := d.machines[containerID]
+	d.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("no vm for %s", containerID)
+	}
+	select {
+	case <-current.machine.Exited():
+		return d.volumes.Capture(ctx, containerID, imageRef, func() (func() error, error) {
+			return func() error { return nil }, nil
+		})
+	default:
 	}
 	syncCtx, cancel := context.WithTimeout(ctx, syncTimeout)
-	err = current.machine.Agent().Sync(syncCtx)
+	err := current.machine.Agent().Sync(syncCtx)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("flush guest filesystems: %w", err)

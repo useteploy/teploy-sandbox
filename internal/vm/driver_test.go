@@ -504,3 +504,77 @@ func TestVCPUsRoundUpToWholeCPUs(t *testing.T) {
 		}
 	}
 }
+
+// Remove kills the VM before it destroys the volume, and the kill cannot
+// be undone. When the volume then cannot be destroyed, the manager throws
+// the stop snapshot away and keeps the run as "running" — on a VM that no
+// longer exists. The run's disk must still be capturable, or the only
+// thing left to do with it is destroy it.
+func TestAStopWhoseVolumeRemovalFailedCanBeRetried(t *testing.T) {
+	rig := newRig(t, nil)
+	created, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := []byte("the work")
+	must(t, rig.manager.WriteFile(bg, created.ID, run.LeaseCredential{}, "/work/a", bytes.NewReader(blob)))
+
+	rig.zfs.fail["destroy "+rig.volume(created.ID)] = errors.New("dataset is busy")
+	if _, err := rig.manager.Stop(bg, created.ID); err == nil {
+		t.Fatal("stop succeeded although the volume was not removed")
+	}
+	machine := rig.hypervisor.machine(containerName(created.ID))
+	if !machine.isDead() {
+		t.Fatal("the scenario needs the VM killed by the failed remove")
+	}
+	if z := rig.zfs; z.originOf(rig.volume(created.ID)) != testGolden {
+		t.Fatalf("the discarded capture left the run volume on %q", z.originOf(rig.volume(created.ID)))
+	}
+
+	stopped, err := rig.manager.Stop(bg, created.ID)
+	if err != nil {
+		t.Fatalf("the retried stop of a run whose VM is gone: %v", err)
+	}
+	if stopped.State != run.StateStopped {
+		t.Fatalf("stopped: %+v", stopped)
+	}
+	resumed, err := rig.manager.Resume(bg, created.ID, 0)
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	got, err := rig.manager.ReadFile(bg, resumed.ID, "/work/a")
+	if err != nil || !bytes.Equal(got, blob) {
+		t.Fatalf("the run's disk did not survive: %q %v", got, err)
+	}
+	must(t, rig.manager.Destroy(bg, created.ID))
+	assertPool(t, rig.zfs, pristine...)
+}
+
+// A guest that powers itself off (or a hypervisor that crashes) leaves a
+// run with a disk and no VM. Stop keeps that disk like any other.
+func TestARunWhoseVMExitedCanStillBeStoppedAndResumed(t *testing.T) {
+	rig := newRig(t, nil)
+	created, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	must(t, rig.manager.WriteFile(bg, created.ID, run.LeaseCredential{}, "/work/a", strings.NewReader("kept")))
+	machine := rig.hypervisor.machine(containerName(created.ID))
+	must(t, machine.Kill(bg)) // the guest powered off
+	machine.events = nil
+
+	if _, err := rig.manager.Stop(bg, created.ID); err != nil {
+		t.Fatalf("stop of a run whose VM exited: %v", err)
+	}
+	// Nothing is asked of a VM that is not there.
+	if slices.Contains(machine.events, "sync") || slices.Contains(machine.events, "pause") || slices.Contains(machine.events, "resume") {
+		t.Fatalf("a dead VM was asked to quiesce: %v", machine.events)
+	}
+	resumed, err := rig.manager.Resume(bg, created.ID, 0)
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if got, err := rig.manager.ReadFile(bg, resumed.ID, "/work/a"); err != nil || string(got) != "kept" {
+		t.Fatalf("read after resume: %q %v", got, err)
+	}
+}

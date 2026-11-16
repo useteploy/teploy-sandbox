@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/useteploy/teploy-sandbox/internal/egress"
@@ -41,6 +43,11 @@ func ParseUser(raw string) (root bool, err error) {
 var (
 	ErrNotFound   = errors.New("run not found")
 	ErrBadRequest = errors.New("bad request")
+	// ErrStopped: the call needs a container and the run is stopped (see
+	// lifecycle.go). ErrRunning: the call needs a stopped run. Both are
+	// conflicts with the run's state, not missing runs.
+	ErrStopped = errors.New("run is stopped")
+	ErrRunning = errors.New("run is running")
 )
 
 // Network tiers. The wire accepts "egress" as an alias for
@@ -100,7 +107,25 @@ type Run struct {
 	CacheDir  string    `json:"-"`
 	CachePath string    `json:"-"`
 	CreatedAt time.Time `json:"createdAt"`
+	// ExpiresAt is the running deadline. A stopped run keeps the deadline
+	// it had and is not reaped by it; RetainUntil governs it instead.
 	ExpiresAt time.Time `json:"expiresAt"`
+	// State is StateRunning or StateStopped. A stopped run has no
+	// container: its filesystem is held in a snapshot until resume.
+	State string `json:"state"`
+	// Labels are the caller's own key/value metadata, opaque to the daemon.
+	Labels map[string]string `json:"labels,omitempty"`
+	// OnExpire is what the reaper does at ExpiresAt: OnExpireDestroy or
+	// OnExpireStop.
+	OnExpire string `json:"onExpire"`
+	// Usage is filled in on the copies Get/List hand out.
+	Usage RunUsage `json:"usage"`
+	// StoppedAt and RetainUntil are set only while stopped; a stopped run
+	// is deleted, snapshot included, once RetainUntil passes.
+	StoppedAt   *time.Time `json:"stoppedAt,omitempty"`
+	RetainUntil *time.Time `json:"retainUntil,omitempty"`
+	// ForkedFrom is the run this one was forked from, when it was.
+	ForkedFrom string `json:"forkedFrom,omitempty"`
 	// Lease is the run's writable-takeover lease when one is held (see
 	// lease.go). Guarded by Manager.mu and copy-on-write: the pointer is
 	// replaced, never mutated, so the copies Get/List hand out stay
@@ -116,6 +141,33 @@ type Run struct {
 	exclusive      bool
 	removing       bool
 	pendingCleanup bool
+
+	// What it takes to recreate the container on resume or fork. Guarded
+	// by Manager.mu and never mutated in place (the maps and slices are
+	// shared with the copies Get/List hand out).
+	env         map[string]string
+	egressAllow []string
+	limits      Limits
+	warmReq     *WarmRequest
+	// snapshot is the stop snapshot while stopped. images are snapshot
+	// refs this run's container was created from, which Docker will not
+	// delete while that container exists: they go when it does.
+	snapshot string
+	images   []string
+	// leftover is a container a failed resume could not remove. It still
+	// holds the run's container name, so it must go before the next try.
+	leftover string
+	// runningFor is the time spent running before the current stretch;
+	// runningSince is when the current stretch began (zero while stopped).
+	runningFor   time.Duration
+	runningSince time.Time
+}
+
+// RunUsage is what a run has consumed so far.
+type RunUsage struct {
+	// RunningSec is the total time spent in StateRunning, accumulated
+	// across stop/resume and including the current stretch.
+	RunningSec int64 `json:"runningSec"`
 }
 
 // WarmState is the warm-cache view of a run: which repo's volume it
@@ -149,6 +201,11 @@ type CreateRequest struct {
 	// tests, binding low ports). Root stays reachable from the default
 	// through passwordless sudo.
 	User string `json:"user,omitempty"`
+	// Labels are caller metadata returned on the run (ValidateLabels).
+	Labels map[string]string `json:"labels,omitempty"`
+	// OnExpire is "destroy" (or absent) to remove the run at its deadline,
+	// "stop" to stop it there instead (see Manager.Stop).
+	OnExpire string `json:"onExpire,omitempty"`
 }
 
 type Limits struct {
@@ -158,7 +215,8 @@ type Limits struct {
 }
 
 // Manager owns the run registry, lifecycle, and the TTL reaper — every
-// run dies at its deadline no matter what (the preview-env lesson).
+// run's container dies at its deadline no matter what (the preview-env
+// lesson); a run that asked for onExpire "stop" leaves a snapshot behind.
 type Manager struct {
 	runtime Runtime
 	log     *slog.Logger
@@ -177,9 +235,19 @@ type Manager struct {
 	// (DefaultSandboxUser unless the operator changed it). Empty runs every
 	// run as root, the behaviour before the account existed.
 	SandboxUser string
+	// StoppedRetention is how long a stopped run is kept before the reaper
+	// deletes it and its snapshot.
+	StoppedRetention time.Duration
 
 	mu   sync.Mutex
 	runs map[string]*Run
+
+	// statePath is the durable registry file ("" = memory only). persistMu
+	// orders writers so an older registry can never replace a newer one;
+	// it is taken before mu, never under it.
+	statePath  string
+	persistMu  sync.Mutex
+	stateDirty atomic.Bool
 }
 
 func NewManager(runtime Runtime, log *slog.Logger) *Manager {
@@ -189,7 +257,8 @@ func NewManager(runtime Runtime, log *slog.Logger) *Manager {
 		now:     time.Now,
 		runs:    make(map[string]*Run),
 
-		SandboxUser: DefaultSandboxUser,
+		SandboxUser:      DefaultSandboxUser,
+		StoppedRetention: DefaultStoppedRetention,
 	}
 }
 
@@ -221,53 +290,34 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	if err != nil {
 		return nil, err
 	}
-	ttl := DefaultTTL
-	if req.TTLSec > 0 {
-		ttl = time.Duration(req.TTLSec) * time.Second
+	ttl, err := resolveTTL(req.TTLSec)
+	if err != nil {
+		return nil, err
 	}
-	if ttl > MaxTTL {
-		return nil, fmt.Errorf("%w: ttlSec exceeds the %s maximum", ErrBadRequest, MaxTTL)
+	onExpire, err := ParseOnExpire(req.OnExpire)
+	if err != nil {
+		return nil, err
 	}
-
-	spec := CreateSpec{
-		Image:    req.Image,
-		Env:      req.Env,
-		MemoryMB: DefaultMemoryMB,
-		CPUs:     DefaultCPUs,
-		Pids:     DefaultPids,
-		Network:  network,
-		User:     RootUser,
+	if err := ValidateLabels(req.Labels); err != nil {
+		return nil, err
 	}
-	if !wantRoot && m.SandboxUser != "" {
-		spec.User = m.SandboxUser
-	}
-	if network == NetworkAllowlist {
-		if m.ProxyURL == "" && m.Egress == nil {
-			return nil, fmt.Errorf("%w: allowlist network unavailable: proxy/firewall required", ErrBadRequest)
-		}
-		// Only the allowlist tier has a proxy to point at. On "none"
-		// there is nothing to reach and on "open" a proxy env var
-		// would quietly re-impose the filter the caller opted out of.
-		spec.ProxyURL = m.ProxyURL
-	}
-	if req.Limits != nil {
-		if req.Limits.MemoryMB > 0 {
-			spec.MemoryMB = req.Limits.MemoryMB
-		}
-		if req.Limits.CPUs > 0 {
-			spec.CPUs = req.Limits.CPUs
-		}
-		if req.Limits.Pids > 0 {
-			spec.Pids = req.Limits.Pids
-		}
+	if network == NetworkAllowlist && m.ProxyURL == "" && m.Egress == nil {
+		return nil, fmt.Errorf("%w: allowlist network unavailable: proxy/firewall required", ErrBadRequest)
 	}
 
 	now := m.now()
-	id := NewULID(now)
-	spec.Name = "teploy-sbx-" + strings.ToLower(id)
-
-	warmState := (*WarmState)(nil)
-	seedFromSnapshot := false
+	boot := bootRequest{
+		id:      NewULID(now),
+		image:   req.Image,
+		env:     maps.Clone(req.Env),
+		network: network,
+		extra:   extra,
+		limits:  resolveLimits(req.Limits),
+		user:    RootUser,
+	}
+	if !wantRoot && m.SandboxUser != "" {
+		boot.user = m.SandboxUser
+	}
 	if req.Warm != nil {
 		if m.Cache == nil {
 			return nil, fmt.Errorf("%w: this daemon has no cache store (serve --cache-root)", ErrBadRequest)
@@ -280,44 +330,162 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		if err != nil {
 			return nil, err
 		}
+		boot.warm = &WarmRequest{Repo: slug, Path: path}
+	}
+
+	run := &Run{
+		Image:     req.Image,
+		CreatedAt: now,
+		ExpiresAt: now.Add(ttl),
+		Labels:    maps.Clone(req.Labels),
+		OnExpire:  onExpire,
+	}
+	created, err := m.launch(ctx, boot, run)
+	if err != nil {
+		return nil, err
+	}
+	m.log.Info("run created", "id", created.ID, "image", req.Image, "network", network, "user", created.User, "egressAllow", len(extra), "expiresAt", created.ExpiresAt)
+	return created, nil
+}
+
+// resolveTTL applies the create rules to a wire ttlSec: absent (or not
+// positive) is the default, and nothing outlives MaxTTL.
+func resolveTTL(ttlSec int) (time.Duration, error) {
+	ttl := DefaultTTL
+	if ttlSec > 0 {
+		ttl = time.Duration(ttlSec) * time.Second
+	}
+	if ttl > MaxTTL {
+		return 0, fmt.Errorf("%w: ttlSec exceeds the %s maximum", ErrBadRequest, MaxTTL)
+	}
+	return ttl, nil
+}
+
+func resolveLimits(req *Limits) Limits {
+	limits := Limits{MemoryMB: DefaultMemoryMB, CPUs: DefaultCPUs, Pids: DefaultPids}
+	if req != nil {
+		if req.MemoryMB > 0 {
+			limits.MemoryMB = req.MemoryMB
+		}
+		if req.CPUs > 0 {
+			limits.CPUs = req.CPUs
+		}
+		if req.Pids > 0 {
+			limits.Pids = req.Pids
+		}
+	}
+	return limits
+}
+
+// bootRequest is everything needed to start a run's container, already
+// validated and normalized: the one description create, resume and fork
+// all boot from.
+type bootRequest struct {
+	id string
+	// image is what the container is created from — the requested image
+	// on create, a snapshot on resume and fork.
+	image   string
+	env     map[string]string
+	network string
+	// extra is the run's own allowlist entries (validated).
+	extra  []string
+	limits Limits
+	// user is the account to run as; an image without it falls back to root.
+	user string
+	// warm is the normalized warm request, nil for a run without a volume.
+	warm *WarmRequest
+}
+
+// bootResult is what a boot produced. It is filled in as far as the boot
+// got even on failure, so a container that could not be rolled back can
+// still be tracked with its volume.
+type bootResult struct {
+	containerID string
+	user        string
+	warm        *WarmState
+	cacheDir    string
+	cachePath   string
+}
+
+func containerName(id string) string { return "teploy-sbx-" + strings.ToLower(id) }
+
+// boot starts the container for b: warm volume, per-run proxy, container,
+// snapshot seed. On failure it gives back everything it took — except when
+// the container could not be removed: then leftover names it, its warm
+// volume is still held, and the caller must keep track of both until a
+// removal succeeds.
+func (m *Manager) boot(ctx context.Context, b bootRequest) (res bootResult, leftover string, err error) {
+	if len(b.extra) > 0 && m.Egress == nil {
+		return res, "", fmt.Errorf("%w: this daemon has no egress proxy, so egressAllow cannot be honoured", ErrBadRequest)
+	}
+	spec := CreateSpec{
+		Name:     containerName(b.id),
+		Image:    b.image,
+		Env:      b.env,
+		MemoryMB: b.limits.MemoryMB,
+		CPUs:     b.limits.CPUs,
+		Pids:     b.limits.Pids,
+		Network:  b.network,
+		User:     b.user,
+	}
+	if b.network == NetworkAllowlist {
+		if m.ProxyURL == "" && m.Egress == nil {
+			return res, "", fmt.Errorf("%w: allowlist network unavailable: proxy/firewall required", ErrBadRequest)
+		}
+		// Only the allowlist tier has a proxy to point at. On "none"
+		// there is nothing to reach and on "open" a proxy env var
+		// would quietly re-impose the filter the caller opted out of.
+		spec.ProxyURL = m.ProxyURL
+	}
+
+	seedFromSnapshot := false
+	if b.warm != nil {
+		if m.Cache == nil {
+			return res, "", fmt.Errorf("%w: this daemon has no cache store (serve --cache-root)", ErrBadRequest)
+		}
 		// Restoring a volume-aware snapshot: the image carries the run's
 		// exact workspace bytes, so the volume boots EMPTY (not from the
 		// repo template — a template seed would merge trees and resurrect
 		// files the run deleted) and is seeded from the image after the
 		// container exists. An image that cannot be inspected is left to
 		// Create to fail on; only a labelled snapshot takes this path.
-		fromSnapshot, inspectErr := m.runtime.ImageIsSnapshot(ctx, req.Image)
+		fromSnapshot, inspectErr := m.runtime.ImageIsSnapshot(ctx, b.image)
 		if inspectErr != nil {
-			return nil, inspectErr
+			return res, "", inspectErr
 		}
 		var hostPath string
 		var mf WarmManifest
 		var booted bool
 		if fromSnapshot {
-			hostPath, err = m.Cache.BootEmpty(id)
+			hostPath, err = m.Cache.BootEmpty(b.id)
 			seedFromSnapshot = true
 		} else {
-			hostPath, mf, booted, err = m.Cache.Boot(id, slug)
+			hostPath, mf, booted, err = m.Cache.Boot(b.id, b.warm.Repo)
 		}
 		if err != nil {
-			return nil, err
+			return res, "", err
 		}
-		warmState = &WarmState{Repo: slug, Booted: booted, LockHash: mf.LockHash, RepoDir: mf.RepoDir}
+		res.warm = &WarmState{Repo: b.warm.Repo, Booted: booted, LockHash: mf.LockHash, RepoDir: mf.RepoDir}
+		res.cacheDir = hostPath
+		res.cachePath = b.warm.Path
 		spec.CacheHostPath = hostPath
-		spec.CachePath = path
+		spec.CachePath = b.warm.Path
+	}
+	releaseVolume := func() {
+		if res.warm != nil {
+			m.Cache.Release(b.id)
+		}
 	}
 
-	if len(extra) > 0 {
+	if len(b.extra) > 0 {
 		// A private proxy carrying default+extra, alive only as long as
 		// this run — the entries must not leak to any other container
 		// sharing the bridge. Opened last, so nothing between here and
 		// Create can fail with a listener already bound.
-		proxyURL, err := m.Egress.OpenFor(id, extra)
+		proxyURL, err := m.Egress.OpenFor(b.id, b.extra)
 		if err != nil {
-			if warmState != nil {
-				m.Cache.Release(id)
-			}
-			return nil, fmt.Errorf("per-run egress proxy: %w", err)
+			releaseVolume()
+			return res, "", fmt.Errorf("per-run egress proxy: %w", err)
 		}
 		spec.ProxyURL = proxyURL
 	}
@@ -327,18 +495,17 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		// An image without the sandbox user — built before it existed, or a
 		// project's own image. Root is what every run got before, so the
 		// run still boots; the response and the log say which user it got.
-		m.log.Warn("image has no sandbox user; running as root", "id", id, "image", req.Image, "user", spec.User)
+		m.log.Warn("image has no sandbox user; running as root", "id", b.id, "image", b.image, "user", spec.User)
 		spec.User = RootUser
 		containerID, err = m.runtime.Create(ctx, spec)
 	}
+	res.user = spec.User
 	if err != nil {
-		if containerID != "" {
-			m.trackRollback(id, containerID, spec, warmState)
-		} else if warmState != nil {
-			m.Cache.Release(id)
+		if containerID == "" {
+			releaseVolume()
 		}
-		m.closeEgress(id)
-		return nil, err
+		m.closeEgress(b.id)
+		return res, containerID, err
 	}
 	if seedFromSnapshot {
 		// The restore half of a volume-aware snapshot: without this copy
@@ -346,38 +513,72 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		// carries, and the restored run boots an empty /work. A seed
 		// failure is a failed restore, not a degraded one — destroy and
 		// say so, exactly like a Create failure.
-		if err := m.runtime.SeedVolume(ctx, containerID, req.Image, spec.CachePath); err != nil {
+		if err := m.runtime.SeedVolume(ctx, containerID, b.image, spec.CachePath); err != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			cleanupErr := m.runtime.Remove(cleanupCtx, containerID)
 			cancel()
-			if cleanupErr != nil {
-				m.trackRollback(id, containerID, spec, warmState)
-			} else if warmState != nil {
-				m.Cache.Release(id)
+			if cleanupErr == nil {
+				releaseVolume()
+				containerID = ""
 			}
-			m.closeEgress(id)
-			return nil, errors.Join(fmt.Errorf("seed restored workspace: %w", err), cleanupErr)
+			m.closeEgress(b.id)
+			return res, containerID, errors.Join(fmt.Errorf("seed restored workspace: %w", err), cleanupErr)
 		}
-		m.log.Info("warm volume seeded from snapshot", "id", id, "image", req.Image, "path", spec.CachePath)
+		m.log.Info("warm volume seeded from snapshot", "id", b.id, "image", b.image, "path", spec.CachePath)
 	}
+	res.containerID = containerID
+	return res, "", nil
+}
 
-	run := &Run{
-		ID:          id,
-		Image:       req.Image,
-		Network:     network,
-		User:        spec.User,
-		ContainerID: containerID,
-		Warm:        warmState,
-		CacheDir:    spec.CacheHostPath,
-		CachePath:   spec.CachePath,
-		CreatedAt:   now,
-		ExpiresAt:   now.Add(ttl),
+// launch boots b and registers run under b.id as a new running run. The
+// caller presets what it decides (image lineage, deadline, labels, ...);
+// launch fills in what the boot decides. A boot that leaves a container
+// behind is tracked for the reaper, carrying run's owned images so they
+// are deleted once that container is.
+func (m *Manager) launch(ctx context.Context, b bootRequest, run *Run) (*Run, error) {
+	res, leftover, err := m.boot(ctx, b)
+	if err != nil {
+		if leftover != "" {
+			m.trackRollback(b, res, leftover, run.images)
+		} else {
+			m.releaseImages(run.images)
+		}
+		return nil, err
 	}
+	run.ID = b.id
+	run.Network = b.network
+	run.User = res.user
+	run.ContainerID = res.containerID
+	if run.Warm == nil {
+		run.Warm = res.warm
+	}
+	run.CacheDir = res.cacheDir
+	run.CachePath = res.cachePath
+	run.State = StateRunning
+	run.env = b.env
+	run.egressAllow = b.extra
+	run.limits = b.limits
+	run.warmReq = b.warm
 	m.mu.Lock()
-	m.runs[id] = run
+	run.runningSince = m.now()
+	m.runs[b.id] = run
+	view := m.viewLocked(run)
 	m.mu.Unlock()
-	m.log.Info("run created", "id", id, "image", req.Image, "network", network, "user", spec.User, "egressAllow", len(extra), "expiresAt", run.ExpiresAt)
-	return run, nil
+	return view, nil
+}
+
+// viewLocked copies a run for a caller and stamps its usage as of now.
+// Caller holds Manager.mu.
+func (m *Manager) viewLocked(run *Run) *Run {
+	view := *run
+	running := run.runningFor
+	if !run.runningSince.IsZero() {
+		if stretch := m.now().Sub(run.runningSince); stretch > 0 {
+			running += stretch
+		}
+	}
+	view.Usage = RunUsage{RunningSec: int64(running / time.Second)}
+	return &view
 }
 
 // Get returns a snapshot copy of the run: lease state changes replace
@@ -389,8 +590,20 @@ func (m *Manager) Get(id string) (*Run, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	snapshot := *run
-	return &snapshot, nil
+	return m.viewLocked(run), nil
+}
+
+// GetLive is Get for callers that need the run's container: a stopped
+// run is ErrStopped.
+func (m *Manager) GetLive(id string) (*Run, error) {
+	current, err := m.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if current.State == StateStopped {
+		return nil, stoppedErr(id)
+	}
+	return current, nil
 }
 
 // List returns snapshot copies for the same reason as Get.
@@ -399,8 +612,7 @@ func (m *Manager) List() []*Run {
 	defer m.mu.Unlock()
 	runs := make([]*Run, 0, len(m.runs))
 	for _, run := range m.runs {
-		snapshot := *run
-		runs = append(runs, &snapshot)
+		runs = append(runs, m.viewLocked(run))
 	}
 	return runs
 }
@@ -417,6 +629,11 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 		return ErrBusy
 	}
 	current.removing = true
+	if current.State == StateStopped {
+		stopped := *current
+		m.mu.Unlock()
+		return m.destroyStopped(ctx, &stopped)
+	}
 	m.mu.Unlock()
 	// Revoke egress immediately; keep the volume/registry until removal succeeds.
 	m.closeEgress(id)
@@ -434,6 +651,12 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 		return err
 	}
 	m.releaseWarm(current)
+	if len(current.images) > 0 {
+		// The container is gone, so the snapshots it was created from can
+		// go too; the registry stops listing them as owned.
+		m.releaseImages(current.images)
+		m.persist()
+	}
 	return nil
 }
 
@@ -444,6 +667,9 @@ func (m *Manager) beginCapture(id string) (*Run, func(), error) {
 	current, ok := m.runs[id]
 	if !ok {
 		return nil, nil, ErrNotFound
+	}
+	if current.State == StateStopped {
+		return nil, nil, stoppedErr(id)
 	}
 	if current.pendingCleanup || current.exclusive || current.removing || current.execs > 0 {
 		return nil, nil, ErrBusy
@@ -482,6 +708,17 @@ func (m *Manager) Snapshot(ctx context.Context, id string) (string, error) {
 		return "", err
 	}
 	defer release()
+	ref, err := m.capture(ctx, current)
+	if err != nil {
+		return "", err
+	}
+	m.log.Info("run snapshotted", "id", id, "image", ref, "warm", current.CachePath != "")
+	return ref, nil
+}
+
+// capture commits current's filesystem to a fresh snapshot ref. The
+// caller holds the run's capture exclusivity (beginCapture).
+func (m *Manager) capture(ctx context.Context, current *Run) (string, error) {
 	ref := SnapshotRepo + ":" + strings.ToLower(NewULID(m.now()))
 	// CachePath (not just CacheDir): a warm run's workspace lives ON the
 	// mounted volume, and the snapshot must bake those bytes in or the
@@ -489,7 +726,6 @@ func (m *Manager) Snapshot(ctx context.Context, id string) (string, error) {
 	if err := m.runtime.Snapshot(ctx, current.ContainerID, current.CachePath, ref); err != nil {
 		return "", err
 	}
-	m.log.Info("run snapshotted", "id", id, "image", ref, "warm", current.CachePath != "")
 	return ref, nil
 }
 
@@ -499,6 +735,12 @@ func (m *Manager) Snapshot(ctx context.Context, id string) (string, error) {
 func (m *Manager) DeleteSnapshot(ctx context.Context, ref string) error {
 	if !strings.HasPrefix(ref, SnapshotRepo+":") {
 		return fmt.Errorf("%w: not a sandbox snapshot ref: %s", ErrBadRequest, ref)
+	}
+	// A snapshot the registry itself holds (a stopped run's filesystem, or
+	// the image a resumed or forked run booted from) is not the caller's
+	// to delete: it goes with the run that owns it.
+	if holder := m.imageHolder(ref); holder != "" {
+		return fmt.Errorf("%w: snapshot %s belongs to run %s; delete the run instead", ErrBusy, ref, holder)
 	}
 	if err := m.runtime.RemoveImage(ctx, ref); err != nil {
 		return err
@@ -608,15 +850,41 @@ func (m *Manager) DropWarm(slug string) error {
 	return m.Cache.Drop(normalized)
 }
 
-// Reap force-removes every expired run and enforces the warm-cache
-// size cap (LRU eviction runs here — the one place with a clock tick
-// that is already sweeping). Called by the serve ticker and exposed for
-// tests.
+// Reap enforces every deadline: a running run past ExpiresAt is destroyed,
+// or stopped when it asked for onExpire "stop"; a stopped run past
+// RetainUntil is deleted with its snapshot. It also enforces the
+// warm-cache size cap (LRU eviction runs here — the one place with a
+// clock tick that is already sweeping). Called by the serve ticker and
+// exposed for tests; returns how many runs it destroyed, stopped or
+// deleted.
 func (m *Manager) Reap(ctx context.Context) int {
 	now := m.now()
 	reaped := 0
 	for _, current := range m.List() {
-		if !current.ExpiresAt.After(now) {
+		switch {
+		case current.State == StateStopped:
+			if current.leftover != "" {
+				m.retryLeftover(ctx, current.ID)
+			}
+			if current.RetainUntil == nil || current.RetainUntil.After(now) {
+				continue
+			}
+			if err := m.Destroy(ctx, current.ID); err != nil {
+				m.log.Error("reap of stopped run failed", "id", current.ID, "error", err)
+			} else {
+				m.log.Info("stopped run passed its retention and was deleted", "id", current.ID)
+				reaped++
+			}
+		case current.ExpiresAt.After(now):
+		case current.OnExpire == OnExpireStop && !current.pendingCleanup:
+			// Never destroyed on a failed stop: the run asked to keep its
+			// state, so it waits for a tick where the stop succeeds.
+			if _, err := m.Stop(ctx, current.ID); err != nil {
+				m.log.Error("reap stop failed; retrying next tick", "id", current.ID, "error", err)
+			} else {
+				reaped++
+			}
+		default:
 			if err := m.Destroy(ctx, current.ID); err != nil {
 				m.log.Error("reap remove failed", "id", current.ID, "error", err)
 			} else {
@@ -626,6 +894,9 @@ func (m *Manager) Reap(ctx context.Context) int {
 	}
 	if m.Cache != nil {
 		m.Cache.Sweep(ctx)
+	}
+	if m.stateDirty.Load() {
+		m.persist()
 	}
 	return reaped
 }
@@ -660,11 +931,26 @@ func (m *Manager) StartReaper(ctx context.Context, interval time.Duration) {
 	}()
 }
 
-// DestroyAll removes every run (graceful shutdown).
-func (m *Manager) DestroyAll(ctx context.Context) {
-	for _, run := range m.List() {
-		_ = m.Destroy(ctx, run.ID)
+// Shutdown is the graceful-shutdown sweep. Runs that asked for onExpire
+// "stop" are stopped, so they are in the registry file for the next
+// daemon life; every other running run is destroyed. Stopped runs are
+// left as they are. Stops go first: they are the ones with state to lose
+// if the budget runs out.
+func (m *Manager) Shutdown(ctx context.Context) {
+	runs := m.List()
+	for _, run := range runs {
+		if run.State == StateRunning && run.OnExpire == OnExpireStop && !run.pendingCleanup {
+			if _, err := m.Stop(ctx, run.ID); err != nil {
+				m.log.Error("shutdown stop failed; the run's state is lost with its container", "id", run.ID, "error", err)
+			}
+		}
 	}
+	for _, run := range runs {
+		if run.State == StateRunning && (run.OnExpire != OnExpireStop || run.pendingCleanup) {
+			_ = m.Destroy(ctx, run.ID)
+		}
+	}
+	m.persist()
 }
 
 // ValidateWorkPath confines a files-API path to the workdir: relative,
@@ -729,8 +1015,8 @@ func validEnvName(name string) bool {
 	return true
 }
 
-func (m *Manager) trackRollback(id, containerID string, spec CreateSpec, warm *WarmState) {
+func (m *Manager) trackRollback(b bootRequest, res bootResult, containerID string, images []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.runs[id] = &Run{ID: id, Image: spec.Image, Network: spec.Network, ContainerID: containerID, Warm: warm, CacheDir: spec.CacheHostPath, CachePath: spec.CachePath, ExpiresAt: m.now(), pendingCleanup: true}
+	m.runs[b.id] = &Run{ID: b.id, Image: b.image, Network: b.network, ContainerID: containerID, Warm: res.warm, CacheDir: res.cacheDir, CachePath: res.cachePath, ExpiresAt: m.now(), State: StateRunning, OnExpire: OnExpireDestroy, limits: b.limits, images: images, pendingCleanup: true}
 }

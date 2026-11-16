@@ -92,6 +92,10 @@ func (m *Manager) AcquireLease(runID, owner string, ttl time.Duration) (uint64, 
 		m.mu.Unlock()
 		return 0, time.Time{}, ErrNotFound
 	}
+	if current.State == StateStopped {
+		m.mu.Unlock()
+		return 0, time.Time{}, stoppedErr(runID)
+	}
 	now := m.now()
 	if lease := activeLease(current, now); lease != nil && lease.Holder != owner {
 		m.mu.Unlock()
@@ -128,6 +132,9 @@ func (m *Manager) RenewLease(runID, owner string, generation uint64, ttl time.Du
 	if !ok {
 		return time.Time{}, ErrNotFound
 	}
+	if current.State == StateStopped {
+		return time.Time{}, stoppedErr(runID)
+	}
 	lease := activeLease(current, m.now())
 	if lease == nil || lease.Holder != owner || lease.Generation != generation {
 		return time.Time{}, fmt.Errorf("%w: no active generation %d lease held by %q on run %s", ErrLeaseSuperseded, generation, owner, runID)
@@ -152,6 +159,9 @@ func (m *Manager) ReleaseLease(runID, owner string, generation uint64) error {
 	current, ok := m.runs[runID]
 	if !ok {
 		return ErrNotFound
+	}
+	if current.State == StateStopped {
+		return stoppedErr(runID)
 	}
 	if current.Lease == nil || current.Lease.Holder != owner || current.Lease.Generation != generation {
 		return fmt.Errorf("%w: no generation %d lease held by %q on run %s", ErrLeaseSuperseded, generation, owner, runID)
@@ -184,6 +194,10 @@ func (m *Manager) BeginExec(runID string, cred LeaseCredential) (*ExecSession, e
 	if !ok {
 		m.mu.Unlock()
 		return nil, ErrNotFound
+	}
+	if current.State == StateStopped {
+		m.mu.Unlock()
+		return nil, stoppedErr(runID)
 	}
 	if current.pendingCleanup || current.exclusive || current.removing {
 		m.mu.Unlock()
@@ -238,6 +252,10 @@ func (m *Manager) WriteFile(ctx context.Context, runID string, cred LeaseCredent
 		m.mu.Unlock()
 		return ErrNotFound
 	}
+	if current.State == StateStopped {
+		m.mu.Unlock()
+		return stoppedErr(runID)
+	}
 	if current.pendingCleanup || current.exclusive || current.removing {
 		m.mu.Unlock()
 		return ErrBusy
@@ -258,7 +276,7 @@ func (m *Manager) WriteFile(ctx context.Context, runID string, cred LeaseCredent
 // lease gates writable ownership, not visibility: any caller may read
 // whether or not a lease is held.
 func (m *Manager) ReadFile(ctx context.Context, runID, path string) ([]byte, error) {
-	current, err := m.Get(runID)
+	current, err := m.GetLive(runID)
 	if err != nil {
 		return nil, err
 	}

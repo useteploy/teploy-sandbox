@@ -112,6 +112,9 @@ type ZFS interface {
 	// fails while anything is cloned from what it would remove.
 	Destroy(ctx context.Context, name string) error
 	SetProperty(ctx context.Context, name, key, value string) error
+	// Property is the effective value of a property on a dataset, whether
+	// set there or inherited.
+	Property(ctx context.Context, name, key string) (string, error)
 }
 
 // zfsCLI is ZFS over the zfs(8) command.
@@ -270,6 +273,14 @@ func (z *zfsCLI) Destroy(ctx context.Context, name string) error {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+func (z *zfsCLI) Property(ctx context.Context, name, key string) (string, error) {
+	out, err := z.run(ctx, "get", "-H", "-p", "-o", "value", key, name)
+	if err != nil {
+		return "", err
+	}
+	return field(strings.TrimSpace(string(out))), nil
 }
 
 func (z *zfsCLI) SetProperty(ctx context.Context, name, key, value string) error {

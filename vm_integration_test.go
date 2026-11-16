@@ -143,6 +143,16 @@ func TestVMLifecycle(t *testing.T) {
 		t.Fatalf("hypervisor processes before the suite started: %v", left)
 	}
 	manager, _, _, _ := newVMManager(t, config, stateDir)
+	// No volume of a run may ever show its partitions to the host: with
+	// them come the guest's filesystem labels, which a host mount by label
+	// can pick up. Checked wherever a volume has just been made.
+	partitionsBefore := zvolPartitions(t)
+	noGuestPartitions := func(when string) {
+		t.Helper()
+		if got := zvolPartitions(t); !slices.Equal(got, partitionsBefore) {
+			t.Fatalf("%s: the host has partition devices for guest disks: %v (before the suite: %v)", when, got, partitionsBefore)
+		}
+	}
 
 	// Refusals come first and cost nothing: no VM is booted for them.
 	for name, req := range map[string]run.CreateRequest{
@@ -175,6 +185,7 @@ func TestVMLifecycle(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	timed("create (clone + cold boot to agent ready)", start)
+	noGuestPartitions("after create")
 	id := created.ID
 	defer manager.Destroy(context.Background(), id)
 	if created.State != run.StateRunning || created.User != run.RootUser || created.Network != run.NetworkNone {
@@ -312,6 +323,7 @@ func TestVMLifecycle(t *testing.T) {
 		t.Fatalf("resume: %v", err)
 	}
 	timed("resume (clone + cold boot to agent ready)", start)
+	noGuestPartitions("after resume")
 	if resumed.ID != id || resumed.State != run.StateRunning {
 		t.Fatalf("resumed: %+v", resumed)
 	}
@@ -340,6 +352,7 @@ func TestVMLifecycle(t *testing.T) {
 		t.Fatalf("fork: %v", err)
 	}
 	timed("fork (sync + pause + snapshot + resume parent + clone + cold boot child)", start)
+	noGuestPartitions("after fork")
 	defer manager2.Destroy(context.Background(), forked.ID)
 	if forked.ForkedFrom != id || forked.ID == id || forked.State != run.StateRunning {
 		t.Fatalf("forked: %+v", forked)
@@ -382,6 +395,7 @@ func TestVMLifecycle(t *testing.T) {
 		t.Fatalf("snapshot: %v", err)
 	}
 	timed("snapshot of a running run (sync + pause + snapshot + resume)", start)
+	noGuestPartitions("after snapshot")
 	if !slices.Contains(poolListing(t, config.Pool), ref) {
 		t.Fatalf("the snapshot ref %q is not a ZFS snapshot in the pool", ref)
 	}
@@ -448,6 +462,24 @@ func TestVMPreflightNamesAMissingGoldenSnapshot(t *testing.T) {
 	if strings.Contains(err.Error(), "/dev/kvm") || strings.Contains(err.Error(), "hypervisor binary") {
 		t.Fatalf("this host should only be missing the golden snapshot: %v", err)
 	}
+}
+
+// zvolPartitions lists the partition devices the host has made for ZFS
+// volumes (zd0p1, ...), sorted.
+func zvolPartitions(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir("/sys/class/block")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var partitions []string
+	for _, entry := range entries {
+		if disk, number, ok := strings.Cut(entry.Name(), "p"); ok && strings.HasPrefix(disk, "zd") && number != "" {
+			partitions = append(partitions, entry.Name())
+		}
+	}
+	sort.Strings(partitions)
+	return partitions
 }
 
 // dirBytes is the total size of the regular files under dir.

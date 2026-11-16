@@ -142,14 +142,32 @@ boot), nested virtualisation inside a run, and memory reclaim policy.
 Host requirements, checked at start; the daemon refuses to start and
 names what is missing: `/dev/kvm`, the `cloud-hypervisor` binary
 (`--vm-hypervisor`), an uncompressed guest kernel (`--vm-kernel`), a ZFS
-pool (`--vm-pool`) and a golden snapshot (`--vm-golden`). Build the
-golden with `scripts/build-golden.sh` from a volume holding a bootable
-systemd root filesystem. `GET /v1/capacity` reports `driver` and
-`nestedVirt`.
+pool (`--vm-pool`) with `volmode=dev` set on it, and a golden snapshot
+(`--vm-golden`). Build the golden with `scripts/build-golden.sh` from a
+volume holding a bootable systemd root filesystem. `GET /v1/capacity`
+reports `driver` and `nestedVirt`.
 
-Every volume the driver creates has `volmode=dev`, so the host never
-sees a guest's partitions as block devices and never mounts or parses a
-guest filesystem.
+Guest disks and the host. `zfs set volmode=dev POOL` is what keeps the
+host kernel from scanning a guest's disk for partitions: every volume
+under the pool inherits it, so no guest partition becomes a block device
+on the host. Setting it on each volume as it is cloned is not enough (on
+ZFS 2.2 the device node can be created before the property applies), so
+the daemon requires it on the pool and checks each run's device before
+booting from it.
+
+The whole disk is still a block device on the host for as long as the
+volume exists, and udev probes it like any other disk. A guest that
+writes a filesystem signature over the start of its disk gets a
+`/dev/disk/by-label` or `by-uuid` link on the host with a label of its
+choosing. The daemon does not prevent this. A host that mounts anything
+by label or UUID should stop udev from probing ZFS volumes, for example
+with `/etc/udev/rules.d/59-zvol-noprobe.rules` containing
+`KERNEL=="zd*", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}="1"`
+(it applies to every ZFS volume on the host; the `/dev/zvol` links stay).
+
+A VM's console and its hypervisor's output are kept in the daemon's
+memory, the last 64 KiB of each; nothing a guest can make grow is written
+to `--vm-run-dir`.
 
 Test against a real hypervisor (needs root, KVM and ZFS; CI has neither
 and only vets it):

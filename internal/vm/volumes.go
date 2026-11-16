@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -47,6 +48,9 @@ type Volumes struct {
 	// flushDevice pushes the host's buffered writes for it to the volume.
 	waitDevice  func(ctx context.Context, path string) error
 	flushDevice func(path string) error
+	// checkDevice refuses a volume device the host would scan for
+	// partitions.
+	checkDevice func(path string) error
 
 	// mu serializes every change to the clone topology. The operations are
 	// short; correctness is worth more than interleaving them.
@@ -61,6 +65,7 @@ func NewVolumes(zfs ZFS, root, golden, owner string, log *slog.Logger) *Volumes 
 		deviceDir:   "/dev/zvol",
 		waitDevice:  waitForPath,
 		flushDevice: fsyncPath,
+		checkDevice: partitionsHidden,
 	}
 }
 
@@ -123,9 +128,22 @@ func (v *Volumes) live(dataset Dataset, snapshot SnapshotInfo) bool {
 // (seen: a host mounting a run's EFI partition as its own /boot/efi, which
 // then pinned the volume), and where the host parses filesystem metadata a
 // guest controls.
+//
+// Setting it here is not what makes it hold. `zfs clone -o volmode=dev`
+// applies the property after the clone exists, and the kernel can create
+// the device node before that, with the mode the volume inherited (seen
+// on ZFS 2.2: clones of a run's own snapshots came up with every guest
+// partition exposed while the property read "dev"). So Preflight requires
+// volmode=dev on the root, where a new volume has it from its first
+// instant, and CreateRun checks the device it is about to hand out.
 func (v *Volumes) props(kind string) map[string]string {
-	return map[string]string{propOwner: v.owner, propKind: kind, "volmode": "dev"}
+	return map[string]string{propOwner: v.owner, propKind: kind, propVolmode: volmodeDev}
 }
+
+const (
+	propVolmode = "volmode"
+	volmodeDev  = "dev"
+)
 
 // ErrNoSnapshot is CreateRun's answer for a reference that is not (or no
 // longer) a usable snapshot.
@@ -158,7 +176,11 @@ func (v *Volumes) CreateRun(ctx context.Context, name, ref string) (string, erro
 		return "", fmt.Errorf("clone %s: %w", source, err)
 	}
 	device := v.DevicePath(name)
-	if err := v.waitDevice(ctx, device); err != nil {
+	err := v.waitDevice(ctx, device)
+	if err == nil {
+		err = v.checkDevice(device)
+	}
+	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
 		return "", errors.Join(fmt.Errorf("volume device %s: %w", device, err), v.removeVolume(cleanupCtx, volume))
@@ -497,6 +519,24 @@ func waitForPath(ctx context.Context, path string) error {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
+}
+
+// partitionsHidden reports an error unless the kernel will not scan the
+// block device at path for partitions: a disk created without partition
+// support has an ext_range of 1.
+func partitionsHidden(path string) error {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(filepath.Join("/sys/class/block", filepath.Base(resolved), "ext_range"))
+	if err != nil {
+		return fmt.Errorf("cannot tell whether the host scans %s for partitions: %w", path, err)
+	}
+	if strings.TrimSpace(string(raw)) != "1" {
+		return fmt.Errorf("the host exposes the partitions of %s although the volume is volmode=dev; set volmode=dev on the pool so that new volumes inherit it", path)
+	}
+	return nil
 }
 
 func fsyncPath(path string) error {

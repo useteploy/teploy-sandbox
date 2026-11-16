@@ -31,6 +31,9 @@ type fakeZFS struct {
 	calls []string
 	// fail makes the named call ("destroy pool/x") return an error once.
 	fail map[string]error
+	// poolProps are the properties set on the pool, which a volume
+	// without its own value inherits.
+	poolProps map[string]string
 }
 
 type fakeDataset struct {
@@ -53,7 +56,7 @@ const (
 
 // newFakeZFS has a pool with an unowned golden volume and snapshot.
 func newFakeZFS() *fakeZFS {
-	z := &fakeZFS{datasets: map[string]*fakeDataset{}, snapshots: map[string]*fakeSnapshot{}, fail: map[string]error{}}
+	z := &fakeZFS{datasets: map[string]*fakeDataset{}, snapshots: map[string]*fakeSnapshot{}, fail: map[string]error{}, poolProps: map[string]string{propVolmode: volmodeDev}}
 	z.datasets[testPool+"/golden"] = &fakeDataset{props: map[string]string{}, files: map[string][]byte{}}
 	z.snapshots[testGolden] = &fakeSnapshot{txg: z.tick(), props: map[string]string{}, files: map[string][]byte{}}
 	return z
@@ -244,6 +247,17 @@ func (z *fakeZFS) Destroy(_ context.Context, name string) error {
 	return nil
 }
 
+func (z *fakeZFS) Property(_ context.Context, name, key string) (string, error) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	if dataset, ok := z.datasets[name]; ok {
+		if value, ok := dataset.props[key]; ok {
+			return value, nil
+		}
+	}
+	return z.poolProps[key], nil
+}
+
 func (z *fakeZFS) SetProperty(_ context.Context, name, key, value string) error {
 	z.mu.Lock()
 	defer z.mu.Unlock()
@@ -302,6 +316,7 @@ func newTestVolumes(z *fakeZFS) *Volumes {
 	v := NewVolumes(z, testPool, testGolden, testOwner, quietLog())
 	v.waitDevice = func(context.Context, string) error { return nil }
 	v.flushDevice = func(string) error { return nil }
+	v.checkDevice = func(string) error { return nil }
 	return v
 }
 

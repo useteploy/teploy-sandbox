@@ -119,3 +119,17 @@ func TestDefaultsAreConsistent(t *testing.T) {
 		t.Fatalf("owner dir: %q", dir)
 	}
 }
+
+// volmode=dev on the volumes themselves does not hold (see Volumes.props):
+// a pool that does not hand it to every new volume is refused, with the
+// command that fixes it.
+func TestPreflightRequiresThePoolToHideGuestPartitions(t *testing.T) {
+	for _, mode := range []string{"default", "full", "none", ""} {
+		zfs := newFakeZFS()
+		zfs.poolProps[propVolmode] = mode
+		err := preflight(context.Background(), goodConfig(), zfs, goodHost())
+		if err == nil || !strings.Contains(err.Error(), "zfs set volmode=dev "+testPool) {
+			t.Errorf("pool volmode %q: %v", mode, err)
+		}
+	}
+}

@@ -127,6 +127,12 @@ func preflight(ctx context.Context, config Config, zfs ZFS, host host) error {
 			miss("the ZFS pool %q (--vm-pool / SBX_VM_POOL): %v", config.Pool, err)
 		} else if !ok {
 			miss("the ZFS pool %q (--vm-pool / SBX_VM_POOL)", config.Pool)
+		} else if mode, err := zfs.Property(ctx, config.Pool, propVolmode); err != nil {
+			miss("the volmode of %q: %v", config.Pool, err)
+		} else if mode != volmodeDev {
+			// Set on the volumes alone it is not enough: see Volumes.props.
+			miss("volmode=dev on %q, where every volume under it inherits it (it is %q; run `zfs set volmode=dev %s`): without it the host scans guest disks for partitions",
+				config.Pool, mode, config.Pool)
 		}
 		switch {
 		case !strings.Contains(config.Golden, "@"):

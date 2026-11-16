@@ -91,7 +91,7 @@ func serve(args []string) error {
 	vmCmdline := flags.String("vm-cmdline", envOr("SBX_VM_CMDLINE", vm.DefaultCmdline()),
 		"vm driver: the guest kernel command line")
 	vmPool := flags.String("vm-pool", envOr("SBX_VM_POOL", vm.DefaultPool),
-		"vm driver: the ZFS pool (or a dataset in one) run volumes and snapshots are created under")
+		"vm driver: the ZFS pool (or a dataset in one) run volumes and snapshots are created under; it must have volmode=dev")
 	vmGolden := flags.String("vm-golden", envOr("SBX_VM_GOLDEN", ""),
 		"vm driver: the golden snapshot runs are cloned from (default <vm-pool>/golden-guestd@v1; see scripts/build-golden.sh)")
 	vmRunDir := flags.String("vm-run-dir", envOr("SBX_VM_RUN_DIR", vm.DefaultRunDir),

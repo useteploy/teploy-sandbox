@@ -6,6 +6,10 @@
 #   sudo scripts/build-golden.sh --from POOL/base@snap --to POOL/golden-guestd@v1 \
 #        --guestd ./teploy-guestd
 #
+# The pool needs `zfs set volmode=dev POOL` first: the daemon refuses to
+# start without it, and nothing else keeps the host from scanning guest
+# disks for partitions.
+#
 # The base is a zvol holding a bootable Linux root filesystem with systemd
 # (for example a cloud image written to the volume, cloud-init disabled).
 # The base snapshot is only cloned, never modified. The new volume stays a
@@ -22,7 +26,7 @@ while [ $# -gt 0 ]; do
     --to) to="$2"; shift 2 ;;
     --guestd) guestd="$2"; shift 2 ;;
     --root-partition) part="$2"; shift 2 ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) echo "build-golden: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -59,6 +63,16 @@ trap cleanup EXIT
 
 zfs clone "$from" "$volume"
 created=1
+# The pool hides partitions on every volume (volmode=dev, which the daemon
+# requires), and this one volume needs its root partition for as long as
+# it is being built. The device node is recreated when the mode changes,
+# so the change is made once the node exists; made earlier it can be lost.
+for _ in $(seq 1 200); do
+  [ -b "/dev/zvol/$volume" ] && break
+  sleep 0.05
+done
+[ -b "/dev/zvol/$volume" ] || die "/dev/zvol/$volume did not appear (is volmode=none set on the pool?)"
+zfs set volmode=full "$volume"
 # Resolve the kernel's own partition node. The /dev/zvol/...-partN links
 # are made by a udev helper that has been seen to mislabel partitions
 # numbered above 9 as -part1, so they are not trusted here.

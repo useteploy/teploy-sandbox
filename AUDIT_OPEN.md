@@ -182,6 +182,16 @@ Found by that run and fixed: volumes were created with the default
 and mounted one run's EFI partition as its own `/boot/efi` by label.
 Volumes are now `volmode=dev`.
 
+That fix did not hold. `zfs clone -o volmode=dev` sets the property after
+the clone exists, and on ZFS 2.2.2 the kernel made the device node first
+for clones of a run's own snapshot (a resume, a fork, a snapshot
+holder): the property read `dev` and the guest's partitions were block
+devices on the host. The pool must now have `volmode=dev`
+itself, which a new volume inherits from its first instant; the daemon
+refuses to start without it, and refuses a run device the host would
+scan. The live suite checks for partition devices after create, resume,
+fork and snapshot.
+
 Not verified:
 
 - An x86-64 host, and bare metal. Boot time and density figures from the
@@ -207,3 +217,9 @@ Known limits:
   processes the registry does not name.
 - The golden image is trusted: the daemon boots whatever
   `--vm-golden` names.
+- A run volume's whole-disk device is probed by the host's udev. A guest
+  that writes a filesystem signature over the start of its disk gets a
+  `/dev/disk/by-label` or `by-uuid` link on the host under a label it
+  chose (confirmed: a vfat labelled by hand appeared at once). Closing
+  this takes a udev rule on the host (README), which the daemon neither
+  installs nor checks.

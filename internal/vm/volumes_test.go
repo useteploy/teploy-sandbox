@@ -587,6 +587,31 @@ func TestVolumesHideGuestPartitionsFromTheHost(t *testing.T) {
 	}
 }
 
+// The property alone proves nothing about the device the kernel made, so
+// the device is looked at before a VM is given it; one that shows its
+// partitions to the host is not used and does not stay.
+func TestCreateRunRefusesADeviceThatExposesPartitions(t *testing.T) {
+	z := newFakeZFS()
+	v := newTestVolumes(z)
+	var checked []string
+	v.checkDevice = func(path string) error {
+		checked = append(checked, path)
+		return errors.New("the host exposes the partitions")
+	}
+	if _, err := v.CreateRun(bg, runName(1), ""); err == nil || !strings.Contains(err.Error(), "exposes the partitions") {
+		t.Fatalf("create: %v", err)
+	}
+	if want := []string{"/dev/zvol/" + testPool + "/" + runName(1)}; !slices.Equal(checked, want) {
+		t.Fatalf("checked %v, want %v", checked, want)
+	}
+	assertPool(t, z, pristine...)
+
+	// The real check fails closed on something it cannot judge.
+	if err := partitionsHidden(t.TempDir()); err == nil {
+		t.Fatal("a path that is not a block device passed the partition check")
+	}
+}
+
 // cliZFS is the fake pool behaving like the zfs command under a context:
 // a context that is already done starts no command at all, and a command
 // that was killed as its context ended may have taken effect anyway

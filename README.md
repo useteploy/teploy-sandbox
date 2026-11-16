@@ -3,7 +3,8 @@
 Tier 1 single-box sandbox runner: isolated ephemeral execution
 environments for agent runs, on your own server. Each run gets its own
 filesystem and network namespace via Docker; state persists between
-execs; everything dies at its TTL.
+execs; everything dies at its TTL, unless the run asked to be stopped
+there instead (see Persistent runs).
 
 ```sh
 teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/sandbox/token
@@ -13,15 +14,101 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 
 | Route | Does |
 |---|---|
-| `POST /v1/runs` | `{image, env?, ttlSec?, network?, egressAllow?, limits?, warm?, user?}` → `{id, server, expiresAt, user, warm?}` — network `none` (default), `allowlist` or `open` (see Egress); defaults 1 CPU / 1 GB / 256 pids, never the `teploy` app network; `user` `default` (absent) or `root` (see Run user); `warm: {repo, path?}` gives the run a private volume for the repo (below) |
+| `POST /v1/runs` | `{image, env?, ttlSec?, network?, egressAllow?, limits?, warm?, user?, labels?, onExpire?}` → the run: `{id, server, state, expiresAt, user, onExpire, usage, labels?, warm?}` — network `none` (default), `allowlist` or `open` (see Egress); defaults 1 CPU / 1 GB / 256 pids, never the `teploy` app network; `user` `default` (absent) or `root` (see Run user); `warm: {repo, path?}` gives the run a private volume for the repo (below) |
 | `POST /v1/runs/{id}/exec` | `{cmd, cwd?, timeoutSec?, env?, owner?, generation?, outputEncoding?}` (`env`: name → value, set in the command's environment; POSIX names, no NUL, ≤64 vars / 64 KiB, else 400; values reach the container through a private (0600, removed after) `--env-file`, never argv and never the docker CLI's own environment; so no line breaks) → SSE: `stdout`/`stderr` chunks, then `exit` `{exitCode, timedOut}`; while the run holds a lease, only the holder's `owner`+`generation` may exec (409 otherwise) |
 | `PUT/GET /v1/runs/{id}/files/{path}` | Confined to `/work`; traversal rejected. PUT takes the lease credential as `?owner=&generation=` query and is fenced like exec; GET is open, lease or not |
-| `DELETE /v1/runs/{id}` | Destroy now (the reaper enforces TTLs regardless, default 30 min) |
+| `DELETE /v1/runs/{id}` | Destroy now (the reaper enforces TTLs regardless, default 30 min); on a stopped run, deletes the record and its snapshot |
+| `POST /v1/runs/{id}/stop` | Capture the filesystem, remove the container, keep the run → the run, `state: "stopped"` (see Persistent runs) |
+| `POST /v1/runs/{id}/resume` | `{ttlSec?}` → the same run, same `id`, `state: "running"`, new deadline |
+| `POST /v1/runs/{id}/fork` | `{ttlSec?, labels?, onExpire?}` → 201, a new run started from this one's filesystem and settings, with `forkedFrom` |
+| `GET /v1/capacity` | `{server, driver, runtime, cpus, memoryMb, runs: {running, stopped}, allocated: {cpus, memoryMb}}` — the host's size and the sum of running runs' limits |
 | `GET /v1/runs`, `GET /health` | List; `{status, version}` |
 
 Run IDs are ULIDs and every response carries a `server` field — nothing
 assumes one box, so the Tier 2 fleet scheduler fronts N daemons without
 API rework.
+
+## Persistent runs
+
+A run can outlive its container. `stop` commits the filesystem to an
+image the daemon owns, removes the container and keeps the run in the
+list as `stopped`; `resume` recreates the container from that image under
+the same `id`. A stopped run costs disk and nothing else. This is what a
+caller did by hand before — snapshot, destroy, create from the snapshot —
+as one lifecycle, with the run's identity kept.
+
+Every run carries, in every response that returns one:
+
+| Field | Meaning |
+|---|---|
+| `state` | `running` or `stopped` |
+| `labels` | The caller's own metadata from create: at most 16; keys `^[a-z0-9]([a-z0-9._-]{0,62})$`; values at most 256 bytes, no control characters. Anything else is a 400 |
+| `onExpire` | `destroy` (default: the run is removed at its deadline, as always) or `stop` (it is stopped there instead). Anything else is a 400 |
+| `usage.runningSec` | Seconds spent `running`, summed across every stop and resume, current stretch included |
+| `stoppedAt`, `retainUntil` | Only while stopped. At `retainUntil` the run and its snapshot are deleted |
+| `forkedFrom` | The source run's `id`, on a fork |
+
+**Stop** needs an idle run, like snapshot: 409 `busy` while an exec, a
+write, a capture or a removal is in flight. It captures exactly as
+snapshot does (a warm volume is baked into the image), then removes the
+container, closes the run's private egress proxy, releases its warm
+volume and clears its lease. There is no half state: if the capture
+fails nothing has changed, and if the container cannot be removed after
+a good capture the run stays `running` and the capture is deleted.
+Stopping a stopped run is a 409.
+
+**Resume** boots the stop snapshot with what the run was created with:
+env, network tier, `egressAllow`, limits, user and warm volume. `image`
+on the run is still the image it was created from. A warm run takes the
+snapshot-restore path — an empty volume seeded from the image, never the
+repo template merged underneath. The deadline is now + `ttlSec`, with
+create's default and maximum. A resume that fails leaves the run stopped
+with its snapshot intact. Lease generations keep counting across a
+stop, so a credential from before it never passes the fence again.
+Resuming a running run is a 409.
+
+**Fork** captures a running source (same idle rule; the source keeps
+running) or borrows a stopped source's snapshot, and starts a new run
+from it with the source's env, network, `egressAllow`, limits, user and
+warm request. `labels` and `onExpire` are the source's unless the body
+gives them.
+
+**While stopped,** exec, files, snapshot, lease and warm calls answer 409
+and say to resume. A stopped run ignores its old `expiresAt`; the reaper
+deletes it at `retainUntil`, which is stop time plus
+`--stopped-retention` / `SBX_STOPPED_RETENTION` (a Go duration, default
+`336h`; a malformed or non-positive value refuses to start). A run with
+`onExpire: "stop"` whose stop fails at the deadline is retried on every
+reaper tick and is never destroyed in its place — so a run that is busy
+at every tick outlives its deadline until one finds it idle.
+
+The images behind all this belong to the daemon, not the caller: they
+are not returned, `DELETE /v1/snapshots` refuses them with a 409, and
+each is deleted when the last run using it lets go. Docker will not
+delete an image while a container created from it exists, so a stop
+snapshot outlives the resume that used it and goes when that container
+does — at the next stop, or at destroy. The same holds for the capture
+behind a fork, which goes with the child.
+
+### Surviving a restart
+
+`serve --state-dir` / `SBX_STATE_DIR` (default
+`/var/lib/teploy-sandbox/state`) holds the registry as one JSON file,
+replaced atomically on every change to a stopped run. It is `0600` in a
+`0700` directory because it holds each stopped run's env, which is where
+callers put tokens. One daemon owns a state directory.
+
+- On start, stopped runs are loaded and can be resumed. Running runs are
+  not: no container outlives its daemon (the startup sweep removes them
+  all, as before), and the images only those runs held are deleted.
+- On graceful shutdown, runs with `onExpire: "stop"` are stopped and
+  written to the file; every other run is destroyed, as before. A crash
+  stops nothing — a running run's state is lost with its container.
+- A state file that cannot be read or parsed refuses the start. Starting
+  empty would orphan every stopped run's snapshot without a word.
+- An empty `--state-dir` keeps the registry in memory. Stop, resume and
+  fork still work; nothing stopped survives a restart, and the snapshots
+  are left behind for the operator.
 
 ## Writable leases
 
@@ -177,7 +264,9 @@ Docker socket into a run.
 
 `go test ./...` (interface-mocked) · `go test -tags integration ./...`
 (real Docker on a disposable box; `SBX_TEST_USER_IMAGE=<image with the
-sandbox user>` adds the run-user round trip).
+sandbox user>` adds the run-user round trip;
+`-run TestRealStopResumeAcrossRestart` is the persistent-runs round trip:
+stop, a fresh manager over the same state dir, resume, same bytes).
 
 ## Snapshots (M3)
 
@@ -188,7 +277,9 @@ sandbox user>` adds the run-user round trip).
 
 Snapshots deliberately survive the TTL reaper — they exist so state can
 outlive a container (a parked agent run restores days later). Deletion
-is explicit and owned by the caller.
+is explicit and owned by the caller. `stop`/`resume` (Persistent runs)
+is the same idea with the daemon doing the bookkeeping; this route stays
+for callers that want the image itself.
 
 ## Warm repo cache (SB-A)
 

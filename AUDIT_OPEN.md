@@ -89,3 +89,55 @@ firewall has a separate isolated Linux namespace deny/allow/revoke fixture.
 Legacy unlabeled containers are retained by scoped startup cleanup. Operators
 must drain older workloads when migrating deployment; startup never sweeps
 containers belonging to another daemon identity.
+
+## 2026-11-15 — persistent runs (stop / resume / fork, durable registry)
+
+Added, all additive on the wire (no existing field, status or default
+changed for a caller that does not use them):
+
+- Run `state` (`running`/`stopped`), `labels`, `onExpire`
+  (`destroy`/`stop`), `usage.runningSec`, `stoppedAt`, `retainUntil`,
+  `forkedFrom`.
+- `POST /v1/runs/{id}/stop`, `/resume`, `/fork`; `GET /v1/capacity`.
+  Create, resume and fork share one boot path.
+- Reaper: stops instead of destroying when `onExpire` is `stop` (a failed
+  stop is retried, never turned into a destroy); deletes a stopped run at
+  `retainUntil` (`--stopped-retention`, default 14 days).
+- Durable registry (`--state-dir`): stopped runs survive a restart; a
+  corrupt or unreadable file refuses the start; graceful shutdown stops
+  `onExpire: stop` runs instead of destroying them.
+
+**Not yet run against real Docker.** Everything above is proven only
+against the in-process fake runtime (`go test`, `go test -race`). The
+integration test `TestRealStopResumeAcrossRestart` compiles and has never
+been executed. Before deployment it must pass on a healthy daemon, cold
+and warm, and under `SBX_TEST_RUNTIME=runsc`. What only that run can
+show:
+
+1. Image deletion. The design assumes Docker refuses to delete an image
+   while a container created from it exists, and that deleting a
+   snapshot a later snapshot was committed on top of succeeds (untag,
+   layers kept). So the stop snapshot is deleted when the resumed
+   container goes, not at resume. If an image store behaves differently
+   the cost is a leaked image or an early delete of an image whose
+   layers a live container still holds; the test counts snapshot images
+   before and after to catch the first.
+2. Recreating a container under the same name immediately after
+   `docker rm -f` of the old one.
+3. Stop on a paused/unpaused capture followed at once by removal; resume
+   of a warm run seeding a volume directory that was released and
+   re-created under the same path.
+
+Known limits, deliberate in this slice:
+
+- A crash between a capture and the registry write leaks that one image:
+  nothing on disk names it yet.
+- Deleting a stopped run removes the record even when the image delete
+  fails (logged with the ref). The alternative is a record that can
+  never be deleted once its image is gone.
+- Shutdown stops runs one after another inside the existing 45 s cleanup
+  budget. Runs it does not reach are lost with their containers, exactly
+  as on a crash.
+- A run with `onExpire: stop` that has an exec in flight at every reaper
+  tick is never stopped and so outlives its deadline.
+- The registry file holds env values in the clear (0600, 0700 dir).

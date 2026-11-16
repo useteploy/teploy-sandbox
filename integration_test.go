@@ -716,3 +716,63 @@ func TestRealStopResumeAcrossRestart(t *testing.T) {
 		})
 	}
 }
+
+// Soak: stop and resume one cold run many times. Each stop commits the
+// container on top of the image the previous resume started from, so the
+// snapshot's layer chain grows by one per cycle; this measures how far
+// that goes and what it costs. Opt-in: SBX_TEST_CYCLES=<n>.
+func TestRealStopResumeSoak(t *testing.T) {
+	cycles, _ := strconv.Atoi(os.Getenv("SBX_TEST_CYCLES"))
+	if cycles <= 0 {
+		t.Skip("SBX_TEST_CYCLES unset")
+	}
+	image := os.Getenv("SBX_TEST_IMAGE")
+	if image == "" {
+		image = "debian:bookworm-slim"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cycles)*time.Minute)
+	defer cancel()
+	runtime := &run.DockerRuntime{Runtime: os.Getenv("SBX_TEST_RUNTIME")}
+	manager := run.NewManager(runtime, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := manager.LoadState(ctx, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	imagesBefore := snapshotImageCount(t)
+	created, err := manager.Create(ctx, run.CreateRequest{Image: image, TTLSec: 3600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), created.ID) })
+	containerID := created.ContainerID
+	var slowest time.Duration
+	for i := 1; i <= cycles; i++ {
+		if _, _, err := execRun(t, runtime, containerID, fmt.Sprintf("printf %d > /work/cycle.txt", i)); err != nil {
+			t.Fatalf("cycle %d: write: %v", i, err)
+		}
+		started := time.Now()
+		if _, err := manager.Stop(ctx, created.ID); err != nil {
+			t.Fatalf("cycle %d: stop: %v", i, err)
+		}
+		resumed, err := manager.Resume(ctx, created.ID, 3600)
+		if err != nil {
+			t.Fatalf("cycle %d: resume: %v", i, err)
+		}
+		took := time.Since(started)
+		if took > slowest {
+			slowest = took
+		}
+		containerID = resumed.ContainerID
+		if _, out, err := execRun(t, runtime, containerID, "cat /work/cycle.txt"); err != nil || out != strconv.Itoa(i) {
+			t.Fatalf("cycle %d: read back %q err=%v", i, out, err)
+		}
+		if i%10 == 0 || i == cycles {
+			t.Logf("cycle %d: stop+resume %s (slowest so far %s), snapshot images %d", i, took.Round(time.Millisecond), slowest.Round(time.Millisecond), snapshotImageCount(t)-imagesBefore)
+		}
+	}
+	if err := manager.Destroy(ctx, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if after := snapshotImageCount(t); after != imagesBefore {
+		t.Fatalf("snapshot images leaked: %d before, %d after", imagesBefore, after)
+	}
+}

@@ -117,9 +117,14 @@ disconnected before the container was removed.
 
 Left open by that review:
 
-- Each stop commits on top of the previous snapshot, so one run stopped
-  and resumed about a hundred times may reach the storage driver's layer
-  limit and stop failing. Unmeasured.
+- Each stop commits on top of the previous snapshot, so the snapshot's
+  layer chain grows by one per cycle. Measured with
+  `SBX_TEST_CYCLES=150 go test -tags integration -run TestRealStopResumeSoak .`
+  on Docker 29.5 with the containerd image store (`overlayfs`): 150 cycles
+  pass, one snapshot image held at a time, none leaked; a stop plus resume
+  takes about 0.6 s at first and about 1.1 s by cycle 150. Not measured on
+  the older `overlay2` storage driver, which caps an image at about 125
+  layers; run the soak there before relying on long-lived runs.
 - A crash between a capture and the registry write leaks one image, and
   registry-owned and caller-owned snapshots share the `teploy-sbx-snap:`
   namespace, so nothing can garbage-collect them safely yet.
@@ -127,26 +132,17 @@ Left open by that review:
   next tick); a restart inside that window loses the run.
 - Shutdown stops share the 45-second cleanup budget.
 
-**Not yet run against real Docker.** Everything above is proven only
-against the in-process fake runtime (`go test`, `go test -race`). The
-integration test `TestRealStopResumeAcrossRestart` compiles and has never
-been executed. Before deployment it must pass on a healthy daemon, cold
-and warm, and under `SBX_TEST_RUNTIME=runsc`. What only that run can
-show:
-
-1. Image deletion. The design assumes Docker refuses to delete an image
-   while a container created from it exists, and that deleting a
-   snapshot a later snapshot was committed on top of succeeds (untag,
-   layers kept). So the stop snapshot is deleted when the resumed
-   container goes, not at resume. If an image store behaves differently
-   the cost is a leaked image or an early delete of an image whose
-   layers a live container still holds; the test counts snapshot images
-   before and after to catch the first.
-2. Recreating a container under the same name immediately after
-   `docker rm -f` of the old one.
-3. Stop on a paused/unpaused capture followed at once by removal; resume
-   of a warm run seeding a volume directory that was released and
-   re-created under the same path.
+**Run against real Docker 2026-11-15** (Docker 29.5, arm64, `runc`,
+Linux 6.8, as root): the whole integration suite passes, including
+`TestRealStopResumeAcrossRestart` cold and warm and the host firewall
+fixtures. Still unverified: `SBX_TEST_RUNTIME=runsc`, an x86-64 host, and
+`TestRealSandboxUser` (skipped without `SBX_TEST_USER_IMAGE`).
+The three assumptions only a real daemon could confirm held on that image
+store: an image a container was created from cannot be deleted until the
+container is gone, while a snapshot a later one was committed on top of
+can; a container can be recreated under the same name straight after
+`docker rm -f`; and a warm run's volume directory can be released and
+seeded again under the same path.
 
 Known limits, deliberate in this slice:
 

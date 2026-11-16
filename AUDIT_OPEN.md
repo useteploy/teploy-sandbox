@@ -330,3 +330,164 @@ Not verified, or not done:
   for the confinement either way.
 - This change has had no independent review.
 
+
+## 2026-11-16 — VM driver: guest networking and the egress tiers
+
+The VM driver refused every network but `none`. It now serves `allowlist`
+(with `egressAllow`) and `open`, on a design that assumes the guest is
+hostile: it runs its own kernel and can send any frame. The Docker
+driver, its tiers and its tests are unchanged. On the wire nothing
+changed either: the same request fields, the same run object.
+
+Design, and why:
+
+- One tap per VM in the host's network namespace, routed (a /32 per VM,
+  one gateway address on a dummy interface), no bridge. A bridge with
+  port isolation would have put the isolation in a setting; without a
+  bridge there is no layer-2 path between guests to isolate.
+- The daemon creates the tap and passes the open descriptor to Cloud
+  Hypervisor (`--net fd=3`). Nothing of the hypervisor's confinement
+  gave: it is still unprivileged and in its empty network namespace,
+  with seccomp and Landlock on. Cloud Hypervisor v54.1 cannot read the
+  tap's MTU from there (the interface is not in its namespace); it logs
+  a warning and does not advertise an MTU, which leaves the guest on
+  the default of 1500, the tap's own.
+- nftables, in tables of the daemon's own: a `netdev` ingress filter
+  per tap for what must be judged before the host's ARP and IP code
+  (source MAC and address, ARP, IPv6), and one `inet` table for input,
+  forward and masquerade, rewritten atomically from the list of running
+  VMs. The Docker tiers keep their iptables chain, which exists because
+  the bridge is Docker's; the two never touch the same interfaces.
+- The guest gets its address, routes and resolvers through its agent,
+  not from DHCP and not from the kernel command line: no DHCP server
+  for a guest to talk to on the host, and it works with the images that
+  already exist. The same step sets the guest's clock, which was wrong
+  before this change (a guest has no clock to read at boot; it came up
+  weeks behind and no TLS certificate verified).
+
+What is enforced, and how each was checked on a real hypervisor (Cloud
+Hypervisor v54.1, Linux 6.8, arm64, nested KVM; `-tags vmintegration`,
+`TestVMNetworkIsolation`, `TestVMNetworkTiers`,
+`TestVMNetworkAfterADaemonCrash`). Every refusal has a control: a network
+namespace beside the host that answers on a private, a shared, a
+link-local (169.254.169.254) and a benchmarking address, reached by the
+host before a guest tries, and a TCP and UDP listener bound to every
+address of the host, reached by a neighbour that is not a guest.
+
+1. **Guest to guest: nothing.** From an open guest and from an allowlist
+   guest (which added itself a default route) to another guest that was
+   listening: ICMP, TCP, UDP, frames sent straight to the other guest's
+   MAC, to broadcast and to multicast, ARP claims of the other guest's
+   address and of the gateway's, the other guest's address taken as a
+   second address, and IPv6 link-local (ping, TCP, all-nodes,
+   all-routers) with IPv6 turned back on in both guests. The target
+   received nothing, kept its network, and the host's neighbour entries
+   did not move.
+2. **Guest to the host itself: only its own proxy port.** TCP to the
+   listener's port and to 22, UDP and ICMP, on the gateway address, the
+   host's own address and its address facing the neighbour namespace:
+   nothing answered and the listener saw nothing. An allowlist run
+   connects to its proxy port on the gateway; other runs do not connect
+   to that port, and a fork cannot use its source's proxy even with the
+   source's credential (nor the reverse). Without the credential the
+   proxy answers 407, for HTTP and CONNECT.
+3. **Ranges.** An open run on a default driver reached the internet
+   (name resolution, HTTP, HTTPS, a raw TCP connection) and none of the
+   six non-public addresses the host could reach; its private resolver
+   only on port 53. With `--vm-open-private` it reached the private and
+   shared addresses, still not the link-local one, and never port 25
+   (while port 8080 of the same peer answered). An allowlist run reached
+   a host on the built-in list and its own `egressAllow` entry through
+   its proxy, got 403 for everything else, and got nowhere around the
+   proxy, with or without a default route of its own making.
+4. **Spoofing.** Of eleven hand-made frames from a guest, the one with
+   its own MAC and address reached the peer; the nine with another MAC
+   or source address (the other guest's, the host's, the gateway's, an
+   outside one, loopback) were dropped at the tap's ingress filter
+   (its counter), and the one for 127.0.0.1 went nowhere.
+5. **A tier stays with a run.** Stop, resume and fork of an allowlist
+   run and stop and resume of an open run: everything in 2 and 3 holds
+   again afterwards. A resumed run has a new credential; a fork has its
+   own tap, address, MAC, proxy port and credential.
+6. **Teardown and restart.** After stop and after destroy: no tap, no
+   route, no element in the sets, no ingress filter, no listener on the
+   proxy port, no conntrack entry for the address. After a crash (a new
+   driver over a live run): the old rules were the run's tier until the
+   new driver wrote its table, from then on the leftover guest reached
+   nothing, and the sweep removed the VM, its tap and a stray tap with
+   this daemon's prefix, while a tap and a table of another daemon
+   identity and an unrelated tap were left alone. The crashed daemon's
+   own late teardown changed nothing in the new one's table.
+7. **The hypervisor's confinement.** The existing confinement checks
+   pass on a VM with a network device: unprivileged UID, no
+   capabilities, seccomp on every thread, a network namespace holding
+   only a loopback that is down. Its descriptor 3 is `/dev/net/tun` and
+   its command line names no interface.
+
+Also checked: with the daemon's tables deleted by hand under running
+guests, they were back within the two-second watch interval (0.8 and
+1.3 s measured) and 1 and 2 held again. And the checks themselves, by weakening
+the firewall and running them: with the guest-to-guest rules removed the
+suite reported the other guest reachable; with host input accepted, all
+nine host probes open; with port 25 not dropped, the port 25 connection;
+with the ingress filter passing any IPv4 source, the spoofed frame at
+the peer.
+
+Measured in that nested arm64 setup (not a statement about bare metal):
+host-side setup per create (tap, sysctls, conntrack, two nft
+transactions, link, route, neighbour: nine short commands) 30 to 130 ms
+over sixteen creates, most of them 40 to 50 ms; the guest's own setup,
+clock included, 0.3 to 1.2 s; a 1 GiB HTTP download from the neighbour
+namespace at 260 to 290 MB/s on the open tier and 250 to 300 MB/s
+through the allowlist proxy, against 570 to 840 MB/s from the host
+itself to the same Python server (two runs of each). A cold boot took
+9 to 15 s in the same runs, so the network adds a few percent to a
+create.
+
+Different from the Docker tiers, on purpose:
+
+- `open` is the public internet only, without the host itself and
+  without port 25. Docker's `open` is everything the host can route.
+  `--vm-open-private` gives back the private, shared, documentation and
+  benchmarking ranges; never link-local or the host. A caller can
+  therefore tell the drivers apart on `open`; the alternative was to
+  give strangers' code the host's LAN and metadata service by default.
+- Every allowlist run has its own authenticated proxy; Docker shares an
+  unauthenticated one between runs without `egressAllow`.
+- An allowlist guest has no resolver at all.
+
+Not done, not verified, or known to be weak:
+
+- An x86-64 host and bare metal. Other Cloud Hypervisor versions: the
+  hand-over relies on v54.1 tolerating a tap whose interface it cannot
+  see.
+- A host with another firewall that drops by default (ufw, firewalld,
+  Docker's FORWARD chain). The daemon names such chains in its log at
+  start and nothing more; no such host was tried, and guests' traffic
+  will not pass there until that firewall allows it.
+- `net.ipv4.ip_forward=1` is required and is host-wide: the host now
+  routes between all of its interfaces. The daemon's table only judges
+  traffic from and to its own taps.
+- If something removes the daemon's tables, guests are unfiltered until
+  the next check, at most two seconds. While the daemon is dead nothing
+  checks. A design in which a missing table fails closed was not found
+  with nftables alone.
+- After a crash an allowlist guest's rule still admits it to its proxy
+  port on the gateway, where nothing listens any more; a process that
+  bound that port before the restart would be reachable by that guest.
+- No limit on a guest's bandwidth, packet rate or number of tracked
+  connections. An open guest can fill the host's connection tracking
+  table, which is shared with everything else on the host.
+- No IPv6 for guests.
+- A guest whose image has no `ip` command cannot be given a network;
+  the create (or resume) fails and says so. A run that removes iproute2
+  and is then stopped can no longer be resumed.
+- Packets a process on the host sends to a guest's address are not
+  filtered (the answers are dropped).
+- The proxy itself is the Docker tiers' proxy: it dials what the
+  allowlist names, including a private address behind an allowed name.
+- The seccomp filter was not exercised by a forbidden call; that the
+  hypervisor serves a tap under it without being killed is what was
+  seen.
+- The guest's setup time was measured, not explained.
+- This change has had no independent review.

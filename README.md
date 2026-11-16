@@ -126,12 +126,11 @@ it changed.
 
 What works, through the same HTTP API: create, exec (stdout, stderr, exit
 code, env, cwd, timeout), file write and read, snapshot, stop, resume
-after a daemon restart, fork of a running run, destroy.
+after a daemon restart, fork of a running run, destroy, and the three
+network tiers with `egressAllow` (see Guest networking below).
 
-What is refused with a 400 rather than faked, in this first slice:
+What is refused with a 400 rather than faked:
 
-- any `network` other than `none`, and `egressAllow` (a VM has no guest
-  network yet);
 - `warm` (no warm repo cache);
 - `limits.pids` (a VM is bounded by its memory and CPUs; the task limit
   on its hypervisor is the driver's, not the caller's);
@@ -144,8 +143,10 @@ Host setup: `sudo scripts/install-host.sh [POOL]` prepares a host and can
 be run again at any time; a second run changes nothing. It installs the
 udev rule described below, makes sure `/dev/kvm` is openable by a group
 rather than by root alone, checks the VM UID range and the cgroup
-controllers, sets `volmode=dev` on the pool, and reports whether the
-kernel has Landlock. The pool, the kernel image and the golden snapshot
+controllers, sets `volmode=dev` on the pool, checks what guest networking
+needs (the `ip`, `nft` and `conntrack` commands, `/dev/net/tun`, dummy
+interfaces, nftables ingress hooks), turns on IPv4 forwarding and makes
+that permanent, and reports whether the kernel has Landlock. The pool, the kernel image and the golden snapshot
 are yours to provide: build the golden with `scripts/build-golden.sh`
 from a volume holding a bootable systemd root filesystem.
 
@@ -167,7 +168,13 @@ there is one:
   and `pids` controllers (`--vm-cgroup`, default
   `/sys/fs/cgroup/teploy-sandbox-vm`);
 - a directory for device nodes on a filesystem that allows them
-  (`--vm-dev-dir`, default `/dev/teploy-sandbox`; `/run` is `nodev`).
+  (`--vm-dev-dir`, default `/dev/teploy-sandbox`; `/run` is `nodev`);
+- for guest networking: the `ip` (iproute2), `nft` (nftables) and
+  `conntrack` (conntrack-tools) commands, `/dev/net/tun`,
+  `net.ipv4.ip_forward=1`, an IPv4 subnet nothing else on the host uses
+  (`--vm-subnet`, default `10.209.0.0/16`), and an IPv4 DNS resolver
+  that is not on the host itself (`--vm-dns`, default: the host's own
+  resolvers). These are required whatever tiers you use.
 
 `GET /v1/capacity` reports `driver` and `nestedVirt`.
 
@@ -206,6 +213,101 @@ The layers are independent; each is checked by the live suite.
   run reports its VM gone. The group is removed with the VM, and a
   starting daemon kills and removes whatever groups its previous life
   left.
+
+The guest's clock is set by the daemon each time a VM boots (a guest has
+no clock of its own to read, and with the wrong date no TLS certificate
+verifies).
+
+### Guest networking
+
+A guest controls its own kernel, so nothing here depends on what a guest
+does with its network device: it can send any frame, claim any address
+and speak any protocol, and the host decides what leaves the tap.
+
+| `network` | What a VM run gets |
+|---|---|
+| `none` (default) | No network device at all. |
+| `allowlist` | A device whose only reachable destination is the run's own proxy port on the gateway address. Always a proxy of its own with a random credential in its URL (the Docker driver shares one proxy between runs that pass no `egressAllow`); the same proxy env, the same allowlist and the same `egressAllow` grammar. No default route and no resolver: the proxy resolves. |
+| `open` | A device that is routed and masqueraded to the public internet, with the host's resolvers. See below for what that excludes. |
+
+How it is built:
+
+- **One tap per VM, no bridge.** The daemon creates the tap in the host's
+  network namespace and hands the hypervisor the open descriptor
+  (`--net fd=3`). The hypervisor stays unprivileged and in its empty
+  network namespace: it has a file descriptor, not an interface. The tap
+  is not persistent, so it exists exactly as long as its hypervisor does.
+  With no bridge there is no layer-2 path from one guest to another.
+- **At the tap's ingress hook** (nftables, `netdev` family, before the
+  host's ARP and IP code runs): only frames from the VM's MAC, only IPv4
+  from the VM's address, and only ARP requests for the gateway from that
+  MAC and address. Everything else is dropped there: spoofed MACs and
+  addresses, IPv6 of every kind, DHCP, multicast, broadcast, other
+  ethertypes. IPv6 is also turned off on the host's side of the tap. The
+  host's neighbour entry for a guest is permanent, so no ARP a guest
+  sends can change who the host thinks has an address.
+- **Addresses.** Each VM has one address, a /32 routed to its tap; the
+  gateway address is the same for every VM and lives on a dummy
+  interface. The guest is told its address, route and resolvers through
+  its agent (it needs `ip` from iproute2; with systemd-resolved it is
+  configured through `resolvectl`, otherwise `/etc/resolv.conf` is
+  written). Nothing is offered by DHCP. An address is not handed to
+  another VM until every other address has been used, and the connection
+  tracker's entries for it are deleted when it is given up and again
+  before it is used.
+- **To the host itself** (any of its addresses, any protocol): dropped,
+  except TCP from an allowlist run's tap and address to that run's proxy
+  port on the gateway. Not the daemon's API, not SSH, not another run's
+  proxy.
+- **Through the host:** nothing from an allowlist run (the kernel's
+  per-interface forwarding is off on its tap as well). From an open run:
+  never to another guest or the guest subnet; DNS to the configured
+  resolvers; then everything except the ranges that are not the public
+  internet, and except TCP port 25. To a guest: only answers.
+- **One nftables table per daemon identity**, rewritten as a whole, in
+  one transaction, from the list of running VMs; a tap whose name starts
+  with the daemon's prefix and that the table does not name is dropped at
+  every hook. The daemon checks every two seconds that its tables are
+  still there and puts them back (a host firewall reload that begins
+  with `flush ruleset` removes them; until they are back, at most those
+  two seconds, guests are not filtered).
+
+Where the `open` tier differs from the Docker driver's, on purpose. The
+Docker `open` tier is "everything the host can route", including the
+host's LAN, an overlay network, a cloud metadata service and the host's
+own services on the bridge gateway. A VM run on `open`:
+
+- reaches the **public internet only** by default. Private
+  (`10/8`, `172.16/12`, `192.168/16`), shared (`100.64/10`), link-local
+  (`169.254/16`, where metadata services are), loopback, documentation,
+  benchmarking, multicast and reserved ranges are dropped.
+  `--vm-open-private` (`SBX_VM_OPEN_PRIVATE=true`) restores the Docker
+  meaning for the private, shared, documentation and benchmarking
+  ranges; link-local, loopback, multicast and reserved space stay closed;
+- never reaches the **host itself** or another guest, with or without
+  that flag;
+- cannot connect to **TCP port 25** anywhere (the Docker tier does not
+  close it);
+- has **no IPv6**.
+
+The resolvers are an exception to the private ranges for port 53 only:
+a host that resolves through its router still gives its guests DNS.
+
+What to know before relying on it:
+
+- `net.ipv4.ip_forward=1` makes the host route between all of its
+  interfaces, not only for guests. If that is new on your host, filter
+  forwarding for the rest in your own firewall.
+- Another firewall on the host that drops by default (a `policy drop`
+  input or forward chain: ufw, firewalld, Docker's `FORWARD` chain)
+  still applies: an accept in this daemon's table does not overrule a
+  drop in another. Allow traffic arriving on the daemon's taps there
+  (the daemon logs the chains it finds at start, and the tap prefix).
+- While the daemon is dead (a crash), its rules stay as they were, so a
+  leftover guest has exactly its tier, but its proxy is gone and nothing
+  watches the tables. The next start rewrites the table before anything
+  else, which cuts every leftover guest off, and the sweep then kills
+  them and removes their taps.
 
 The guest's disk is opened with direct I/O, so it is not cached a second
 time in the host's page cache at the VM's expense.
@@ -247,8 +349,9 @@ A VM's console and its hypervisor's output are kept in the daemon's
 memory, the last 64 KiB of each; nothing a guest can make grow is written
 to `--vm-run-dir`.
 
-Test against a real hypervisor (needs root, KVM, ZFS and a host set up
-by `scripts/install-host.sh`; CI has none of it and only vets the suite):
+Test against a real hypervisor (needs root, KVM, ZFS, a host set up by
+`scripts/install-host.sh`, and outbound internet for the network tiers;
+CI has none of it and only vets the suite):
 `CGO_ENABLED=0 go test -c -tags vmintegration -o vm.test . && sudo ./vm.test -test.run TestVM -test.v`
 
 ## Writable leases
@@ -337,6 +440,9 @@ working ecosystem is still one `egressAllow` away:
 
 ### What the allowlist tier cannot do
 
+(The mechanism below is the Docker driver's. Under the VM driver the
+same limits hold by other means; see Guest networking.)
+
 The `teploy-sbx-egress-v2` bridge is internal with inter-container
 communication disabled. Linux `iptables` admits only active proxy listeners
 on its gateway and denies other host services; IPv6 is disabled in allowlist
@@ -363,6 +469,9 @@ Everything follows from that:
   admitted the host.
 
 ### What `open` actually does
+
+(Under the Docker driver. The VM driver's `open` tier is narrower; see
+Guest networking in the VM driver section.)
 
 `open` puts the run on Docker's default NAT bridge and injects no proxy
 env at all. A raw TCP or UDP connection to any port simply works: SSH

@@ -617,6 +617,42 @@ func TestCheckRestoresTablesSomethingElseRemoved(t *testing.T) {
 	}
 }
 
+// A guest that powers off takes its tap with it, and the kernel removes
+// the tap's ingress filter with the device. That is not a filter that
+// something else removed: nothing is restored, and nothing is attempted
+// every two seconds until the run is removed.
+func TestCheckLeavesAVMThatIsGoneAlone(t *testing.T) {
+	network, fake := startedNetwork(t, nil)
+	_, err := network.Attach(bg, "run-a", run.NetworkOpen, 0)
+	must(t, err)
+	_, err = network.Attach(bg, "run-b", run.NetworkOpen, 0)
+	must(t, err)
+	fake.mu.Lock()
+	delete(fake.links, "tv012345-0")
+	delete(fake.chains, "tap0")
+	wantChain := fake.chains["tap1"]
+	delete(fake.chains, "tap1")
+	before := len(fake.events)
+	fake.mu.Unlock()
+	if !network.check(bg) {
+		t.Fatal("the watch gave up")
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if _, restored := fake.chains["tap0"]; restored {
+		t.Fatal("a filter was installed for a tap that does not exist")
+	}
+	for _, event := range fake.events[before:] {
+		if strings.Contains(event, "tv012345-0") {
+			t.Fatalf("the check touched the tap of a VM that is gone: %s", event)
+		}
+	}
+	// The VM that is still there has its filter back.
+	if fake.chains["tap1"] != wantChain || wantChain == "" {
+		t.Fatalf("the filter of a live tap was not restored: %v", fake.chains)
+	}
+}
+
 func TestGuestNetScriptConfiguresTheTier(t *testing.T) {
 	allow := guestNetScript(&GuestNetwork{MAC: "02:54:0a:d1:00:02", HostMAC: "fe:54:00:00:00:01",
 		Address: netip.MustParseAddr("10.209.0.2"), Gateway: netip.MustParseAddr("10.209.0.1"), Tier: run.NetworkAllowlist})

@@ -551,8 +551,18 @@ func (n *hostNetwork) check(ctx context.Context) bool {
 		}
 	}
 	chains, err := n.sys.run(ctx, "nft", "list", "table", "netdev", n.plan.table)
+	links, linksErr := n.sys.links()
 	for _, each := range n.attached {
 		if each.closing || (err == nil && strings.Contains(string(chains), "chain "+chainName(each.slot)+" {")) {
+			continue
+		}
+		if linksErr == nil && !slices.Contains(links, each.tap) {
+			// The VM is gone (its guest powered off, or its hypervisor
+			// died) and took the tap along, and the kernel removed the
+			// filter with the device. There is nothing to filter and
+			// nothing to restore until the run is removed; a guest must
+			// not be able to make the daemon log an error every two
+			// seconds by shutting down.
 			continue
 		}
 		n.log.Error("a tap's ingress filter was removed by something else; putting it back", "tap", each.tap)

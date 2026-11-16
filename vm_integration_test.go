@@ -449,3 +449,84 @@ func TestVMPreflightNamesAMissingGoldenSnapshot(t *testing.T) {
 		t.Fatalf("this host should only be missing the golden snapshot: %v", err)
 	}
 }
+
+// dirBytes is the total size of the regular files under dir.
+func dirBytes(t *testing.T, dir string) int64 {
+	t.Helper()
+	var total int64
+	err := filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return total
+}
+
+// What a guest can do to the host and to its own run without the agent's
+// cooperation: write to its console without end, and power itself off.
+func TestVMGuestConsoleFloodAndPowerOff(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Fatal("the vm suite needs root (zfs, /dev/kvm)")
+	}
+	config := vmTestConfig(t)
+	ctx := context.Background()
+	manager, _, _, _ := newVMManager(t, config, t.TempDir())
+	baseline := poolListing(t, config.Pool)
+	created, err := manager.Create(ctx, run.CreateRequest{Image: vm.GoldenImage, Limits: &run.Limits{MemoryMB: 1024, CPUs: 1}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	id := created.ID
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), id) })
+
+	// --- the console is the guest's to write, and the host's memory is not
+	// (an emulated UART is slow, so the flood is small and the bound on
+	// what the host may keep of it on disk is smaller)
+	const flood = 64 << 10
+	result := vmRun(t, manager, id, `head -c 65536 /dev/zero | tr '\0' x > /dev/console; echo done`, "", nil, 5*time.Minute)
+	if result.code != 0 || !strings.Contains(result.stdout, "done") {
+		t.Fatalf("console flood: %+v", result)
+	}
+	runDir := filepath.Join(config.RunDir, config.Owner[:16])
+	if kept := dirBytes(t, runDir); kept > flood/16 {
+		t.Errorf("a guest that wrote %d bytes to its console left %d bytes in the host's runtime dir %s", flood, kept, runDir)
+	}
+
+	// --- a guest that powers itself off keeps its disk: stop, resume
+	if result = vmRun(t, manager, id, `echo kept > kept.txt && sync`, "", nil, 30*time.Second); result.code != 0 {
+		t.Fatalf("write before power off: %+v", result)
+	}
+	if session, err := manager.BeginExec(id, run.LeaseCredential{}); err == nil {
+		_, _, _ = session.Exec(ctx, `poweroff -f`, "", nil, 30*time.Second, io.Discard, io.Discard)
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for len(hypervisorProcesses(t, config.RunDir)) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the hypervisor outlived its guest's power off")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if _, err := manager.Stop(ctx, id); err != nil {
+		t.Fatalf("stop of a run whose guest powered off: %v", err)
+	}
+	if _, err := manager.Resume(ctx, id, 0); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if result = vmRun(t, manager, id, `cat kept.txt`, "", nil, 30*time.Second); strings.TrimSpace(result.stdout) != "kept" {
+		t.Fatalf("the disk of a powered-off guest after stop and resume: %+v", result)
+	}
+
+	if err := manager.Destroy(ctx, id); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+	if got := poolListing(t, config.Pool); !slices.Equal(got, baseline) {
+		t.Fatalf("volumes or snapshots left behind:\n  %v\nwant exactly the baseline\n  %v", got, baseline)
+	}
+	if left := hypervisorProcesses(t, config.RunDir); len(left) != 0 {
+		t.Fatalf("hypervisor processes left behind: %v", left)
+	}
+}

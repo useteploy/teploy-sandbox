@@ -41,7 +41,7 @@ func TestMachineArgsAreTheProvenCommandLine(t *testing.T) {
 		"--memory", "size=2048M",
 		"--vsock", "cid=7,socket=/run/sbx/abc/teploy-sbx-x/vsock.sock",
 		"--balloon", "size=0,free_page_reporting=on,deflate_on_oom=on",
-		"--serial", "file=/run/sbx/abc/teploy-sbx-x/serial.log",
+		"--serial", "tty",
 		"--console", "off",
 		"--api-socket", "/run/sbx/abc/teploy-sbx-x/api.sock",
 	}
@@ -290,5 +290,82 @@ func TestStartAndKillManageTheProcessAndItsRuntimeDir(t *testing.T) {
 	long := &CloudHypervisor{Bin: script, RunDir: filepath.Join(root, strings.Repeat("d", 100))}
 	if _, err := long.Start(ctx, MachineConfig{Name: "teploy-sbx-c"}); err == nil || !strings.Contains(err.Error(), "too long") {
 		t.Fatalf("a runtime dir too long for a socket path: %v", err)
+	}
+}
+
+// The serial console is the guest's to write to, without limit. None of it
+// may land in the runtime dir (usually a tmpfs: host memory), and the
+// daemon keeps a fixed amount of it.
+func TestAGuestsConsoleOutputIsBoundedOnTheHost(t *testing.T) {
+	h := &CloudHypervisor{Bin: "/opt/ch", Kernel: "/k", Cmdline: "c", RunDir: "/run/sbx/abc"}
+	for _, arg := range h.machineArgs(MachineConfig{Name: "teploy-sbx-x", Disk: "/dev/zvol/tank/teploy-sbx-x", CPUs: 1, MemoryMB: 64}, "/run/sbx/abc/teploy-sbx-x", 3) {
+		if strings.HasPrefix(arg, "file=") || strings.Contains(arg, ",file=") {
+			t.Fatalf("the hypervisor is told to write a file a guest can grow: %q", arg)
+		}
+	}
+
+	root := shortDir(t)
+	script := filepath.Join(root, "fake-hypervisor")
+	// 4 MiB on the console and as much of its own output, then a marker.
+	body := "#!/bin/sh\nhead -c 4194304 /dev/zero | tr '\\0' x\nhead -c 4194304 /dev/zero | tr '\\0' y >&2\necho console-end\necho output-end >&2\nexec sleep 300\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h = &CloudHypervisor{Bin: script, Kernel: "/k", Cmdline: "c", RunDir: filepath.Join(root, "run")}
+	started, err := h.Start(context.Background(), MachineConfig{Name: "teploy-sbx-a", Disk: "/dev/null", CPUs: 1, MemoryMB: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	defer started.Kill(ctx)
+	for {
+		diagnostics := started.Diagnostics()
+		if strings.Contains(diagnostics, "console-end") && strings.Contains(diagnostics, "output-end") {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("the end of the output was not kept: %q", diagnostics)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	machine := started.(*chMachine)
+	for name, buf := range map[string]*tailBuffer{"serial": machine.serial, "output": machine.output} {
+		buf.mu.Lock()
+		held := cap(buf.buf)
+		buf.mu.Unlock()
+		if held > 4*outputTail {
+			t.Errorf("%s: %d bytes held for a %d byte tail", name, held, outputTail)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "run", "teploy-sbx-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if info, err := entry.Info(); err == nil && info.Mode().IsRegular() {
+			t.Errorf("a file in the runtime dir: %s (%d bytes)", entry.Name(), info.Size())
+		}
+	}
+}
+
+func TestTailBufferKeepsTheEnd(t *testing.T) {
+	buf := &tailBuffer{limit: 8}
+	for _, chunk := range []string{"ab", "cdef", "ghijk", "l", "mnopqrstuvwxyz0123456789", "!"} {
+		if n, err := buf.Write([]byte(chunk)); n != len(chunk) || err != nil {
+			t.Fatalf("write %q: %d %v", chunk, n, err)
+		}
+		if len(buf.buf) > 2*buf.limit {
+			t.Fatalf("after %q the buffer holds %d bytes", chunk, len(buf.buf))
+		}
+	}
+	if got := buf.Tail(64); got != "3456789!" {
+		t.Fatalf("tail = %q", got)
+	}
+	if got := buf.Tail(3); got != "89!" {
+		t.Fatalf("short tail = %q", got)
+	}
+	if got := (&tailBuffer{limit: 8}).Tail(8); got != "" {
+		t.Fatalf("empty tail = %q", got)
 	}
 }

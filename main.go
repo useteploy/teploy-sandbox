@@ -95,7 +95,7 @@ func serve(args []string) error {
 	vmGolden := flags.String("vm-golden", envOr("SBX_VM_GOLDEN", ""),
 		"vm driver: the golden snapshot runs are cloned from (default <vm-pool>/golden-guestd@v1; see scripts/build-golden.sh)")
 	vmRunDir := flags.String("vm-run-dir", envOr("SBX_VM_RUN_DIR", vm.DefaultRunDir),
-		"vm driver: directory for each VM's sockets and serial log")
+		"vm driver: directory for each VM's sockets")
 	vmBootTimeout := flags.Duration("vm-boot-timeout", envDuration("SBX_VM_BOOT_TIMEOUT", vm.DefaultBootTimeout),
 		"vm driver: how long a new VM may take to answer")
 	if err := flags.Parse(args); err != nil {

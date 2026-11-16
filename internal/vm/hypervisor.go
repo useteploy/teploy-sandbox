@@ -69,8 +69,10 @@ type Hypervisor interface {
 
 // CloudHypervisor runs VMs as cloud-hypervisor processes.
 //
-// Each VM gets a directory under RunDir holding its API socket, its vsock
-// socket, its serial log and the hypervisor's own output. RunDir is
+// Each VM gets a directory under RunDir holding its API socket and its
+// vsock socket, and nothing a guest can make grow: the serial console and
+// the hypervisor's own output come to the daemon through pipes and only
+// their last outputTail bytes are kept. RunDir is
 // specific to one daemon identity, which is what makes it the owner mark
 // for processes: Sweep only ever signals a process whose own command line
 // names an API socket inside RunDir.
@@ -112,8 +114,10 @@ func DefaultCmdline() string {
 const (
 	apiSocketName   = "api.sock"
 	vsockSocketName = "vsock.sock"
-	serialLogName   = "serial.log"
-	hypervisorLog   = "hypervisor.log"
+
+	// outputTail is how much of a VM's serial console, and of its
+	// hypervisor's own output, the daemon keeps for Diagnostics.
+	outputTail = 64 << 10
 
 	// maxSocketPath is the usable length of a unix socket path on Linux
 	// (sun_path is 108 bytes, with its terminating NUL).
@@ -137,7 +141,10 @@ func (h *CloudHypervisor) machineArgs(config MachineConfig, dir string, cid uint
 		// A zero-sized balloon that only reports free pages: memory the
 		// guest stops using goes back to the host. No policy sits on top.
 		"--balloon", "size=0,free_page_reporting=on,deflate_on_oom=on",
-		"--serial", "file=" + filepath.Join(dir, serialLogName),
+		// The console goes to the hypervisor's stdout, which Start reads
+		// into a bounded buffer. Never to a file: the guest decides how
+		// much it writes there, and the runtime dir is usually host memory.
+		"--serial", "tty",
 		"--console", "off",
 		"--api-socket", filepath.Join(dir, apiSocketName),
 	}
@@ -156,19 +163,17 @@ func (h *CloudHypervisor) Start(_ context.Context, config MachineConfig) (Machin
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	output, err := os.OpenFile(filepath.Join(dir, hypervisorLog), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	defer output.Close()
-
 	// Guest CIDs start at 3. The hypervisor's vsock is a userspace device
 	// behind its own unix socket, so the number only has to be valid; one
 	// per VM keeps logs unambiguous.
 	cid := 3 + h.nextCID.Add(1)
 	// Not CommandContext: the VM outlives the request that created it.
 	cmd := exec.Command(h.Bin, h.machineArgs(config, dir, cid)...)
-	cmd.Stdout, cmd.Stderr = output, output
+	serial, output := &tailBuffer{limit: outputTail}, &tailBuffer{limit: outputTail}
+	cmd.Stdout, cmd.Stderr = serial, output
+	// Should anything else ever hold the output pipes open, the process
+	// exiting still counts as the VM being gone.
+	cmd.WaitDelay = 5 * time.Second
 	// Its own session: a signal aimed at the daemon's process group (a
 	// terminal's ^C) must not take every run with it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -180,6 +185,8 @@ func (h *CloudHypervisor) Start(_ context.Context, config MachineConfig) (Machin
 		dir:     dir,
 		process: cmd.Process,
 		exited:  make(chan struct{}),
+		serial:  serial,
+		output:  output,
 		agent: &guest.Client{Dial: func(ctx context.Context) (net.Conn, error) {
 			return dialVsock(ctx, filepath.Join(dir, vsockSocketName), guest.Port)
 		}},
@@ -204,6 +211,9 @@ type chMachine struct {
 	exited  chan struct{}
 	agent   *guest.Client
 	api     *http.Client
+	// serial is the end of the guest's console, output the end of what
+	// the hypervisor itself printed.
+	serial, output *tailBuffer
 
 	killOnce sync.Once
 }
@@ -245,27 +255,58 @@ func (m *chMachine) Kill(ctx context.Context) error {
 
 func (m *chMachine) Diagnostics() string {
 	var parts []string
-	for _, name := range []string{hypervisorLog, serialLogName} {
-		if tail := tailFile(filepath.Join(m.dir, name), 2<<10); tail != "" {
-			parts = append(parts, name+": "+tail)
+	for _, source := range []struct {
+		name string
+		buf  *tailBuffer
+	}{{"hypervisor", m.output}, {"serial console", m.serial}} {
+		if tail := source.buf.Tail(2 << 10); tail != "" {
+			parts = append(parts, source.name+": "+tail)
 		}
 	}
 	return strings.Join(parts, " | ")
 }
 
-// tailFile returns the last limit bytes of a file, trimmed; "" if it
-// cannot be read or is empty.
-func tailFile(path string, limit int64) string {
-	file, err := os.Open(path)
-	if err != nil {
-		return ""
+// tailBuffer is an io.Writer that keeps the last limit bytes written to
+// it. It is where a VM's console and its hypervisor's output end up:
+// whatever the guest writes, the daemon holds a fixed amount of it.
+type tailBuffer struct {
+	limit int
+
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	written := len(p)
+	if len(p) >= b.limit {
+		b.buf = append(b.buf[:0], p[len(p)-b.limit:]...)
+		return written, nil
 	}
-	defer file.Close()
-	if info, err := file.Stat(); err == nil && info.Size() > limit {
-		_, _ = file.Seek(-limit, io.SeekEnd)
+	// Let it run to twice the limit before moving the tail down, so a
+	// stream of small writes is not a copy of the whole buffer each time.
+	if len(b.buf)+len(p) > 2*b.limit {
+		keep := b.limit - len(p)
+		b.buf = append(b.buf[:0], b.buf[len(b.buf)-keep:]...)
 	}
-	data, _ := io.ReadAll(io.LimitReader(file, limit))
-	return strings.TrimSpace(strings.ToValidUTF8(string(data), "?"))
+	b.buf = append(b.buf, p...)
+	return written, nil
+}
+
+// Tail returns the last max bytes written, trimmed, as valid UTF-8.
+func (b *tailBuffer) Tail(max int) string {
+	b.mu.Lock()
+	data := b.buf
+	if len(data) > b.limit {
+		data = data[len(data)-b.limit:]
+	}
+	if len(data) > max {
+		data = data[len(data)-max:]
+	}
+	text := string(data)
+	b.mu.Unlock()
+	return strings.TrimSpace(strings.ToValidUTF8(text, "?"))
 }
 
 // owns reports whether a process is a VM of this daemon identity: its own

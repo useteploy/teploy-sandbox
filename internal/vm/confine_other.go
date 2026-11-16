@@ -4,6 +4,7 @@ package vm
 
 import (
 	"errors"
+	"net"
 	"os"
 	"syscall"
 )
@@ -15,3 +16,5 @@ func confinedProcAttr(uint32, uint32, []uint32, *os.File) (*syscall.SysProcAttr,
 }
 
 func landlockABI() (int, error) { return 0, errLinuxOnly }
+
+func socketOwner(net.Conn) (uint32, error) { return 0, errLinuxOnly }

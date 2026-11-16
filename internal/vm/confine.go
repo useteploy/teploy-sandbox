@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -59,6 +60,9 @@ type confineSys struct {
 	procAttr func(uid, gid uint32, groups []uint32, cgroup *os.File) (*syscall.SysProcAttr, error)
 	// openCgroup opens a cgroup directory to start a process in.
 	openCgroup func(dir string) (*os.File, error)
+	// socketOwner is the UID of the process listening at the other end
+	// of a connected unix socket, as the kernel recorded it.
+	socketOwner func(conn net.Conn) (uint32, error)
 }
 
 func realConfineSys() confineSys {
@@ -70,9 +74,10 @@ func realConfineSys() confineSys {
 			}
 			return nil
 		},
-		chown:      func(path string, uid, gid uint32) error { return os.Lchown(path, int(uid), int(gid)) },
-		procAttr:   confinedProcAttr,
-		openCgroup: os.Open,
+		chown:       func(path string, uid, gid uint32) error { return os.Lchown(path, int(uid), int(gid)) },
+		procAttr:    confinedProcAttr,
+		openCgroup:  os.Open,
+		socketOwner: socketOwner,
 	}
 }
 
@@ -157,6 +162,36 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 // only needed until then: started closes it.
 func (c *cell) procAttr() (*syscall.SysProcAttr, error) {
 	return c.owner.sys.procAttr(c.uid, c.uid, c.owner.groups, c.cgroup)
+}
+
+// dial connects to one of the VM's unix sockets and proves that the VM's
+// own process is what answers there.
+//
+// The sockets live in the VM's runtime dir, which belongs to the VM's UID:
+// its process has to make them. A hypervisor that a guest took over can
+// therefore put anything at those paths, a link to another run's socket
+// or to a service of the host included, and the daemon connects as root,
+// which no file permission refuses. The path is not what is trusted: the
+// kernel records who listens on a unix socket, and a connection that is
+// not answered by this VM's UID is closed before a byte is written to it.
+// What the daemon says to a VM (commands, files, a pause) then only ever
+// reaches that VM.
+func (c *cell) dial(ctx context.Context, path string) (net.Conn, error) {
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "unix", path)
+	if err != nil {
+		return nil, err
+	}
+	owner, err := c.owner.sys.socketOwner(conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("identify who listens on %s: %w", path, err)
+	}
+	if owner != c.uid {
+		_ = conn.Close()
+		return nil, fmt.Errorf("refusing %s: uid %d listens there, not this VM's uid %d", path, owner, c.uid)
+	}
+	return conn, nil
 }
 
 func (c *cell) started() {

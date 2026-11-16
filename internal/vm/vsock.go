@@ -13,8 +13,16 @@ import (
 // ports over one socket: the host connects, sends "CONNECT <port>\n", and
 // after an "OK <n>\n" line the stream is the guest connection.
 func dialVsock(ctx context.Context, socketPath string, port uint32) (net.Conn, error) {
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "unix", socketPath)
+	return dialVsockWith(ctx, func(ctx context.Context) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "unix", socketPath)
+	}, port)
+}
+
+// dialVsockWith is dialVsock over a connection the caller makes: nothing
+// is written to it before dial has returned it.
+func dialVsockWith(ctx context.Context, dial func(ctx context.Context) (net.Conn, error), port uint32) (net.Conn, error) {
+	conn, err := dial(ctx)
 	if err != nil {
 		return nil, err
 	}

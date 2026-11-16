@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -603,5 +604,99 @@ func TestConfinementSweepRemovesGroupsAndNodes(t *testing.T) {
 	}
 	if groups, _ := c.cgroups.fs.children(c.cgroups.dir); len(groups) != 0 {
 		t.Fatalf("groups left: %v", groups)
+	}
+}
+
+// A VM's runtime dir belongs to the VM's UID, so a hypervisor that a guest
+// took over decides what is at its socket paths. The daemon connects as
+// root; what it says must never reach anything but that VM's own process.
+func TestDialRefusesASocketThatIsNotTheVMsOwn(t *testing.T) {
+	// Short paths: a unix socket path has about a hundred bytes.
+	root, err := os.MkdirTemp("/tmp", "sbx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+	c, _, _ := newTestConfinement(t, root)
+	const victimUID = 70001
+	listeners := map[string]uint32{}
+	c.sys.socketOwner = func(conn net.Conn) (uint32, error) {
+		uid, ok := listeners[conn.RemoteAddr().String()]
+		if !ok {
+			return 0, fmt.Errorf("no owner recorded for %q", conn.RemoteAddr())
+		}
+		return uid, nil
+	}
+	ctx := context.Background()
+	config := MachineConfig{Name: runName(1), Disk: "/dev/zvol/tank/" + runName(1), CPUs: 1, MemoryMB: 512}
+	dir := filepath.Join(root, "run", config.Name)
+	own, err := c.enter(ctx, config, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan string, 4)
+	listen := func(path string, uid uint32) {
+		t.Helper()
+		listener, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { listener.Close() })
+		listeners[path] = uid
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				buf := make([]byte, 64)
+				n, _ := conn.Read(buf)
+				received <- path + ": " + string(buf[:n])
+				conn.Close()
+			}
+		}()
+	}
+	// The VM's own socket is reached.
+	ownSocket := filepath.Join(dir, apiSocketName)
+	listen(ownSocket, own.uid)
+	conn, err := own.dial(ctx, ownSocket)
+	if err != nil {
+		t.Fatalf("the VM's own socket: %v", err)
+	}
+	fmt.Fprint(conn, "hello")
+	conn.Close()
+	if got := <-received; got != ownSocket+": hello" {
+		t.Fatalf("own socket received %q", got)
+	}
+	// Another run's socket, put at this VM's path as a link: the daemon
+	// follows it as root, and must not speak.
+	victimSocket := filepath.Join(root, "victim.sock")
+	listen(victimSocket, victimUID)
+	link := filepath.Join(dir, vsockSocketName)
+	if err := os.Symlink(victimSocket, link); err != nil {
+		t.Fatal(err)
+	}
+	if conn, err := own.dial(ctx, link); err == nil {
+		conn.Close()
+		t.Fatal("a link to another run's socket was accepted")
+	} else if !strings.Contains(err.Error(), "70001") {
+		t.Fatalf("the refusal does not say who listens there: %v", err)
+	}
+	// And through the vsock handshake, which is what would carry commands.
+	if conn, err := dialVsockWith(ctx, func(ctx context.Context) (net.Conn, error) { return own.dial(ctx, link) }, 1024); err == nil {
+		conn.Close()
+		t.Fatal("a vsock handshake went to another run's socket")
+	}
+	if got := <-received; got != victimSocket+": " {
+		t.Fatalf("the other run's socket was sent %q", got)
+	}
+	if got := <-received; got != victimSocket+": " {
+		t.Fatalf("the other run's socket was sent %q", got)
+	}
+	// An owner that cannot be established is a refusal too.
+	delete(listeners, victimSocket)
+	if conn, err := own.dial(ctx, link); err == nil {
+		conn.Close()
+		t.Fatal("a socket with no known owner was accepted")
 	}
 }

@@ -244,14 +244,15 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 		serial:  serial,
 		output:  output,
 		agent: &guest.Client{Dial: func(ctx context.Context) (net.Conn, error) {
-			return dialVsock(ctx, filepath.Join(dir, vsockSocketName), guest.Port)
+			return dialVsockWith(ctx, func(ctx context.Context) (net.Conn, error) {
+				return confined.dial(ctx, filepath.Join(dir, vsockSocketName))
+			}, guest.Port)
 		}},
 	}
 	machine.api = &http.Client{Transport: &http.Transport{
 		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var dialer net.Dialer
-			return dialer.DialContext(ctx, "unix", filepath.Join(dir, apiSocketName))
+			return confined.dial(ctx, filepath.Join(dir, apiSocketName))
 		},
 	}}
 	go func() {

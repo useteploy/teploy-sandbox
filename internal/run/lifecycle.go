@@ -137,7 +137,11 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool) (*
 	if err != nil {
 		return nil, err
 	}
-	attempt, cancel := context.WithTimeout(ctx, 15*time.Second)
+	// Detached from the request: a caller that gives up once the capture
+	// exists must not abort the removal half way. A cancelled removal is
+	// reported as failed although the runtime may still carry it out, and
+	// the capture — then the only copy of the run — would be thrown away.
+	attempt, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	err = m.runtime.Remove(attempt, current.ContainerID)
 	cancel()
 	if err != nil {

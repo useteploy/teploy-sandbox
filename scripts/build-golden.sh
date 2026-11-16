@@ -12,6 +12,9 @@
 #
 # The base is a zvol holding a bootable Linux root filesystem with systemd
 # (for example a cloud image written to the volume, cloud-init disabled).
+# For runs with a network it needs iproute2 (`ip`), the virtio-net driver,
+# and nothing that configures network devices on its own: the daemon tells
+# each guest its address through the agent, and there is no DHCP.
 # The base snapshot is only cloned, never modified. The new volume stays a
 # clone of it, so the base cannot be destroyed while the golden exists.
 #
@@ -26,7 +29,7 @@ while [ $# -gt 0 ]; do
     --to) to="$2"; shift 2 ;;
     --guestd) guestd="$2"; shift 2 ;;
     --root-partition) part="$2"; shift 2 ;;
-    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "build-golden: unknown argument: $1" >&2; exit 2 ;;
   esac
 done

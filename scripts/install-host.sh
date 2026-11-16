@@ -25,6 +25,13 @@
 #   4. volmode=dev on the pool, so the host kernel does not scan guest
 #      disks for partitions.
 #
+#   5. Guest networking: the ip, nft and conntrack commands, /dev/net/tun,
+#      the dummy interface type, and IPv4 forwarding (persisted in
+#      /etc/sysctl.d). Each VM with a network gets a tap of its own that
+#      the daemon creates and filters; forwarding is what carries the
+#      traffic of runs with network "open". Note that it makes the host
+#      route between all of its interfaces, not only for guests.
+#
 # It also reports whether the kernel has Landlock, which the daemon
 # requires and this script cannot install.
 #
@@ -37,6 +44,7 @@ UID_COUNT=4096
 CGROUP="${SBX_VM_CGROUP:-/sys/fs/cgroup/teploy-sandbox-vm}"
 RULE_FILE=/etc/udev/rules.d/59-teploy-zvol-noprobe.rules
 KVM_RULE_FILE=/etc/udev/rules.d/59-teploy-kvm.rules
+SYSCTL_FILE=/etc/sysctl.d/60-teploy-sandbox-vm.conf
 
 changed=0
 problems=0
@@ -158,6 +166,59 @@ elif [ "$(zfs get -H -o value volmode "$POOL")" = dev ]; then
 else
     zfs set volmode=dev "$POOL"
     did "zfs set volmode=dev $POOL"
+fi
+
+echo "network: taps, nftables and IPv4 forwarding for guests"
+for tool in ip:iproute2 nft:nftables conntrack:conntrack; do
+    if command -v "${tool%%:*}" >/dev/null 2>&1; then
+        ok "the ${tool%%:*} command"
+    else
+        fail "the ${tool%%:*} command is not installed (package ${tool##*:})"
+    fi
+done
+[ -c /dev/net/tun ] || modprobe tun 2>/dev/null || true
+if [ -c /dev/net/tun ]; then
+    ok "/dev/net/tun"
+else
+    fail "/dev/net/tun does not exist: the kernel has no tun/tap driver (modprobe tun)"
+fi
+if command -v ip >/dev/null 2>&1; then
+    # The gateway address guests reach the host at lives on a dummy
+    # interface; make and remove one to see that the kernel can.
+    probe="tvprobe$$"
+    if ip link add "$probe" type dummy 2>/dev/null; then
+        ip link del "$probe"
+        ok "dummy interfaces"
+    else
+        fail "the kernel cannot create a dummy interface (modprobe dummy)"
+    fi
+fi
+if command -v nft >/dev/null 2>&1; then
+    probe="teploy_sbx_probe_$$"
+    if nft "add table netdev $probe; add chain netdev $probe c { type filter hook ingress device lo priority 0; }" 2>/dev/null; then
+        nft delete table netdev "$probe"
+        ok "nftables with ingress hooks"
+    else
+        nft delete table netdev "$probe" 2>/dev/null || true
+        fail "nftables cannot hook a device's ingress (the kernel needs nf_tables with the netdev family)"
+    fi
+    # Not something this script can fix: another firewall that drops by
+    # default has to be told to let guests' traffic through.
+    foreign="$(nft list chains 2>/dev/null | awk '$1 == "table" { t = $2 " " $3 } $1 == "chain" { c = $2 } /policy drop/ && (/hook input/ || /hook forward/) && t !~ /teploy_sbx_vm_/ { print "table " t " chain " c }' | tr '\n' ';')"
+    if [ -n "$foreign" ]; then
+        echo "  note:    another firewall drops by default (${foreign%;}). Allow traffic arriving on the daemon's taps (tv*) there: to the gateway address for the allowlist tier, forwarded for the open tier."
+    fi
+fi
+if write_file "$SYSCTL_FILE" "# Installed by teploy-sandbox scripts/install-host.sh. The vm driver routes
+# the traffic of runs with network \"open\" from their taps.
+net.ipv4.ip_forward = 1"; then
+    did "wrote $SYSCTL_FILE"
+fi
+if [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ]; then
+    ok "net.ipv4.ip_forward = 1"
+else
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    did "net.ipv4.ip_forward is now 1"
 fi
 
 echo "kernel: Landlock"

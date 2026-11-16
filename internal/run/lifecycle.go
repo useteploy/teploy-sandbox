@@ -116,6 +116,12 @@ func (m *Manager) beginStopped(id string) (*Run, func(), error) {
 // resume collide with it, and would let the container drift from the
 // snapshot that claims to be it.
 func (m *Manager) Stop(ctx context.Context, id string) (*Run, error) {
+	return m.stopIf(ctx, id, nil)
+}
+
+// stopIf is Stop, gated on due when it is given (see destroyIf): due sees
+// the copy taken under the lock together with the capture admission.
+func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool) (*Run, error) {
 	current, release, err := m.beginCapture(id)
 	if errors.Is(err, ErrStopped) {
 		return nil, fmt.Errorf("%w: run %s is already stopped", ErrStopped, id)
@@ -124,6 +130,9 @@ func (m *Manager) Stop(ctx context.Context, id string) (*Run, error) {
 		return nil, err
 	}
 	defer release()
+	if due != nil && !due(current) {
+		return nil, errNotDue
+	}
 	ref, err := m.capture(ctx, current)
 	if err != nil {
 		return nil, err

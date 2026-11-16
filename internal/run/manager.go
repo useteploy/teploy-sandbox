@@ -618,6 +618,18 @@ func (m *Manager) List() []*Run {
 }
 
 func (m *Manager) Destroy(ctx context.Context, id string) error {
+	return m.destroyIf(ctx, id, nil)
+}
+
+// errNotDue: the reaper decided on a copy of the run, and by the time it
+// acted the run had moved on (resumed, stopped, given a new deadline).
+var errNotDue = errors.New("run is no longer due")
+
+// destroyIf is Destroy, gated on due when it is given. due is evaluated on
+// the live record under the lock, atomically with the admission: the reaper
+// works from List copies, and a run that was resumed or stopped since the
+// copy was taken must not be deleted for a deadline it no longer has.
+func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool) error {
 	m.mu.Lock()
 	current, ok := m.runs[id]
 	if !ok {
@@ -627,6 +639,10 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 	if current.exclusive || current.removing {
 		m.mu.Unlock()
 		return ErrBusy
+	}
+	if due != nil && !due(current) {
+		m.mu.Unlock()
+		return errNotDue
 	}
 	current.removing = true
 	if current.State == StateStopped {
@@ -869,9 +885,15 @@ func (m *Manager) Reap(ctx context.Context) int {
 			if current.RetainUntil == nil || current.RetainUntil.After(now) {
 				continue
 			}
-			if err := m.Destroy(ctx, current.ID); err != nil {
+			err := m.destroyIf(ctx, current.ID, func(live *Run) bool {
+				return live.State == StateStopped && live.RetainUntil != nil && !live.RetainUntil.After(now)
+			})
+			switch {
+			case errors.Is(err, errNotDue):
+				// Resumed since the list was taken: it has a new deadline.
+			case err != nil:
 				m.log.Error("reap of stopped run failed", "id", current.ID, "error", err)
-			} else {
+			default:
 				m.log.Info("stopped run passed its retention and was deleted", "id", current.ID)
 				reaped++
 			}
@@ -879,15 +901,25 @@ func (m *Manager) Reap(ctx context.Context) int {
 		case current.OnExpire == OnExpireStop && !current.pendingCleanup:
 			// Never destroyed on a failed stop: the run asked to keep its
 			// state, so it waits for a tick where the stop succeeds.
-			if _, err := m.Stop(ctx, current.ID); err != nil {
+			_, err := m.stopIf(ctx, current.ID, func(live *Run) bool { return !live.ExpiresAt.After(now) })
+			switch {
+			case errors.Is(err, errNotDue), errors.Is(err, ErrStopped):
+				// Stopped (and perhaps resumed) by a caller meanwhile.
+			case err != nil:
 				m.log.Error("reap stop failed; retrying next tick", "id", current.ID, "error", err)
-			} else {
+			default:
 				reaped++
 			}
 		default:
-			if err := m.Destroy(ctx, current.ID); err != nil {
+			err := m.destroyIf(ctx, current.ID, func(live *Run) bool {
+				return live.State == StateRunning && !live.ExpiresAt.After(now)
+			})
+			switch {
+			case errors.Is(err, errNotDue):
+				// Stopped by a caller meanwhile: its retention governs now.
+			case err != nil:
 				m.log.Error("reap remove failed", "id", current.ID, "error", err)
-			} else {
+			default:
 				reaped++
 			}
 		}

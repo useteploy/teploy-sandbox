@@ -15,6 +15,22 @@ type Client struct {
 	// Dial opens a stream to the agent: the hypervisor's vsock socket in
 	// production, anything connected to Server.ServeConn in tests.
 	Dial func(ctx context.Context) (net.Conn, error)
+	// FileTimeout bounds what the guest can make of a file call: a whole
+	// ReadFile, and in a WriteFile each frame the guest has to take and
+	// the wait for its answer (not the whole write: how fast the body
+	// arrives is the caller's business). Zero means DefaultFileTimeout.
+	FileTimeout time.Duration
+}
+
+// DefaultFileTimeout is generous for 64 MiB over a local socket and short
+// against a guest that has stopped cooperating.
+const DefaultFileTimeout = 2 * time.Minute
+
+func (c *Client) fileTimeout() time.Duration {
+	if c.FileTimeout > 0 {
+		return c.FileTimeout
+	}
+	return DefaultFileTimeout
 }
 
 // call is one open request.
@@ -143,10 +159,16 @@ func (c *Client) WriteFile(ctx context.Context, path string, data io.Reader) err
 		return err
 	}
 	defer opened.close()
+	// A guest that stops reading blocks the write, and one that never
+	// answers blocks the read of its result; the request's context does
+	// not end either (a server cannot see its client leave while the
+	// request body is unread). The deadline moves with every frame.
+	stall := c.fileTimeout()
 	buf := make([]byte, chunkSize)
 	for {
 		n, rerr := data.Read(buf)
 		if n > 0 {
+			_ = opened.conn.SetWriteDeadline(time.Now().Add(stall))
 			if err := writeFrame(opened.conn, frameData, buf[:n]); err != nil {
 				return opened.wrap(err)
 			}
@@ -160,6 +182,7 @@ func (c *Client) WriteFile(ctx context.Context, path string, data io.Reader) err
 			return fmt.Errorf("write file: read body: %w", rerr)
 		}
 	}
+	_ = opened.conn.SetDeadline(time.Now().Add(stall))
 	if err := writeFrame(opened.conn, frameEnd, nil); err != nil {
 		return opened.wrap(err)
 	}
@@ -169,6 +192,10 @@ func (c *Client) WriteFile(ctx context.Context, path string, data io.Reader) err
 
 // ReadFile returns the file at path, refusing one above MaxFileBytes.
 func (c *Client) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	// The guest has the file at hand, so the whole read gets one deadline:
+	// a per-frame one would let it send a byte at a time for ever.
+	ctx, cancel := context.WithTimeout(ctx, c.fileTimeout())
+	defer cancel()
 	opened, err := c.open(ctx, Request{Op: OpRead, Path: path})
 	if err != nil {
 		return nil, err
@@ -178,6 +205,11 @@ func (c *Client) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	_, err = opened.finish(func(kind byte, payload []byte) error {
 		if kind != frameData {
 			return fmt.Errorf("guest agent sent an unexpected frame %q during read", kind)
+		}
+		if len(payload) == 0 {
+			// The agent never sends one, and an endless run of them would
+			// otherwise pass every limit here.
+			return errors.New("guest agent sent an empty data frame during read")
 		}
 		if len(data)+len(payload) > MaxFileBytes {
 			return errors.New("guest agent sent more than the files-API limit")

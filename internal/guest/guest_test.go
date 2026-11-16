@@ -478,3 +478,71 @@ func waitGone(t *testing.T, pidFile string) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// hostileClient is a client whose peer is fn instead of the agent: a guest
+// that has replaced it.
+func hostileClient(t *testing.T, fn func(conn net.Conn)) *Client {
+	t.Helper()
+	return &Client{FileTimeout: 200 * time.Millisecond, Dial: func(context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		t.Cleanup(func() { server.Close() })
+		go fn(server)
+		return client, nil
+	}}
+}
+
+// The files API has no timeout of its own above this client, and a write
+// holds the run's in-flight slot, which is what stop, snapshot and fork
+// wait for. A guest that stops reading, never answers, or answers a read
+// one byte at a time for ever must not be able to hold a call open.
+func TestAFileCallCannotBeHeldOpenByTheGuest(t *testing.T) {
+	requestOnly := func(conn net.Conn) { _, _, _ = readFrame(conn) }
+	cases := map[string]struct {
+		guest func(conn net.Conn)
+		call  func(client *Client) error
+	}{
+		"write to a guest that stops reading": {requestOnly, func(client *Client) error {
+			return client.WriteFile(ctxT(t), "/work/a", bytes.NewReader(make([]byte, 4*chunkSize)))
+		}},
+		"write to a guest that never answers": {func(conn net.Conn) {
+			for {
+				if _, _, err := readFrame(conn); err != nil {
+					return
+				}
+			}
+		}, func(client *Client) error {
+			return client.WriteFile(ctxT(t), "/work/a", strings.NewReader("body"))
+		}},
+		"read from a guest that never answers": {requestOnly, func(client *Client) error {
+			_, err := client.ReadFile(ctxT(t), "/work/a")
+			return err
+		}},
+		"read from a guest that trickles for ever": {func(conn net.Conn) {
+			_, _, _ = readFrame(conn)
+			for writeFrame(conn, frameData, []byte("x")) == nil {
+				time.Sleep(5 * time.Millisecond)
+			}
+		}, func(client *Client) error {
+			_, err := client.ReadFile(ctxT(t), "/work/a")
+			return err
+		}},
+		"read from a guest that sends empty frames for ever": {func(conn net.Conn) {
+			_, _, _ = readFrame(conn)
+			for writeFrame(conn, frameData, nil) == nil {
+			}
+		}, func(client *Client) error {
+			_, err := client.ReadFile(ctxT(t), "/work/a")
+			return err
+		}},
+	}
+	for name, tc := range cases {
+		start := time.Now()
+		err := tc.call(hostileClient(t, tc.guest))
+		if err == nil {
+			t.Errorf("%s: the call succeeded", name)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("%s: held open for %s (%v)", name, elapsed.Round(time.Millisecond), err)
+		}
+	}
+}

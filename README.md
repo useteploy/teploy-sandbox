@@ -133,19 +133,93 @@ What is refused with a 400 rather than faked, in this first slice:
 - any `network` other than `none`, and `egressAllow` (a VM has no guest
   network yet);
 - `warm` (no warm repo cache);
-- `limits.pids` (a VM is bounded by its memory and CPUs);
+- `limits.pids` (a VM is bounded by its memory and CPUs; the task limit
+  on its hypervisor is the driver's, not the caller's);
 - an `image` that is neither `golden` nor a snapshot this driver took.
 
 Also not built yet: a pool of pre-booted VMs (every create is a cold
 boot), nested virtualisation inside a run, and memory reclaim policy.
 
+Host setup: `sudo scripts/install-host.sh [POOL]` prepares a host and can
+be run again at any time; a second run changes nothing. It installs the
+udev rule described below, makes sure `/dev/kvm` is openable by a group
+rather than by root alone, checks the VM UID range and the cgroup
+controllers, sets `volmode=dev` on the pool, and reports whether the
+kernel has Landlock. The pool, the kernel image and the golden snapshot
+are yours to provide: build the golden with `scripts/build-golden.sh`
+from a volume holding a bootable systemd root filesystem.
+
 Host requirements, checked at start; the daemon refuses to start and
-names what is missing: `/dev/kvm`, the `cloud-hypervisor` binary
-(`--vm-hypervisor`), an uncompressed guest kernel (`--vm-kernel`), a ZFS
-pool (`--vm-pool`) with `volmode=dev` set on it, and a golden snapshot
-(`--vm-golden`). Build the golden with `scripts/build-golden.sh` from a
-volume holding a bootable systemd root filesystem. `GET /v1/capacity`
-reports `driver` and `nestedVirt`.
+names everything that is missing, with the command that fixes it where
+there is one:
+
+- root, on Linux 5.13 or newer with cgroup v2 and Landlock (`landlock`
+  in `/sys/kernel/security/lsm`). There is no mode that runs without
+  Landlock: a host that lacks it is refused, not warned.
+- `/dev/kvm`, with a group (or everyone) allowed to open it;
+- the `cloud-hypervisor` binary (`--vm-hypervisor`) and an uncompressed
+  guest kernel (`--vm-kernel`), both readable by any user;
+- a ZFS pool (`--vm-pool`) with `volmode=dev` set on it, and a golden
+  snapshot in it (`--vm-golden`);
+- udev not probing ZFS volumes for filesystems (below);
+- 4096 UIDs no account has, from `--vm-uid-base` (default 1879048192);
+- a cgroup the daemon may create groups in, with the `cpu`, `memory`
+  and `pids` controllers (`--vm-cgroup`, default
+  `/sys/fs/cgroup/teploy-sandbox-vm`);
+- a directory for device nodes on a filesystem that allows them
+  (`--vm-dev-dir`, default `/dev/teploy-sandbox`; `/run` is `nodev`).
+
+`GET /v1/capacity` reports `driver` and `nestedVirt`.
+
+Confinement of the hypervisor. The hypervisor process is what a guest
+talks to, so each one is run as if a guest had already taken it over.
+The layers are independent; each is checked by the live suite.
+
+- **Its own user.** Every VM's hypervisor runs under a UID and GID of
+  its own from the reserved range, for as long as it runs, with one
+  supplementary group (the one that opens `/dev/kvm`), no capabilities
+  and `no_new_privs`, in network and IPC namespaces of its own that
+  hold nothing (not even a working loopback). Nothing in its process
+  tree is root. Per-VM UIDs
+  rather than one shared account, because with a shared account one
+  hypervisor could open another run's disk, connect to another run's
+  control socket and signal another run's process; with its own UID,
+  plain file permissions already refuse all three. No account has to be
+  created. The daemon stays root and reaches each VM's sockets as root.
+- **Its own disk node.** The hypervisor is not given the volume's node
+  under `/dev/zvol` (udev resets that node's ownership on every change
+  event, and it is shared with the host's tools). It gets a private
+  block device node for the same volume in `--vm-dev-dir`, mode 0600
+  and owned by the VM's UID, removed with the VM. No other run's node
+  is touched.
+- **The hypervisor's own sandbox.** `--seccomp true` (a system call
+  outside the hypervisor's list kills it) and `--landlock`, which limits
+  the process to the paths on its command line: the kernel image, its
+  disk node, its two sockets and `/dev/kvm`. A file its UID owns
+  elsewhere is refused.
+- **Its own cgroup**, entered at the moment the process is created:
+  `memory.max` is the guest's size plus 64 MiB plus 8 MiB per GiB of
+  guest (`memory.swap.max` 0), `pids.max` is 128 plus 4 per vCPU, and
+  `cpu.max` is the VM's vCPUs. A guest that uses all of its memory
+  stays inside that (measured: at most 7 MiB over the guest's size); a
+  hypervisor that grows past it is killed by the host's kernel and the
+  run reports its VM gone. The group is removed with the VM, and a
+  starting daemon kills and removes whatever groups its previous life
+  left.
+
+The guest's disk is opened with direct I/O, so it is not cached a second
+time in the host's page cache at the VM's expense.
+
+The cgroup: by default the daemon makes `/sys/fs/cgroup/teploy-sandbox-vm`
+itself at start, beside the groups systemd manages, the way a container
+runtime's cgroupfs driver does. That needs the root group to pass `cpu`,
+`memory` and `pids` down, which systemd does by default. To keep the VMs
+inside the daemon's own unit instead, give the unit `Delegate=yes` and
+`DelegateSubgroup=daemon` (systemd 254 or newer; the daemon's own process
+then sits in a subgroup, which leaves the unit's group free to have
+children with controllers) and pass
+`--vm-cgroup /sys/fs/cgroup/system.slice/UNIT.service/vms`. Both
+arrangements were run against the live suite.
 
 Guest disks and the host. `zfs set volmode=dev POOL` is what keeps the
 host kernel from scanning a guest's disk for partitions: every volume
@@ -156,21 +230,25 @@ the daemon requires it on the pool and checks each run's device before
 booting from it.
 
 The whole disk is still a block device on the host for as long as the
-volume exists, and udev probes it like any other disk. A guest that
-writes a filesystem signature over the start of its disk gets a
+volume exists, and udev would probe it like any other disk: a guest that
+writes a filesystem signature over the start of its disk would get a
 `/dev/disk/by-label` or `by-uuid` link on the host with a label of its
-choosing. The daemon does not prevent this. A host that mounts anything
-by label or UUID should stop udev from probing ZFS volumes, for example
-with `/etc/udev/rules.d/59-zvol-noprobe.rules` containing
+choosing. The host must turn that off, with
+`/etc/udev/rules.d/59-teploy-zvol-noprobe.rules` containing
 `KERNEL=="zd*", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}="1"`
-(it applies to every ZFS volume on the host; the `/dev/zvol` links stay).
+(`scripts/install-host.sh` installs it; it applies to every ZFS volume
+on the host, and the `/dev/zvol` links stay). The daemon does not take
+the rule file's word for it: at start it creates a 1 MiB scratch volume,
+writes a labelled filesystem signature to it as a guest could, lets udev
+handle the device and refuses to start if udev recorded a filesystem or
+made a link. The scratch volume is destroyed either way.
 
 A VM's console and its hypervisor's output are kept in the daemon's
 memory, the last 64 KiB of each; nothing a guest can make grow is written
 to `--vm-run-dir`.
 
-Test against a real hypervisor (needs root, KVM and ZFS; CI has neither
-and only vets it):
+Test against a real hypervisor (needs root, KVM, ZFS and a host set up
+by `scripts/install-host.sh`; CI has none of it and only vets the suite):
 `CGO_ENABLED=0 go test -c -tags vmintegration -o vm.test . && sudo ./vm.test -test.run TestVM -test.v`
 
 ## Writable leases

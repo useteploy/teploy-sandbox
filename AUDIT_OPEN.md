@@ -220,6 +220,113 @@ Known limits:
 - A run volume's whole-disk device is probed by the host's udev. A guest
   that writes a filesystem signature over the start of its disk gets a
   `/dev/disk/by-label` or `by-uuid` link on the host under a label it
-  chose (confirmed: a vfat labelled by hand appeared at once). Closing
-  this takes a udev rule on the host (README), which the daemon neither
-  installs nor checks.
+  chose (confirmed: a vfat labelled by hand appeared at once). Closed in
+  the hardening entry below: the rule is installed by
+  `scripts/install-host.sh` and the daemon refuses a host that probes.
+
+## 2026-11-16 — VM driver: host-side hardening
+
+An independent review of the first slice left three things open that
+block running strangers' code: the hypervisor ran as root with no
+confinement, the host's udev probed every run's disk, and one VM could
+use host CPU and memory without bound. All three are now enforced by the
+daemon, which refuses to start on a host where any of them cannot be.
+`scripts/install-host.sh` sets a host up (idempotent).
+
+What is enforced, and how it was checked on a real hypervisor (Cloud
+Hypervisor v54.1, Linux 6.8, ZFS 2.2, arm64, nested KVM; the
+`vmintegration` suite, which now starts by requiring the host setup):
+
+- **No root.** Each hypervisor runs under a UID and GID of its own from
+  a reserved range (4096 from `--vm-uid-base`), one supplementary group
+  (that of `/dev/kvm`), started directly in that identity. Checked from
+  `/proc/PID/status` of every VM the suite boots: all four UIDs and GIDs
+  equal and non-zero, `CapInh`/`CapPrm`/`CapEff`/`CapAmb` empty,
+  `NoNewPrivs: 1`, two VMs with different UIDs, and no process left
+  under a VM's UID after destroy. The process is also created in
+  network and IPC namespaces of its own (checked: both differ from the
+  host's, and the only interface is a loopback that is down). Per-VM UIDs were chosen over one
+  shared account because a shared account lets one hypervisor open
+  another run's disk and control socket and signal its process.
+- **A private disk node.** The hypervisor gets a 0600 block device node
+  of its own for its volume, outside udev's reach, instead of a change
+  of ownership on the `/dev/zvol` node (udev resets that on every change
+  event). Checked: owner, mode and device number of the node; the
+  shared node still root's; node gone after destroy.
+- **seccomp and Landlock.** `--seccomp true --landlock`. Checked:
+  `Seccomp: 2` on every thread; through the hypervisor's API, attaching
+  a file that its own UID owns (mode 0666, in a 0755 directory) is
+  refused with `Permission denied`, as is another VM's disk node, while
+  pause and resume still work. The same request without `--landlock`
+  succeeded when tried by hand, so the refusal is Landlock's. A kernel
+  without Landlock is refused at start; there is no fallback.
+- **A cgroup per VM**, entered at process creation (`CLONE_INTO_CGROUP`):
+  `memory.max`, `memory.swap.max=0`, `pids.max`, `cpu.max`. Checked: the
+  group holds exactly the hypervisor and has the expected values while
+  the VM runs, is gone after destroy, and is killed and removed by the
+  next daemon's startup sweep. With the limit lowered by hand to 640 MiB
+  under a 1 GiB guest that then used its memory, the host kernel killed
+  the hypervisor (`oom_kill 2`, `memory.peak` 640.0 MiB), the run
+  failed at once instead of hanging, and destroy left nothing.
+- **udev.** At start the daemon writes a labelled filesystem signature
+  to a scratch volume and refuses the host if udev records a filesystem
+  or makes a link. Checked both ways: before the rule was installed the
+  daemon refused this host, naming the rule and the command; after
+  `install-host.sh` it started. In the suite a guest writes a vfat
+  filesystem with a label over the start of its own disk; the host's
+  `blkid` reads that label from the volume, and `/dev/disk/by-*` is
+  unchanged after udev is made to look at the device again.
+
+Measured, the same setup, guests with two vCPUs whose memory was
+exhausted from inside (`tail /dev/zero` until the guest's kernel killed
+it), after 256 MiB of disk writes. Cgroup figures, so kernel memory
+charged to the VM (page tables included) is counted:
+
+| Guest | Idle | Peak | Peak minus guest | Limit | Host OOM kills |
+|---|---|---|---|---|---|
+| 512 MiB | 292 to 301 MiB | 515.7 to 515.8 MiB | 3.7 to 3.8 MiB | 584 MiB | 0 |
+| 2048 MiB | 324 to 328 MiB | 2052.5 to 2054.6 MiB | 4.5 to 6.6 MiB | 2128 MiB | 0 |
+| 4096 MiB | 447 to 449 MiB | 4058.2 to 4072.6 MiB | below guest size | 4192 MiB | 0 |
+
+(Three or four runs each. The 4 GiB guest's kernel ran out before every
+page had been touched.) The limit is the guest's size plus 64 MiB plus
+8 MiB per GiB of guest: roughly ten times the overhead seen, because a
+VM at its limit is killed and the cost of headroom is bounded. Tasks:
+11 idle, 14 to 20 at peak, against a limit of 136 (128 plus 4 per
+vCPU). The guest disk is now opened with direct I/O; before that, the
+host's page cache for a booted guest was charged to the VM (166 MiB at
+boot in one measurement).
+
+Not verified, or not done:
+
+- An x86-64 host and bare metal: every figure above is from nested arm64.
+  The overhead allowance in particular should be measured again there.
+- Other Cloud Hypervisor versions. Landlock is used as v54.1 does it
+  (rules derived from the command line); which paths a different
+  version allows was not looked at.
+- The seccomp filter was observed to be installed, not exercised: no
+  test makes the hypervisor issue a forbidden system call.
+- `cpu.max` is set and read back; that a VM is actually held to its
+  vCPUs' worth of CPU under contention was not measured.
+- No I/O limit: a guest can saturate the pool's disks. Nothing bounds
+  how much pool space one run's volume can take beyond the golden
+  image's size.
+- A hypervisor escape is still a process on the host: unprivileged,
+  seccomp-filtered, Landlock-restricted and in a cgroup, but with
+  `/dev/kvm` open and the host kernel's system call surface that the
+  filter allows. It shares the host's mount and PID namespaces: it
+  sees the host's file tree (Landlock is what stops it opening any of
+  it) and the host's process list.
+- The VM UID range is checked against `/etc/passwd` only; accounts
+  that exist only in a directory service are not seen. Two daemons on
+  one host may share a range (a UID that owns a live process is never
+  handed out), but that check is not atomic between daemons; give each
+  its own `--vm-uid-base`.
+- The daemon itself still runs as root.
+- Boot times during this work were two to four times the 7 to 10 s
+  recorded above, with and without confinement (an unconfined
+  hypervisor started by hand as root at the same moment took as long),
+  so the test host was slow, not the driver; no boot-time claim is made
+  for the confinement either way.
+- This change has had no independent review.
+

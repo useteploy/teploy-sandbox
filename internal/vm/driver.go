@@ -342,6 +342,9 @@ func prepareGuest(ctx context.Context, machine Machine, network *GuestNetwork) e
 		if len(detail) > 512 {
 			detail = detail[len(detail)-512:]
 		}
+		if network == nil {
+			return fmt.Errorf("guest setup: exit %d: %s", code, detail)
+		}
 		return fmt.Errorf("configure the guest's network device (the image needs iproute2): exit %d: %s", code, detail)
 	}
 	return nil

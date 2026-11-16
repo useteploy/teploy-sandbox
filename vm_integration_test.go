@@ -5,6 +5,7 @@
 // golden snapshot built by scripts/build-golden.sh, so it has its own
 // build tag and CI (which has no KVM) does not run it:
 //
+//	sudo scripts/install-host.sh POOL
 //	CGO_ENABLED=0 go test -c -tags vmintegration -o vm.test .
 //	sudo SBX_VM_HYPERVISOR=... SBX_VM_KERNEL=... SBX_VM_POOL=... SBX_VM_GOLDEN=... ./vm.test -test.v
 //
@@ -47,6 +48,7 @@ func vmTestConfig(t *testing.T) vm.Config {
 		Pool:       pool,
 		Golden:     envOr("SBX_VM_GOLDEN", pool+"/golden-guestd@v1"),
 		RunDir:     envOr("SBX_VM_RUN_DIR", "/run/teploy-vmtest"),
+		Cgroup:     envOr("SBX_VM_CGROUP", vm.DefaultCgroup),
 		Owner:      hex.EncodeToString(owner[:]),
 	}
 }

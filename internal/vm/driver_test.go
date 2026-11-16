@@ -578,3 +578,29 @@ func TestARunWhoseVMExitedCanStillBeStoppedAndResumed(t *testing.T) {
 		t.Fatalf("read after resume: %q %v", got, err)
 	}
 }
+
+// A pause whose answer is lost (the request's context ended, the API call
+// timed out) may still have paused the VM. Nothing else would ever resume
+// it, so a failed pause is followed by a resume.
+func TestAPauseThatFailedIsUndone(t *testing.T) {
+	rig := newRig(t, nil)
+	created, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine := rig.hypervisor.machine(containerName(created.ID))
+	machine.pauseErr, machine.pauseLands = context.DeadlineExceeded, true
+	if _, err := rig.manager.Snapshot(bg, created.ID); err == nil {
+		t.Fatal("snapshot succeeded without a pause")
+	}
+	machine.mu.Lock()
+	paused := machine.paused
+	machine.mu.Unlock()
+	if paused {
+		t.Fatal("the VM was left paused by a pause that reported failure")
+	}
+	machine.pauseErr = nil
+	if _, _, err := rig.driver.Exec(bg, containerName(created.ID), "true", "", nil, time.Second, io.Discard, io.Discard); err != nil {
+		t.Fatalf("exec after the failed snapshot: %v", err)
+	}
+}

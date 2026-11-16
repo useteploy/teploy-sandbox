@@ -408,7 +408,10 @@ type fakeMachine struct {
 	pingErr  error
 	killErr  error
 	pauseErr error
-	syncErr  error
+	// pauseLands makes a failing pause take effect anyway: the hypervisor
+	// paused the VM, and the answer was lost.
+	pauseLands bool
+	syncErr    error
 	// events is the order of sync, pause, resume and kill calls.
 	events []string
 	// execs records each exec's merged environment.
@@ -434,11 +437,14 @@ func (m *fakeMachine) event(name string) {
 }
 
 func (m *fakeMachine) Pause(context.Context) error {
-	if m.pauseErr != nil {
-		return m.pauseErr
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.pauseErr != nil {
+		if m.pauseLands {
+			m.paused = true
+		}
+		return m.pauseErr
+	}
 	m.events = append(m.events, "pause")
 	m.paused = true
 	return nil

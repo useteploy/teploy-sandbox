@@ -356,22 +356,28 @@ func (d *Driver) Snapshot(ctx context.Context, containerID, volumePath, imageRef
 	if err != nil {
 		return fmt.Errorf("flush guest filesystems: %w", err)
 	}
+	resume := func() error {
+		// Detached from the request: a paused VM that is never resumed
+		// is a hung run, whatever happened to the caller.
+		resumeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseTimeout)
+		defer cancel()
+		if err := current.machine.Resume(resumeCtx); err != nil {
+			return fmt.Errorf("resume vm after snapshot: %w", err)
+		}
+		return nil
+	}
 	return d.volumes.Capture(ctx, containerID, imageRef, func() (func() error, error) {
 		pauseCtx, cancel := context.WithTimeout(ctx, pauseTimeout)
 		defer cancel()
 		if err := current.machine.Pause(pauseCtx); err != nil {
+			// A pause that reports failure may still have happened: the
+			// request can end, or time out, after the hypervisor acted on
+			// it. Resuming a VM that is not paused is refused and harmless,
+			// so the answer does not matter.
+			_ = resume()
 			return nil, fmt.Errorf("pause vm: %w", err)
 		}
-		return func() error {
-			// Detached from the request: a paused VM that is never resumed
-			// is a hung run, whatever happened to the caller.
-			resumeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseTimeout)
-			defer cancel()
-			if err := current.machine.Resume(resumeCtx); err != nil {
-				return fmt.Errorf("resume vm after snapshot: %w", err)
-			}
-			return nil
-		}, nil
+		return resume, nil
 	})
 }
 

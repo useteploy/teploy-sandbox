@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/useteploy/teploy-sandbox/internal/egress"
 	"github.com/useteploy/teploy-sandbox/internal/run"
 	"github.com/useteploy/teploy-sandbox/internal/vm"
 )
@@ -106,11 +107,21 @@ func vmRun(t *testing.T, manager *run.Manager, id, cmd, cwd string, env map[stri
 
 func newVMManager(t *testing.T, config vm.Config, stateDir string) (*run.Manager, *vm.Driver, int, int) {
 	t.Helper()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return newVMManagerLogging(t, config, stateDir, io.Discard)
+}
+
+// newVMManagerLogging is a manager on the VM driver, wired as serve wires
+// it, with the daemon's log going to logs.
+func newVMManagerLogging(t *testing.T, config vm.Config, stateDir string, logs io.Writer) (*run.Manager, *vm.Driver, int, int) {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(logs, nil))
 	driver, err := vm.New(context.Background(), config, log)
 	if err != nil {
 		t.Fatalf("vm driver: %v", err)
 	}
+	// With no VM left this removes the driver's firewall tables and its
+	// gateway device; a driver that a later one replaced touches nothing.
+	t.Cleanup(func() { _ = driver.Close(context.Background()) })
 	// What serve does, in serve's order: sweep, then load the registry.
 	processes, volumes, err := driver.Sweep(context.Background())
 	if err != nil {
@@ -118,6 +129,11 @@ func newVMManager(t *testing.T, config vm.Config, stateDir string) (*run.Manager
 	}
 	manager := run.NewManager(driver, log)
 	manager.SandboxUser = ""
+	if gateway, ok := driver.Gateway(); ok {
+		pool := &egress.Pool{Base: egress.DefaultAllowlist, Bind: gateway, Log: log, Private: true}
+		t.Cleanup(pool.Shutdown)
+		manager.Egress = pool
+	}
 	if _, err := manager.LoadState(context.Background(), stateDir); err != nil {
 		t.Fatalf("load state: %v", err)
 	}
@@ -158,10 +174,10 @@ func TestVMLifecycle(t *testing.T) {
 
 	// Refusals come first and cost nothing: no VM is booted for them.
 	for name, req := range map[string]run.CreateRequest{
-		"allowlist":    {Image: vm.GoldenImage, Network: "allowlist"},
-		"open":         {Image: vm.GoldenImage, Network: "open"},
-		"warm":         {Image: vm.GoldenImage, Warm: &run.WarmRequest{Repo: "example/repo"}},
-		"an OCI image": {Image: "debian:bookworm-slim"},
+		"a pids limit":                           {Image: vm.GoldenImage, Limits: &run.Limits{Pids: 64}},
+		"egressAllow without the allowlist tier": {Image: vm.GoldenImage, Network: "open", EgressAllow: []string{"example.com"}},
+		"warm":                                   {Image: vm.GoldenImage, Warm: &run.WarmRequest{Repo: "example/repo"}},
+		"an OCI image":                           {Image: "debian:bookworm-slim"},
 	} {
 		start := time.Now()
 		if _, err := manager.Create(ctx, req); !errors.Is(err, run.ErrBadRequest) {
@@ -198,6 +214,11 @@ func TestVMLifecycle(t *testing.T) {
 	start = time.Now()
 	result := vmRun(t, manager, id, `printf 'to stdout'; printf 'to stderr' >&2; exit 42`, "", nil, 30*time.Second)
 	timed("exec (trivial command, round trip)", start)
+	// The default tier is the absence of a network device, not a firewall
+	// in front of one.
+	if devices := vmRun(t, manager, id, `ls /sys/class/net | tr '\n' ' '`, "", nil, 30*time.Second); strings.TrimSpace(devices.stdout) != "lo" {
+		t.Fatalf("a run on network \"none\" has network devices: %q", devices.stdout)
+	}
 	if result.stdout != "to stdout" || result.stderr != "to stderr" || result.code != 42 || result.timedOut {
 		t.Fatalf("exec streams: %+v", result)
 	}

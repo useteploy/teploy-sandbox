@@ -967,6 +967,108 @@ func TestATableWithAnotherInstancesMarkIsLeftAlone(t *testing.T) {
 	}
 }
 
+// The watch stood down for good when it could not list its own mark
+// beside a table that was there: one failed command was read as another
+// instance having taken over. Only another instance's mark is that.
+func TestTheWatchOnlyStandsDownForAnotherInstancesMark(t *testing.T) {
+	network, fake := startedNetwork(t, nil)
+	_, err := network.Attach(bg, "run-a", run.NetworkOpen, 0)
+	must(t, err)
+	said := logOf(network)
+	table := fake.table()
+	busy := errors.New("fork/exec /usr/sbin/nft: resource temporarily unavailable")
+
+	// The kernel cannot be asked at all: nothing is concluded.
+	fake.mu.Lock()
+	fake.fail["nft list chain"], fake.fail["nft list table"] = busy, busy
+	fake.mu.Unlock()
+	if !network.check(bg) {
+		t.Fatal("the watch gave up after one failed look")
+	}
+	if network.superseded {
+		t.Fatal("a failed command was taken for another instance")
+	}
+	if !strings.Contains(said.String(), "could not be checked") {
+		t.Fatalf("a look that failed was not reported: %s", said)
+	}
+	// While it cannot be asked, nothing new is admitted, and the reason
+	// is the failure, not a takeover.
+	fake.mu.Lock()
+	fake.fail["nft list chain"], fake.fail["nft list table"] = busy, busy
+	fake.mu.Unlock()
+	if _, err := network.Attach(bg, "run-b", run.NetworkOpen, 0); err == nil || errors.Is(err, errSuperseded) || !strings.Contains(err.Error(), "resource temporarily unavailable") {
+		t.Fatalf("attach while the kernel cannot be asked: %v", err)
+	}
+	if _, err := network.Listen(bg, "run-b"); err != nil {
+		t.Fatalf("listen once the kernel answers again: %v", err)
+	}
+
+	// Its own mark cannot be listed, and the table shows it: still its
+	// own. (The old watch stopped here.)
+	fake.mu.Lock()
+	fake.fail["nft list chain"] = busy
+	fake.mu.Unlock()
+	if !network.check(bg) || network.superseded {
+		t.Fatal("the watch gave up although the table carries its own mark")
+	}
+	// And the upkeep goes on: damage done afterwards is repaired.
+	said.Reset()
+	fake.mu.Lock()
+	fake.inet = strings.Replace(fake.inet, "tcp dport 25 counter drop", "tcp dport 25 accept", 1)
+	fake.fail["nft list chain"] = busy
+	fake.mu.Unlock()
+	if !network.check(bg) || fake.table() != table {
+		t.Fatalf("a changed table was not restored after a failed look:\n%s", fake.table())
+	}
+
+	// The table is there without any mark (its marker chain was
+	// deleted): nobody else owns it, so it is written again.
+	fake.mu.Lock()
+	fake.inet = "table inet teploy_sbx_vm_01234567 {\n\tchain forward {\n\t}\n}"
+	fake.mu.Unlock()
+	if !network.check(bg) || network.superseded || fake.table() != table {
+		t.Fatalf("a table that lost its mark was not written again:\n%s", fake.table())
+	}
+
+	// Another instance's mark: positive evidence, and the only thing
+	// that stops the watch.
+	foreign := strings.Replace(table, network.instance, "instance_ffffffffffff", 1)
+	fake.mu.Lock()
+	fake.inet = foreign
+	fake.mu.Unlock()
+	said.Reset()
+	if network.check(bg) || !network.superseded {
+		t.Fatal("the watch went on under another instance's mark")
+	}
+	if !strings.Contains(said.String(), "instance_ffffffffffff") {
+		t.Fatalf("standing down was not reported with the mark that caused it: %s", said)
+	}
+	if fake.table() != foreign {
+		t.Fatal("another instance's table was rewritten")
+	}
+}
+
+// The watch loop itself: a look that fails is followed by the next one.
+func TestTheWatchKeepsLooking(t *testing.T) {
+	fake := newFakeNet(t)
+	network := newHostNetwork(testPlan(t, nil), fake.sys(), quietLog())
+	must(t, network.writeHostLocked(bg))
+	table := fake.table()
+	busy := errors.New("cannot allocate memory")
+	fake.mu.Lock()
+	fake.fail["nft list chain"], fake.fail["nft list table"] = busy, busy
+	fake.mu.Unlock()
+	if !network.check(bg) {
+		t.Fatal("the watch would have ended")
+	}
+	fake.mu.Lock()
+	fake.inet = ""
+	fake.mu.Unlock()
+	if !network.check(bg) || fake.table() != table {
+		t.Fatal("the look after a failed one did not restore the table")
+	}
+}
+
 // logOf is a network's log, to see what it said.
 func logOf(network *hostNetwork) *strings.Builder {
 	var log strings.Builder

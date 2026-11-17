@@ -399,7 +399,7 @@ func newHostNetwork(plan netPlan, sys netSys, log *slog.Logger) *hostNetwork {
 	_, _ = rand.Read(mark)
 	return &hostNetwork{
 		plan: plan, sys: sys, log: log,
-		instance: "instance_" + hex.EncodeToString(mark),
+		instance: instancePrefix + hex.EncodeToString(mark),
 		attached: map[string]*attachment{},
 		slots:    map[int]bool{},
 	}
@@ -707,20 +707,69 @@ const (
 	tablesOurs tableState = iota
 	tablesForeign
 	tablesMissing
+	// tablesUnknown: the kernel could not be asked. Nothing is concluded
+	// from it; whoever asked asks again.
+	tablesUnknown
 )
 
-func (n *hostNetwork) tableStateLocked(ctx context.Context) tableState {
+// instancePrefix starts the name of the chain each hostNetwork marks the
+// host's table with.
+const instancePrefix = "instance_"
+
+// tableStateLocked asks the kernel whose the host's table is.
+//
+// Another instance has taken over only when its mark is there to be
+// read. That this instance's own mark could not be listed says nothing
+// by itself: a command that could not be started, or was killed, or ran
+// out of memory fails the same way, and an instance that stood down on
+// that would leave every run it has without upkeep until a restart. So a
+// table that is there without any mark, or not there at all, is one to
+// write again, and a kernel that cannot be asked is asked again later.
+func (n *hostNetwork) tableStateLocked(ctx context.Context) (tableState, error) {
 	if n.superseded {
-		return tablesForeign
+		return tablesForeign, nil
 	}
 	if _, err := n.sys.run(ctx, "", "nft", "list", "chain", "inet", n.plan.table, n.instance); err == nil {
-		return tablesOurs
+		return tablesOurs, nil
 	}
-	if _, err := n.sys.run(ctx, "", "nft", "list", "table", "inet", n.plan.table); err == nil {
-		n.superseded = true
-		return tablesForeign
+	listing, err := n.sys.run(ctx, "", "nft", "list", "table", "inet", n.plan.table)
+	switch {
+	case err != nil && isGone(err):
+		return tablesMissing, nil
+	case err != nil:
+		return tablesUnknown, fmt.Errorf("ask the kernel for the firewall table %s: %w", n.plan.table, err)
 	}
-	return tablesMissing
+	ours := false
+	for _, line := range strings.Split(string(listing), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "chain" || !strings.HasPrefix(fields[1], instancePrefix) {
+			continue
+		}
+		if fields[1] != n.instance {
+			n.superseded = true
+			n.log.Warn("another daemon instance has taken over the vm firewall table; this one stops its upkeep", "table", n.plan.table, "mark", fields[1])
+			return tablesForeign, nil
+		}
+		ours = true
+	}
+	if ours {
+		// The first question failed and the second found the mark.
+		return tablesOurs, nil
+	}
+	return tablesMissing, nil
+}
+
+// ownedLocked is the question everything that changes the network asks
+// first: it is refused when another instance has the table, and when
+// the kernel cannot say.
+func (n *hostNetwork) ownedLocked(ctx context.Context) error {
+	switch state, err := n.tableStateLocked(ctx); state {
+	case tablesForeign:
+		return errSuperseded
+	case tablesUnknown:
+		return err
+	}
+	return nil
 }
 
 // listHost and listRun are a ruleset as the kernel has it, without its
@@ -764,7 +813,7 @@ func (n *hostNetwork) writeRun(ctx context.Context, a *attachment, sealed bool) 
 
 // applyLocked brings the host's table in line with the attached VMs.
 func (n *hostNetwork) applyLocked(ctx context.Context) error {
-	if n.tableStateLocked(ctx) == tablesForeign {
+	if state, _ := n.tableStateLocked(ctx); state == tablesForeign {
 		return errSuperseded
 	}
 	return n.writeHostLocked(ctx)
@@ -792,15 +841,19 @@ func (n *hostNetwork) watch(stop <-chan struct{}) {
 }
 
 // check is one look at every ruleset this network wrote; it reports
-// whether to keep looking.
+// whether to keep looking. It stops only when another instance's mark is
+// on the table: a look that failed is followed by the next.
 func (n *hostNetwork) check(ctx context.Context) bool {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	switch n.tableStateLocked(ctx) {
+	switch state, err := n.tableStateLocked(ctx); state {
 	case tablesForeign:
 		return false
+	case tablesUnknown:
+		// The runs' own rulesets are still looked at below.
+		n.log.Error("the vm firewall table could not be checked; trying again", "table", n.plan.table, "error", err)
 	case tablesMissing:
 		n.log.Error("the vm firewall table was removed by something else; putting it back", "table", n.plan.table)
 		if err := n.writeHostLocked(ctx); err != nil {
@@ -887,8 +940,8 @@ func (n *hostNetwork) placeLocked(ctx context.Context, name string) (_ *attachme
 	if _, exists := n.attached[name]; exists {
 		return nil, fmt.Errorf("%s already has a place in the network", name)
 	}
-	if n.tableStateLocked(ctx) == tablesForeign {
-		return nil, errSuperseded
+	if err := n.ownedLocked(ctx); err != nil {
+		return nil, err
 	}
 	// The next free slot after the last one given out, not the lowest: an
 	// address is not handed to a new VM while anything might still
@@ -1016,8 +1069,8 @@ func (n *hostNetwork) Attach(ctx context.Context, name, tier string, proxyPort i
 	case tier == run.NetworkOpen && a != nil:
 		return nil, fmt.Errorf("%s holds a place in the network for a proxy, and an open run has none", name)
 	}
-	if n.tableStateLocked(ctx) == tablesForeign {
-		return nil, errSuperseded
+	if err := n.ownedLocked(ctx); err != nil {
+		return nil, err
 	}
 	if a == nil {
 		if a, err = n.placeLocked(ctx, name); err != nil {
@@ -1190,8 +1243,8 @@ func isGone(err error) bool {
 func (n *hostNetwork) Sweep(ctx context.Context) (int, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.tableStateLocked(ctx) == tablesForeign {
-		return 0, errSuperseded
+	if err := n.ownedLocked(ctx); err != nil {
+		return 0, err
 	}
 	live := map[string]bool{}
 	for _, each := range n.attached {
@@ -1246,7 +1299,7 @@ func (n *hostNetwork) Close(ctx context.Context) error {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if len(n.attached) > 0 || n.tableStateLocked(ctx) != tablesOurs {
+	if state, _ := n.tableStateLocked(ctx); len(n.attached) > 0 || state != tablesOurs {
 		// A VM that could not be torn down keeps the table that judges
 		// its link; a table another instance wrote is that instance's.
 		return nil

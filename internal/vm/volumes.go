@@ -55,6 +55,12 @@ type Volumes struct {
 	// mu serializes every change to the clone topology. The operations are
 	// short; correctness is worth more than interleaving them.
 	mu sync.Mutex
+
+	// bases remembers, by guid, the base images found by walking a
+	// volume's origins (see Transfer.BaseOf): a golden image that is no
+	// longer the configured one still has runs descending from it.
+	basesMu sync.Mutex
+	bases   map[string]string
 }
 
 // NewVolumes lays the driver's volumes out under root, cloning fresh runs
@@ -66,6 +72,7 @@ func NewVolumes(zfs ZFS, root, golden, owner string, log *slog.Logger) *Volumes 
 		waitDevice:  waitForPath,
 		flushDevice: fsyncPath,
 		checkDevice: partitionsHidden,
+		bases:       map[string]string{},
 	}
 }
 
@@ -392,6 +399,18 @@ func (v *Volumes) collect(ctx context.Context, start string, remove bool) error 
 			// The golden image or someone else's volume: not ours to judge.
 			continue
 		}
+		switch dataset.Kind {
+		case kindRestore:
+			// A restore in progress: its own to finish or remove.
+			continue
+		case kindBase:
+			// A received base image goes whole, once nothing is cloned
+			// from it; its snapshot is never destroyed on its own.
+			if err := v.collectBase(ctx, dataset.Name); err != nil {
+				return err
+			}
+			continue
+		}
 		snapshots, err := v.zfs.Snapshots(ctx, dataset.Name)
 		if err != nil {
 			return err
@@ -459,7 +478,9 @@ func (v *Volumes) heir(ctx context.Context, snapshot SnapshotInfo) (string, erro
 		if err != nil {
 			return "", err
 		}
-		if v.mine(dataset) {
+		// A volume a restore is still receiving is not an heir: it is
+		// not anything yet.
+		if v.mine(dataset) && (dataset.Kind == kindRun || dataset.Kind == kindSnapshot) {
 			return clone, nil
 		}
 	}
@@ -503,7 +524,7 @@ func (v *Volumes) Sweep(ctx context.Context) (int, error) {
 			}
 		}
 	}
-	return removed, nil
+	return removed, v.sweepTransfers(ctx)
 }
 
 func waitForPath(ctx context.Context, path string) error {

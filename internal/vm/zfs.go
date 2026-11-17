@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os/exec"
 	"slices"
@@ -53,6 +54,71 @@ func (execCommander) Run(ctx context.Context, name string, args ...string) ([]by
 	return stdout.Bytes(), nil
 }
 
+// Streamer is the part of the seam that carries a stream: a command
+// whose output, or input, is too large to hold (zfs send, zfs receive).
+type Streamer interface {
+	// Stream runs a command with stdin as its input (nil for none) and
+	// stdout for its output (nil to discard it).
+	Stream(ctx context.Context, stdin io.Reader, stdout io.Writer, name string, args ...string) error
+}
+
+// streamStderr is how much of a streaming command's complaint is kept.
+const streamStderr = 4 << 10
+
+func (execCommander) Stream(ctx context.Context, stdin io.Reader, stdout io.Writer, name string, args ...string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stderr := tailBuffer{limit: streamStderr}
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdout, cmd.Stderr = stdout, &stderr
+	// A command that has exited is not waited on for a pipe someone
+	// else still holds open.
+	cmd.WaitDelay = 5 * time.Second
+	command := name
+	if len(args) > 0 {
+		command += " " + args[0]
+	}
+	var fed chan error
+	if stdin != nil {
+		// Fed by hand rather than through cmd.Stdin: Wait would block on
+		// a reader that never ends, and an input that fails must kill
+		// the command instead of looking like the end of the stream.
+		pipe, err := cmd.StdinPipe()
+		if err != nil {
+			return err
+		}
+		fed = make(chan error, 1)
+		go func() {
+			_, err := io.Copy(pipe, stdin)
+			if err != nil {
+				cancel()
+			}
+			_ = pipe.Close()
+			fed <- err
+		}()
+	}
+	if err := cmd.Start(); err != nil {
+		return &CommandError{Command: command, Err: err}
+	}
+	err := cmd.Wait()
+	var feedErr error
+	if fed != nil {
+		select {
+		case feedErr = <-fed:
+		default:
+			// Still blocked reading its source; the caller closes that.
+		}
+	}
+	if feedErr != nil && !errors.Is(feedErr, io.ErrClosedPipe) && err != nil {
+		// The input is why the command died.
+		return feedErr
+	}
+	if err != nil {
+		return &CommandError{Command: command, Stderr: stderr.Tail(streamStderr), Err: err}
+	}
+	return feedErr
+}
+
 // User properties this driver puts on what it creates. ZFS user property
 // names need a colon; snapshots inherit their dataset's.
 const (
@@ -70,6 +136,13 @@ const (
 	// kindProbe is the scratch volume Preflight tests the host's udev
 	// with; it exists only while that check runs.
 	kindProbe = "probe"
+	// kindRestore is a volume being received from remote storage: not
+	// usable, and removed at the next start, until its restore commits.
+	kindRestore = "restore"
+	// kindBase is a base image received from remote storage: a golden
+	// image of another host, which runs restored here are clones of. It
+	// goes when nothing is cloned from it any more.
+	kindBase = "base"
 )
 
 // Dataset is a volume as the driver needs to see it.
@@ -121,6 +194,17 @@ type ZFS interface {
 	// Property is the effective value of a property on a dataset, whether
 	// set there or inherited.
 	Property(ctx context.Context, name, key string) (string, error)
+	// Send writes the stream of a snapshot to w: all of it, or with from
+	// (a snapshot it descends from) only what changed since.
+	Send(ctx context.Context, snapshot, from string, w io.Writer) error
+	// Receive creates snapshot (dataset@name, the dataset new) from a
+	// stream, as a clone of origin when the stream is incremental, with
+	// the given properties. A stream that ends early or is not one
+	// creates nothing.
+	Receive(ctx context.Context, snapshot, origin string, props map[string]string, r io.Reader) error
+	// Space is the bytes available to, and the bytes used by, a dataset
+	// and everything under it.
+	Space(ctx context.Context, root string) (available, used int64, err error)
 }
 
 // zfsCLI is ZFS over the zfs(8) command.
@@ -301,4 +385,51 @@ func (z *zfsCLI) Property(ctx context.Context, name, key string) (string, error)
 func (z *zfsCLI) SetProperty(ctx context.Context, name, key, value string) error {
 	_, err := z.run(ctx, "set", key+"="+value, name)
 	return err
+}
+
+func (z *zfsCLI) stream(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error {
+	streamer, ok := z.cmd.(Streamer)
+	if !ok {
+		return errors.New("zfs: this command runner cannot carry a stream")
+	}
+	return streamer.Stream(ctx, stdin, stdout, z.bin, args...)
+}
+
+// Send streams a snapshot. Blocks are sent as they are stored (-c), so a
+// compressed pool uploads what it holds rather than the expanded data.
+func (z *zfsCLI) Send(ctx context.Context, snapshot, from string, w io.Writer) error {
+	args := []string{"send", "-c"}
+	if from != "" {
+		args = append(args, "-i", from)
+	}
+	return z.stream(ctx, nil, w, append(args, snapshot)...)
+}
+
+func (z *zfsCLI) Receive(ctx context.Context, snapshot, origin string, props map[string]string, r io.Reader) error {
+	args := []string{"receive"}
+	if origin != "" {
+		args = append(args, "-o", "origin="+origin)
+	}
+	for _, key := range slices.Sorted(maps.Keys(props)) {
+		args = append(args, "-o", key+"="+props[key])
+	}
+	return z.stream(ctx, r, nil, append(args, snapshot)...)
+}
+
+func (z *zfsCLI) Space(ctx context.Context, root string) (available, used int64, err error) {
+	out, err := z.run(ctx, "list", "-H", "-p", "-o", "available,used", root)
+	if err != nil {
+		return 0, 0, err
+	}
+	cols := strings.Fields(string(out))
+	if len(cols) != 2 {
+		return 0, 0, fmt.Errorf("zfs list: unexpected output %q", strings.TrimSpace(string(out)))
+	}
+	if available, err = strconv.ParseInt(cols[0], 10, 64); err != nil {
+		return 0, 0, err
+	}
+	if used, err = strconv.ParseInt(cols[1], 10, 64); err != nil {
+		return 0, 0, err
+	}
+	return available, used, nil
 }

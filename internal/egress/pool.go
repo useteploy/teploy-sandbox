@@ -34,6 +34,10 @@ type Pool struct {
 	// a driver whose runs are not on one bridge: each is admitted to its own
 	// port alone.
 	Private bool
+	// Listen, when set, makes a run's private listener instead of a bind
+	// to Bind: a driver whose runs each have a network of their own
+	// listens inside the run's. Its address is the run's proxy address.
+	Listen func(runID string) (net.Listener, error)
 	// PermitPort admits only proxy listeners through the sandbox host firewall.
 	PermitPort func(int) error
 	RevokePort func(int) error
@@ -100,7 +104,11 @@ func (p *Pool) OpenFor(runID string, extra []string) (string, error) {
 	allow = append(allow, ParseAllowlist(strings.Join(extra, ","))...)
 	// Port 0: the kernel picks. Authentication binds the listener to the
 	// run even if another run discovers the port.
-	listener, err := net.Listen("tcp", net.JoinHostPort(p.Bind, "0"))
+	listen := p.Listen
+	if listen == nil {
+		listen = func(string) (net.Listener, error) { return net.Listen("tcp", net.JoinHostPort(p.Bind, "0")) }
+	}
+	listener, err := listen(runID)
 	if err != nil {
 		return "", err
 	}

@@ -146,3 +146,47 @@ func TestPrivatePoolGivesEveryRunItsOwnAuthenticatedProxy(t *testing.T) {
 		t.Fatalf("closing one run's proxy took another's: %d", got)
 	}
 }
+
+// A driver whose runs each have a network of their own makes the
+// listener itself: the pool serves on whatever it is handed, and the
+// run's proxy address is that listener's.
+func TestPoolListensWhereItsDriverSays(t *testing.T) {
+	asked := []string{}
+	var made net.Listener
+	pool := &Pool{Bind: "192.0.2.1", Private: true, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Listen: func(runID string) (net.Listener, error) {
+		asked = append(asked, runID)
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		made = listener
+		return listener, err
+	}}
+	defer pool.Shutdown()
+	proxyURL, err := pool.OpenFor("run-a", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil || len(asked) != 1 || asked[0] != "run-a" || parsed.Host != made.Addr().String() {
+		t.Fatalf("proxy URL %q, asked %v, listener %v (%v)", proxyURL, asked, made.Addr(), err)
+	}
+	// Served, and with the run's credential.
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(parsed)}}
+	resp, err := client.Get("http://not-on-the-list.example/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("through the driver's listener: %d, want the proxy's own refusal", resp.StatusCode)
+	}
+	// Closing the run closes the driver's listener.
+	pool.Close("run-a")
+	if conn, err := net.Dial("tcp", made.Addr().String()); err == nil {
+		conn.Close()
+		t.Fatal("the driver's listener is still open after the run's proxy was closed")
+	}
+	// A driver that cannot make one fails the open.
+	pool.Listen = func(string) (net.Listener, error) { return nil, net.ErrClosed }
+	if _, err := pool.OpenFor("run-b", nil); err == nil {
+		t.Fatal("an open without a listener succeeded")
+	}
+}

@@ -43,7 +43,8 @@
 # libraries; the script says which kind it finds.
 #
 # It also reports whether the kernel has Landlock, which the daemon
-# requires and this script cannot install.
+# requires and this script cannot install, and whether unprivileged
+# processes can create user namespaces, which it leaves as it finds.
 #
 # Environment: SBX_VM_UID_BASE, SBX_VM_CGROUP and SBX_VM_HYPERVISOR, as
 # for the daemon.
@@ -283,6 +284,24 @@ if [ -r /sys/kernel/security/lsm ] && tr ',' '\n' < /sys/kernel/security/lsm | g
     ok "Landlock is active"
 else
     fail "Landlock is not active: it needs Linux 5.13 or newer and \"landlock\" in the lsm= kernel parameter (see /sys/kernel/security/lsm)"
+fi
+
+# Reported, not changed: other software on the host may need them. A
+# hypervisor's main thread may create namespaces as far as its own
+# seccomp filter is concerned, and a user namespace gives whoever took
+# the hypervisor over capabilities inside namespaces of its own: not a
+# way to the host's files, but a way to much more of the kernel than a
+# jailed process otherwise reaches.
+echo "kernel: user namespaces for unprivileged processes"
+sysctl_value() { cat "/proc/sys/$1" 2>/dev/null || true; }
+if [ "$(sysctl_value user/max_user_namespaces)" = 0 ]; then
+    ok "user namespaces are off (user.max_user_namespaces = 0)"
+elif [ "$(sysctl_value kernel/unprivileged_userns_clone)" = 0 ]; then
+    ok "unprivileged processes cannot create user namespaces (kernel.unprivileged_userns_clone = 0)"
+elif [ "$(sysctl_value kernel/apparmor_restrict_unprivileged_userns)" = 1 ]; then
+    ok "AppArmor confines the user namespaces of unprivileged processes (kernel.apparmor_restrict_unprivileged_userns = 1)"
+else
+    echo "  note:    unprivileged processes can create user namespaces. If nothing on this host needs them (rootless containers and browser sandboxes do), turn them off: sysctl -w user.max_user_namespaces=0, and persist it in /etc/sysctl.d."
 fi
 
 echo

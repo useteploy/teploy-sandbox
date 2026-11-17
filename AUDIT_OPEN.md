@@ -957,7 +957,8 @@ Open, and what closing each would take:
   of the daemon's own, installed by the helper under the hypervisor's
   (no `clone` with a namespace flag, `clone3` answered with `ENOSYS`, no
   `unshare`, no `setns`), or `user.max_user_namespaces = 0` on a host
-  that runs nothing else. `install-host.sh` does neither.
+  that runs nothing else. `install-host.sh` now says which of these a
+  host has and changes nothing.
 - **The watch gives up for good if it mistakes its table for another
   instance's.** It asks for its marker chain and, when that fails, for
   the table; a marker that cannot be listed beside a table that can is

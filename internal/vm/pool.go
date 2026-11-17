@@ -456,7 +456,9 @@ func (p *warmPool) remove(vm *warmVM, why string) {
 
 // take hands out a ready VM of this size, or nil. The oldest goes first.
 // A VM is only ever handed out once: it leaves the pool here, under the
-// lock, and nothing puts it back.
+// lock, and nothing puts it back. The caller pokes the pool once its claim
+// is done: a boot started at once would take the CPU the claim needs (or
+// the periodic look starts it, at most two seconds later).
 func (p *warmPool) take(cpus, memoryMB int) *warmVM {
 	if p == nil {
 		return nil
@@ -476,7 +478,6 @@ func (p *warmPool) take(cpus, memoryMB int) *warmVM {
 	for len(p.ready[key]) > 0 {
 		vm := p.ready[key][0]
 		p.ready[key] = slices.Delete(p.ready[key], 0, 1)
-		p.poke()
 		select {
 		case <-vm.machine.Exited():
 			dead = append(dead, vm)

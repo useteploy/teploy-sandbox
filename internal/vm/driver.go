@@ -231,6 +231,8 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 	if pool := d.warmPool(); pool != nil && ref == "" {
 		if warm := pool.take(cpus, spec.MemoryMB); warm != nil {
 			name, machine, source = warm.name, warm.machine, "warm pool"
+			// The refill, once this claim is done with the CPU.
+			defer pool.poke()
 		}
 	}
 	if machine == nil {

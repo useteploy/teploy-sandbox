@@ -263,7 +263,9 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 		}
 		// From here a failure gives the run back (unclaimHeld).
 		durable = current.Remote != nil && current.Remote.State == RemoteDurable
-		if err := m.ensureLocal(ctx, current.snapshot); err != nil {
+		// The run's own snapshot: it holds the reference itself, so
+		// whether the fetch materialized it changes nothing.
+		if _, err := m.ensureLocal(ctx, current.snapshot); err != nil {
 			m.unclaimHeld(ctx, id)
 			return nil, err
 		}
@@ -419,7 +421,9 @@ func (m *Manager) Fork(ctx context.Context, id string, req ForkRequest) (*Run, e
 		defer release()
 		image = source.snapshot
 		fromStopped = true
-		if err := m.ensureLocal(ctx, image); err != nil {
+		// The child registers the image (below), so the fetch's
+		// materialization is the child's from the start.
+		if _, err := m.ensureLocal(ctx, image); err != nil {
 			return nil, err
 		}
 		if source.Remote != nil && !source.Remote.Local {

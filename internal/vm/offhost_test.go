@@ -2,6 +2,7 @@ package vm
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"slices"
@@ -844,6 +845,135 @@ func TestACallersSnapshotBootsOnAnotherHost(t *testing.T) {
 	}
 	if has, _ := a.service.HasLocal(bg, ref); has {
 		t.Fatal("a deleted snapshot is still on the host")
+	}
+}
+
+// A snapshot fetched for a create is the run's to release: the registry
+// would otherwise never name it, and nothing collects what the registry
+// does not name.
+func TestAFetchedSnapshotDoesNotOutliveItsRun(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	a, b := newHost(t, bucket, "host-a", nil), newHost(t, bucket, "host-b", nil)
+	data := payload(t, 400)
+	created := a.startRun(t, data)
+	ref, remote, err := a.manager.SnapshotRemote(bg, created.ID)
+	if err != nil || remote == nil || remote.ID == "" {
+		t.Fatalf("snapshot: %q %+v %v", ref, remote, err)
+	}
+	snapshots := func(z *fakeZFS) []string {
+		var out []string
+		for _, name := range z.names() {
+			// A volume, not the snapshot on it (names() lists both).
+			if strings.Contains(name, snapshotPrefix) && !strings.Contains(name, "@") {
+				out = append(out, name)
+			}
+		}
+		return out
+	}
+	// A boot that fails gives back what the fetch materialized.
+	b.zfs.blockClone = make(chan struct{})
+	close(b.zfs.blockClone)
+	if _, err := b.manager.Create(bg, run.CreateRequest{Image: "snapshot:" + remote.ID}); err == nil {
+		t.Fatal("a boot made to fail must fail")
+	}
+	if left := snapshots(b.zfs); len(left) != 0 {
+		t.Fatalf("a snapshot fetched for a boot that failed stayed on the host: %v", left)
+	}
+	// A run that boots holds the copy for its lifetime, and no longer.
+	booted, err := b.manager.Create(bg, run.CreateRequest{Image: "snapshot:" + remote.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left := snapshots(b.zfs); len(left) != 1 {
+		t.Fatalf("the fetched copy is missing before its run ended: %v", left)
+	}
+	if err := b.manager.Destroy(bg, booted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if left := snapshots(b.zfs); len(left) != 0 {
+		t.Fatalf("a snapshot fetched for a run outlived the run: %v", left)
+	}
+	if has, _ := a.store.HasSnapshot(bg, remote.ID); !has {
+		t.Fatal("the caller's snapshot left remote storage")
+	}
+	if has, _ := a.service.HasLocal(bg, ref); !has {
+		t.Fatal("the snapshot left the host that made it")
+	}
+}
+
+// Runs stopped before remote storage was configured have no remote
+// state at all. Once it is, they belong off the host like any other
+// stopped run.
+func TestRunsFromBeforeRemoteStorageAreUploaded(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	a, b := newHost(t, bucket, "host-a", nil), newHost(t, bucket, "host-b", nil)
+	data := payload(t, 300)
+	created := a.startRun(t, data)
+	remote := a.manager.OffHost
+	a.manager.OffHost = nil
+	if _, err := a.manager.Stop(bg, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if view, _ := a.manager.Get(created.ID); view.Remote != nil {
+		t.Fatalf("a stop without remote storage has remote state: %+v", view.Remote)
+	}
+	a.manager.OffHost = remote
+	a.manager.Maintain(bg)
+	view, _ := a.manager.Get(created.ID)
+	if view.Remote == nil || view.Remote.State != run.RemoteDurable {
+		t.Fatalf("a run stopped before remote storage was configured: %+v", view.Remote)
+	}
+	b.sync(t)
+	resumed, err := b.manager.Resume(bg, created.ID, 0)
+	if err != nil {
+		t.Fatalf("resume on another host: %v", err)
+	}
+	if !bytes.Equal(b.read(t, resumed.ID), data) {
+		t.Fatal("bytes differ")
+	}
+}
+
+// A resume that claimed a run and then failed to boot it gives the run
+// back. The caller that gave up on the resume is gone; publishing the
+// run's stop must not go with it.
+func TestAGivenBackRunIsPublishedAfterItsCallerIsGone(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	a, b := newHost(t, bucket, "host-a", nil), newHost(t, bucket, "host-b", nil)
+	created := a.startRun(t, payload(t, 300))
+	a.stop(t, created.ID)
+	b.sync(t)
+
+	block := make(chan struct{})
+	b.zfs.blockClone = block
+	ctx, cancel := context.WithCancel(bg)
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.manager.ResumeWith(ctx, created.ID, run.ResumeRequest{Takeover: true})
+		done <- err
+	}()
+	for i := 0; ; i++ {
+		if len(bucket.Keys("fleet/v1/run/"+created.ID)) >= 2 {
+			break // the takeover's claim is written
+		}
+		if i > 1000 {
+			t.Fatal("the takeover never claimed the run")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	close(block)
+	if err := <-done; err == nil {
+		t.Fatal("a resume whose boot was cut off must fail")
+	}
+	for i := 0; ; i++ {
+		view, _ := b.manager.Get(created.ID)
+		if view.Remote != nil && view.Remote.State == run.RemoteDurable {
+			return // published under its own deadline, caller or not
+		}
+		if i > 1000 {
+			t.Fatalf("the given-back run was not published: %+v", view.Remote)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

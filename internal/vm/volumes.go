@@ -61,6 +61,12 @@ type Volumes struct {
 	// longer the configured one still has runs descending from it.
 	basesMu sync.Mutex
 	bases   map[string]string
+
+	// receiving counts, by dataset name, the base images a restore is
+	// receiving onto right now. Under mu: Reclaim must not take a base
+	// whose clone — the thing that would otherwise pin it — is not on
+	// the pool yet.
+	receiving map[string]int
 }
 
 // NewVolumes lays the driver's volumes out under root, cloning fresh runs
@@ -73,6 +79,7 @@ func NewVolumes(zfs ZFS, root, golden, owner string, log *slog.Logger) *Volumes 
 		flushDevice: fsyncPath,
 		checkDevice: partitionsHidden,
 		bases:       map[string]string{},
+		receiving:   map[string]int{},
 	}
 }
 

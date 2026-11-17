@@ -237,9 +237,24 @@ func (t *Transfer) Receive(ctx context.Context, id, from string, r io.Reader) er
 		// What an interrupted restore left under this name.
 		err = v.discardStaged(ctx, datasetOf(target))
 	}
+	base := ""
+	if err == nil && origin != "" {
+		// Until the receive makes the clone, nothing on the pool pins
+		// the origin — a base image included, which a Reclaim in the
+		// same moment would take. Held by name until the receive ends.
+		base = datasetOf(origin)
+		v.receiving[base]++
+	}
 	v.mu.Unlock()
 	if err != nil {
 		return err
+	}
+	if base != "" {
+		defer func() {
+			v.mu.Lock()
+			v.receiving[base]--
+			v.mu.Unlock()
+		}()
 	}
 	return v.zfs.Receive(ctx, target, origin, v.props(kindRestore), r)
 }
@@ -399,7 +414,7 @@ func (t *Transfer) Reclaim(ctx context.Context) error {
 		return err
 	}
 	for _, dataset := range volumes {
-		if v.mine(dataset) && dataset.Kind == kindBase {
+		if v.mine(dataset) && dataset.Kind == kindBase && v.receiving[dataset.Name] == 0 {
 			if err := v.collectBase(ctx, dataset.Name); err != nil {
 				return fmt.Errorf("reclaim %s: %w", dataset.Name, err)
 			}

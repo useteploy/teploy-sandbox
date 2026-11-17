@@ -66,13 +66,16 @@ func setRemoteLocked(live *Run, state RemoteState) {
 func (m *Manager) publishHeld(ctx context.Context, id string) error {
 	m.mu.Lock()
 	live, ok := m.runs[id]
-	if !ok || live.State != StateStopped || live.Remote == nil ||
-		live.Remote.State == RemoteDurable || live.Remote.State == RemoteSuperseded {
+	if !ok || live.State != StateStopped ||
+		(live.Remote != nil && (live.Remote.State == RemoteDurable || live.Remote.State == RemoteSuperseded)) {
+		// A run with no remote state at all is publishable: a registry
+		// written before remote storage was configured has stopped runs
+		// like that.
 		m.mu.Unlock()
 		return nil
 	}
 	snapshot, base, key, generation := live.snapshot, live.base, live.remoteKey, live.remoteGen
-	local := live.Remote.Local
+	local := live.Remote == nil || live.Remote.Local
 	payload := m.remotePayloadLocked(live)
 	m.mu.Unlock()
 
@@ -136,10 +139,15 @@ func (m *Manager) publishHeld(ctx context.Context, id string) error {
 }
 
 // publishPending retries every stopped run that is not durable yet.
+// That includes runs with no remote state at all: a registry written
+// before remote storage was configured has stopped runs that were never
+// uploaded, and without this they would never reach another host.
 func (m *Manager) publishPending(ctx context.Context) {
 	for _, current := range m.List() {
-		if current.State != StateStopped || current.Remote == nil ||
-			(current.Remote.State != RemotePending && current.Remote.State != RemoteFailed) {
+		if current.State != StateStopped {
+			continue
+		}
+		if current.Remote != nil && current.Remote.State != RemotePending && current.Remote.State != RemoteFailed {
 			continue
 		}
 		_, release, err := m.beginStopped(current.ID)
@@ -225,14 +233,26 @@ func (m *Manager) evictUnderPressure(ctx context.Context) {
 }
 
 // ensureLocal makes sure a snapshot is on this host before something
-// boots from it.
-func (m *Manager) ensureLocal(ctx context.Context, ref string) error {
+// boots from it. fetched says this daemon materialized the snapshot
+// itself: false when it was already here (and so may be one a caller
+// owns, which must stay after the run), and when nothing could be
+// proven either way.
+func (m *Manager) ensureLocal(ctx context.Context, ref string) (fetched bool, err error) {
 	if m.OffHost == nil || !m.ownsSnapshotRef(ref) {
-		return nil
+		return false, nil
+	}
+	if has, err := m.OffHost.HasLocal(ctx, ref); err == nil {
+		if has {
+			return false, nil
+		}
+		fetched = true
 	}
 	ctx, cancel := context.WithTimeout(ctx, m.publishTimeout())
 	defer cancel()
-	return m.OffHost.Ensure(ctx, ref)
+	if err := m.OffHost.Ensure(ctx, ref); err != nil {
+		return false, err
+	}
+	return fetched, nil
 }
 
 // adoptLocked builds the stopped run a remote record describes. held says
@@ -606,7 +626,13 @@ func (m *Manager) unclaimHeld(ctx context.Context, id string) {
 	setRemoteLocked(live, RemoteState{State: RemotePending, Local: local})
 	m.mu.Unlock()
 	if !uploaded {
-		_ = m.publishHeld(ctx, id)
+		// The resume's own context is what just ran out (or whose caller
+		// hung up) — the very reason the boot failed. Publishing under it
+		// would be dead on arrival, so detach, exactly as the give-back
+		// below does.
+		attempt, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.publishTimeout())
+		defer cancel()
+		_ = m.publishHeld(attempt, id)
 		return
 	}
 	// The snapshot is where it was before the claim: only the record

@@ -403,9 +403,15 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	}
 	// A snapshot that is in remote storage and not on this host is
 	// fetched first. One that is in neither fails the boot below, as
-	// before.
-	if err := m.ensureLocal(ctx, req.Image); err != nil {
+	// before. What the fetch materialized is the run's to release: the
+	// registry would otherwise never name it, and nothing collects what
+	// the registry does not name.
+	fetched, err := m.ensureLocal(ctx, req.Image)
+	if err != nil {
 		return nil, err
+	}
+	if fetched {
+		run.images = []string{req.Image}
 	}
 	created, err := m.launch(ctx, boot, run)
 	if err != nil {

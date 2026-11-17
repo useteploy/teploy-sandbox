@@ -35,6 +35,9 @@ type fakeZFS struct {
 	sends []string
 	// fail makes the named call ("destroy pool/x") return an error once.
 	fail map[string]error
+	// blockClone, when not nil, is consumed by the next Clone, which
+	// waits for it to close (or its context to end) and then fails.
+	blockClone chan struct{}
 	// poolProps are the properties set on the pool, which a volume
 	// without its own value inherits.
 	poolProps map[string]string
@@ -163,7 +166,21 @@ func (z *fakeZFS) Exists(_ context.Context, name string) (bool, error) {
 	return isDataset || isSnapshot || name == strings.SplitN(testPool, "/", 2)[0] || name == testPool, nil
 }
 
-func (z *fakeZFS) Clone(_ context.Context, snapshot, dataset string, props map[string]string) error {
+func (z *fakeZFS) Clone(ctx context.Context, snapshot, dataset string, props map[string]string) error {
+	if z.blockClone != nil {
+		// A test's hold on the next clone: it fails once, with the
+		// caller's context error when that has run out.
+		wait := z.blockClone
+		z.blockClone = nil
+		select {
+		case <-wait:
+		case <-ctx.Done():
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return errors.New("clone held and released by a test")
+	}
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	if err := z.record("clone " + snapshot + " " + dataset); err != nil {

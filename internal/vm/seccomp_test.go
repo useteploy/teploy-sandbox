@@ -111,6 +111,24 @@ var seccompMustDeny = []string{
 	"bpf", "perf_event_open", "userfaultfd", "init_module", "finit_module",
 	"kexec_load", "kexec_file_load", "open_by_handle_at", "name_to_handle_at",
 	"io_uring_setup", "io_uring_enter", "io_uring_register",
+	// Every entry to the mount API, the newest included: a list that
+	// names open_tree and not open_tree_attr refuses nothing.
+	"open_tree", "open_tree_attr", "move_mount", "fsopen", "fsconfig", "fsmount", "fspick",
+	"mount_setattr", "statmount", "listmount",
+}
+
+// The numbers of the calls that were added after the list was first
+// written, as the kernel's tables have them (the same on every
+// architecture): arch/x86/entry/syscalls/syscall_64.tbl and
+// scripts/syscall.tbl.
+func TestSeccompNamesTheNewerMountCalls(t *testing.T) {
+	for name, want := range map[string]uint32{"statmount": 457, "listmount": 458, "open_tree_attr": 467} {
+		for goarch, arch := range seccompArches {
+			if got, listed := arch.deniedCalls()[name]; !listed || got != want {
+				t.Errorf("%s on %s: the filter has %d (listed: %v), the kernel %d", name, goarch, got, listed, want)
+			}
+		}
+	}
 }
 
 func TestSeccompFilterOnBothArchitectures(t *testing.T) {

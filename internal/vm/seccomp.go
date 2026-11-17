@@ -120,7 +120,11 @@ type seccompArch struct {
 }
 
 // sharedDenied are the refused calls that have one number on every
-// architecture (everything added since Linux 5.1 has).
+// architecture (everything added since Linux 5.1 has). The mount calls
+// are all of them, the ones that only read as well: statmount and
+// listmount tell a process what is mounted where and from what, which
+// the jail, having no /proc, otherwise keeps from it, and
+// open_tree_attr is open_tree and mount_setattr in one call.
 var sharedDenied = map[string]uint32{
 	"io_uring_setup":    425,
 	"io_uring_enter":    426,
@@ -136,6 +140,9 @@ var sharedDenied = map[string]uint32{
 	"mount_setattr":     442,
 	"quotactl_fd":       443,
 	"memfd_secret":      447,
+	"statmount":         457,
+	"listmount":         458,
+	"open_tree_attr":    467,
 }
 
 var seccompArches = map[string]seccompArch{

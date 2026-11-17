@@ -395,3 +395,91 @@ func TestVMLimits(t *testing.T) {
 		t.Errorf("a socket filesystem is still mounted:\n%s", mounts)
 	}
 }
+
+// TestVMDestroyIsNotHeldByQueuedIO is a guest that makes its own removal
+// wait. A read or write the kernel holds back for io.max cannot be taken
+// back, and a killed process does not end while it has one; the guest
+// chooses how much it queues. Under a limit of 2 MiB/s, with one setting
+// of its block device raised and 48 direct writes of 16 MiB started at
+// once, the hypervisor of this guest stayed after its kill for more than
+// six minutes, and every destroy in that time failed. A killed VM keeps
+// its limit for vm.DrainGrace and no longer.
+func TestVMDestroyIsNotHeldByQueuedIO(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Fatal("the vm suite needs root (zfs, /dev/kvm)")
+	}
+	ctx := context.Background()
+	config := vmTestConfig(t)
+	baseline := poolListing(t, config.Pool)
+	const capMB = 2
+	config.DiskMBPerSecond, config.DiskIOPS = capMB, -1
+	manager, _, _, _ := newVMManager(t, config, t.TempDir())
+	created, err := manager.Create(ctx, run.CreateRequest{Image: vm.GoldenImage, Limits: &run.Limits{MemoryMB: 1024, CPUs: 2}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	id := created.ID
+	destroyed, group := false, ""
+	defer func() {
+		// Whatever the test found, the VM is not left: with the limit
+		// lifted by hand if the driver did not.
+		for attempt := 0; !destroyed && attempt < 30; attempt++ {
+			if file := filepath.Join(group, "io.max"); attempt > 0 && group != "" {
+				line, _ := os.ReadFile(file)
+				device, _, _ := strings.Cut(string(line), " ")
+				_ = os.WriteFile(file, []byte(device+" rbps=max wbps=max riops=max wiops=max"), 0)
+			}
+			destroyed = manager.Destroy(ctx, id) == nil
+		}
+		if !destroyed {
+			t.Errorf("the VM could not be destroyed even with its limit lifted")
+		}
+	}()
+	machine := inspectVM(t, config, manager, id, 2, 1024)
+	group = machine.cgroup
+	// As root in the guest: let one request carry as much as the device
+	// takes, then start more direct writes than the limit passes in
+	// minutes. The writes are left running.
+	const writers, eachMB = 48, 64
+	// (Everything the script runs after the writers is read from the
+	// disk before them: behind that queue nothing else is.)
+	started := vmRun(t, manager, id, fmt.Sprintf(`for q in /sys/block/vd*/queue; do echo 1048576 > $q/max_sectors_kb; done
+sleep 0.1
+for i in $(seq 1 %d); do (dd if=/dev/zero of=/work/q$i bs=16M count=%d oflag=direct >/dev/null 2>&1 &); done
+sleep 4; echo started`, writers, eachMB/16), "", nil, time.Minute)
+	if started.code != 0 || strings.TrimSpace(started.stdout) != "started" {
+		t.Fatalf("the guest's writers: exit %d %q %q", started.code, started.stdout, started.stderr)
+	}
+	limit := cgroupValue(t, machine.cgroup, "io.max")
+	if !strings.Contains(limit, fmt.Sprintf("wbps=%d", capMB<<20)) {
+		t.Fatalf("io.max of a VM that is alive, with writes queued: %q", limit)
+	}
+	stat := cgroupValue(t, machine.cgroup, "io.stat")
+	began := time.Now()
+	err = manager.Destroy(ctx, id)
+	took := time.Since(began)
+	destroyed = err == nil
+	t.Logf("a guest with %d writers of %d MiB under %d MiB/s (io.max %q; io.stat at the kill: %s): destroy took %s: %v",
+		writers, eachMB, capMB, limit, stat, took.Round(100*time.Millisecond), err)
+	if err != nil {
+		t.Errorf("destroy of a VM with I/O queued under its disk limit: %v", err)
+	}
+	// The grace, and what a destroy takes anyway.
+	if took > vm.DrainGrace+8*time.Second {
+		t.Errorf("destroy took %s: the VM's queue held it beyond the %s a killed VM keeps its limit", took.Round(100*time.Millisecond), vm.DrainGrace)
+	}
+	// Honest about what the test showed: without a queue that outlasts
+	// the grace, a destroy this quick proves nothing about the lift.
+	if took < vm.DrainGrace {
+		t.Errorf("destroy took %s, less than the grace of %s: the guest did not queue enough to hold it", took.Round(100*time.Millisecond), vm.DrainGrace)
+	}
+	if !destroyed {
+		return
+	}
+	if after := poolListing(t, config.Pool); !sameSet(after, baseline) {
+		t.Errorf("the pool was left changed:\n before %v\n after  %v", baseline, after)
+	}
+	if _, err := os.Stat(machine.cgroup); !os.IsNotExist(err) {
+		t.Errorf("the VM's cgroup is still there: %v", err)
+	}
+}

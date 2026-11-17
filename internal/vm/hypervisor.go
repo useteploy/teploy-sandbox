@@ -308,6 +308,14 @@ func (m *chMachine) call(ctx context.Context, action string) error {
 
 func (m *chMachine) Kill(ctx context.Context) error {
 	m.killOnce.Do(func() { _ = m.process.Kill() })
+	// A killed process does not end while the kernel holds back I/O it
+	// queued under its disk limit, and how much that is was the guest's
+	// choice. It gets a moment to drain at its rate; then the limit goes.
+	waited, drained := make(chan struct{}), make(chan struct{})
+	go func() { defer close(drained); m.cell.drain(waited) }()
+	// Not left behind: a VM made later is never the one whose limit is
+	// lifted.
+	defer func() { close(waited); <-drained }()
 	select {
 	case <-m.exited:
 		// The sockets are of no use once the VM is gone, and its cgroup,
@@ -417,8 +425,16 @@ func (h *CloudHypervisor) Sweep(ctx context.Context) (int, error) {
 	}
 	// A volume cannot be destroyed while its hypervisor still has it open,
 	// so wait for the killed ones to be gone before reporting success.
-	deadline := time.Now().Add(15 * time.Second)
+	began := time.Now()
+	deadline := began.Add(15 * time.Second)
+	lifted := false
 	for killed > 0 {
+		if !lifted && time.Since(began) >= h.confine.cgroups.drainGrace {
+			// Still there after a kill: waiting for I/O that their own
+			// disk limits hold back (see DrainGrace).
+			lifted = true
+			_ = h.confine.cgroups.unthrottleAll()
+		}
 		remaining := 0
 		if processes, err = list(); err != nil {
 			return killed, fmt.Errorf("list processes: %w", err)

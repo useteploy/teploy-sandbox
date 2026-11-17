@@ -261,6 +261,19 @@ func (c *cell) dial(ctx context.Context, path string) (net.Conn, error) {
 	return conn, nil
 }
 
+// drain is for a VM whose process was killed and has not ended: after
+// the grace it lifts the VM's disk limits (see DrainGrace). It returns
+// when that is done, or when stop is closed.
+func (c *cell) drain(stop <-chan struct{}) {
+	grace := time.NewTimer(c.owner.cgroups.drainGrace)
+	defer grace.Stop()
+	select {
+	case <-stop:
+	case <-grace.C:
+		_ = c.owner.cgroups.unthrottle(c.name)
+	}
+}
+
 func (c *cell) started() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -554,10 +567,29 @@ type cgroups struct {
 	fs        cgroupFS
 	// removeTimeout bounds the wait for a killed group to empty.
 	removeTimeout time.Duration
+	// drainGrace is how long a killed group keeps its disk limits.
+	drainGrace time.Duration
 }
 
+// DrainGrace is how long a VM that was killed keeps its disk limits.
+//
+// A read or write the kernel is holding back for io.max cannot be taken
+// back, and a process does not end while it has one: a hypervisor that
+// was killed with its guest's writes queued stays, with its memory, its
+// volume and its cgroup, until the queue has drained at the limit's
+// rate. How much is queued is the guest's choice (a few hundred MiB
+// with the stock block driver and one setting changed, far more with a
+// driver of its own), so a guest could keep its own removal waiting for
+// minutes at the default limit and for hours at a low one. So the limit
+// is for the living: a killed VM has this long to drain at its rate,
+// which is more than a guest that queued nothing unusual needs, and
+// then its limits are lifted and what is left reaches the volume at the
+// volume's speed. That is one queue's worth, once, from a VM that is
+// already gone.
+const DrainGrace = 3 * time.Second
+
 func newCgroups(root, dir string) *cgroups {
-	return &cgroups{root: root, dir: dir, fs: realCgroupFS(), removeTimeout: 15 * time.Second}
+	return &cgroups{root: root, dir: dir, fs: realCgroupFS(), removeTimeout: 15 * time.Second, drainGrace: DrainGrace}
 }
 
 // prepare makes the driver's groups and turns on, for their children, the
@@ -662,7 +694,9 @@ func (c *cgroups) create(ctx context.Context, name string, limits cgroupLimits) 
 // that is not there is already removed.
 func (c *cgroups) remove(ctx context.Context, name string) error {
 	dir := c.path(name)
-	deadline := time.Now().Add(c.removeTimeout)
+	began := time.Now()
+	deadline := began.Add(c.removeTimeout)
+	lifted := false
 	for {
 		err := c.fs.rmdir(dir)
 		if err == nil || os.IsNotExist(err) {
@@ -672,6 +706,12 @@ func (c *cgroups) remove(ctx context.Context, name string) error {
 		// every process in the group, including any that is being
 		// forked while it is written.
 		_ = c.fs.write(filepath.Join(dir, "cgroup.kill"), "1")
+		if !lifted && time.Since(began) >= c.drainGrace {
+			// Killed and still there: it is waiting for I/O that its
+			// own limit holds back (see DrainGrace).
+			lifted = true
+			_ = c.unthrottle(name)
+		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("cgroup %s: %w", dir, err)
 		}
@@ -681,6 +721,50 @@ func (c *cgroups) remove(ctx context.Context, name string) error {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+// unthrottle lifts the disk limits of a VM's group, for every device it
+// has one on. It is for a group whose processes were killed: what they
+// had queued is then let through, so that they can end. A group that is
+// gone, or has no limits, is left as it is.
+func (c *cgroups) unthrottle(name string) error {
+	file := filepath.Join(c.path(name), "io.max")
+	limits, err := c.fs.read(file)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var failed []error
+	for _, line := range strings.Split(limits, "\n") {
+		// "MAJOR:MINOR rbps=... wbps=... riops=... wiops=...".
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if err := c.fs.write(file, fields[0]+" rbps=max wbps=max riops=max wiops=max"); err != nil && !os.IsNotExist(err) {
+			failed = append(failed, err)
+		}
+	}
+	return errors.Join(failed...)
+}
+
+// unthrottleAll lifts the disk limits of every VM group of this daemon
+// identity: what the startup sweep does for the hypervisors it killed.
+func (c *cgroups) unthrottleAll() error {
+	names, err := c.fs.children(c.dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var failed []error
+	for _, name := range names {
+		failed = append(failed, c.unthrottle(name))
+	}
+	return errors.Join(failed...)
 }
 
 // sweep removes every VM group of this daemon identity.

@@ -28,6 +28,9 @@ type fakeCgroupTree struct {
 	kills []string
 	// unkillable groups keep their processes when killed.
 	unkillable map[string]bool
+	// draining groups keep their processes when killed for as long as
+	// they have a disk limit: a process with I/O queued under io.max.
+	draining map[string]bool
 }
 
 func (f *fakeCgroupTree) populate(dir, controllers string) error {
@@ -114,10 +117,22 @@ func (f *fakeCgroupTree) fs() cgroupFS {
 				f.mu.Lock()
 				dir := filepath.Dir(path)
 				f.kills = append(f.kills, dir)
-				if !f.unkillable[dir] {
+				limit, _ := read(filepath.Join(dir, "io.max"))
+				if !f.unkillable[dir] && !(f.draining[dir] && limit != "") {
 					delete(f.procs, dir)
 				}
 				f.mu.Unlock()
+			case "io.max":
+				// The kernel lists a device only while it has a limit.
+				if device, limits, _ := strings.Cut(value, " "); device != "" && limits == "rbps=max wbps=max riops=max wiops=max" {
+					value = ""
+					f.mu.Lock()
+					dir := filepath.Dir(path)
+					if f.draining[dir] && slices.Contains(f.kills, dir) {
+						delete(f.procs, dir)
+					}
+					f.mu.Unlock()
+				}
 			}
 			return os.WriteFile(path, []byte(value), 0o644)
 		},
@@ -130,7 +145,7 @@ func (f *fakeCgroupTree) fs() cgroupFS {
 func newFakeCgroups(t *testing.T, delegated string) (*cgroups, *fakeCgroupTree) {
 	t.Helper()
 	top := t.TempDir()
-	tree := &fakeCgroupTree{procs: map[string][]int{}, unkillable: map[string]bool{}}
+	tree := &fakeCgroupTree{procs: map[string][]int{}, unkillable: map[string]bool{}, draining: map[string]bool{}}
 	if err := tree.populate(top, "cpuset cpu io memory pids"); err != nil {
 		t.Fatal(err)
 	}
@@ -874,5 +889,81 @@ func TestCgroupBoundsWhatAVMDoesToItsDisk(t *testing.T) {
 	other := MachineConfig{Name: runName(2), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
 	if _, err := c.enter(ctx, other, filepath.Join(root, "run", other.Name)); err == nil || !strings.Contains(err.Error(), "io.max") {
 		t.Fatalf("a VM was confined without its disk limit: %v", err)
+	}
+}
+
+// A process that was killed does not end while the kernel holds back
+// I/O it queued under io.max, and a guest chooses how much it queues: a
+// VM could keep its own removal waiting for as long as its queue takes
+// to drain at the limit's rate. A killed group keeps its limit for the
+// grace and no longer.
+func TestAKilledGroupIsNotHeldByItsDiskLimit(t *testing.T) {
+	c, tree := newFakeCgroups(t, "cpu io memory pids")
+	if err := c.prepare(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	config := MachineConfig{Name: runName(1), CPUs: 1, MemoryMB: 512}
+	limits := limitsFor(config)
+	limits.Disk, limits.DiskDevice = diskLimits{BytesPerSecond: 2 << 20}, 230<<8|32
+	queued := func() string {
+		t.Helper()
+		dir, err := c.create(ctx, config.Name, limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cgroupFile(t, dir, "io.max"); got != "230:32 rbps=2097152 wbps=2097152 riops=max wiops=max" {
+			t.Fatalf("io.max: %q", got)
+		}
+		tree.procs[dir], tree.draining[dir] = []int{7}, true
+		return dir
+	}
+
+	// The control: with the limit left in place the group stays busy.
+	c.removeTimeout, c.drainGrace = 100*time.Millisecond, time.Hour
+	dir := queued()
+	if err := c.remove(ctx, config.Name); !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("a killed group with I/O queued under its limit, and the limit kept: %v", err)
+	}
+	if got := cgroupFile(t, dir, "io.max"); got == "" {
+		t.Fatal("the limit was lifted before the grace was over")
+	}
+
+	// The limit holds for the grace, then goes, and the group with it.
+	c.removeTimeout, c.drainGrace = 5*time.Second, 150*time.Millisecond
+	began := time.Now()
+	if err := c.remove(ctx, config.Name); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if took := time.Since(began); took < c.drainGrace || took > 2*time.Second {
+		t.Fatalf("removal took %s; the limit is to hold for %s and not much longer", took, c.drainGrace)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("group left: %v", err)
+	}
+
+	// Every device with a limit, and every group of this daemon: what
+	// the startup sweep lifts for the hypervisors it killed.
+	dir = queued()
+	if err := os.WriteFile(filepath.Join(dir, "io.max"), []byte("230:32 rbps=1 wbps=max riops=max wiops=max\n8:0 rbps=max wbps=max riops=5 wiops=max\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var wrote []string
+	write := c.fs.write
+	c.fs.write = func(path, value string) error {
+		if filepath.Base(path) == "io.max" {
+			wrote = append(wrote, value)
+		}
+		return write(path, value)
+	}
+	if err := c.unthrottleAll(); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"230:32 rbps=max wbps=max riops=max wiops=max", "8:0 rbps=max wbps=max riops=max wiops=max"}; !slices.Equal(wrote, want) {
+		t.Fatalf("lifted: %q, want %q", wrote, want)
+	}
+	// A group that is gone, or has no io controller, is not an error.
+	if err := c.unthrottle(runName(9)); err != nil {
+		t.Fatalf("a group that is not there: %v", err)
 	}
 }

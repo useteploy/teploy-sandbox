@@ -226,7 +226,7 @@ func (c Config) withDefaults() Config {
 	for _, each := range []struct {
 		value    *int
 		fallback int
-	}{{&c.DiskMBPerSecond, DefaultDiskMBPerSecond}, {&c.DiskIOPS, DefaultDiskIOPS}} {
+	}{{&c.DiskMBPerSecond, DefaultDiskMBPerSecond}, {&c.DiskIOPS, DefaultDiskIOPS}, {&c.NetMbit, DefaultNetMbit}, {&c.NetConnections, DefaultNetConnections}} {
 		if *each.value == 0 {
 			*each.value = each.fallback
 		}

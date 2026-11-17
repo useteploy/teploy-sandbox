@@ -59,7 +59,12 @@ import (
 //     holds that descriptor.
 //   - The daemon compares every ruleset it wrote with what the kernel
 //     has, every watchInterval, and writes back what differs.
+//   - What a run may use of the host's network is bounded as well: a
+//     queue with a rate on the run's devices (its tap, and an open run's
+//     link), which is the kernel's and no rule, and a count of the
+//     connections a run may have tracked at once.
 //
+
 // Everything is named after the daemon identity, so the startup sweep
 // removes what this daemon left and nothing else.
 
@@ -98,6 +103,13 @@ const (
 	proxyPortBase = 20000
 	// netnsDir is where iproute2 keeps named network namespaces.
 	netnsDir = "/run/netns"
+
+	// DefaultNetMbit is what a run may send and receive per second, each
+	// way, and DefaultNetConnections how many connections it may have
+	// tracked at once. Like the disk's, they keep one run from taking
+	// the host's link, or its connection table, from the others.
+	DefaultNetMbit        = 200
+	DefaultNetConnections = 4096
 )
 
 // netPlan is the network configuration, checked and resolved.
@@ -110,6 +122,10 @@ type netPlan struct {
 	// dns is what an open run's guest is told to resolve with.
 	dns         []netip.Addr
 	openPrivate bool
+	// rateMbit bounds what a run sends and what it receives, in megabits
+	// per second; connections bounds the connections it has tracked at
+	// once. Zero is no limit.
+	rateMbit, connections int
 	// nsPrefix starts the name of every run's network namespace,
 	// tapPrefix that of the tap inside it and linkPrefix that of the
 	// host's end of an open run's link; table is the host's nftables
@@ -145,6 +161,8 @@ func planNetwork(config Config, discovered, local []netip.Addr) (netPlan, error)
 		subnet:      subnet,
 		gateway:     subnet.Addr().Next(),
 		openPrivate: config.OpenPrivate,
+		rateMbit:    max(config.NetMbit, 0),
+		connections: max(config.NetConnections, 0),
 		// An interface name has 15 characters: 3 + 6 + 1 leaves 5 for the
 		// slot. "n", "h" and "g" are not hex digits, so one kind of name
 		// can never be taken for another.
@@ -604,6 +622,10 @@ func (n *hostNetwork) runRules(a *attachment, sealed bool) string {
 	line("		type filter hook input priority filter; policy drop;")
 	line("		meta nfproto != ipv4 counter drop")
 	if !sealed && a.tier == run.NetworkAllowlist {
+		if p.connections > 0 {
+			// The proxy's connections are the daemon's open files.
+			line("		iifname %q ct state new ct count over %d counter drop", a.tap, p.connections)
+		}
 		line("		iifname %q ip saddr %s ip daddr %s tcp dport %d accept", a.tap, a.addr, p.gateway, a.proxyPort)
 	}
 	line("		counter drop")
@@ -614,6 +636,14 @@ func (n *hostNetwork) runRules(a *attachment, sealed bool) string {
 	if !sealed && a.tier == run.NetworkOpen {
 		// To the guest: answers, nothing else.
 		line("		iifname %q oifname %q ct state established,related accept", uplinkDev, a.tap)
+		if p.connections > 0 {
+			// Counted here, where only this run's are: a connection the
+			// run may not start never reaches the host, whose table of
+			// tracked connections is one for everything on it. Whatever
+			// is tracked counts, in any protocol, until the kernel
+			// forgets it.
+			line("		iifname %q ct state new ct count over %d counter drop", a.tap, p.connections)
+		}
 		line("		iifname %q oifname %q ip saddr %s jump out", a.tap, uplinkDev, a.addr)
 	}
 	line("		counter drop")
@@ -662,6 +692,30 @@ func (n *hostNetwork) openRoutes(a *attachment) string {
 	b.WriteString(hostRoutes(nil, a.hostAddrs))
 	line("route replace default via %s dev %s onlink", uplinkHop, uplinkDev)
 	return b.String()
+}
+
+// shape puts the run's rate on a device of its namespace, as a token
+// bucket on what leaves through it: on the tap that is what the guest
+// receives, on an open run's link what it sends. A queueing discipline
+// is the kernel's own, on the device: no ruleset holds it, a flushed
+// firewall does not remove it, and it goes with the device.
+func (n *hostNetwork) shape(ctx context.Context, a *attachment, dev string) error {
+	if n.plan.rateMbit <= 0 {
+		return nil
+	}
+	if _, err := n.sys.run(ctx, a.ns, "tc", append([]string{"qdisc", "replace", "dev", dev, "root"}, tbfArgs(n.plan.rateMbit)...)...); err != nil {
+		return fmt.Errorf("limit %s in %s to %d Mbit/s: %w", dev, a.ns, n.plan.rateMbit, err)
+	}
+	return nil
+}
+
+// tbfArgs is a token bucket filter for a rate. The bucket holds what the
+// rate carries in 20 ms, and never less than one of the 64 KiB packets
+// the kernel hands a tap; what does not fit waits up to 50 ms and is
+// dropped after that, which is what tells a sender to slow down.
+func tbfArgs(mbit int) []string {
+	burst := max(mbit*1000*1000/8/50, 64<<10)
+	return []string{"tbf", "rate", fmt.Sprintf("%dmbit", mbit), "burst", fmt.Sprintf("%db", burst), "latency", "50ms"}
 }
 
 // hostRoutes is the batch that moves a namespace's unreachable routes
@@ -1117,6 +1171,10 @@ func (n *hostNetwork) Attach(ctx context.Context, name, tier string, proxyPort i
 				return nil, fmt.Errorf("set %s on %s: %w", setting[0], a.link, err)
 			}
 		}
+		// What the guest sends leaves the namespace through the link.
+		if err = n.shape(ctx, a, uplinkDev); err != nil {
+			return nil, err
+		}
 	}
 	if tap, err = n.sys.openTap(a.ns, a.tap); err != nil {
 		return nil, fmt.Errorf("create tap %s in %s: %w", a.tap, a.ns, err)
@@ -1126,6 +1184,10 @@ func (n *hostNetwork) Attach(ctx context.Context, name, tier string, proxyPort i
 	// host's table, the routes.
 	if err = n.sys.ip(ctx, a.ns, fmt.Sprintf("link set dev %s address %s\n", a.tap, gatewayMACFor(n.plan.gateway))); err != nil {
 		return nil, fmt.Errorf("set the address of %s: %w", a.tap, err)
+	}
+	// What the guest receives leaves the namespace through the tap.
+	if err = n.shape(ctx, a, a.tap); err != nil {
+		return nil, err
 	}
 	if err = n.writeRun(ctx, a, false); err != nil {
 		return nil, fmt.Errorf("install the ruleset of %s: %w", a.ns, err)
@@ -1337,6 +1399,12 @@ func probeNamespace(ctx context.Context, sys netSys, name string) (err error) {
 	rules := fmt.Sprintf("table netdev %[1]s {\n chain ingress { type filter hook ingress device \"probe\" priority -300; policy drop; }\n}\ntable inet %[1]s {\n chain forward { type filter hook forward priority filter; policy drop; ct state established,related accept; }\n}\n", runTable)
 	if err := sys.nft(ctx, name, rules); err != nil {
 		return fmt.Errorf("an nftables ruleset in a namespace (the inet and netdev families and connection tracking are needed): %w", err)
+	}
+	if err := sys.nft(ctx, name, fmt.Sprintf("add rule inet %s forward ct state new ct count over 1 drop\n", runTable)); err != nil {
+		return fmt.Errorf("a limit on tracked connections in a namespace (nftables' \"ct count\": the nft_connlimit module): %w", err)
+	}
+	if _, err := sys.run(ctx, name, "tc", append([]string{"qdisc", "replace", "dev", "probe", "root"}, tbfArgs(1)...)...); err != nil {
+		return fmt.Errorf("a rate on a device in a namespace (the tc command, and the sch_tbf module): %w", err)
 	}
 	return nil
 }

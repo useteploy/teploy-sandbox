@@ -1069,6 +1069,79 @@ func TestTheWatchKeepsLooking(t *testing.T) {
 	}
 }
 
+// A run's share of the host's network: a rate on what leaves its
+// devices, and a count of the connections it may have tracked.
+func TestARunsNetworkIsBounded(t *testing.T) {
+	network, fake := startedNetwork(t, func(c *Config) { c.NetMbit, c.NetConnections = 100, 512 })
+	attachAllowlist(t, network, "run-a")
+	_, err := network.Attach(bg, "run-b", run.NetworkOpen, 0)
+	must(t, err)
+	const tbf = "root tbf rate 100mbit burst 250000b latency 50ms"
+	// The rate is on a device before the device is up.
+	for _, each := range [][2]string{
+		{"[tvn012345-0] tc qdisc replace dev tv012345-0 " + tbf, "[tvn012345-0] ip: link set dev tv012345-0 up"},
+		{"[tvn012345-1] tc qdisc replace dev tv012345-1 " + tbf, "[tvn012345-1] ip: link set dev tv012345-1 up"},
+		{"[tvn012345-1] tc qdisc replace dev uplink " + tbf, "[tvn012345-1] ip: link set dev uplink up"},
+	} {
+		if fake.index(t, each[0]) > fake.index(t, each[1]) {
+			t.Errorf("%q came after %q", each[0], each[1])
+		}
+	}
+	// An allowlist run has no link, so nothing to limit there.
+	for _, event := range fake.events {
+		if strings.Contains(event, "[tvn012345-0] tc") && strings.Contains(event, "uplink") {
+			t.Errorf("an allowlist run was given a link to limit: %s", event)
+		}
+	}
+	allow, open := fake.space("tvn012345-0").rules, fake.space("tvn012345-1").rules
+	count := `iifname "tv012345-%d" ct state new ct count over 512 counter drop`
+	for _, each := range []struct{ rules, limit, admits string }{
+		{allow, fmt.Sprintf(count, 0), "tcp dport 20000 accept"},
+		{open, fmt.Sprintf(count, 1), "jump out"},
+	} {
+		at, admitted := strings.Index(each.rules, each.limit), strings.Index(each.rules, each.admits)
+		if at < 0 || admitted < at {
+			t.Errorf("the connection limit %q is not ahead of %q in:\n%s", each.limit, each.admits, each.rules)
+		}
+	}
+
+	// A small rate still passes the kernel's largest packets.
+	if got := strings.Join(tbfArgs(1), " "); got != "tbf rate 1mbit burst 65536b latency 50ms" {
+		t.Errorf("a 1 Mbit/s limit: %q", got)
+	}
+
+	// No limit: no queue and no count.
+	network, fake = startedNetwork(t, func(c *Config) { c.NetMbit, c.NetConnections = -1, -1 })
+	_, err = network.Attach(bg, "run-a", run.NetworkOpen, 0)
+	must(t, err)
+	for _, event := range fake.events {
+		if strings.Contains(event, " tc ") {
+			t.Errorf("a network without a rate was given one: %s", event)
+		}
+	}
+	if strings.Contains(fake.space("tvn012345-0").rules, "ct count") {
+		t.Error("a network without a connection limit was given one")
+	}
+	// The daemon's defaults.
+	plan, err := planNetwork(Config{Owner: testOwner}.withDefaults(), nil, nil)
+	must(t, err)
+	if plan.rateMbit != DefaultNetMbit || plan.connections != DefaultNetConnections {
+		t.Errorf("default network limits: %d Mbit/s, %d connections", plan.rateMbit, plan.connections)
+	}
+}
+
+// A device that cannot be given its rate is not brought up.
+func TestARunWithoutItsRateIsNotAttached(t *testing.T) {
+	network, fake := startedNetwork(t, func(c *Config) { c.NetMbit = 50 })
+	fake.fail["tc qdisc"] = errors.New("RTNETLINK answers: Operation not supported")
+	if _, err := network.Attach(bg, "run-a", run.NetworkOpen, 0); err == nil || !strings.Contains(err.Error(), "50 Mbit/s") {
+		t.Fatalf("attach without a rate: %v", err)
+	}
+	if fake.space("tvn012345-0") != nil || fake.links["tvh012345-0"] || len(network.attached) != 0 {
+		t.Fatal("a run that could not be limited was left attached")
+	}
+}
+
 // logOf is a network's log, to see what it said.
 func logOf(network *hostNetwork) *strings.Builder {
 	var log strings.Builder
@@ -1261,7 +1334,10 @@ func TestProbeNamespaceTriesEverythingARunNeedsAndRemovesIt(t *testing.T) {
 	if len(fake.spaces) != 0 || fake.links["tvp012345"] {
 		t.Fatalf("the probe left something: %v %v", fake.spaces, fake.links)
 	}
-	for _, step := range []string{"ip netns add", "ip link add", "ip: rule add", "tap probe", "nft -f"} {
+	for _, step := range []string{"[tvn012345-probe] nft -f: sealed", "[tvn012345-probe] tc qdisc replace dev probe root tbf rate 1mbit"} {
+		fake.index(t, step)
+	}
+	for _, step := range []string{"ip netns add", "ip link add", "ip: rule add", "tap probe", "nft -f: ruleset", "nft -f: sealed", "tc qdisc"} {
 		fake := newFakeNet(t)
 		fake.fail[step] = errors.New("operation not supported")
 		if err := probeNamespace(bg, fake.sys(), "tvn012345-probe"); err == nil {

@@ -1541,7 +1541,15 @@ the code, the unit suite and the same nested arm64 host. Five defects,
 each fixed with a test in its own commit; none of them let one run reach
 another, or a run reach the host. One new live test,
 `TestVMWarmPoolRaces`. The whole `vmintegration` suite (fifteen tests
-now) passes with the pool on (`SBX_VM_WARM=1x512=2,1x1024=1`).
+now) passes with the pool on (`SBX_VM_WARM=1x512=2,1x1024=1`), with the
+final code, on a host that was three times slower than for the entry
+above (the machine under it was busy: a cold boot took 14 s median and
+up to 23 s). One run in between, on the same busy host, failed two
+tests on time alone: a guest command that did not answer within its
+minute in `TestVMDestroyIsNotHeldByQueuedIO`, which passed alone and in
+the next whole run, and the new test's burst, then nine creates at once
+of which six were cold boots that did not finish inside the driver's
+two minutes; it is six creates now.
 
 ### Defects found and fixed
 

@@ -44,7 +44,15 @@ type jailReport struct {
 	Writes    map[string]string
 	CoreLimit syscall.Rlimit
 	Status    string
+	// Open is every descriptor from 3 up that the program was started
+	// with, and what a read of the stray one gave.
+	Open  []int
+	Stray string
 }
+
+// strayDescriptor is where the tests put a descriptor that nothing
+// handed to the jailed program: far above anything else that is open.
+const strayDescriptor = 200
 
 func init() {
 	switch os.Getenv(jailProbeEnv) {
@@ -54,6 +62,21 @@ func init() {
 		os.Exit(0)
 	}
 	report := jailReport{UID: os.Getuid(), GID: os.Getgid(), PID: os.Getpid(), Sockets: map[string]string{}, Writes: map[string]string{}}
+	// First, before this program opens anything itself.
+	for fd := 3; fd < 1024; fd++ {
+		var info syscall.Stat_t
+		if syscall.Fstat(fd, &info) == nil {
+			report.Open = append(report.Open, fd)
+		}
+	}
+	// What a directory of the host that came along as a descriptor is
+	// good for: everything under it, whatever the jail's root holds.
+	if fd, err := syscall.Openat(strayDescriptor, "secret", syscall.O_RDONLY|syscall.O_CLOEXEC, 0); err == nil {
+		buf := make([]byte, 16)
+		n, _ := syscall.Read(fd, buf)
+		report.Stray = string(buf[:max(n, 0)])
+		_ = syscall.Close(fd)
+	}
 	report.Groups, _ = os.Getgroups()
 	report.Hostname, _ = os.Hostname()
 	_ = filepath.WalkDir("/", func(path string, entry fs.DirEntry, err error) error {
@@ -175,12 +198,38 @@ func TestJailHoldsNothingOfTheHost(t *testing.T) {
 			spec.Paths[i].Path = "/dev/zero"
 		}
 	}
+	// What the daemon cannot rule out: it was itself started with a
+	// descriptor it knows nothing of (a wrapper script's lock, a log, a
+	// directory), which every process it starts then inherits. Here it
+	// is a directory of the host that the jail does not hold, open
+	// without close-on-exec. The program is handed one file on purpose,
+	// as a VM is handed its tap.
+	// Anyone may read it: nothing but the jail keeps the program out.
+	if err := os.Chmod(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	otherDir, err := os.Open(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherDir.Close()
+	if _, _, errno := syscall.Syscall(syscall.SYS_DUP3, otherDir.Fd(), strayDescriptor, 0); errno != 0 {
+		t.Fatalf("make a stray descriptor: %v", errno)
+	}
+	defer syscall.Close(strayDescriptor)
+	handed, err := os.Open(kernel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handed.Close()
+	spec.Descriptors = standardDescriptors + 1
 	cmd, err := jailCommand(spec, jailTestCgroup(t), self, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	cmd.ExtraFiles = []*os.File{handed}
 	cmd.Env = []string{jailProbeEnv + "=report"}
 	cmd.Dir = "/"
 	if err := cmd.Run(); err != nil {
@@ -206,6 +255,14 @@ func TestJailHoldsNothingOfTheHost(t *testing.T) {
 	}
 	if report.Status != "" {
 		t.Errorf("the jail has a /proc")
+	}
+	// The one file it was handed, and nothing else that was open in the
+	// process that started it.
+	if !slices.Equal(report.Open, []int{standardDescriptors}) {
+		t.Errorf("descriptors the jailed program was started with, from 3 up: %v, want only the one it was handed", report.Open)
+	}
+	if report.Stray != "" {
+		t.Errorf("the jailed program read %q from a directory of the host, through a descriptor that nobody handed it", report.Stray)
 	}
 	// The tree: the named paths, the directories that lead to them, and
 	// nothing else.

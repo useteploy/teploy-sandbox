@@ -308,6 +308,30 @@ var hostSockets = []string{
 	"/run/snapd-snap.socket",
 }
 
+// strayDescriptor is a descriptor this process holds on the host's root
+// directory, open without close-on-exec, from before the first VM is
+// started: what a daemon has when whoever started it left one open (a
+// wrapper script's lock file, a log, a directory). Every process it
+// starts inherits it unless something closes it, and a directory of the
+// host in a hypervisor's hands is a way around its jail's root.
+const strayDescriptor = 200
+
+var strayOnce sync.Once
+
+func holdStrayDescriptor(t *testing.T) {
+	t.Helper()
+	strayOnce.Do(func() {
+		root, err := os.Open("/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		if _, _, errno := syscall.Syscall(syscall.SYS_DUP3, root.Fd(), strayDescriptor, 0); errno != 0 {
+			t.Fatalf("hold a stray descriptor: %v", errno)
+		}
+	})
+}
+
 // jailControls logs the control for the jail's missing sockets once.
 var jailControls sync.Once
 
@@ -449,6 +473,32 @@ func inspectJail(t *testing.T, config vm.Config, machine confinedVM, kvmGroup ui
 	hypervisor, err := exec.LookPath(config.Hypervisor)
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	// --- nothing open but what it was handed and what it opened itself:
+	// its tap, the devices and the lock file in its jail, and things
+	// without a path. Not the directory this process holds open (the
+	// control: it is still open here, and a child that is not jailed
+	// has it).
+	if link, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", strayDescriptor)); err != nil || link != "/" {
+		t.Fatalf("control: this process's stray descriptor: %q %v", link, err)
+	}
+	if out, err := exec.Command("readlink", fmt.Sprintf("/proc/self/fd/%d", strayDescriptor)).Output(); err != nil || strings.TrimSpace(string(out)) != "/" {
+		t.Fatalf("control: a child of this process does not inherit the stray descriptor: %q %v", out, err)
+	}
+	descriptors, err := os.ReadDir(filepath.Join(proc, "fd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := []string{"/dev/null", "/dev/net/tun", "/dev/kvm", "/dev/urandom", machine.node, filepath.Join(machine.runDir, "api.sock.lock")}
+	for _, each := range descriptors {
+		link, err := os.Readlink(filepath.Join(proc, "fd", each.Name()))
+		if err != nil {
+			continue // closed meanwhile
+		}
+		if strings.HasPrefix(link, "/") && !slices.Contains(allowed, link) {
+			t.Errorf("the hypervisor holds descriptor %s on %s, which nobody handed it and its jail does not hold", each.Name(), link)
+		}
 	}
 
 	// --- process 1 of a PID namespace that holds nothing else

@@ -75,7 +75,18 @@ type jailSpec struct {
 	Groups []uint32 `json:"groups,omitempty"`
 	// Paths is the whole content of the jail.
 	Paths []jailPath `json:"paths"`
+	// Descriptors is how many open files the program is given, counted
+	// from 0: its input and two outputs, and whatever the daemon hands it
+	// after those (a tap). No other descriptor the helper was started
+	// with reaches the program. An open directory of the host would be a
+	// way out of the jail's root for whoever holds it, and the daemon
+	// cannot know what it was itself started with: a lock file a wrapper
+	// script holds, a log, a working directory.
+	Descriptors int `json:"descriptors"`
 }
+
+// standardDescriptors are a program's input and its two outputs.
+const standardDescriptors = 3
 
 func (s jailSpec) validate() error {
 	switch {
@@ -85,6 +96,8 @@ func (s jailSpec) validate() error {
 		return errors.New("refusing to start a hypervisor in group root")
 	case !filepath.IsAbs(s.Root) || filepath.Clean(s.Root) == "/":
 		return fmt.Errorf("%q is not a directory to mount a jail on", s.Root)
+	case s.Descriptors < standardDescriptors:
+		return fmt.Errorf("a jailed program is given at least its %d standard descriptors, not %d", standardDescriptors, s.Descriptors)
 	}
 	for _, each := range s.Paths {
 		if !filepath.IsAbs(each.Path) || filepath.Clean(each.Path) != each.Path || each.Path == "/" {
@@ -128,7 +141,8 @@ const (
 // jailFor is the jail of one VM: the hypervisor's binary (and what it is
 // linked against, if anything), the kernel image, the VM's own disk
 // node, /dev/kvm and /dev/urandom, and the directory its two sockets are
-// made in. The tap, if there is one, is a descriptor and needs no path.
+// made in. The tap, if there is one, is a descriptor and needs no path:
+// whoever hands it over raises Descriptors by one.
 func jailFor(root string, uid uint32, groups []uint32, bin, kernel, disk, dir string, libraries []jailPath) jailSpec {
 	paths := []jailPath{
 		{Path: bin, Kind: jailFile, Exec: true},
@@ -138,7 +152,7 @@ func jailFor(root string, uid uint32, groups []uint32, bin, kernel, disk, dir st
 		{Path: rngDevice, Kind: jailDevice},
 		{Path: dir, Kind: jailDir, Write: true},
 	}
-	return jailSpec{Root: root, UID: uid, GID: uid, Groups: groups, Paths: append(paths, libraries...)}
+	return jailSpec{Root: root, UID: uid, GID: uid, Groups: groups, Paths: append(paths, libraries...), Descriptors: standardDescriptors}
 }
 
 // libraryDirs are where a dynamically linked program's loader and

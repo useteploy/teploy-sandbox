@@ -180,11 +180,19 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 
 // command is the VM's process, not yet started: the hypervisor bin with
 // args, in a jail that holds it, the kernel image and what is this VM's.
-// The cgroup handle is only needed until it is started: started closes
-// it.
-func (c *cell) command(bin, kernel string, args []string) (*exec.Cmd, error) {
+// files are the open files it is handed, as descriptors 3 and up; no
+// other descriptor of the daemon's, or of whoever started the daemon,
+// reaches it. The cgroup handle is only needed until it is started:
+// started closes it.
+func (c *cell) command(bin, kernel string, args []string, files ...*os.File) (*exec.Cmd, error) {
 	jail := jailFor(c.jailRoot(), c.uid, c.owner.groups, bin, kernel, c.disk, c.dir, c.owner.libraries)
-	return c.owner.sys.command(jail, c.cgroup, bin, args)
+	jail.Descriptors += len(files)
+	cmd, err := c.owner.sys.command(jail, c.cgroup, bin, args)
+	if err != nil {
+		return nil, err
+	}
+	cmd.ExtraFiles = files
+	return cmd, nil
 }
 
 // dial connects to one of the VM's unix sockets and proves that the VM's

@@ -24,6 +24,9 @@ func TestJailSpecRefusesRootAndPathsThatAreNotItsOwn(t *testing.T) {
 		"the whole tree":    func(s *jailSpec) { s.Paths[0].Path = "/" },
 		"an unknown kind":   func(s *jailSpec) { s.Paths[0].Kind = "everything" },
 		"a link to nowhere": func(s *jailSpec) { s.Paths[0] = jailPath{Path: "/lib", Kind: jailSymlink} },
+		// Fewer than its standard three: a spec that does not say what
+		// the program is given would let everything through.
+		"no descriptors": func(s *jailSpec) { s.Descriptors = 0 },
 	} {
 		spec := good
 		spec.Paths = append([]jailPath(nil), good.Paths...)

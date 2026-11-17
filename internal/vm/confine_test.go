@@ -507,7 +507,7 @@ func TestEnterGivesAVMItsOwnUserDeviceAndCgroup(t *testing.T) {
 		{Path: "/dev/kvm", Kind: jailDevice},
 		{Path: "/dev/urandom", Kind: jailDevice},
 		{Path: dir, Kind: jailDir, Write: true},
-	}}
+	}, Descriptors: 3}
 	if len(log.jails) != 1 || !reflect.DeepEqual(log.jails[0], wantJail) {
 		t.Fatalf("jail:\n%+v\nwant:\n%+v", log.jails, wantJail)
 	}
@@ -516,6 +516,20 @@ func TestEnterGivesAVMItsOwnUserDeviceAndCgroup(t *testing.T) {
 	}
 	if want := fmt.Sprintf("uid=70000 gid=70000 groups=[993] cgroup=%s", c.cgroups.path(config.Name)); !slices.Equal(log.started, []string{want}) {
 		t.Fatalf("started %v, want %s", log.started, want)
+	}
+	// A file it is handed (its tap) is its fourth descriptor, and the
+	// jail is told to let exactly that many through.
+	handed, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handed.Close()
+	withTap, err := first.command("/opt/ch", "/boot/Image", []string{"--landlock"}, handed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withTap.ExtraFiles) != 1 || withTap.ExtraFiles[0] != handed || log.jails[1].Descriptors != 4 {
+		t.Fatalf("a VM with a tap: extra files %v, descriptors let through %d; want the tap and 4", withTap.ExtraFiles, log.jails[1].Descriptors)
 	}
 
 	// A second VM shares nothing with the first.

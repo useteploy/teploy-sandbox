@@ -218,15 +218,17 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 	// per VM keeps logs unambiguous.
 	cid := 3 + h.nextCID.Add(1)
 	// Not a CommandContext: the VM outlives the request that created it.
-	cmd, err := confined.command(h.Bin, h.Kernel, h.machineArgs(config, dir, cid))
+	var files []*os.File
+	if config.Net != nil {
+		// Descriptor tapFD in the hypervisor.
+		files = append(files, config.Net.Tap)
+	}
+	cmd, err := confined.command(h.Bin, h.Kernel, h.machineArgs(config, dir, cid), files...)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("start hypervisor: %w", err), confined.release(cleanupCtx))
 	}
 	serial, output := &tailBuffer{limit: outputTail}, &tailBuffer{limit: outputTail}
 	cmd.Stdout, cmd.Stderr = serial, output
-	if config.Net != nil {
-		cmd.ExtraFiles = []*os.File{config.Net.Tap}
-	}
 	// Nothing of the daemon's: not its environment, which may hold
 	// secrets, and not its working directory.
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}

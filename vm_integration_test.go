@@ -40,6 +40,7 @@ import (
 // and nobody else's.
 func vmTestConfig(t *testing.T) vm.Config {
 	t.Helper()
+	holdStrayDescriptor(t)
 	owner := sha256.Sum256([]byte("teploy-sandbox vmintegration suite"))
 	pool := envOr("SBX_VM_POOL", vm.DefaultPool)
 	return vm.Config{

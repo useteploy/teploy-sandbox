@@ -62,6 +62,12 @@ func jailCommand(spec jailSpec, cgroup *os.File, bin string, args []string) (*ex
 }
 
 const (
+	// close_range has one number on every architecture; with
+	// closeRangeCloexec it marks the descriptors instead of closing them
+	// (Linux 5.11, older than the Landlock this driver requires).
+	sysCloseRange     = 436
+	closeRangeCloexec = 4
+
 	prSetNoNewPrivs = 38
 	prCapBSetDrop   = 24
 	// lastCapability is beyond the highest capability any kernel has.
@@ -170,6 +176,15 @@ func enterJail(args, env []string) error {
 	}
 	if _, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0); errno != 0 {
 		return fmt.Errorf("set no_new_privs: %w", errno)
+	}
+	// Whatever else this process was started with stays behind: the
+	// daemon's own files are close-on-exec, but what the daemon itself
+	// inherited from whoever started it is not, and a descriptor is not
+	// stopped by a root that has no path to its file. Marked rather than
+	// closed, so that the runtime's own are there until the exec, and
+	// last, so that nothing opened on the way is missed.
+	if _, _, errno := syscall.RawSyscall(sysCloseRange, uintptr(spec.Descriptors), uintptr(^uint32(0)), closeRangeCloexec); errno != 0 {
+		return fmt.Errorf("close the descriptors from %d on: %w", spec.Descriptors, errno)
 	}
 	return step("execute "+args[1], syscall.Exec(args[1], args[1:], env))
 }

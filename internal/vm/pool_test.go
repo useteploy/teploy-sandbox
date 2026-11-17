@@ -36,7 +36,7 @@ func TestParseWarmSizes(t *testing.T) {
 func newWarmRig(t *testing.T, config WarmConfig) *testRig {
 	t.Helper()
 	rig := newRig(t, nil)
-	rig.driver.warm = config.withDefaults()
+	rig.driver.setWarm(config)
 	rig.driver.owner = t.Name()
 	rig.driver.hostMemory = func() (int, error) { return 1 << 20, nil }
 	t.Cleanup(func() { _ = rig.driver.Close(context.Background()) })
@@ -226,7 +226,7 @@ func TestTheWarmPoolBoundsItsBoots(t *testing.T) {
 	gate := make(chan struct{})
 	rig := newRig(t, nil)
 	rig.hypervisor.bootGate = gate
-	rig.driver.warm = WarmConfig{Sizes: []WarmSize{{1, 1024, 4}, {2, 2048, 4}}, Boots: 2}.withDefaults()
+	rig.driver.setWarm(WarmConfig{Sizes: []WarmSize{{1, 1024, 4}, {2, 2048, 4}}, Boots: 2})
 	rig.driver.owner = t.Name()
 	rig.driver.hostMemory = func() (int, error) { return 1 << 20, nil }
 	t.Cleanup(func() { _ = rig.driver.Close(context.Background()) })
@@ -281,7 +281,7 @@ func TestTheWarmPoolLeavesTheHostItsMemory(t *testing.T) {
 		defer mu.Unlock()
 		return available - len(rig.hypervisor.running())*MemoryLimitMB(1024), nil
 	}
-	rig.driver.warm = WarmConfig{Sizes: []WarmSize{{1, 1024, 3}}, Boots: 3, HeadroomMB: 1024}.withDefaults()
+	rig.driver.setWarm(WarmConfig{Sizes: []WarmSize{{1, 1024, 3}}, Boots: 3, HeadroomMB: 1024})
 	rig.driver.owner = t.Name()
 	t.Cleanup(func() { _ = rig.driver.Close(context.Background()) })
 	must(t, func() error { _, _, err := rig.driver.Sweep(bg); return err }())
@@ -358,7 +358,7 @@ func TestAFailedClaimDestroysThePoolVM(t *testing.T) {
 func TestABootThatFailsIsRetriedLater(t *testing.T) {
 	rig := newRig(t, nil)
 	rig.hypervisor.startErr = errors.New("no kvm today")
-	rig.driver.warm = WarmConfig{Sizes: []WarmSize{{1, 1024, 1}}}.withDefaults()
+	rig.driver.setWarm(WarmConfig{Sizes: []WarmSize{{1, 1024, 1}}})
 	rig.driver.owner = t.Name()
 	rig.driver.hostMemory = func() (int, error) { return 1 << 20, nil }
 	t.Cleanup(func() { _ = rig.driver.Close(context.Background()) })
@@ -456,5 +456,33 @@ func TestMaxRunsRefusesWithAtCapacity(t *testing.T) {
 	}
 	if len(rig.hypervisor.started) != 2 {
 		t.Fatalf("%d VMs booted", len(rig.hypervisor.started))
+	}
+}
+
+// --vm-warm-headroom-mb 0 is no headroom (the config says it with a
+// negative value): the pool then boots whenever the host's available
+// memory covers the VM's own limit. It used to keep the default headroom
+// all the same, the defaults having been applied twice.
+func TestNoHeadroomIsNoHeadroom(t *testing.T) {
+	rig := newRig(t, nil)
+	// Enough for the VM's limit and 10 MiB more: far less than the
+	// default headroom.
+	rig.driver.hostMemory = func() (int, error) { return MemoryLimitMB(1024) + 10, nil }
+	rig.driver.setWarm(WarmConfig{Sizes: []WarmSize{{1, 1024, 1}}, HeadroomMB: -1})
+	rig.driver.owner = t.Name()
+	t.Cleanup(func() { _ = rig.driver.Close(context.Background()) })
+	must(t, func() error { _, _, err := rig.driver.Sweep(bg); return err }())
+	if got := rig.driver.warmPool().config.HeadroomMB; got != 0 {
+		t.Fatalf("the pool keeps %d MiB of headroom with none configured", got)
+	}
+	waitPool(t, rig.driver, "full", full)
+
+	// Unset is the default, and a headroom is itself.
+	for configured, want := range map[int]int{0: DefaultWarmHeadroomMB, 300: 300} {
+		driver := &Driver{}
+		driver.setWarm(WarmConfig{HeadroomMB: configured})
+		if got := newWarmPool(driver, driver.warm).config.HeadroomMB; got != want {
+			t.Errorf("headroom %d became %d, want %d", configured, got, want)
+		}
 	}
 }

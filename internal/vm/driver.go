@@ -64,8 +64,8 @@ type Driver struct {
 	BootTimeout time.Duration
 	// MaxRuns is how many VMs runs may have at once; zero is no limit.
 	MaxRuns int
-	// warm is the warm pool's configuration; the pool itself starts
-	// after the startup sweep (Sweep).
+	// warm is the warm pool's configuration as it was given (setWarm);
+	// the pool itself starts after the startup sweep (Sweep).
 	warm  WarmConfig
 	owner string
 	// hostMemory is the host's available memory in MiB for the warm

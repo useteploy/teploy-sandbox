@@ -697,7 +697,7 @@ func New(ctx context.Context, config Config, log *slog.Logger) (*Driver, error) 
 		driver.BootTimeout = config.BootTimeout
 	}
 	driver.MaxRuns = max(config.MaxRuns, 0)
-	driver.warm = config.Warm.withDefaults()
+	driver.setWarm(config.Warm)
 	driver.owner = config.Owner
 	for _, warning := range sizingWarnings(config, realSizingHost()) {
 		log.Warn("host sizing: "+warning.text, warning.attrs...)

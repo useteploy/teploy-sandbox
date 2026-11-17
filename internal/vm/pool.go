@@ -82,6 +82,12 @@ func (c WarmConfig) VMs() (vms, memoryMB int) {
 	return vms, memoryMB
 }
 
+// setWarm gives the driver its warm pool's configuration, as the flags
+// gave it. The defaults are applied once, when the pool is made
+// (newWarmPool): applied twice, "no headroom" (negative, which the first
+// pass turns into zero) would become the default headroom.
+func (d *Driver) setWarm(config WarmConfig) { d.warm = config }
+
 func (c WarmConfig) withDefaults() WarmConfig {
 	if c.Boots <= 0 {
 		c.Boots = DefaultWarmBoots

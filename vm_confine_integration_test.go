@@ -120,6 +120,11 @@ func labelLinks(t *testing.T) []string {
 // as the daemon does: as root, whoever owns the socket.
 func hypervisorAPI(t *testing.T, socket, action, body string) (int, string) {
 	t.Helper()
+	return hypervisorCall(t, http.MethodPut, socket, action, body)
+}
+
+func hypervisorCall(t *testing.T, method, socket, action, body string) (int, string) {
+	t.Helper()
 	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{
 		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -127,7 +132,7 @@ func hypervisorAPI(t *testing.T, socket, action, body string) (int, string) {
 			return dialer.DialContext(ctx, "unix", socket)
 		},
 	}}
-	req, err := http.NewRequest(http.MethodPut, "http://localhost/api/v1/"+action, strings.NewReader(body))
+	req, err := http.NewRequest(method, "http://localhost/api/v1/"+action, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +142,7 @@ func hypervisorAPI(t *testing.T, socket, action, body string) (int, string) {
 		t.Fatalf("hypervisor %s: %v", action, err)
 	}
 	defer resp.Body.Close()
-	answer, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+	answer, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	return resp.StatusCode, string(answer)
 }
 
@@ -808,7 +813,7 @@ func TestVMConfinement(t *testing.T) {
 	}
 	config := vmTestConfig(t)
 	ctx := context.Background()
-	manager, _, _, _ := newVMManager(t, config, t.TempDir())
+	manager, driver, _, _ := newVMManager(t, config, t.TempDir())
 	baseline := poolListing(t, config.Pool)
 	linksBefore := labelLinks(t)
 
@@ -968,9 +973,10 @@ func TestVMConfinement(t *testing.T) {
 
 	// --- a daemon that starts over sweeps what the last one left: the
 	// process, and the cgroup, device node and runtime dir with it
+	warm := settledWarmPool(t, driver)
 	_, _, processes, volumes := newVMManager(t, config, t.TempDir())
-	if processes != 1 || volumes != 1 {
-		t.Errorf("startup sweep: %d processes and %d volumes, want the one VM left running", processes, volumes)
+	if processes != 1+warm || volumes != 1+warm {
+		t.Errorf("startup sweep: %d processes and %d volumes, want the one VM left running and %d warm pool VMs", processes, volumes, warm)
 	}
 	second.assertGone(t)
 	if got := poolListing(t, config.Pool); !slices.Equal(got, baseline) {

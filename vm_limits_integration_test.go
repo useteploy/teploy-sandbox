@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -391,7 +392,11 @@ func TestVMLimits(t *testing.T) {
 		t.Errorf("the pool was left changed:\n before %v\n after  %v", baseline, after)
 	}
 	assertNoNetworkLeft(t, namesFor(base))
-	if mounts, _ := os.ReadFile("/proc/self/mountinfo"); strings.Contains(string(mounts), base.RunDir) {
+	if mounts, _ := os.ReadFile("/proc/self/mountinfo"); slices.ContainsFunc(strings.Split(string(mounts), "\n"), func(line string) bool {
+		fields := strings.Fields(line)
+		// A warm pool's VMs have theirs until the pool is closed.
+		return len(fields) > 4 && strings.HasPrefix(fields[4], base.RunDir) && !vm.WarmPoolHolds(filepath.Base(fields[4]))
+	}) {
 		t.Errorf("a socket filesystem is still mounted:\n%s", mounts)
 	}
 }

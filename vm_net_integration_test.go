@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -1000,16 +1001,27 @@ echo "raw=$(nc -z -w 5 example.com 443 >/dev/null 2>&1 && echo connected)"`
 	// nothing. The tap is in the run's namespace, which is not the
 	// hypervisor's, and the hypervisor only has a descriptor.
 	confined := inspectVM(t, config, manager, openID, cpus, memoryMB)
+	// Its command line is a VM's without a network (the device was handed
+	// to it running, over its API socket); it holds the tap as a
+	// descriptor; it was never told an interface name; and its own idea
+	// of the device is the run's MAC.
 	cmdline, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(confined.pid), "cmdline"))
 	args := strings.Split(string(cmdline), "\x00")
-	if at := slices.Index(args, "--net"); at < 0 || args[at+1] != "fd=3,mac="+openNIC.mac {
-		t.Fatalf("the hypervisor's network device: %q", args)
+	if slices.Contains(args, "--net") || strings.Contains(string(cmdline), "tap") {
+		t.Fatalf("the hypervisor's command line names a network device: %q", args)
 	}
-	if target, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(confined.pid), "fd", "3")); err != nil || target != "/dev/net/tun" {
-		t.Fatalf("the hypervisor's descriptor 3: %q %v", target, err)
+	descriptors, _ := os.ReadDir(filepath.Join("/proc", strconv.Itoa(confined.pid), "fd"))
+	taps := 0
+	for _, each := range descriptors {
+		if target, _ := os.Readlink(filepath.Join("/proc", strconv.Itoa(confined.pid), "fd", each.Name())); target == "/dev/net/tun" {
+			taps++
+		}
 	}
-	if strings.Contains(string(cmdline), "tap=") {
-		t.Fatalf("the hypervisor was told an interface name: %q", args)
+	if taps == 0 {
+		t.Fatal("the hypervisor of an open run holds no tap")
+	}
+	if code, info := hypervisorCall(t, http.MethodGet, filepath.Join(confined.runDir, "api.sock"), "vm.info", ""); code != 200 || !strings.Contains(info, `"mac":"`+openNIC.mac+`"`) || strings.Contains(info, `"tap":"t`) {
+		t.Fatalf("the hypervisor's own view of the device: %d %s", code, info)
 	}
 	if out := inNS(t, openNIC.ns, "ip", "-o", "link", "show", "dev", openNIC.tap); !strings.Contains(out, "UP") {
 		t.Fatalf("the tap is not up in the run's namespace: %s", out)
@@ -1377,7 +1389,7 @@ func TestVMNetworkAfterADaemonCrash(t *testing.T) {
 	ctx := context.Background()
 	startPeer(t)
 	guard := startCanary(t)
-	crashed, _, _, _ := newVMManager(t, config, t.TempDir())
+	crashed, crashedDriver, _, _ := newVMManager(t, config, t.TempDir())
 	baseline := poolListing(t, config.Pool)
 
 	created, err := crashed.Create(ctx, run.CreateRequest{Image: vm.GoldenImage, Network: "open", Limits: &run.Limits{MemoryMB: 512, CPUs: 1}})
@@ -1441,6 +1453,7 @@ func TestVMNetworkAfterADaemonCrash(t *testing.T) {
 
 	// --- the restart, up to the moment before its sweep: the new daemon
 	// has written its firewall and knows no run. The guest is still alive.
+	warm := settledWarmPool(t, crashedDriver)
 	restarted, err := vm.New(ctx, config, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("restart: %v", err)
@@ -1459,8 +1472,8 @@ func TestVMNetworkAfterADaemonCrash(t *testing.T) {
 
 	// --- the sweep
 	processes, _, err := restarted.Sweep(ctx)
-	if err != nil || processes != 1 {
-		t.Fatalf("sweep: %d processes, %v", processes, err)
+	if err != nil || processes != 1+warm {
+		t.Fatalf("sweep: %d processes (want the leftover run's and %d warm pool VMs), %v", processes, warm, err)
 	}
 	for _, link := range []string{otherLink, unrelatedTap} {
 		if _, err := hostTry("ip", "link", "show", "dev", link); err != nil {

@@ -27,6 +27,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,7 +44,14 @@ func vmTestConfig(t *testing.T) vm.Config {
 	holdStrayDescriptor(t)
 	owner := sha256.Sum256([]byte("teploy-sandbox vmintegration suite"))
 	pool := envOr("SBX_VM_POOL", vm.DefaultPool)
+	// SBX_VM_WARM runs the whole suite with a warm pool, as the daemon's
+	// --vm-warm: every test then gets pool VMs wherever its sizes match.
+	warm, err := vm.ParseWarmSizes(os.Getenv("SBX_VM_WARM"))
+	if err != nil {
+		t.Fatalf("SBX_VM_WARM: %v", err)
+	}
 	return vm.Config{
+		Warm:       vm.WarmConfig{Sizes: warm, Boots: int(envFloat("SBX_VM_WARM_BOOTS", vm.DefaultWarmBoots))},
 		Hypervisor: envOr("SBX_VM_HYPERVISOR", vm.DefaultHypervisor),
 		Kernel:     envOr("SBX_VM_KERNEL", vm.DefaultKernel),
 		Cmdline:    envOr("SBX_VM_CMDLINE", vm.DefaultCmdline()),
@@ -55,20 +63,27 @@ func vmTestConfig(t *testing.T) vm.Config {
 	}
 }
 
-// poolListing is every dataset and snapshot in the pool, sorted.
+// poolListing is every dataset and snapshot in the pool, sorted, except
+// the volumes of warm pool VMs: those come and go on their own, and are
+// nobody's run.
 func poolListing(t *testing.T, pool string) []string {
 	t.Helper()
 	out, err := exec.Command("zfs", "list", "-H", "-r", "-t", "all", "-o", "name", pool).Output()
 	if err != nil {
 		t.Fatalf("zfs list: %v", err)
 	}
-	names := strings.Fields(string(out))
+	var names []string
+	for _, name := range strings.Fields(string(out)) {
+		if !vm.WarmPoolHolds(filepath.Base(name)) {
+			names = append(names, name)
+		}
+	}
 	sort.Strings(names)
 	return names
 }
 
 // hypervisorProcesses lists the pids whose command line names an API
-// socket under dir: the suite's own VMs.
+// socket under dir: the suite's own VMs, except those a warm pool holds.
 func hypervisorProcesses(t *testing.T, dir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir("/proc")
@@ -78,11 +93,42 @@ func hypervisorProcesses(t *testing.T, dir string) []string {
 	var pids []string
 	for _, entry := range entries {
 		raw, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
-		if err == nil && strings.Contains(string(raw), "--api-socket\x00"+dir+"/") {
+		if err != nil {
+			continue
+		}
+		args := strings.Split(string(raw), "\x00")
+		at := slices.Index(args, "--api-socket")
+		if at < 0 || at+1 >= len(args) || !strings.HasPrefix(args[at+1], dir+"/") {
+			continue
+		}
+		if !vm.WarmPoolHolds(filepath.Base(filepath.Dir(args[at+1]))) {
 			pids = append(pids, entry.Name())
 		}
 	}
 	return pids
+}
+
+// settledWarmPool waits until the driver's warm pool is full and nothing
+// of it is booting, and returns how many VMs it holds: 0 with no pool.
+// A test that is about to restart its daemon calls it, so that it knows
+// how many VMs the new daemon's sweep will find besides the runs'.
+func settledWarmPool(t *testing.T, driver *vm.Driver) int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Minute)
+	for {
+		ready, settled := 0, true
+		for _, size := range driver.WarmPool() {
+			ready += size.Ready
+			settled = settled && size.Ready == size.Target && size.Booting == 0
+		}
+		if settled {
+			return ready
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the warm pool did not fill: %+v", driver.WarmPool())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 type vmExec struct {
@@ -115,7 +161,8 @@ func newVMManager(t *testing.T, config vm.Config, stateDir string) (*run.Manager
 // it, with the daemon's log going to logs.
 func newVMManagerLogging(t *testing.T, config vm.Config, stateDir string, logs io.Writer) (*run.Manager, *vm.Driver, int, int) {
 	t.Helper()
-	log := slog.New(slog.NewTextHandler(logs, nil))
+	claims := &claimCounter{w: logs}
+	log := slog.New(slog.NewTextHandler(claims, nil))
 	driver, err := vm.New(context.Background(), config, log)
 	if err != nil {
 		t.Fatalf("vm driver: %v", err)
@@ -138,7 +185,27 @@ func newVMManagerLogging(t *testing.T, config vm.Config, stateDir string, logs i
 	if _, err := manager.LoadState(context.Background(), stateDir); err != nil {
 		t.Fatalf("load state: %v", err)
 	}
+	if len(config.Warm.Sizes) > 0 {
+		// A full pool, so that every create of a size it keeps is a
+		// claim, and the test says how many there were.
+		settledWarmPool(t, driver)
+		t.Cleanup(func() { t.Logf("runs given a warm pool VM by this daemon: %d", claims.n.Load()) })
+	}
 	return manager, driver, processes, volumes
+}
+
+// claimCounter passes the daemon's log on and counts the runs it hands a
+// warm pool VM.
+type claimCounter struct {
+	w io.Writer
+	n atomic.Int64
+}
+
+func (c *claimCounter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(`from="warm pool"`)) {
+		c.n.Add(1)
+	}
+	return c.w.Write(p)
 }
 
 func TestVMLifecycle(t *testing.T) {
@@ -161,7 +228,7 @@ func TestVMLifecycle(t *testing.T) {
 	if left := hypervisorProcesses(t, config.RunDir); len(left) > 0 {
 		t.Fatalf("hypervisor processes before the suite started: %v", left)
 	}
-	manager, _, _, _ := newVMManager(t, config, stateDir)
+	manager, driver, _, _ := newVMManager(t, config, stateDir)
 	// No volume of a run may ever show its partitions to the host: with
 	// them come the guest's filesystem labels, which a host mount by label
 	// can pick up. Checked wherever a volume has just been made.
@@ -322,11 +389,13 @@ func TestVMLifecycle(t *testing.T) {
 
 	// --- a daemon restart: a new driver and a new manager, same pool,
 	// same state dir. The first manager is simply abandoned, as on a crash.
+	// A warm pool's VMs are the crashed daemon's leftovers too.
+	warm := settledWarmPool(t, driver)
 	start = time.Now()
 	manager2, _, sweptProcesses, sweptVolumes := newVMManager(t, config, stateDir)
 	timed("restart (sweep one orphan VM + load registry)", start)
-	if sweptProcesses != 1 || sweptVolumes != 1 {
-		t.Fatalf("the restart sweep removed %d processes and %d volumes; want the one orphan run", sweptProcesses, sweptVolumes)
+	if sweptProcesses != 1+warm || sweptVolumes != 1+warm {
+		t.Fatalf("the restart sweep removed %d processes and %d volumes; want the one orphan run and %d warm pool VMs", sweptProcesses, sweptVolumes, warm)
 	}
 	if left := hypervisorProcesses(t, config.RunDir); len(left) != 0 {
 		t.Fatalf("the sweep left hypervisor processes: %v", left)
@@ -449,7 +518,9 @@ func TestVMLifecycle(t *testing.T) {
 	if left := hypervisorProcesses(t, config.RunDir); len(left) != 0 {
 		t.Fatalf("hypervisor processes left behind: %v", left)
 	}
-	if entries, _ := os.ReadDir(filepath.Join(config.RunDir, config.Owner[:16])); len(entries) != 0 {
+	if entries, _ := os.ReadDir(filepath.Join(config.RunDir, config.Owner[:16])); slices.ContainsFunc(entries, func(entry os.DirEntry) bool {
+		return !vm.WarmPoolHolds(strings.TrimSuffix(entry.Name(), ".jail"))
+	}) {
 		t.Fatalf("runtime dirs left behind: %v", entries)
 	}
 	if len(manager2.List()) != 0 {

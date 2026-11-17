@@ -419,3 +419,36 @@ func TestAKeyOpensOnlyForItsOwner(t *testing.T) {
 		t.Fatalf("garbage opened: %v", err)
 	}
 }
+
+func TestMarkChainsRefusesAnEndlessChain(t *testing.T) {
+	needed := map[string]bool{"tail": true}
+	manifests := map[string]*Manifest{"tail": {Parent: "head"}, "head": {Parent: "tail"}}
+	if err := markChains(needed, manifests); err == nil {
+		t.Fatal("a chain that circles must be an error, not a hang")
+	}
+}
+
+// A manifest another collector deletes between this round's listing and
+// its read is not this round's failure: nothing of it is left to keep.
+func TestCollectToleratesAManifestThatVanishesMidRound(t *testing.T) {
+	store, bucket := testStore(t)
+	parentKey, _ := store.Keys().NewKey("parent")
+	if _, err := store.Upload(bg, Manifest{ID: "parent", Purpose: PurposeSnapshot, GUID: "1"}, parentKey, bytes.NewReader(randomBytes(t, 1500))); err != nil {
+		t.Fatal(err)
+	}
+	childKey, _ := store.Keys().NewKey("child")
+	if _, err := store.Upload(bg, Manifest{ID: "child", Purpose: PurposeSnapshot, GUID: "2", Parent: "parent"}, childKey, bytes.NewReader(randomBytes(t, 1500))); err != nil {
+		t.Fatal(err)
+	}
+	bucket.Remove("fleet/v1/snap/parent/manifest")
+	stats, err := store.Collect(bg, time.Hour)
+	if err != nil {
+		t.Fatalf("a manifest that vanished mid-round must not fail the round: %v", err)
+	}
+	if stats.Snapshots != 0 {
+		t.Fatalf("nothing is old enough to delete: %+v", stats)
+	}
+	if has, _ := store.HasSnapshot(bg, "child"); !has {
+		t.Fatal("the surviving snapshot was deleted")
+	}
+}

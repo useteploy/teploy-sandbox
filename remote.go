@@ -147,8 +147,8 @@ func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, sta
 	if *f.local != run.LocalKeep && *f.local != run.LocalDrop {
 		return nil, fmt.Errorf("remote-local must be %q or %q, got %q", run.LocalKeep, run.LocalDrop, *f.local)
 	}
-	if *f.gcGrace < 0 || *f.gcInterval <= 0 || *f.syncInterval <= 0 {
-		return nil, errors.New("remote-gc-grace must not be negative, and remote-gc-interval and remote-sync-interval must be positive")
+	if *f.gcGrace <= 0 || *f.gcInterval <= 0 || *f.syncInterval <= 0 {
+		return nil, errors.New("remote-gc-grace, remote-gc-interval and remote-sync-interval must be positive: a grace of zero would delete in the very round a snapshot is first seen unreferenced, while a fork may still be naming it")
 	}
 	secret, err := secretFrom(*f.secretKeyFile, "SBX_REMOTE_SECRET_KEY", "AWS_SECRET_ACCESS_KEY")
 	if err != nil {

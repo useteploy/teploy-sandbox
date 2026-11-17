@@ -2,6 +2,7 @@ package offhost
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -19,6 +20,31 @@ type CollectStats struct {
 	Bytes     int64
 	// Kept is how many snapshots something still needs.
 	Kept int
+}
+
+// maxChainWalk bounds how far the chain of a needed snapshot is
+// followed. A real chain is as long as --remote-max-chain plus one, but
+// the walk follows whatever a manifest says, and one damaged manifest
+// must not hang every daemon's collector.
+const maxChainWalk = 64
+
+// markChains marks as needed everything a needed snapshot builds on.
+func markChains(needed map[string]bool, manifests map[string]*Manifest) error {
+	for id := range needed {
+		hops := 0
+		for parent := id; parent != ""; {
+			if hops++; hops > maxChainWalk {
+				return fmt.Errorf("the chain of snapshot %s does not end within %d hops", id, maxChainWalk)
+			}
+			manifest := manifests[parent]
+			if manifest == nil {
+				break
+			}
+			needed[parent] = true
+			parent = manifest.Parent
+		}
+	}
+	return nil
 }
 
 // Collect deletes what nothing refers to any more:
@@ -135,6 +161,12 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 		}
 		manifest, _, err := s.Manifest(ctx, id)
 		if err != nil {
+			if errors.Is(err, ErrNoSnapshot) {
+				// It was in this round's own listing and is gone now:
+				// another collector, or a caller's delete. Nothing of
+				// it is left to keep.
+				continue
+			}
 			return stats, fmt.Errorf("collect: %w", err)
 		}
 		manifests[id] = manifest
@@ -142,16 +174,8 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 			needed[id] = true
 		}
 	}
-	// What a needed snapshot builds on is needed.
-	for id := range needed {
-		for parent := id; parent != ""; {
-			manifest := manifests[parent]
-			if manifest == nil {
-				break
-			}
-			needed[parent] = true
-			parent = manifest.Parent
-		}
+	if err := markChains(needed, manifests); err != nil {
+		return stats, fmt.Errorf("collect: %w", err)
 	}
 
 	var doomed []s3.Object

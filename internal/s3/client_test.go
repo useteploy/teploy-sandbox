@@ -476,3 +476,61 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		}
 	}
 }
+
+// A redirect in front of the bucket must fail the write: followed, it
+// turns the PUT into a GET of the target that reports success.
+func TestPutDoesNotFollowARedirect(t *testing.T) {
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		if r.Method == http.MethodPut {
+			w.Header().Set("Location", "/bucket/elsewhere")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	client, err := New(Config{Endpoint: server.URL, Bucket: "bucket", PathStyle: true,
+		Credentials: Credentials{AccessKey: "AKIDEXAMPLE", SecretKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Put(context.Background(), "some/key", []byte("data"), PutOptions{}); err == nil {
+		t.Fatal("a redirect must fail the write")
+	} else if !strings.Contains(err.Error(), "302") {
+		t.Fatalf("the failure must name the redirect: %v", err)
+	}
+	if len(requests) != 1 || requests[0] != "PUT /bucket/some/key" {
+		t.Fatalf("only the PUT may be made: %v", requests)
+	}
+}
+
+// A service that repeats its continuation token must end the listing,
+// not feed the same page to the caller forever while its slice grows.
+func TestAListingThatRepeatsItsTokenEnds(t *testing.T) {
+	pages := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("list-type") != "2" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		pages++
+		w.Header().Set("Content-Type", "application/xml")
+		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>stuck</NextContinuationToken>
+<Contents><Key>page-%d</Key></Contents></ListBucketResult>`, pages)
+	}))
+	t.Cleanup(server.Close)
+	client, err := New(Config{Endpoint: server.URL, Bucket: "bucket", PathStyle: true,
+		Credentials: Credentials{AccessKey: "AKIDEXAMPLE", SecretKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ListAll(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "continuation") {
+		t.Fatalf("a repeated continuation token: %v", err)
+	}
+	if pages != 2 {
+		t.Fatalf("two pages are enough to see the repeat, got %d", pages)
+	}
+}

@@ -115,6 +115,11 @@ func New(cfg Config) (*Client, error) {
 			IdleConnTimeout:       90 * time.Second,
 		}}
 	}
+	// An S3 service does not redirect legitimately, and a followed one
+	// turns a PUT into a GET of the target that reports success: never
+	// follow, whatever client was handed in. A 3xx then arrives as a
+	// response of its own and fails as an error.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Client{cfg: cfg, endpoint: endpoint, http: client, now: time.Now, sleep: sleepContext}, nil
 }
 
@@ -242,7 +247,26 @@ func serviceError(resp *response) *Error {
 	if xml.Unmarshal(resp.body, &document) == nil {
 		failure.Code, failure.Message = document.Code, document.Message
 	}
+	if failure.Code == "RequestTimeTooSkewed" {
+		// Name the real cause: an operator reading "AccessDenied" looks
+		// at credentials, not at the clock. The service's own Date says
+		// by how much the two disagree.
+		if date, err := http.ParseTime(resp.headers.Get("Date")); err == nil {
+			failure.Message += fmt.Sprintf(" (this daemon's clock and the service's differ by about %s; synchronize the clock)", respSkew(date))
+		} else {
+			failure.Message += " (synchronize this daemon's clock with the service's)"
+		}
+	}
 	return failure
+}
+
+// respSkew formats a clock difference without its sign mattering.
+func respSkew(date time.Time) string {
+	d := time.Since(date)
+	if d < 0 {
+		d = -d
+	}
+	return d.Round(time.Second).String()
 }
 
 // retryable reports whether another attempt can help.
@@ -435,11 +459,22 @@ func (c *Client) List(ctx context.Context, prefix, delimiter, token string) (Pag
 	return page, nil
 }
 
-// ListAll lists every key under prefix.
+// maxListPages bounds a listing the service never ends. S3 itself caps
+// a listing at 1000 pages of 1000 keys.
+const maxListPages = 1000
+
+// ListAll lists every key under prefix. A service that repeats a
+// continuation token, or never stops paginating, is an error, not a
+// listing: without a bound one broken answer would grow this without
+// end while the maintenance round that asked waits behind it.
 func (c *Client) ListAll(ctx context.Context, prefix string) ([]Object, error) {
 	var objects []Object
 	token := ""
-	for {
+	seen := map[string]bool{}
+	for page := 0; ; page++ {
+		if page >= maxListPages {
+			return nil, fmt.Errorf("s3: the listing of %q did not end within %d pages", prefix, maxListPages)
+		}
 		page, err := c.List(ctx, prefix, "", token)
 		if err != nil {
 			return nil, err
@@ -448,6 +483,10 @@ func (c *Client) ListAll(ctx context.Context, prefix string) ([]Object, error) {
 		if page.Next == "" {
 			return objects, nil
 		}
+		if seen[page.Next] {
+			return nil, fmt.Errorf("s3: the service repeats the continuation token of %q", prefix)
+		}
+		seen[page.Next] = true
 		token = page.Next
 	}
 }

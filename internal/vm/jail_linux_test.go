@@ -60,6 +60,12 @@ func init() {
 		return
 	case "exit":
 		os.Exit(0)
+	case "seccomp":
+		probeSeccomp()
+		os.Exit(0)
+	case "fill":
+		probeFill(os.Getenv(jailProbeEnv + "_DIR"))
+		os.Exit(0)
 	}
 	report := jailReport{UID: os.Getuid(), GID: os.Getgid(), PID: os.Getpid(), Sockets: map[string]string{}, Writes: map[string]string{}}
 	// First, before this program opens anything itself.

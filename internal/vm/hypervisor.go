@@ -82,7 +82,8 @@ type Hypervisor interface {
 // CloudHypervisor runs VMs as cloud-hypervisor processes.
 //
 // Each VM gets a directory under RunDir holding its API socket and its
-// vsock socket, and nothing a guest can make grow: the serial console and
+// vsock socket, on a small filesystem of its own that is mounted there,
+// and nothing a guest can make grow: the serial console and
 // the hypervisor's own output come to the daemon through pipes and only
 // their last outputTail bytes are kept. RunDir is
 // specific to one daemon identity, which is what makes it the owner mark
@@ -202,7 +203,7 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 	}
 	// Whatever a previous VM of this name left is stale: its process is
 	// gone (the caller removed it, or the startup sweep did).
-	if err := os.RemoveAll(dir); err != nil {
+	if err := h.confine.clearDir(dir); err != nil {
 		return nil, err
 	}
 	// Cleanup must not depend on the request that asked for the VM.
@@ -452,7 +453,8 @@ func (h *CloudHypervisor) Sweep(ctx context.Context) (int, error) {
 		return killed, err
 	}
 	for _, entry := range entries {
-		if err := os.RemoveAll(filepath.Join(h.RunDir, entry.Name())); err != nil {
+		// A VM's dir has its socket filesystem mounted on it.
+		if err := h.confine.clearDir(filepath.Join(h.RunDir, entry.Name())); err != nil {
 			return killed, err
 		}
 	}

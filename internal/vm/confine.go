@@ -16,7 +16,7 @@ import (
 )
 
 // A hypervisor process is the one thing on the host that a guest talks to
-// directly, so it is run as if it were already hostile. Five layers, none
+// directly, so it is run as if it were already hostile. Six layers, none
 // of which depends on another holding:
 //
 //   - its own user. Each VM gets a UID (and matching GID) from a reserved
@@ -36,8 +36,17 @@ import (
 //   - the hypervisor's own sandbox: a seccomp filter on every thread and a
 //     Landlock ruleset that allows only the paths named on its command
 //     line (the kernel image, the disk node, its sockets, /dev/kvm).
-//   - its own cgroup: memory, process count and CPU time are bounded per
-//     VM by the host kernel, whatever the hypervisor does.
+//   - its own cgroup: memory, process count, CPU time and what it reads
+//     from and writes to its disk are bounded per VM by the host kernel,
+//     whatever the hypervisor does.
+//   - the daemon's own seccomp filter (seccomp.go), under the
+//     hypervisor's: no new namespaces, no sockets but unix sockets, and
+//     none of the calls only an administrator or an attacker has a use
+//     for.
+//
+// The one place it can write, the directory its sockets are made in, is
+// a small tmpfs of its own: what it puts there counts against that
+// filesystem's few blocks and inodes, not against the host's /run.
 //
 // It is also started in network and IPC namespaces of its own, which are
 // empty: it has no use for either.
@@ -54,7 +63,9 @@ type confinement struct {
 	// libraries is what the hypervisor binary needs in its jail besides
 	// itself: nothing, for a statically linked one.
 	libraries []jailPath
-	sys       confineSys
+	// disk is what every VM may read from and write to its disk.
+	disk diskLimits
+	sys  confineSys
 }
 
 // confineSys is the host as confinement uses it; tests replace it.
@@ -72,7 +83,22 @@ type confineSys struct {
 	// socketOwner is the UID of the process listening at the other end
 	// of a connected unix socket, as the kernel recorded it.
 	socketOwner func(conn net.Conn) (uint32, error)
+	// mountSockets mounts a VM's own small filesystem on its runtime
+	// dir; unmountSockets takes whatever is mounted there away again,
+	// and succeeds when nothing is.
+	mountSockets   func(dir string) error
+	unmountSockets func(dir string) error
 }
+
+// What a VM's socket directory holds: the hypervisor's API socket, its
+// lock file and the vsock socket, none of which has any content. The
+// filesystem has room for a few more names and for no data to speak of.
+// Its top belongs to root when it is mounted and is handed to the VM's
+// UID afterwards, like the directory under it.
+const (
+	SocketDirKB     = 64
+	SocketDirInodes = 16
+)
 
 func realConfineSys() confineSys {
 	return confineSys{
@@ -83,10 +109,12 @@ func realConfineSys() confineSys {
 			}
 			return nil
 		},
-		chown:       func(path string, uid, gid uint32) error { return os.Lchown(path, int(uid), int(gid)) },
-		command:     jailCommand,
-		openCgroup:  os.Open,
-		socketOwner: socketOwner,
+		chown:          func(path string, uid, gid uint32) error { return os.Lchown(path, int(uid), int(gid)) },
+		command:        jailCommand,
+		openCgroup:     os.Open,
+		socketOwner:    socketOwner,
+		mountSockets:   mountSocketDir,
+		unmountSockets: unmountSocketDir,
 	}
 }
 
@@ -141,6 +169,12 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 	if err = os.Mkdir(dir, 0o700); err != nil {
 		return nil, err
 	}
+	// The dir is the one place the VM's process can write. It is a
+	// filesystem of the VM's own, so what a hypervisor that was taken
+	// over puts there fills that and nothing of the host's.
+	if err = c.sys.mountSockets(dir); err != nil {
+		return nil, fmt.Errorf("mount the socket directory %s: %w", dir, err)
+	}
 	if err = c.sys.chown(dir, uid, uid); err != nil {
 		return nil, err
 	}
@@ -168,7 +202,9 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 	if err = c.sys.chown(current.disk, uid, uid); err != nil {
 		return nil, err
 	}
-	group, err := c.cgroups.create(ctx, config.Name, limitsFor(config))
+	limits := limitsFor(config)
+	limits.Disk, limits.DiskDevice = c.disk, dev
+	group, err := c.cgroups.create(ctx, config.Name, limits)
 	if err != nil {
 		return nil, fmt.Errorf("cgroup: %w", err)
 	}
@@ -252,7 +288,7 @@ func (c *cell) release(ctx context.Context) error {
 	if err := os.Remove(c.disk); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if err := os.RemoveAll(c.dir); err != nil {
+	if err := c.owner.clearDir(c.dir); err != nil {
 		return err
 	}
 	if err := os.Remove(c.jailRoot()); err != nil && !os.IsNotExist(err) {
@@ -261,6 +297,16 @@ func (c *cell) release(ctx context.Context) error {
 	c.owner.uids.release(c.uid)
 	c.released = true
 	return nil
+}
+
+// clearDir removes a VM's runtime dir: the filesystem mounted on it, with
+// everything in it, and then the directory. A dir that is not there, or
+// has nothing mounted on it, is removed as far as it exists.
+func (c *confinement) clearDir(dir string) error {
+	if err := c.sys.unmountSockets(dir); err != nil {
+		return fmt.Errorf("unmount the socket directory %s: %w", dir, err)
+	}
+	return os.RemoveAll(dir)
 }
 
 // sweep removes what a previous daemon life left: every cgroup of this
@@ -368,10 +414,11 @@ const (
 	memoryOverheadPerGB = 8
 
 	// pidsBase and pidsPerCPU bound the tasks in a VM's cgroup. The
-	// hypervisor is one process: a thread per vCPU, one per virtio queue,
-	// four of its own, and io_uring workers for the disk that come and go
-	// (measured with two vCPUs: 11 threads idle, 20 at most under disk
-	// load). It never needs to start another program. The limit is there
+	// hypervisor is one process: a thread per vCPU, one per virtio queue
+	// and four of its own (measured with two vCPUs: 11 threads idle; the
+	// io_uring workers that took it to 20 under disk load are gone since
+	// the daemon's seccomp filter refuses io_uring). It never needs to
+	// start another program. The limit is there
 	// to stop a hypervisor that a guest took over from filling the host's
 	// process table, not to be approached: reaching it would fail a
 	// thread the hypervisor needs.
@@ -387,6 +434,51 @@ type cgroupLimits struct {
 	Pids        int
 	// CPUs is the CPU time the whole process may use, in CPUs.
 	CPUs int
+	// Disk is what the process may read from and write to the block
+	// device with the number DiskDevice.
+	Disk       diskLimits
+	DiskDevice uint64
+}
+
+// Defaults for what one VM may do to its disk, in each direction. They
+// are there so that one run cannot take a host's storage from the
+// others, not to be felt by a run that builds and tests software.
+const (
+	DefaultDiskMBPerSecond = 256
+	DefaultDiskIOPS        = 16000
+)
+
+// diskLimits is what a VM may do to its disk per second, for reads and
+// for writes separately. Zero is no limit.
+type diskLimits struct {
+	BytesPerSecond int64
+	IOPS           int64
+}
+
+// ioMax is the line that sets the limits for one device in a cgroup's
+// io.max, or "" when there is nothing to limit.
+//
+// The limit is the host kernel's, at the block device: the guest's disk
+// is opened for direct I/O, so every read and write the hypervisor makes
+// for its guest is charged to the hypervisor's cgroup as it is
+// submitted. The hypervisor has a rate limiter of its own, which is not
+// used: it would be the hypervisor limiting itself.
+func (l diskLimits) ioMax(device uint64) string {
+	if l.BytesPerSecond <= 0 && l.IOPS <= 0 {
+		return ""
+	}
+	value := func(limit int64) string {
+		if limit <= 0 {
+			return "max"
+		}
+		return strconv.FormatInt(limit, 10)
+	}
+	// A device number as Linux packs it: twelve bits of major above
+	// eight of minor, and the rest of each above those.
+	major := (device>>8)&0xfff | (device>>32)&^uint64(0xfff)
+	minor := device&0xff | (device>>12)&^uint64(0xff)
+	bps, iops := value(l.BytesPerSecond), value(l.IOPS)
+	return fmt.Sprintf("%d:%d rbps=%s wbps=%s riops=%s wiops=%s", major, minor, bps, bps, iops, iops)
 }
 
 // MemoryLimitMB is the host memory limit of a VM with a guest of the
@@ -407,7 +499,7 @@ func limitsFor(config MachineConfig) cgroupLimits {
 }
 
 // cgroupControllers are the controllers a VM's limits need.
-var cgroupControllers = []string{"cpu", "memory", "pids"}
+var cgroupControllers = []string{"cpu", "io", "memory", "pids"}
 
 // cgroupFS is the cgroup filesystem as the driver uses it: directories
 // made and removed, and one-line files read and written.
@@ -550,6 +642,12 @@ func (c *cgroups) create(ctx context.Context, name string, limits cgroupLimits) 
 		{file: "memory.oom.group", value: "1", optional: true},
 		{file: "pids.max", value: strconv.Itoa(limits.Pids)},
 		{file: "cpu.max", value: fmt.Sprintf("%d %d", limits.CPUs*cpuPeriodUsec, cpuPeriodUsec)},
+	}
+	if line := limits.Disk.ioMax(limits.DiskDevice); line != "" {
+		settings = append(settings, struct {
+			file, value string
+			optional    bool
+		}{file: "io.max", value: line})
 	}
 	for _, setting := range settings {
 		err := c.fs.write(filepath.Join(dir, setting.file), setting.value)

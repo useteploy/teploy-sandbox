@@ -51,6 +51,8 @@ func goodHost() host {
 		},
 		resolvers:      func() []netip.Addr { return []netip.Addr{netip.MustParseAddr("192.0.2.53")} },
 		probeNamespace: func(string) error { return nil },
+		seccomp:        func() error { return nil },
+		probeSocketDir: func(string) error { return nil },
 		subordinateIDs: func() ([]idRange, error) {
 			return []idRange{{file: "/etc/subuid", owner: "dev", start: 100000, count: 65536}}, nil
 		},
@@ -105,6 +107,20 @@ func TestPreflightNamesEachMissingPiece(t *testing.T) {
 		"Landlock in the host kernel": func(_ *Config, h *host) {
 			h.landlockABI = func() (int, error) { return 0, errors.New("operation not supported") }
 		},
+		"a seccomp filter of the daemon's own for every hypervisor: the vm driver has no seccomp filter for riscv64": func(_ *Config, h *host) {
+			h.seccomp = func() error { _, err := seccompProgram("riscv64"); return err }
+		},
+		`a tmpfs of its own for each VM's sockets, mounted in the runtime dir "/run/teploy-sandbox/vm/0123456789abcdef": the trial failed: mount a tmpfs: operation not permitted`: func(_ *Config, h *host) {
+			h.probeSocketDir = func(dir string) error { return errors.New("mount a tmpfs: operation not permitted") }
+		},
+		`the "tc" command (iproute2: the rate on each run's network devices)`: func(_ *Config, h *host) {
+			h.lookPath = func(name string) (string, error) {
+				if name == "tc" {
+					return "", errors.New("not found")
+				}
+				return name, nil
+			}
+		},
 		"a VM UID range above every account's": func(c *Config, _ *host) { c.UIDBase = 1000 },
 		"uid 1879048200 is an account": func(_ *Config, h *host) {
 			h.accountUIDs = func() ([]uint32, error) { return []uint32{0, 1879048200}, nil }
@@ -124,7 +140,7 @@ func TestPreflightNamesEachMissingPiece(t *testing.T) {
 		"the host's subordinate ID ranges, to check that none holds a VM UID: permission denied": func(_ *Config, h *host) {
 			h.subordinateIDs = func() ([]idRange, error) { return nil, errors.New("permission denied") }
 		},
-		"network namespaces as the driver uses them: a named namespace (`ip netns add`), a veth link into it, a routing rule that matches a port (Linux 4.17 or newer) and an nftables ruleset inside it; the trial failed: routing rules in a namespace: invalid argument": func(_ *Config, h *host) {
+		"network namespaces as the driver uses them: a named namespace (`ip netns add`), a veth link into it, a routing rule that matches a port (Linux 4.17 or newer), an nftables ruleset inside it with a limit on tracked connections (`ct count`), and a rate on a device (`tc`, a tbf qdisc); the trial failed: routing rules in a namespace: invalid argument": func(_ *Config, h *host) {
 			h.probeNamespace = func(name string) error {
 				if name != "tvn012345-probe" {
 					return errors.New("probed as " + name)
@@ -135,7 +151,7 @@ func TestPreflightNamesEachMissingPiece(t *testing.T) {
 		"in a container that does not map them": func(_ *Config, h *host) {
 			h.mappedUIDs = func(uint32, uint32) (bool, error) { return false, nil }
 		},
-		"a cgroup v2 group for VMs with the cpu, memory and pids controllers (--vm-cgroup / SBX_VM_CGROUP): no memory controller": func(_ *Config, h *host) {
+		"a cgroup v2 group for VMs with the cpu, io, memory and pids controllers (--vm-cgroup / SBX_VM_CGROUP): no memory controller": func(_ *Config, h *host) {
 			h.prepareCgroup = func(string, string) error { return errors.New("no memory controller") }
 		},
 		"a directory for VM device nodes (--vm-dev-dir / SBX_VM_DEV_DIR): nodev": func(_ *Config, h *host) {

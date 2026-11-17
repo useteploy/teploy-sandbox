@@ -80,6 +80,14 @@ type Config struct {
 	// host's LAN, an overlay network), as the Docker driver's open tier
 	// does. Off, an open run reaches the public internet only.
 	OpenPrivate bool
+	// DiskMBPerSecond and DiskIOPS bound what each VM reads from its
+	// disk and what it writes to it, each on its own (so a VM may read
+	// and write that much at once). NetMbit bounds what a run with a
+	// network sends and what it receives, in megabits per second, and
+	// NetConnections the connections it has tracked at once. For each,
+	// zero means the default and a negative value no limit.
+	DiskMBPerSecond, DiskIOPS int
+	NetMbit, NetConnections   int
 }
 
 // host is what Preflight asks of the machine; a struct of functions so the
@@ -121,6 +129,11 @@ type host struct {
 	probeNamespace func(name string) error
 	// subordinateIDs is the ranges /etc/subuid and /etc/subgid hand out.
 	subordinateIDs func() ([]idRange, error)
+	// seccomp reports whether a hypervisor can be put under the daemon's
+	// seccomp filter here.
+	seccomp func() error
+	// probeSocketDir mounts and removes a VM's socket filesystem in dir.
+	probeSocketDir func(dir string) error
 }
 
 func realHost() host {
@@ -167,6 +180,8 @@ func realHost() host {
 			return probeNamespace(ctx, realNetSys(), name)
 		},
 		subordinateIDs: func() ([]idRange, error) { return subordinateIDs(os.ReadFile) },
+		seccomp:        seccompAvailable,
+		probeSocketDir: probeSocketDir,
 		lookPath:       exec.LookPath,
 		stat:           os.Stat,
 		mkdirAll: func(path string, mode os.FileMode) error {
@@ -208,7 +223,21 @@ func (c Config) withDefaults() Config {
 	if c.Subnet == "" {
 		c.Subnet = DefaultSubnet
 	}
+	for _, each := range []struct {
+		value    *int
+		fallback int
+	}{{&c.DiskMBPerSecond, DefaultDiskMBPerSecond}, {&c.DiskIOPS, DefaultDiskIOPS}} {
+		if *each.value == 0 {
+			*each.value = each.fallback
+		}
+	}
 	return c
+}
+
+// diskLimits is what the config lets each VM do to its disk.
+func (c Config) diskLimits() diskLimits {
+	c = c.withDefaults()
+	return diskLimits{BytesPerSecond: int64(max(c.DiskMBPerSecond, 0)) << 20, IOPS: int64(max(c.DiskIOPS, 0))}
 }
 
 // MachineCgroup is the cgroup of the VM with the given name, and
@@ -421,6 +450,11 @@ func preflight(ctx context.Context, config Config, zfs ZFS, host host) error {
 		// could still open, and every kernel this driver supports has it.
 		miss("Landlock in the host kernel (%v): Linux 5.13 or newer with \"landlock\" in the lsm= boot parameter; see /sys/kernel/security/lsm", err)
 	}
+	if err := host.seccomp(); err != nil {
+		// Refused rather than run without, like Landlock: the filter is
+		// what keeps a hypervisor from making namespaces and sockets.
+		miss("a seccomp filter of the daemon's own for every hypervisor: %v", err)
+	}
 	switch {
 	case config.UIDBase < 65536 || uint64(config.UIDBase)+UIDCount > 1<<31:
 		miss("a VM UID range above every account's: %d UIDs from a base between 65536 and %d, got %d (--vm-uid-base / SBX_VM_UID_BASE)",
@@ -461,7 +495,7 @@ func preflight(ctx context.Context, config Config, zfs ZFS, host host) error {
 	}
 	if root {
 		if err := host.prepareCgroup(config.Cgroup, filepath.Join(config.Cgroup, config.ownerName())); err != nil {
-			miss("a cgroup v2 group for VMs with the cpu, memory and pids controllers (--vm-cgroup / SBX_VM_CGROUP): %v", err)
+			miss("a cgroup v2 group for VMs with the cpu, io, memory and pids controllers (--vm-cgroup / SBX_VM_CGROUP): %v", err)
 		}
 		if err := host.prepareDevDir(config.devDir()); err != nil {
 			miss("a directory for VM device nodes (--vm-dev-dir / SBX_VM_DEV_DIR): %v", err)
@@ -527,6 +561,10 @@ func preflight(ctx context.Context, config Config, zfs ZFS, host host) error {
 			miss("a writable runtime dir %q (--vm-run-dir / SBX_VM_RUN_DIR): %v", config.RunDir, err)
 		} else if err := reachable(host.stat, dir, 0o001); err != nil {
 			miss("a runtime dir that an unprivileged VM process can reach (--vm-run-dir / SBX_VM_RUN_DIR): %v", err)
+		} else if !root {
+			// Mounting needs root, which is reported above.
+		} else if err := host.probeSocketDir(dir); err != nil {
+			miss("a tmpfs of its own for each VM's sockets, mounted in the runtime dir %q: the trial failed: %v (the daemon must be able to mount: root with CAP_SYS_ADMIN, in a mount namespace it may change)", dir, err)
 		}
 	}
 
@@ -547,6 +585,7 @@ func networkPlan(config Config, host host, miss func(format string, args ...any)
 	tools := true
 	for tool, why := range map[string]string{
 		"ip":        "iproute2: each run's network namespace, its routes and neighbour entries",
+		"tc":        "iproute2: the rate on each run's network devices",
 		"nft":       "nftables: the firewall in each run's network namespace and on the host",
 		"conntrack": "conntrack-tools: forgetting a VM's connections when its address is given up",
 	} {
@@ -558,7 +597,7 @@ func networkPlan(config Config, host host, miss func(format string, args ...any)
 	if tools && host.euid() == 0 && len(config.Owner) >= 8 {
 		// Everything a run's network is made of, made once and removed.
 		if err := host.probeNamespace("tvn" + config.Owner[:6] + "-probe"); err != nil {
-			miss("network namespaces as the driver uses them: a named namespace (`ip netns add`), a veth link into it, a routing rule that matches a port (Linux 4.17 or newer) and an nftables ruleset inside it; the trial failed: %v (scripts/install-host.sh checks the same)", err)
+			miss("network namespaces as the driver uses them: a named namespace (`ip netns add`), a veth link into it, a routing rule that matches a port (Linux 4.17 or newer), an nftables ruleset inside it with a limit on tracked connections (`ct count`), and a rate on a device (`tc`, a tbf qdisc); the trial failed: %v (scripts/install-host.sh checks the same)", err)
 		}
 	}
 	if err := host.openTun(); err != nil {
@@ -631,6 +670,7 @@ func New(ctx context.Context, config Config, log *slog.Logger) (*Driver, error) 
 		cgroups:   newCgroups(config.Cgroup, filepath.Join(config.Cgroup, config.ownerName())),
 		devDir:    config.devDir(),
 		libraries: libraries,
+		disk:      config.diskLimits(),
 		sys:       realConfineSys(),
 	}
 	plan, err := networkPlan(config, realHost(), func(string, ...any) {})

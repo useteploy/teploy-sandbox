@@ -40,6 +40,8 @@ func (f *fakeCgroupTree) populate(dir, controllers string) error {
 			files["pids.max"] = "max"
 		case "cpu":
 			files["cpu.max"] = "max 100000"
+		case "io":
+			files["io.max"] = ""
 		}
 	}
 	for name, value := range files {
@@ -149,12 +151,12 @@ func cgroupFile(t *testing.T, parts ...string) string {
 }
 
 func TestCgroupsPrepareDelegatesTheControllersAVMNeeds(t *testing.T) {
-	c, _ := newFakeCgroups(t, "cpu memory pids")
+	c, _ := newFakeCgroups(t, "cpu io memory pids")
 	if err := c.prepare(); err != nil {
 		t.Fatal(err)
 	}
 	for _, dir := range []string{c.root, c.dir} {
-		if got := cgroupFile(t, dir, "cgroup.subtree_control"); got != "cpu memory pids" {
+		if got := cgroupFile(t, dir, "cgroup.subtree_control"); got != "cpu io memory pids" {
 			t.Fatalf("%s delegates %q", dir, got)
 		}
 	}
@@ -167,7 +169,7 @@ func TestCgroupsPrepareDelegatesTheControllersAVMNeeds(t *testing.T) {
 // A host that passes the driver's group fewer controllers than a VM's
 // limits need is asked for them once, and named if it refuses.
 func TestCgroupsPrepareAsksTheParentForMissingControllers(t *testing.T) {
-	c, _ := newFakeCgroups(t, "memory pids")
+	c, _ := newFakeCgroups(t, "io memory pids")
 	if err := c.prepare(); err != nil {
 		t.Fatalf("the parent had cpu to give: %v", err)
 	}
@@ -175,8 +177,8 @@ func TestCgroupsPrepareAsksTheParentForMissingControllers(t *testing.T) {
 		t.Fatalf("the parent was not asked for cpu: %q", got)
 	}
 
-	c, _ = newFakeCgroups(t, "memory pids")
-	if err := os.WriteFile(filepath.Join(filepath.Dir(c.root), "cgroup.controllers"), []byte("memory pids"), 0o644); err != nil {
+	c, _ = newFakeCgroups(t, "io memory pids")
+	if err := os.WriteFile(filepath.Join(filepath.Dir(c.root), "cgroup.controllers"), []byte("io memory pids"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	err := c.prepare()
@@ -196,7 +198,7 @@ func TestCgroupsPrepareAsksTheParentForMissingControllers(t *testing.T) {
 }
 
 func TestCgroupCarriesTheVMsLimits(t *testing.T) {
-	c, _ := newFakeCgroups(t, "cpu memory pids")
+	c, _ := newFakeCgroups(t, "cpu io memory pids")
 	if err := c.prepare(); err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +242,7 @@ func TestMemoryLimitIsTheGuestPlusABoundedOverhead(t *testing.T) {
 // A limit that cannot be set is not a limit: the group is not left behind
 // for a VM to be started in without it.
 func TestCgroupCreateFailsWithoutALimit(t *testing.T) {
-	c, _ := newFakeCgroups(t, "cpu memory pids")
+	c, _ := newFakeCgroups(t, "cpu io memory pids")
 	if err := c.prepare(); err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +260,7 @@ func TestCgroupCreateFailsWithoutALimit(t *testing.T) {
 }
 
 func TestCgroupRemoveKillsWhatIsLeftInIt(t *testing.T) {
-	c, tree := newFakeCgroups(t, "cpu memory pids")
+	c, tree := newFakeCgroups(t, "cpu io memory pids")
 	if err := c.prepare(); err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +298,7 @@ func TestCgroupRemoveKillsWhatIsLeftInIt(t *testing.T) {
 }
 
 func TestCgroupSweepRemovesOnlyThisDaemonsGroups(t *testing.T) {
-	c, tree := newFakeCgroups(t, "cpu memory pids")
+	c, tree := newFakeCgroups(t, "cpu io memory pids")
 	if err := c.prepare(); err != nil {
 		t.Fatal(err)
 	}
@@ -392,6 +394,8 @@ type confineLog struct {
 	// jails is what each of them was to be confined to.
 	jails []jailSpec
 	fail  map[string]error
+	// mounted is how many socket filesystems are mounted on each dir.
+	mounted map[string]int
 }
 
 // newTestConfinement confines against a fake host under root: device
@@ -399,11 +403,11 @@ type confineLog struct {
 // fake tree.
 func newTestConfinement(t *testing.T, root string) (*confinement, *confineLog, *fakeCgroupTree) {
 	t.Helper()
-	groups, tree := newFakeCgroups(t, "cpu memory pids")
+	groups, tree := newFakeCgroups(t, "cpu io memory pids")
 	if err := groups.prepare(); err != nil {
 		t.Fatal(err)
 	}
-	log := &confineLog{chowns: map[string]uint32{}, nodes: map[string]uint64{}, fail: map[string]error{}}
+	log := &confineLog{chowns: map[string]uint32{}, nodes: map[string]uint64{}, fail: map[string]error{}, mounted: map[string]int{}}
 	failing := func(op string) error {
 		log.mu.Lock()
 		defer log.mu.Unlock()
@@ -457,6 +461,25 @@ func newTestConfinement(t *testing.T, root string) (*confinement, *confineLog, *
 				return cmd, nil
 			},
 			openCgroup: os.Open,
+			// A VM's socket filesystem is a mark on its dir here.
+			mountSockets: func(dir string) error {
+				if err := failing("mountSockets"); err != nil {
+					return err
+				}
+				log.mu.Lock()
+				defer log.mu.Unlock()
+				log.mounted[dir]++
+				return nil
+			},
+			unmountSockets: func(dir string) error {
+				if err := failing("unmountSockets"); err != nil {
+					return err
+				}
+				log.mu.Lock()
+				defer log.mu.Unlock()
+				delete(log.mounted, dir)
+				return nil
+			},
 		},
 	}
 	return c, log, tree
@@ -603,7 +626,7 @@ func TestReleaseKeepsTheUIDUntilTheCgroupIsEmpty(t *testing.T) {
 }
 
 func TestEnterRollsBackWhatItAllocated(t *testing.T) {
-	for _, op := range []string{"deviceNumber", "mknod", "chown"} {
+	for _, op := range []string{"mountSockets", "deviceNumber", "mknod", "chown"} {
 		root := t.TempDir()
 		c, log, _ := newTestConfinement(t, root)
 		log.fail[op] = errors.New("refused")
@@ -619,6 +642,9 @@ func TestEnterRollsBackWhatItAllocated(t *testing.T) {
 		}
 		if len(c.uids.held) != 0 {
 			t.Errorf("%s failing left a UID held: %v", op, c.uids.held)
+		}
+		if len(log.mounted) != 0 {
+			t.Errorf("%s failing left a socket filesystem mounted: %v", op, log.mounted)
 		}
 	}
 }
@@ -740,5 +766,113 @@ func TestDialRefusesASocketThatIsNotTheVMsOwn(t *testing.T) {
 	if conn, err := own.dial(ctx, link); err == nil {
 		conn.Close()
 		t.Fatal("a socket with no known owner was accepted")
+	}
+}
+
+// The one place a VM's process can write is a filesystem of its own: it
+// is mounted before the dir is handed to the VM's UID, and taken away
+// before the dir is removed and the UID given back.
+func TestAVMsSocketDirIsAFilesystemOfItsOwn(t *testing.T) {
+	root := t.TempDir()
+	c, log, _ := newTestConfinement(t, root)
+	ctx := context.Background()
+	config := MachineConfig{Name: runName(1), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
+	dir := filepath.Join(root, "run", config.Name)
+	mountedWhenChowned := 0
+	chown := c.sys.chown
+	c.sys.chown = func(path string, uid, gid uint32) error {
+		if path == dir {
+			log.mu.Lock()
+			mountedWhenChowned = log.mounted[dir]
+			log.mu.Unlock()
+		}
+		return chown(path, uid, gid)
+	}
+	current, err := c.enter(ctx, config, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if log.mounted[dir] != 1 || len(log.mounted) != 1 {
+		t.Fatalf("mounted: %v, want one filesystem, on %s", log.mounted, dir)
+	}
+	if mountedWhenChowned != 1 {
+		t.Fatal("the dir was handed to the VM's UID before its filesystem was mounted: the VM would own the directory under the mount, on the host's own filesystem")
+	}
+	// It cannot be taken away: the dir, the node and the UID stay, and
+	// the release can be made again.
+	log.fail["unmountSockets"] = errors.New("device or resource busy")
+	if err := current.release(ctx); err == nil || !strings.Contains(err.Error(), "unmount the socket directory") {
+		t.Fatalf("release with a filesystem that cannot be unmounted: %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("the dir went with its filesystem still mounted: %v", err)
+	}
+	if next, _ := c.uids.acquire(); next == current.uid {
+		t.Fatal("the UID of a VM whose filesystem is still mounted was handed out")
+	}
+	log.mu.Lock()
+	delete(log.fail, "unmountSockets")
+	log.mu.Unlock()
+	if err := current.release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(log.mounted) != 0 {
+		t.Fatalf("still mounted after the release: %v", log.mounted)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("the dir is still there: %v", err)
+	}
+}
+
+func TestCgroupBoundsWhatAVMDoesToItsDisk(t *testing.T) {
+	for _, each := range []struct {
+		limits diskLimits
+		device uint64
+		want   string
+	}{
+		{diskLimits{BytesPerSecond: 256 << 20, IOPS: 16000}, 230<<8 | 16, "230:16 rbps=268435456 wbps=268435456 riops=16000 wiops=16000"},
+		{diskLimits{BytesPerSecond: 1 << 20}, 8<<8 | 1, "8:1 rbps=1048576 wbps=1048576 riops=max wiops=max"},
+		{diskLimits{IOPS: 500}, 8<<8 | 1, "8:1 rbps=max wbps=max riops=500 wiops=500"},
+		// A minor above 255, as the volumes of a busy pool have: its
+		// high bits are stored above the major.
+		{diskLimits{IOPS: 500}, 230<<8 | 0x30 | 0x12<<20, "230:4656 rbps=max wbps=max riops=500 wiops=500"},
+		{diskLimits{}, 230<<8 | 16, ""},
+		{diskLimits{BytesPerSecond: -1, IOPS: -1}, 230<<8 | 16, ""},
+	} {
+		if got := each.limits.ioMax(each.device); got != each.want {
+			t.Errorf("io.max for %+v on device %#x: %q, want %q", each.limits, each.device, got, each.want)
+		}
+	}
+	// As the daemon is configured: megabytes, with defaults, and a
+	// negative value for no limit.
+	if got := (Config{}).diskLimits(); got != (diskLimits{BytesPerSecond: DefaultDiskMBPerSecond << 20, IOPS: DefaultDiskIOPS}) {
+		t.Errorf("default disk limits: %+v", got)
+	}
+	if got := (Config{DiskMBPerSecond: -1, DiskIOPS: 300}).diskLimits(); got != (diskLimits{IOPS: 300}) {
+		t.Errorf("disk limits with no bandwidth limit: %+v", got)
+	}
+
+	root := t.TempDir()
+	c, _, _ := newTestConfinement(t, root)
+	c.disk = diskLimits{BytesPerSecond: 64 << 20, IOPS: 2000}
+	ctx := context.Background()
+	config := MachineConfig{Name: runName(1), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
+	if _, err := c.enter(ctx, config, filepath.Join(root, "run", config.Name)); err != nil {
+		t.Fatal(err)
+	}
+	if got := cgroupFile(t, c.cgroups.path(config.Name), "io.max"); got != "230:16 rbps=67108864 wbps=67108864 riops=2000 wiops=2000" {
+		t.Fatalf("io.max of the VM's group: %q", got)
+	}
+	// A limit that cannot be set fails the VM, like the others.
+	c.disk = diskLimits{IOPS: 10}
+	if err := os.Remove(filepath.Join(c.cgroups.dir, "cgroup.subtree_control")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(c.cgroups.dir, "cgroup.subtree_control"), []byte("cpu memory pids"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	other := MachineConfig{Name: runName(2), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
+	if _, err := c.enter(ctx, other, filepath.Join(root, "run", other.Name)); err == nil || !strings.Contains(err.Error(), "io.max") {
+		t.Fatalf("a VM was confined without its disk limit: %v", err)
 	}
 }

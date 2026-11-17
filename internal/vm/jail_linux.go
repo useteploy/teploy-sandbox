@@ -177,6 +177,14 @@ func enterJail(args, env []string) error {
 	if _, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0); errno != 0 {
 		return fmt.Errorf("set no_new_privs: %w", errno)
 	}
+	// The daemon's own filter (seccomp.go), under whatever the program
+	// installs for itself: from here on this thread, and everything that
+	// comes of it, can make no namespace, no socket that is not a unix
+	// socket and none of the calls the filter names. It needs
+	// no_new_privs, and nothing after it needs a call it refuses.
+	if err := step("install the seccomp filter", installSeccomp()); err != nil {
+		return err
+	}
 	// Whatever else this process was started with stays behind: the
 	// daemon's own files are close-on-exec, but what the daemon itself
 	// inherited from whoever started it is not, and a descriptor is not

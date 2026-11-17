@@ -14,17 +14,21 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/useteploy/teploy-sandbox/internal/run"
 	"github.com/useteploy/teploy-sandbox/internal/vm"
@@ -216,9 +220,9 @@ func inspectVM(t *testing.T, config vm.Config, manager *run.Manager, id string, 
 		t.Errorf("hypervisor NoNewPrivs = %q", status["NoNewPrivs"])
 	}
 
-	// --- no network: a network namespace of its own with nothing in it
-	// but a loopback that is down, and its own IPC namespace
-	for _, namespace := range []string{"net", "ipc"} {
+	// --- namespaces of its own, all six. No network: the network
+	// namespace has nothing in it but a loopback that is down.
+	for _, namespace := range []string{"mnt", "pid", "net", "ipc", "uts", "cgroup"} {
 		own, err := os.Readlink(filepath.Join("/proc", pids[0], "ns", namespace))
 		host, hostErr := os.Readlink(filepath.Join("/proc/self/ns", namespace))
 		if err != nil || hostErr != nil || own == host {
@@ -280,12 +284,296 @@ func inspectVM(t *testing.T, config vm.Config, manager *run.Manager, id string, 
 	if err != nil || dir.Mode().Perm() != 0o700 || dir.Sys().(*syscall.Stat_t).Uid != machine.uid {
 		t.Errorf("runtime dir %s: %v %v, want 0700 owned by %d", machine.runDir, dir, err, machine.uid)
 	}
+	// The jail's mount point on the host: an empty directory of root's.
+	// The jail itself is mounted in the hypervisor's namespace only.
+	if entries, err := os.ReadDir(machine.runDir + ".jail"); err != nil || len(entries) != 0 {
+		t.Errorf("the jail's mount point on the host: %v %v, want an empty directory", entries, err)
+	}
+	inspectJail(t, config, machine, uint32(kvm.Sys().(*syscall.Stat_t).Gid))
 	return machine
+}
+
+// hostSockets are services of the host that anyone on it may connect to,
+// or that are simply there: what a hypervisor's UID could reach before it
+// had a file tree of its own.
+var hostSockets = []string{
+	"/run/dbus/system_bus_socket",
+	"/run/systemd/journal/socket",
+	"/run/systemd/journal/stdout",
+	"/run/systemd/journal/dev-log",
+	"/run/systemd/resolve/io.systemd.Resolve",
+	"/run/systemd/private",
+	"/run/snapd.socket",
+	"/run/snapd-snap.socket",
+}
+
+// jailView is what a process with the VM's identity finds in the VM's
+// namespaces.
+type jailView struct {
+	uid      int
+	hostname string
+	// tree is every path there is.
+	tree []string
+	// connects is the error of a connect to each of hostSockets, stats
+	// the error of a stat of each path asked about, and opens the error
+	// of opening each device read-write.
+	connects, stats, opens map[string]string
+	// write is the error of creating a file in the root.
+	write string
+}
+
+// viewJail looks around from inside a hypervisor's jail: one thread of
+// this process joins the hypervisor's mount, network, IPC and UTS
+// namespaces, takes the VM's UID, GID and group, and then lists, connects
+// and opens. (Its PID namespace cannot be joined by a running thread; who
+// is in it is read from outside.) The thread is never used again.
+func viewJail(t *testing.T, pid int, uid, gid, group uint32, stats, devices []string) jailView {
+	t.Helper()
+	view := jailView{connects: map[string]string{}, stats: map[string]string{}, opens: map[string]string{}}
+	done := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		done <- func() error {
+			kinds := []struct {
+				name string
+				flag uintptr
+			}{{"net", syscall.CLONE_NEWNET}, {"ipc", syscall.CLONE_NEWIPC}, {"uts", syscall.CLONE_NEWUTS}, {"mnt", syscall.CLONE_NEWNS}}
+			// All opened first: once in the jail there is no /proc.
+			var handles []*os.File
+			for _, kind := range kinds {
+				handle, err := os.Open(fmt.Sprintf("/proc/%d/ns/%s", pid, kind.name))
+				if err != nil {
+					return err
+				}
+				defer handle.Close()
+				handles = append(handles, handle)
+			}
+			// A thread can only change its mount namespace when it shares
+			// its root and working directory with nobody.
+			if err := syscall.Unshare(syscall.CLONE_FS); err != nil {
+				return fmt.Errorf("unshare the thread's root: %w", err)
+			}
+			for i, kind := range kinds {
+				if _, _, errno := syscall.RawSyscall(syscall.SYS_SETNS, handles[i].Fd(), kind.flag, 0); errno != 0 {
+					return fmt.Errorf("join the hypervisor's %s namespace: %w", kind.name, errno)
+				}
+			}
+			// This thread alone becomes the VM's user (the raw calls are
+			// per thread).
+			groups := []uint32{group}
+			if _, _, errno := syscall.RawSyscall(syscall.SYS_SETGROUPS, 1, uintptr(unsafe.Pointer(&groups[0])), 0); errno != 0 {
+				return fmt.Errorf("setgroups: %w", errno)
+			}
+			if _, _, errno := syscall.RawSyscall(syscall.SYS_SETRESGID, uintptr(gid), uintptr(gid), uintptr(gid)); errno != 0 {
+				return fmt.Errorf("setresgid: %w", errno)
+			}
+			if _, _, errno := syscall.RawSyscall(syscall.SYS_SETRESUID, uintptr(uid), uintptr(uid), uintptr(uid)); errno != 0 {
+				return fmt.Errorf("setresuid: %w", errno)
+			}
+			id, _, _ := syscall.RawSyscall(syscall.SYS_GETEUID, 0, 0, 0)
+			view.uid = int(id)
+			var name syscall.Utsname
+			if err := syscall.Uname(&name); err == nil {
+				for _, c := range name.Nodename {
+					if c == 0 {
+						break
+					}
+					view.hostname += string(rune(c))
+				}
+			}
+			var walk func(dir string)
+			walk = func(dir string) {
+				entries, err := os.ReadDir(dir)
+				if err != nil {
+					view.tree = append(view.tree, dir+" !"+err.Error())
+					return
+				}
+				for _, entry := range entries {
+					path := filepath.Join(dir, entry.Name())
+					view.tree = append(view.tree, path)
+					if entry.IsDir() {
+						walk(path)
+					}
+				}
+			}
+			walk("/")
+			result := func(err error) string {
+				if err == nil {
+					return ""
+				}
+				return err.Error()
+			}
+			for _, path := range hostSockets {
+				fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+				if err != nil {
+					return err
+				}
+				view.connects[path] = result(syscall.Connect(fd, &syscall.SockaddrUnix{Name: path}))
+				_ = syscall.Close(fd)
+			}
+			for _, path := range stats {
+				var info syscall.Stat_t
+				view.stats[path] = result(syscall.Stat(path, &info))
+			}
+			for _, path := range devices {
+				fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
+				if err == nil {
+					_ = syscall.Close(fd)
+				}
+				view.opens[path] = result(err)
+			}
+			fd, err := syscall.Open("/probe", syscall.O_CREAT|syscall.O_WRONLY|syscall.O_CLOEXEC, 0o600)
+			if err == nil {
+				_ = syscall.Close(fd)
+			}
+			view.write = result(err)
+			return nil
+		}()
+	}()
+	if err := <-done; err != nil {
+		t.Fatalf("look around inside the jail of pid %d: %v", pid, err)
+	}
+	return view
+}
+
+// inspectJail checks a hypervisor's jail: what its root holds, how each
+// part is mounted, that it is alone in its PID namespace, and what a
+// process with its identity finds from inside.
+func inspectJail(t *testing.T, config vm.Config, machine confinedVM, kvmGroup uint32) {
+	t.Helper()
+	proc := filepath.Join("/proc", strconv.Itoa(machine.pid))
+	hypervisor, err := exec.LookPath(config.Hypervisor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// --- process 1 of a PID namespace that holds nothing else
+	status := procStatus(t, filepath.Join(proc, "status"))
+	if fields := strings.Fields(status["NSpid"]); len(fields) != 2 || fields[0] != strconv.Itoa(machine.pid) || fields[1] != "1" {
+		t.Errorf("NSpid of the hypervisor: %q, want %d on the host and 1 in its own namespace", status["NSpid"], machine.pid)
+	}
+	own, err := os.Readlink(filepath.Join(proc, "ns", "pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var members []string
+	entries, _ := os.ReadDir("/proc")
+	for _, entry := range entries {
+		if _, err := strconv.Atoi(entry.Name()); err != nil {
+			continue
+		}
+		if link, err := os.Readlink(filepath.Join("/proc", entry.Name(), "ns", "pid")); err == nil && link == own {
+			members = append(members, entry.Name())
+		}
+	}
+	if !slices.Equal(members, []string{strconv.Itoa(machine.pid)}) {
+		t.Errorf("processes in the hypervisor's PID namespace: %v, want only %d", members, machine.pid)
+	}
+
+	// --- no core dump, of a process whose memory is its guest's
+	limits, _ := os.ReadFile(filepath.Join(proc, "limits"))
+	if !regexp.MustCompile(`Max core file size\s+1\s+1\s+bytes`).Match(limits) {
+		t.Errorf("the hypervisor's core dump limit is not 1 byte, soft and hard:\n%s", limits)
+	}
+
+	// --- the mounts: a root that is read-only and holds no device or
+	// program of its own, and seven things bound into it
+	want := map[string]string{
+		"/":            "ro,nosuid,nodev,noexec",
+		hypervisor:     "ro,nosuid,nodev",
+		config.Kernel:  "ro,nosuid,nodev,noexec",
+		machine.node:   "ro,nosuid,noexec",
+		"/dev/kvm":     "ro,nosuid,noexec",
+		"/dev/urandom": "ro,nosuid,noexec",
+		machine.runDir: "rw,nosuid,nodev,noexec",
+	}
+	mountinfo, err := os.ReadFile(filepath.Join(proc, "mountinfo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(mountinfo)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+		var flags []string
+		for _, flag := range strings.Split(fields[5], ",") {
+			if flag == "ro" || flag == "rw" || flag == "nosuid" || flag == "nodev" || flag == "noexec" {
+				flags = append(flags, flag)
+			}
+		}
+		got[fields[4]] = strings.Join(flags, ",")
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("the hypervisor's mounts:\n  %v\nwant:\n  %v\n%s", got, want, mountinfo)
+	}
+
+	// --- from inside, as the VM's user
+	other := filepath.Join(filepath.Dir(machine.runDir), "teploy-sbx-someone-else")
+	stats := []string{"/proc", "/sys", "/etc", "/etc/passwd", "/run/dbus", "/run/systemd", "/var", "/home", "/root", "/tmp", "/dev/net/tun", "/dev/vhost-net", "/dev/vhost-vsock", "/dev/udmabuf", "/dev/zvol", filepath.Dir(machine.zvol), other}
+	view := viewJail(t, machine.pid, machine.uid, machine.uid, kvmGroup, stats, []string{machine.node, "/dev/kvm", "/dev/urandom"})
+	if view.uid != int(machine.uid) {
+		t.Fatalf("the look inside ran as uid %d, not the VM's %d", view.uid, machine.uid)
+	}
+	if view.hostname != "vm" {
+		t.Errorf("the host name in the jail is %q", view.hostname)
+	}
+	// The whole tree: the seven paths, the directories that lead to them,
+	// and the VM's two sockets.
+	expected := map[string]bool{}
+	for path := range want {
+		for ; path != "/"; path = filepath.Dir(path) {
+			expected[path] = true
+		}
+	}
+	for _, path := range view.tree {
+		if !expected[path] && filepath.Dir(path) != machine.runDir {
+			t.Errorf("the jail holds %s", path)
+		}
+		delete(expected, path)
+	}
+	for path := range expected {
+		t.Errorf("the jail lacks %s", path)
+	}
+	for _, socket := range []string{"api.sock", "vsock.sock"} {
+		if !slices.Contains(view.tree, filepath.Join(machine.runDir, socket)) {
+			t.Errorf("the VM's %s is not in its jail", socket)
+		}
+	}
+	for path, result := range view.connects {
+		if !strings.Contains(result, "no such file") {
+			t.Errorf("connect to the host's %s from inside the jail: %q, want it not to exist", path, result)
+		}
+	}
+	for path, result := range view.stats {
+		if !strings.Contains(result, "no such file") {
+			t.Errorf("%s inside the jail: %q, want it not to exist", path, result)
+		}
+	}
+	// What it needs is there and opens.
+	for path, result := range view.opens {
+		if result != "" {
+			t.Errorf("open %s inside the jail as the VM's user: %s", path, result)
+		}
+	}
+	if !strings.Contains(view.write, "read-only") {
+		t.Errorf("creating a file in the jail's root: %q, want a read-only file system", view.write)
+	}
+	// The same from outside, through the process's root: the host's
+	// sockets have no name there.
+	for _, path := range hostSockets {
+		if _, err := os.Lstat(filepath.Join(proc, "root", path)); !os.IsNotExist(err) {
+			t.Errorf("%s exists in the hypervisor's root (%v)", path, err)
+		}
+	}
+	slices.Sort(view.tree)
+	t.Logf("jail of %s (pid %d, uid %d): everything in it, seen from inside as that uid:\n  %s", machine.name, machine.pid, machine.uid, strings.Join(view.tree, "\n  "))
 }
 
 func (m confinedVM) assertGone(t *testing.T) {
 	t.Helper()
-	for what, path := range map[string]string{"cgroup": m.cgroup, "device node": m.node, "runtime dir": m.runDir, "process": filepath.Join("/proc", strconv.Itoa(m.pid), "cmdline")} {
+	for what, path := range map[string]string{"cgroup": m.cgroup, "device node": m.node, "runtime dir": m.runDir, "jail mount point": m.runDir + ".jail", "process": filepath.Join("/proc", strconv.Itoa(m.pid), "cmdline")} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			// A recycled pid is not the hypervisor.
 			if what == "process" {
@@ -336,9 +624,18 @@ func TestVMConfinement(t *testing.T) {
 		t.Fatalf("two VMs run under the same UID %d", first.uid)
 	}
 
-	// --- Landlock: a file the hypervisor's UID owns and could open is
-	// refused because it is not one of the paths the VM was started with.
-	// (Without --landlock the same request succeeds; checked by hand.)
+	// --- the jail holds no other run's disk or sockets, by name or at all
+	for name, pair := range map[string][2]confinedVM{"the first VM": {first, second}, "the second VM": {second, first}} {
+		view := viewJail(t, pair[0].pid, pair[0].uid, pair[0].uid, pair[0].uid, []string{pair[1].node, pair[1].runDir, filepath.Join(pair[1].runDir, "api.sock"), pair[1].zvol}, nil)
+		for path, result := range view.stats {
+			if !strings.Contains(result, "no such file") {
+				t.Errorf("from inside the jail of %s, the other VM's %s: %q, want it not to exist", name, path, result)
+			}
+		}
+	}
+
+	// --- a file outside the jail does not exist for the hypervisor, even
+	// one its UID owns and could open
 	outside, err := os.MkdirTemp("/tmp", "vm-outside-")
 	if err != nil {
 		t.Fatal(err)
@@ -356,16 +653,35 @@ func TestVMConfinement(t *testing.T) {
 	}
 	socket := filepath.Join(first.runDir, "api.sock")
 	code, answer := hypervisorAPI(t, socket, "vm.add-disk", fmt.Sprintf(`{"path":%q,"readonly":true,"image_type":"Raw"}`, image))
+	if code < 400 || !strings.Contains(answer, "No such file or directory") {
+		t.Errorf("the hypervisor opened, or found, a file outside its jail: %d %s", code, answer)
+	} else {
+		t.Logf("jail: add-disk of %s (owned by uid %d, mode 0666) -> %d %s", image, first.uid, code, strings.TrimSpace(answer))
+	}
+	// The other VM's disk: not there either.
+	code, answer = hypervisorAPI(t, socket, "vm.add-disk", fmt.Sprintf(`{"path":%q,"readonly":true,"image_type":"Raw"}`, second.node))
+	if code < 400 || !strings.Contains(answer, "No such file or directory") {
+		t.Errorf("one VM's hypervisor opened, or found, another VM's disk: %d %s", code, answer)
+	}
+	// --- Landlock, still: a file that is inside the jail, that the
+	// hypervisor's UID owns and could open, is refused because it is not
+	// one of the paths the VM was started with. The only place such a
+	// file can be is the VM's own runtime dir. (Without --landlock the
+	// same request succeeds; checked by hand.)
+	inside := filepath.Join(first.runDir, "extra.img")
+	if err := os.WriteFile(inside, make([]byte, 1<<20), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(inside, int(first.uid), int(first.uid)); err != nil {
+		t.Fatal(err)
+	}
+	code, answer = hypervisorAPI(t, socket, "vm.add-disk", fmt.Sprintf(`{"path":%q,"readonly":true,"image_type":"Raw"}`, inside))
 	if code < 400 || !strings.Contains(answer, "Permission denied") {
 		t.Errorf("the hypervisor opened a file outside its Landlock rules: %d %s", code, answer)
 	} else {
-		t.Logf("landlock: add-disk of %s (owned by uid %d, mode 0666) -> %d %s", image, first.uid, code, strings.TrimSpace(answer))
+		t.Logf("landlock: add-disk of %s (in the jail, owned by uid %d, mode 0666) -> %d %s", inside, first.uid, code, strings.TrimSpace(answer))
 	}
-	// The other VM's disk: refused twice over, by Landlock and by owner.
-	code, answer = hypervisorAPI(t, socket, "vm.add-disk", fmt.Sprintf(`{"path":%q,"readonly":true,"image_type":"Raw"}`, second.node))
-	if code < 400 || !strings.Contains(answer, "Permission denied") {
-		t.Errorf("one VM's hypervisor opened another VM's disk: %d %s", code, answer)
-	}
+	_ = os.Remove(inside)
 	// The API still works for what the daemon uses it for.
 	if code, answer = hypervisorAPI(t, socket, "vm.pause", ""); code > 299 {
 		t.Errorf("pause under confinement: %d %s", code, answer)

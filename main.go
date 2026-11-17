@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy-sandbox/internal/egress"
+	"github.com/useteploy/teploy-sandbox/internal/offhost"
 	"github.com/useteploy/teploy-sandbox/internal/run"
 	"github.com/useteploy/teploy-sandbox/internal/server"
 	"github.com/useteploy/teploy-sandbox/internal/vm"
@@ -67,6 +68,12 @@ Usage:
                        [--vm-subnet 10.209.0.0/16] [--vm-dns 192.0.2.53,...] [--vm-open-private]
                        [--vm-disk-mbps 256] [--vm-disk-iops 16000] [--vm-net-mbit 200] [--vm-net-connections 4096]
                        [--vm-max-runs 0] [--vm-warm 2x2048=3,...] [--vm-warm-boots 2] [--vm-warm-headroom-mb 1024]
+                       [--remote-endpoint https://s3.example.com --remote-bucket NAME --remote-key-file PATH
+                        [--remote-prefix P] [--remote-region us-east-1] [--remote-path-style]
+                        [--remote-access-key ID] [--remote-secret-key-file PATH]
+                        [--remote-chunk-mb 16] [--remote-parallel 4] [--remote-max-chain 8]
+                        [--remote-local keep|drop] [--remote-pool-reserve 15]
+                        [--remote-sync-interval 1m] [--remote-gc-interval 1h] [--remote-gc-grace 24h] [--remote-unfenced]]
   teploy-sandbox version`)
 }
 
@@ -132,6 +139,7 @@ func serve(args []string) error {
 		"vm driver: host memory (MemAvailable, MiB) the warm pool leaves free beyond a new VM's limit before it boots one; 0 is none")
 	vmBootTimeout := flags.Duration("vm-boot-timeout", envDuration("SBX_VM_BOOT_TIMEOUT", vm.DefaultBootTimeout),
 		"vm driver: how long a new VM may take to answer")
+	remote := addRemoteFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -262,6 +270,9 @@ func serve(args []string) error {
 	// always was; the VM branch replaces every Docker call with a VM.
 	var backend run.Runtime
 	var docker *run.DockerRuntime
+	// snapshots is the driver's snapshots as streams, for remote
+	// storage; nil for a driver that cannot send them anywhere.
+	var snapshots offhost.Snapshots
 	runtimeName := ""
 	proxyURL := ""
 	var pool *egress.Pool
@@ -326,6 +337,7 @@ func serve(args []string) error {
 			defer pool.Shutdown()
 		}
 		backend = driver
+		snapshots = driver.Transfer()
 		runtimeName = "cloud-hypervisor"
 		log.Warn("vm driver is experimental: runs run as root in the guest, and warm caches are unavailable",
 			"pool", *vmPool, "golden", *vmGolden, "kernel", *vmKernel, "subnet", *vmSubnet, "openPrivate", *vmOpenPrivate,
@@ -406,6 +418,16 @@ func serve(args []string) error {
 	if pool != nil {
 		manager.Egress = pool
 	}
+	offHost, err := remote.open(context.Background(), snapshots, *stateDir, log)
+	if err != nil {
+		return err
+	}
+	if offHost != nil {
+		manager.OffHost = offHost
+		manager.LocalCache = *remote.local
+		manager.RemoteSyncInterval = *remote.syncInterval
+		manager.RemoteGCInterval = *remote.gcInterval
+	}
 	if *cacheRoot != "" {
 		manager.Cache = run.NewCacheStore(*cacheRoot, int64(*cacheMaxGB*(1<<30)))
 		live, err := docker.LiveCacheDirs(context.Background())
@@ -428,6 +450,20 @@ func serve(args []string) error {
 			return fmt.Errorf("load run registry: %w", err)
 		}
 		log.Info("durable run registry enabled", "dir", *stateDir, "stopped", stopped, "retention", retention.String())
+		if offHost != nil {
+			// Before serving: the runs other daemons stopped, and the
+			// runs this one was running when it last went down, are in
+			// the list from the first request. A failure is not fatal;
+			// the upkeep beside the reaper tries again.
+			syncCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			stats, err := manager.SyncRemote(syncCtx)
+			cancel()
+			if err != nil {
+				log.Error("first sync with remote storage failed; retrying in the background", "error", err)
+			} else {
+				log.Info("synced with remote storage", "runs", stats.Remote, "changed", stats.Changed)
+			}
+		}
 	} else if stateDirSkipped != "" {
 		log.Warn("default state dir is not writable: stopped runs do not survive a daemon restart (set --state-dir)", "error", stateDirSkipped)
 	} else {

@@ -145,10 +145,12 @@ udev rule described below, makes sure `/dev/kvm` is openable by a group
 rather than by root alone, checks the VM UID range (against accounts and
 against `/etc/subuid` and `/etc/subgid`) and the cgroup controllers, sets
 `volmode=dev` on the pool, checks what guest networking needs (the `ip`,
-`nft` and `conntrack` commands, `/dev/net/tun`, and a trial network
-namespace with a veth link, a routing rule that matches a port and an
-nftables ruleset in it), turns on IPv4 forwarding and makes that
-permanent, says whether the hypervisor binary is statically linked, and
+`tc`, `nft` and `conntrack` commands, `/dev/net/tun`, and a trial network
+namespace with a veth link, a routing rule that matches a port, an
+nftables ruleset with a connection limit and a rate-limited device in
+it), turns on IPv4 forwarding and makes that permanent, says whether the
+hypervisor binary is statically linked, checks that the kernel has
+seccomp filters and that a tmpfs can be mounted for a VM's sockets, and
 reports whether the kernel has Landlock. The pool, the kernel image and the golden snapshot
 are yours to provide: build the golden with `scripts/build-golden.sh`
 from a volume holding a bootable systemd root filesystem.
@@ -157,9 +159,12 @@ Host requirements, checked at start; the daemon refuses to start and
 names everything that is missing, with the command that fixes it where
 there is one:
 
-- root, on Linux 5.13 or newer with cgroup v2 and Landlock (`landlock`
-  in `/sys/kernel/security/lsm`). There is no mode that runs without
-  Landlock: a host that lacks it is refused, not warned.
+- root, on x86-64 or arm64, on Linux 5.13 or newer with cgroup v2,
+  seccomp filters and Landlock (`landlock` in
+  `/sys/kernel/security/lsm`). There is no mode that runs without
+  Landlock or without the daemon's seccomp filter: a host that lacks
+  either is refused, not warned. The daemon must be able to mount (it
+  gives every VM a small tmpfs for its sockets);
 - `/dev/kvm`, with a group (or everyone) allowed to open it;
 - the `cloud-hypervisor` binary (`--vm-hypervisor`) and an uncompressed
   guest kernel (`--vm-kernel`), both readable by any user. Use the
@@ -171,17 +176,19 @@ there is one:
 - udev not probing ZFS volumes for filesystems (below);
 - 4096 UIDs no account has and no range in `/etc/subuid` or
   `/etc/subgid` hands out, from `--vm-uid-base` (default 1879048192);
-- a cgroup the daemon may create groups in, with the `cpu`, `memory`
-  and `pids` controllers (`--vm-cgroup`, default
+- a cgroup the daemon may create groups in, with the `cpu`, `io`,
+  `memory` and `pids` controllers (`--vm-cgroup`, default
   `/sys/fs/cgroup/teploy-sandbox-vm`);
 - a directory for device nodes on a filesystem that allows them
   (`--vm-dev-dir`, default `/dev/teploy-sandbox`; `/run` is `nodev`);
-- for guest networking: the `ip` (iproute2), `nft` (nftables) and
-  `conntrack` (conntrack-tools) commands, `/dev/net/tun`, network
+- for guest networking: the `ip` and `tc` (iproute2), `nft` (nftables)
+  and `conntrack` (conntrack-tools) commands, `/dev/net/tun`, network
   namespaces with veth links, routing rules that match a port (Linux
-  4.17 or newer) and nftables inside a namespace (the daemon makes and
-  removes a trial namespace at start and refuses a host where any of it
-  fails), `net.ipv4.ip_forward=1`, an IPv4 subnet nothing else on the host uses
+  4.17 or newer), nftables inside a namespace with `ct count` (the
+  `nft_connlimit` module) and a `tbf` queue on a device (`sch_tbf`,
+  which some distributions ship in a `linux-modules-extra` package); the
+  daemon makes and removes a trial namespace at start and refuses a host
+  where any of it fails, `net.ipv4.ip_forward=1`, an IPv4 subnet nothing else on the host uses
   (`--vm-subnet`, default `10.209.0.0/16`), and an IPv4 DNS resolver
   that is not on the host itself (`--vm-dns`, default: the host's own
   resolvers). These are required whatever tiers you use.
@@ -244,13 +251,52 @@ The layers are independent; each is checked by the live suite.
   UID owns elsewhere in its jail is refused. Landlock does not judge a
   connect to a unix socket by its path; the jail is what keeps the
   host's sockets from the hypervisor, by not containing them.
+- **The daemon's own seccomp filter, under the hypervisor's.** The
+  hypervisor's filters hold the threads a guest drives tightly, but its
+  main thread may `clone` with any flags, open sockets of any family
+  and set up io_uring, and threads share memory. So the jail helper
+  installs a filter of the daemon's just before it executes the
+  hypervisor (the kernel runs both and takes the stricter answer). It
+  is a list of what is refused, with `EPERM`, and everything else is
+  left to the hypervisor's own allowlist: `unshare`, `setns` and `clone`
+  with any namespace flag (`clone3` answers `ENOSYS`, so a C library
+  falls back to `clone`, whose flags a filter can read); every socket
+  family but unix; `io_uring_*` (the hypervisor falls back to the
+  kernel's older asynchronous I/O for the disk); the mount calls old
+  and new, `pivot_root`, `chroot`; `ptrace`, `process_vm_readv/writev`,
+  `pidfd_getfd`, `kcmp`; `keyctl`, `add_key`, `request_key`; `bpf`,
+  `perf_event_open`, `userfaultfd`, `memfd_secret`; modules, `kexec`,
+  file handles, and the calls only an administrator uses (swap, reboot,
+  clocks, quotas, host name). A call made through another
+  architecture's table (32-bit on x86-64, x32) kills the process. A
+  denylist rather than an allowlist because what a hypervisor needs
+  differs by version, architecture and device, and a call missing from
+  an allowlist kills a VM at an hour nobody tested; the hypervisor's
+  allowlist is still there for the rest. `execve` cannot be on it (the
+  filter is installed before the one `execve` that starts the
+  hypervisor); the hypervisor's own filters refuse it afterwards.
+- **A socket directory with a size.** The one writable place in the
+  jail is the directory the VM's sockets are made in. The daemon mounts
+  a tmpfs of 64 KiB and 16 inodes there for each VM, owned by the VM's
+  UID, and the jail binds that: whatever a hypervisor that was taken
+  over writes there fills its own filesystem and nothing of the host's
+  `/run`. It is unmounted with the VM, and by the startup sweep.
 - **Its sockets are not trusted by path.** The runtime dir is the VM's
   own, so the daemon checks, on every connection, that the VM's UID is
   what listens there before it sends anything.
 - **Its own cgroup**, entered at the moment the process is created:
   `memory.max` is the guest's size plus 64 MiB plus 8 MiB per GiB of
-  guest (`memory.swap.max` 0), `pids.max` is 128 plus 4 per vCPU, and
-  `cpu.max` is the VM's vCPUs. A guest that uses all of its memory
+  guest (`memory.swap.max` 0), `pids.max` is 128 plus 4 per vCPU,
+  `cpu.max` is the VM's vCPUs, and `io.max` on the VM's volume is
+  `--vm-disk-mbps` (default 256 MiB/s) and `--vm-disk-iops` (default
+  16000), each for reads and for writes separately; 0 turns one off.
+  The disk limit is the host kernel's and not the hypervisor's own rate
+  limiter, which a hypervisor that was taken over would be free to
+  ignore; ZFS volumes honour it for direct I/O, which is how the guest's
+  disk is opened (measured: under 20 MiB/s a guest wrote at 19.6 and
+  read at 20.2 MiB/s against 349 and 580 without; under 500 operations
+  per second it made 494 and 505 against 3946 and 5383). The limits are the daemon's, for every run; a create cannot
+  change them. A guest that uses all of its memory
   stays inside that (measured: at most 7 MiB over the guest's size); a
   hypervisor that grows past it is killed by the host's kernel and the
   run reports its VM gone. The group is removed with the VM, and a
@@ -347,7 +393,24 @@ How it is built:
   table and every run's namespace), compares it with what the kernel
   listed when it was written, and writes back whatever differs: a table
   that was deleted, a table that was flushed and left empty, a single
-  changed rule. Each restore is logged as an error.
+  changed rule. Each restore is logged as an error. The watch stops
+  only when it reads another daemon instance's mark in the host's
+  table; a look that fails (an `nft` that could not be started) is
+  logged and followed by the next one.
+- **A run's share of the network is bounded.** `--vm-net-mbit` (default
+  200) is what a run may send and what it may receive, per second: a
+  token bucket (`tbf`) on the run's tap, which is what the guest
+  receives on either tier, and on an open run's link, which is what it
+  sends. A queue on a device is the kernel's and not a rule, so a
+  flushed firewall does not remove it. `--vm-net-connections` (default
+  4096) is how many connections a run may have tracked at once, counted
+  by `ct count` in the run's own namespace: for an open run what it
+  starts through the link, so that one run cannot fill the host's
+  connection table, and for an allowlist run its connections to its
+  proxy, which are the daemon's open files. Connections that both ends
+  closed stop counting at once; UDP and ICMP flows count until the
+  kernel forgets them. 0 turns either off. What an allowlist run sends
+  to its proxy has no rate: it has no device to leave through.
 
 What happens with no rules at all, which the live suite does to four
 running guests (every table of the daemon flushed, then deleted, on the
@@ -454,7 +517,9 @@ to `--vm-run-dir`.
 
 Test against a real hypervisor (needs root, KVM, ZFS, a host set up by
 `scripts/install-host.sh`, and outbound internet for the network tiers;
-CI has none of it and only vets the suite):
+CI has none of it and only vets the suite; what CI does run as root, on
+x86-64, is the jail, the seccomp filter and the socket filesystem from
+the unit tests in `internal/vm`):
 `CGO_ENABLED=0 go test -c -tags vmintegration -o vm.test . && sudo ./vm.test -test.run TestVM -test.v`
 
 ## Writable leases

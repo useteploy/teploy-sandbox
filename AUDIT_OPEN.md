@@ -599,7 +599,7 @@ host's file tree, and the firewall was all that kept a guest from the
 host's services. Both are closed by taking the thing away rather than by
 forbidding it. Same host as above (Cloud Hypervisor v54.1, statically
 linked; Linux 6.8; arm64; nested KVM); the whole `vmintegration` suite
-passes on it (twelve tests, one run after the last change to the code;
+passes on it (eleven tests, one run after the last change to the code;
 its figures are below).
 
 ### What is enforced
@@ -981,3 +981,235 @@ Open, and what closing each would take:
   to with both rulesets gone; the socket directory is on the host's
   `/run`; the jail of a dynamically linked hypervisor was not run with a
   hypervisor; x86-64 and bare metal were not run.
+
+
+## 2026-11-16 — VM driver: the daemon's own seccomp filter, bounded sockets, disk and network limits
+
+What the review above left open, apart from an x86-64 host with a
+hypervisor on it. Same arm64 host (Cloud Hypervisor v54.1, statically
+linked; Linux 6.8; OpenZFS 2.2.2; nested KVM); the whole `vmintegration`
+suite passes on it (twelve tests, one run after the last change to the
+code). The jail, the filter and the socket filesystem were also run on
+x86-64, by CI, without a hypervisor.
+
+### What is enforced
+
+- **A seccomp filter of the daemon's own on every hypervisor.** The
+  jail helper installs it after `no_new_privs`, before the exec; the
+  kernel runs it and the hypervisor's own and takes the stricter
+  answer. Classic BPF built in Go (`internal/vm/seccomp.go`), one
+  program per architecture, 70 instructions on arm64 and 79 on amd64.
+  It checks the architecture first and kills the process on a call
+  through another table (and through x32 on amd64). It refuses, with
+  `EPERM`: `unshare`, `setns`, `clone` with any namespace flag
+  (`clone3` gets `ENOSYS`), `socket` and `socketpair` in any family but
+  unix, `io_uring_setup/enter/register`, `mount`, `umount2`,
+  `pivot_root`, `chroot` and the new mount calls, `ptrace`,
+  `process_vm_readv/writev`, `pidfd_getfd`, `process_madvise`, `kcmp`,
+  `keyctl`, `add_key`, `request_key`, `bpf`, `perf_event_open`,
+  `userfaultfd`, `memfd_secret`, `init_module`, `finit_module`,
+  `delete_module`, `kexec_load`, `kexec_file_load`,
+  `open_by_handle_at`, `name_to_handle_at`, `personality`, and the
+  administrator's calls (swap, reboot, clocks, quotas, accounting,
+  host name; `iopl`, `ioperm`, `modify_ldt` on amd64).
+  **A denylist, by choice.** An allowlist would have to be proven
+  against everything the hypervisor calls on both architectures, with
+  every device and on every path (pause, resume, snapshot, a guest that
+  powers off, an error path); one missing call kills a VM. What was
+  observed is the calls of one version on one architecture. The
+  hypervisor's own filters are allowlists and stay in force for
+  everything this list does not name, so the two together are: the
+  hypervisor's allowlist, minus this list.
+  **io_uring is refused.** v54.1 with its default options probes for it
+  on the main thread (`io_uring_setup(1)`, `IORING_REGISTER_PROBE`) and
+  then makes a ring of 128 entries per disk; seen with strace. Refused,
+  it uses Linux AIO for the disk and boots and runs the same. No
+  socket family but unix is needed: with the tap handed over as a
+  descriptor the only sockets it opens are `AF_UNIX`.
+  This also closes two findings of the review without further code:
+  the main thread can make no namespace on a host that lets
+  unprivileged processes make user namespaces, and the daemon's session
+  keyring is out of reach whatever the hypervisor's filter allows.
+- **The socket directory is a filesystem of the VM's own.** A tmpfs of
+  64 KiB and 16 inodes, mounted by the daemon on the VM's runtime dir
+  before the dir is handed to the VM's UID; the jail binds it. Removed
+  with the VM (after its cgroup is empty, before the UID is given
+  back), before a dir is reused, and by the startup sweep.
+- **Disk I/O per VM.** `io.max` in the VM's cgroup on its volume's
+  device number: `--vm-disk-mbps` (256) and `--vm-disk-iops` (16000),
+  each for reads and writes separately. The `io` controller is now
+  required. **ZFS volumes do honour `io.max`** for direct I/O, which is
+  how the guest's disk is opened: tried first by hand on a scratch
+  volume (10 MiB/s gave 10.4 and 10.5 MB/s; 200 operations per second
+  gave 1000 writes in 4.9 s), then through a guest. So the hypervisor's
+  own rate limiter is not used: it would be a hypervisor limiting
+  itself.
+- **Network per run.** A `tbf` queue (`--vm-net-mbit`, 200) on the
+  run's tap (what the guest receives, both tiers) and on an open run's
+  link inside its namespace (what it sends). `ct state new ct count
+  over N drop` (`--vm-net-connections`, 4096) in the run's ruleset: on
+  an open run's forward path and on an allowlist run's way to its
+  proxy. The host-side `tc` was chosen over the hypervisor's `--net`
+  rate limiter for the same reason as the disk's.
+- **The watch stands down only for another instance's mark** in the
+  host's table. A table without a mark, or none, is written again; a
+  failed `nft` is logged and the next look follows. While the kernel
+  cannot be asked nothing new is admitted, and the error says so.
+- **Preflight and `install-host.sh`** refuse, each with its reason: an
+  architecture without a filter, a kernel without seccomp filters, a
+  runtime dir where a tmpfs cannot be mounted, a cgroup without the
+  `io` controller, no `tc`, and a trial namespace that cannot take a
+  `ct count` rule or a `tbf` queue.
+
+### How it was verified
+
+Unit, on every push (both architectures' programs, on any machine): a
+small BPF interpreter evaluates each program on synthetic
+`seccomp_data`. Every refused call answers `EPERM` with and without
+arguments; `clone3` `ENOSYS`; `clone` with thread flags, as fork and
+with only high bits set is allowed, and with each of the seven
+namespace flags refused; `socket`/`socketpair` allowed for `AF_UNIX`
+and refused for eight other families; 49 calls a hypervisor needs are
+allowed and none shares a number with a refused one; another
+architecture's value, and x32, kill. The numbers are compared with the
+`syscall` package's for the architecture the test is built for.
+
+Root-only unit tests, run on arm64 here and on x86-64 by CI's new
+`vm-root` job (which fails if one of them skips itself):
+
+- `TestJailRefusesTheCallsTheFilterNames`: a process that came through
+  the jail helper makes every call on the list and the ones judged by
+  an argument; the same calls are made by a process with the same UID
+  and no filter. arm64, 75 calls; amd64, 83. All as the filter says. Of
+  the refused ones, 42 (arm64) and 52 (amd64) succeed or fail
+  differently without the filter, so the refusal is the filter's; the
+  other 25 and 23 are refused to an unprivileged process by the kernel
+  anyway (`init_module`, `reboot`, `swapon` and the like), and for
+  those only the BPF evaluation shows the filter. Excerpt (arm64; the
+  amd64 lines are the same):
+
+  ```
+  clone as fork             under the filter: ok                        without: (not made)
+  clone(CLONE_NEWUSER)      under the filter: operation not permitted   without: (not made)
+  clone3                    under the filter: function not implemented  without: invalid argument
+  io_uring_setup            under the filter: operation not permitted   without: bad address
+  keyctl                    under the filter: operation not permitted   without: ok
+  setns                     under the filter: operation not permitted   without: bad file descriptor
+  socket(AF_INET)           under the filter: operation not permitted   without: ok
+  socket(AF_NETLINK)        under the filter: operation not permitted   without: socket type not supported
+  socket(AF_UNIX)           under the filter: ok                        without: ok
+  socket(AF_VSOCK)          under the filter: operation not permitted   without: ok
+  unshare(CLONE_NEWUSER)    under the filter: operation not permitted   without: invalid argument
+  ```
+
+- `TestSocketDirIsBounded`: `as uid 70123 in the mounted dir: one file
+  took 65536 bytes before "no space left on device"; 14 more names
+  before "no space left on device"`; `/run` had 253 blocks and 731
+  inodes in use before and after (259 and 836 on the CI runner). The
+  control, the same dir with nothing mounted: a file of 1 MiB, and
+  `/run` grew by 256 blocks.
+
+Live, on the real hypervisor:
+
+- Every VM any test inspects has `Seccomp: 2` and at least two filters
+  (`Seccomp_filters`) on every thread, the `io.max` of its config, and
+  its socket directory mounted as `tmpfs … size=64k,nr_inodes=16` in
+  the jail and on the host. A thread of the test with the VM's UID,
+  inside the jail's namespaces, fills the directory: `one file reached
+  65536 bytes (no space left on device), then 11 empty files (no space
+  left on device); the host's /run/… had 254 blocks of 4 KiB and 737
+  inodes in use before and 254 and 737 with the fill in place`. After
+  a destroy, and after a sweep by a new daemon, no mount is left.
+- `TestVMLimits`, each limit against the same guest on a driver with
+  the limit off (`dd` with direct I/O). From the suite's last run, on a
+  host that was slow that hour:
+
+  ```
+  disk, no limit (control): 60 MiB written at 70 MiB/s and read at 162 MiB/s; 1600 writes of 4 KiB at 1197 per second, read back at 1646 per second
+  disk, 10 MiB/s each way (io.max "230:32 rbps=10485760 wbps=10485760 riops=max wiops=max"): 60 MiB written at 9.3 MiB/s and read at 8.7 MiB/s
+  disk, 200 operations per second each way (io.max "230:32 rbps=max wbps=max riops=200 wiops=200"): 1600 writes of 4 KiB at 171 per second, read back at 187 per second
+  network, no limit (control): an open run received at 1855 Mbit/s and sent at 275 Mbit/s, an allowlist run received through its proxy at 1624 Mbit/s; of 300 connections opened at once: held 300
+  network, 20 Mbit/s each way: an open run received at 19.2 Mbit/s and sent at 15.5 Mbit/s; an allowlist run received through its proxy at 19.1 Mbit/s
+  connections, at most 200 tracked per run: of 300 opened at once the guest held 197; after closing them, 50 of 50 more were made; the run's rule counted 618 dropped packets
+  ```
+
+  Earlier runs of the same test with higher limits, on a quieter host:
+  under 20 MiB/s, 19.6 written and 20.2 read against 349 and 580
+  without; under 500 operations per second, 494 and 505 against 3946
+  and 5383; under 40 Mbit/s, 38.3 each way and 38.3 through the proxy
+  against 3815, 779 and 3237. The limits in the test were lowered
+  afterwards because the controls vary that much here (the same guest
+  made between 550 and 5400 small writes per second without a limit),
+  not because a limit was exceeded: none was, in any run. The 197 of
+  200 is the count less what the run already had tracked.
+- The watch: unit tests only (`TestTheWatchOnlyStandsDownForAnotherInstancesMark`,
+  `TestTheWatchKeepsLooking`), with a host whose `nft` fails. Not
+  provoked on a real host.
+
+### Measured (nested arm64)
+
+- Refusing io_uring: with it allowed (a build made for the comparison),
+  the same guest wrote 100 MiB at 353 MiB/s and read at 623, and made
+  2368 and 2219 small writes and reads per second; with AIO, 349 and
+  580, and 3946 and 5383 in one run and 208, 791, 2233 and 1864 in
+  another. The difference between the two is inside the difference
+  between two runs of one.
+- The jail with the filter and the mount: a process started and
+  reaped, median of 40, 6.5 ms without a jail and 10.7 ms with one
+  here; 4.0 and 6.8 ms on the CI runner.
+- A boot reads about 100 MiB in about 3400 operations, so a limit
+  below that is felt at create: 10.1 s under 20 MiB/s and 9.3 s under
+  500 operations per second on the quieter host, where a create
+  without took 9 to 13 s; 20.4 s under 10 MiB/s and 24.3 s under 200
+  operations per second in the last run. The defaults are far above
+  what a boot needs.
+- Per create on the host: one mount, one `io.max` write, and one `tc`
+  call per shaped device (one for an allowlist run, two for an open
+  one). Not timed separately.
+
+### Deviations from what was asked, and why
+
+- **No per-run override of the limits.** The HTTP contract has a
+  `limits` object, but a field there would have to be refused by the
+  Docker driver (which was not to change) or silently ignored by it,
+  and a caller that can raise its own ceiling makes the ceiling the
+  caller's. The limits are flags of the daemon.
+- **The rate and the connection count are applied to allowlist runs
+  too,** where they are cheap (the tap's queue, the proxy's
+  connections), not only to open runs.
+- **The live suite does not run in CI.** The runner has `/dev/kvm`
+  (`crw-rw---- root kvm`), the `io` controller, `ct count`, `tbf`,
+  seccomp and Landlock: `install-host.sh` on it reports one problem,
+  no ZFS. Running the suite there needs ZFS installed, a pool on a
+  file, the hypervisor, an x86-64 guest kernel and a golden image built
+  from a root filesystem. That was not attempted.
+
+### What remains
+
+- **x86-64 with a hypervisor.** The filter is run-checked on x86-64 for
+  a jailed test program, not for Cloud Hypervisor: that its x86-64
+  build makes no call on the list on a path that matters (it is a
+  static musl build like the arm64 one, and the calls are the same
+  ones) is inferred. Bare metal was not run either.
+- **What an allowlist run sends to its proxy has no rate.** It leaves
+  through no device; the proxy would have to pace it.
+- **The connection count is of what the run's namespace tracks.** The
+  host's table can hold a flow a little longer than the namespace's
+  does. UDP and ICMP flows count until they time out, so a guest can
+  hold its whole count with one-packet flows and deny itself new
+  connections; it cannot exceed the count.
+- **A queue that is removed is not put back.** Removing it takes root
+  in the run's namespace; the watch compares rulesets, not queues.
+- **`io.max` bounds direct I/O at the volume.** What ZFS itself then
+  does for a write (checksums, compression, its own queues) is the
+  host's and is not charged to the VM.
+- **`execve` is not on the list** (the filter is installed before the
+  exec); the hypervisor's own filters refuse it once they are in place.
+- **The KVM ioctl surface, `/dev/kvm` and `/dev/urandom`** are as
+  exposed as before; the hypervisor's own filter is what judges
+  `ioctl`.
+- Unchanged from the entries above: an open guest can be sent to with
+  both rulesets gone; local routes that are not addresses; the jail of
+  a dynamically linked hypervisor was not run with a hypervisor; a
+  udev rule file that honours neither flag; the per-identity
+  directories that are never swept.

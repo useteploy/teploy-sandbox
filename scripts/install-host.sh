@@ -22,23 +22,28 @@
 #      with that one supplementary group. No account is created; the
 #      script checks that no account already has a UID in the range and
 #      that no subordinate ID range (/etc/subuid, /etc/subgid) holds one.
-#   3. cgroup v2 with the cpu, memory and pids controllers passed down to
-#      the group the daemon keeps its VMs in (--vm-cgroup). Each VM gets
-#      its own group there with a memory, task and CPU limit.
+#   3. cgroup v2 with the cpu, io, memory and pids controllers passed
+#      down to the group the daemon keeps its VMs in (--vm-cgroup). Each
+#      VM gets its own group there with a memory, task and CPU limit and
+#      a limit on what it reads from and writes to its disk.
 #   4. volmode=dev on the pool, so the host kernel does not scan guest
 #      disks for partitions.
 #
-#   5. Guest networking: the ip, nft and conntrack commands, /dev/net/tun,
-#      network namespaces with veth links, routing rules that match a
-#      port and nftables inside them, and IPv4 forwarding (persisted in
-#      /etc/sysctl.d). Each VM with a network gets a network namespace of
+#   5. Guest networking: the ip, tc, nft and conntrack commands,
+#      /dev/net/tun, network namespaces with veth links, routing rules
+#      that match a port and nftables inside them (with a limit on
+#      tracked connections, "ct count"), a rate on a device (a tbf
+#      queue), and IPv4 forwarding (persisted in /etc/sysctl.d). Each VM with a network gets a network namespace of
 #      its own, with its tap in it; a run with network "open" also gets a
 #      link from that namespace to the host, and forwarding is what
 #      carries its traffic on. Note that forwarding makes the host route
 #      between all of its interfaces, not only for guests.
 #
 # Nothing has to be installed for the jail every hypervisor is started
-# in (mount and PID namespaces, pivot_root): the daemon does that itself.
+# in (mount and PID namespaces, pivot_root, a tmpfs for its sockets, a
+# seccomp filter): the daemon does that itself. The script checks that
+# the kernel has seccomp filters and that this is an architecture the
+# daemon has a filter for (x86-64 or arm64).
 # A statically linked hypervisor binary keeps the jail free of the host's
 # libraries; the script says which kind it finds.
 #
@@ -147,7 +152,7 @@ for file in /etc/subuid /etc/subgid; do
     fi
 done
 
-echo "cgroups: $CGROUP with cpu, memory and pids"
+echo "cgroups: $CGROUP with cpu, io, memory and pids"
 if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
     fail "cgroup v2 is not mounted at /sys/fs/cgroup (a legacy or hybrid hierarchy; boot with systemd.unified_cgroup_hierarchy=1)"
 else
@@ -156,20 +161,20 @@ else
         mkdir "$CGROUP"
         did "created $CGROUP"
     fi
-    has_all() { local have=" $(cat "$1") "; for c in cpu memory pids; do case "$have" in *" $c "*) ;; *) return 1 ;; esac; done; }
+    has_all() { local have=" $(cat "$1") "; for c in cpu io memory pids; do case "$have" in *" $c "*) ;; *) return 1 ;; esac; done; }
     if ! has_all "$CGROUP/cgroup.controllers"; then
         # A group has the controllers its parent passes down.
-        if echo "+cpu +memory +pids" > "$parent/cgroup.subtree_control" 2>/dev/null && has_all "$CGROUP/cgroup.controllers"; then
-            did "enabled cpu, memory and pids in $parent/cgroup.subtree_control"
+        if echo "+cpu +io +memory +pids" > "$parent/cgroup.subtree_control" 2>/dev/null && has_all "$CGROUP/cgroup.controllers"; then
+            did "enabled cpu, io, memory and pids in $parent/cgroup.subtree_control"
         else
-            fail "$CGROUP lacks controllers (has: $(cat "$CGROUP/cgroup.controllers")); enable cpu, memory and pids in $parent/cgroup.subtree_control"
+            fail "$CGROUP lacks controllers (has: $(cat "$CGROUP/cgroup.controllers")); enable cpu, io, memory and pids in $parent/cgroup.subtree_control (the io controller needs CONFIG_BLK_CGROUP and CONFIG_BLK_DEV_THROTTLING)"
         fi
     fi
     if has_all "$CGROUP/cgroup.controllers"; then
         if has_all "$CGROUP/cgroup.subtree_control"; then
-            ok "$CGROUP passes cpu, memory and pids to its children"
-        elif echo "+cpu +memory +pids" > "$CGROUP/cgroup.subtree_control" 2>/dev/null; then
-            did "$CGROUP now passes cpu, memory and pids to its children"
+            ok "$CGROUP passes cpu, io, memory and pids to its children"
+        elif echo "+cpu +io +memory +pids" > "$CGROUP/cgroup.subtree_control" 2>/dev/null; then
+            did "$CGROUP now passes cpu, io, memory and pids to its children"
         else
             fail "cannot enable controllers in $CGROUP/cgroup.subtree_control (the group must hold no processes of its own)"
         fi
@@ -192,7 +197,7 @@ else
 fi
 
 echo "network: namespaces, taps, nftables and IPv4 forwarding for guests"
-for tool in ip:iproute2 nft:nftables conntrack:conntrack; do
+for tool in ip:iproute2 tc:iproute2 nft:nftables conntrack:conntrack; do
     if command -v "${tool%%:*}" >/dev/null 2>&1; then
         ok "the ${tool%%:*} command"
     else
@@ -219,8 +224,10 @@ if command -v ip >/dev/null 2>&1 && command -v nft >/dev/null 2>&1; then
        try "add a routing rule that matches a port (Linux 4.17 or newer)" ip -n "$probe_ns" rule add pref 100 ipproto tcp dport 25 unreachable &&
        try "add an unreachable route" ip -n "$probe_ns" route replace unreachable 192.0.2.0/24 &&
        try "hook a device's ingress with nftables inside it (nf_tables with the netdev family)" ip netns exec "$probe_ns" nft "add table netdev guest; add chain netdev guest ingress { type filter hook ingress device uplink priority -300; policy drop; }" &&
-       try "track connections with nftables inside it (nf_conntrack)" ip netns exec "$probe_ns" nft "add table inet guest; add chain inet guest forward { type filter hook forward priority filter; policy drop; }; add rule inet guest forward ct state established,related accept"; then
-        ok "network namespaces with veth links, port-matching routing rules and nftables"
+       try "track connections with nftables inside it (nf_conntrack)" ip netns exec "$probe_ns" nft "add table inet guest; add chain inet guest forward { type filter hook forward priority filter; policy drop; }; add rule inet guest forward ct state established,related accept" &&
+       try "limit the tracked connections of a run (nftables' ct count: the nft_connlimit module)" ip netns exec "$probe_ns" nft "add rule inet guest forward ct state new ct count over 1 drop" &&
+       try "put a rate on a device (tc with a tbf queue: the sch_tbf module, on some distributions in a linux-modules-extra package)" ip netns exec "$probe_ns" tc qdisc replace dev uplink root tbf rate 1mbit burst 65536b latency 50ms; then
+        ok "network namespaces with veth links, port-matching routing rules, nftables with connection limits, and rate-limited devices"
     else
         fail "this kernel cannot $probe_step"
     fi
@@ -279,6 +286,27 @@ else
     esac
 fi
 
+echo "kernel: seccomp filters, and a tmpfs for each VM's sockets"
+case "$(uname -m)" in
+    x86_64|aarch64) ok "the daemon has a seccomp filter for $(uname -m)" ;;
+    *) fail "the daemon has no seccomp filter for $(uname -m): the vm driver runs on x86-64 and arm64" ;;
+esac
+# Seccomp: 2 in a process's status only shows for a filtered process; the
+# list of actions is there on every kernel that has filters (4.14).
+if grep -qw kill_process /proc/sys/kernel/seccomp/actions_avail 2>/dev/null; then
+    ok "the kernel has seccomp filters that can kill a process"
+else
+    fail "the kernel has no seccomp filters (CONFIG_SECCOMP_FILTER, Linux 4.14 or newer; see /proc/sys/kernel/seccomp/actions_avail)"
+fi
+probe_dir="$(mktemp -d /run/teploy-sockdir-probe.XXXXXX)"
+if mount -t tmpfs -o mode=0700,size=64k,nr_inodes=16,nosuid,nodev,noexec tmpfs "$probe_dir" 2>/dev/null; then
+    umount "$probe_dir"
+    ok "a tmpfs can be mounted for a VM's sockets"
+else
+    fail "cannot mount a tmpfs under /run: the daemon gives every VM one for its sockets (it needs CAP_SYS_ADMIN and a mount namespace it may change; not an unprivileged container)"
+fi
+rmdir "$probe_dir" 2>/dev/null || true
+
 echo "kernel: Landlock"
 if [ -r /sys/kernel/security/lsm ] && tr ',' '\n' < /sys/kernel/security/lsm | grep -qx landlock; then
     ok "Landlock is active"
@@ -286,12 +314,10 @@ else
     fail "Landlock is not active: it needs Linux 5.13 or newer and \"landlock\" in the lsm= kernel parameter (see /sys/kernel/security/lsm)"
 fi
 
-# Reported, not changed: other software on the host may need them. A
-# hypervisor's main thread may create namespaces as far as its own
-# seccomp filter is concerned, and a user namespace gives whoever took
-# the hypervisor over capabilities inside namespaces of its own: not a
-# way to the host's files, but a way to much more of the kernel than a
-# jailed process otherwise reaches.
+# Reported, not changed: other software on the host may need them. The
+# daemon's own seccomp filter keeps a hypervisor from creating any
+# namespace, whatever this setting is; a host that also turns user
+# namespaces off does not depend on that filter for it.
 echo "kernel: user namespaces for unprivileged processes"
 sysctl_value() { cat "/proc/sys/$1" 2>/dev/null || true; }
 if [ "$(sysctl_value user/max_user_namespaces)" = 0 ]; then

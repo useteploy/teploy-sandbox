@@ -537,6 +537,9 @@ func TestVMNetworkIsolation(t *testing.T) {
 	}
 	config := vmTestConfig(t)
 	config.OpenPrivate = true
+	// The throughput at the end is the path's, not the limit's; the
+	// limit has a test of its own (TestVMLimits).
+	config.NetMbit = -1
 	names := namesFor(config)
 	ctx := context.Background()
 	peer := startPeer(t)

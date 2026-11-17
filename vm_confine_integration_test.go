@@ -141,6 +141,32 @@ func hypervisorAPI(t *testing.T, socket, action, body string) (int, string) {
 	return resp.StatusCode, string(answer)
 }
 
+// wantIOMax is the io.max line a VM's cgroup has under config, for the
+// volume with the given device number.
+func wantIOMax(config vm.Config, rdev uint64) string {
+	mbps, iops := config.DiskMBPerSecond, config.DiskIOPS
+	if mbps == 0 {
+		mbps = vm.DefaultDiskMBPerSecond
+	}
+	if iops == 0 {
+		iops = vm.DefaultDiskIOPS
+	}
+	if mbps < 0 && iops < 0 {
+		return ""
+	}
+	value := func(limit int) string {
+		if limit < 0 {
+			return "max"
+		}
+		return strconv.Itoa(limit)
+	}
+	if mbps > 0 {
+		mbps <<= 20
+	}
+	major, minor := (rdev>>8)&0xfff|(rdev>>32)&^uint64(0xfff), rdev&0xff|(rdev>>12)&^uint64(0xff)
+	return fmt.Sprintf("%d:%d rbps=%s wbps=%s riops=%s wiops=%s", major, minor, value(mbps), value(mbps), value(iops), value(iops))
+}
+
 type confinedVM struct {
 	id, name   string
 	pid        int
@@ -186,6 +212,13 @@ func inspectVM(t *testing.T, config vm.Config, manager *run.Manager, id string, 
 		if got := cgroupValue(t, machine.cgroup, file); got != want {
 			t.Errorf("%s of %s: %q, want %q", file, current.ContainerID, got, want)
 		}
+	}
+
+	// --- what it may do to its disk, at the volume's device number
+	if volume, err := os.Stat(machine.zvol); err != nil {
+		t.Fatal(err)
+	} else if got, want := cgroupValue(t, machine.cgroup, "io.max"), wantIOMax(config, volume.Sys().(*syscall.Stat_t).Rdev); got != want {
+		t.Errorf("io.max of %s: %q, want %q", current.ContainerID, got, want)
 	}
 
 	// --- the user: not root in any of its four UIDs or GIDs, no
@@ -246,6 +279,11 @@ func inspectVM(t *testing.T, config vm.Config, manager *run.Manager, id string, 
 		fields := procStatus(t, filepath.Join("/proc", pids[0], "task", thread.Name(), "status"))
 		if fields["Seccomp"] != "2" {
 			t.Errorf("thread %s (%s) has Seccomp = %q, want 2 (filter)", thread.Name(), fields["Name"], fields["Seccomp"])
+		}
+		// Two at least: the daemon's, installed by the jail helper, and
+		// the hypervisor's own on top of it.
+		if filters, _ := strconv.Atoi(fields["Seccomp_filters"]); filters < 2 {
+			t.Errorf("thread %s (%s) has %q seccomp filters, want the daemon's and the hypervisor's", thread.Name(), fields["Name"], fields["Seccomp_filters"])
 		}
 		if fields["Uid"] != status["Uid"] {
 			t.Errorf("thread %s (%s) runs as %q", thread.Name(), fields["Name"], fields["Uid"])
@@ -333,7 +371,18 @@ func holdStrayDescriptor(t *testing.T) {
 }
 
 // jailControls logs the control for the jail's missing sockets once.
-var jailControls sync.Once
+var jailControls, fillOnce sync.Once
+
+// filesystemUse is the 4 KiB blocks and the inodes in use on the
+// filesystem that holds path.
+func filesystemUse(t *testing.T, path string) (blocks, inodes int64) {
+	t.Helper()
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		t.Fatal(err)
+	}
+	return int64(stat.Blocks-stat.Bfree) * int64(stat.Bsize) / 4096, int64(stat.Files - stat.Ffree)
+}
 
 // sysSetns is setns(2), which the syscall package does not name on
 // every architecture (not on amd64).
@@ -352,6 +401,11 @@ type jailView struct {
 	connects, stats, opens map[string]string
 	// write is the error of creating a file in the root.
 	write string
+	// What filling the one writable directory came to: the size one
+	// file reached and why it stopped, and the same for empty files.
+	fillBytes               int64
+	fillFiles               int
+	fillError, fillNamesErr string
 }
 
 // viewJail looks around from inside a hypervisor's jail: one thread of
@@ -359,7 +413,7 @@ type jailView struct {
 // namespaces, takes the VM's UID, GID and group, and then lists, connects
 // and opens. (Its PID namespace cannot be joined by a running thread; who
 // is in it is read from outside.) The thread is never used again.
-func viewJail(t *testing.T, pid int, uid, gid, group uint32, stats, devices []string) jailView {
+func viewJail(t *testing.T, pid int, uid, gid, group uint32, stats, devices []string, fill ...string) jailView {
 	t.Helper()
 	view := jailView{connects: map[string]string{}, stats: map[string]string{}, opens: map[string]string{}}
 	done := make(chan error, 1)
@@ -459,6 +513,36 @@ func viewJail(t *testing.T, pid int, uid, gid, group uint32, stats, devices []st
 				_ = syscall.Close(fd)
 			}
 			view.write = result(err)
+			// Last: as much as it will take, in the directory this user
+			// may write to. Whoever asked removes it.
+			for _, dir := range fill {
+				fd, err := syscall.Open(filepath.Join(dir, "fill"), syscall.O_CREAT|syscall.O_WRONLY|syscall.O_CLOEXEC, 0o600)
+				if err != nil {
+					view.fillError = err.Error()
+				} else {
+					chunk := make([]byte, 4096)
+					for view.fillBytes < 64<<20 {
+						n, err := syscall.Write(fd, chunk)
+						if n > 0 {
+							view.fillBytes += int64(n)
+						}
+						if err != nil {
+							view.fillError = err.Error()
+							break
+						}
+					}
+					_ = syscall.Close(fd)
+				}
+				for view.fillFiles < 100000 {
+					fd, err := syscall.Open(filepath.Join(dir, fmt.Sprintf("name-%d", view.fillFiles)), syscall.O_CREAT|syscall.O_EXCL|syscall.O_WRONLY|syscall.O_CLOEXEC, 0o600)
+					if err != nil {
+						view.fillNamesErr = err.Error()
+						break
+					}
+					_ = syscall.Close(fd)
+					view.fillFiles++
+				}
+			}
 			return nil
 		}()
 	}()
@@ -566,11 +650,58 @@ func inspectJail(t *testing.T, config vm.Config, machine confinedVM, kvmGroup ui
 	if !maps.Equal(got, want) {
 		t.Errorf("the hypervisor's mounts:\n  %v\nwant:\n  %v\n%s", got, want, mountinfo)
 	}
+	// The one writable mount is a filesystem of the VM's own, with a
+	// size and a number of inodes, in the jail and on the host alike.
+	hostMounts, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for where, listing := range map[string][]byte{"in the jail": mountinfo, "on the host": hostMounts} {
+		found := false
+		for _, line := range strings.Split(string(listing), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 10 || fields[4] != machine.runDir {
+				continue
+			}
+			found = true
+			kind, options := fields[len(fields)-3], fields[len(fields)-1]
+			if kind != "tmpfs" || !strings.Contains(options, fmt.Sprintf("size=%dk", vm.SocketDirKB)) || !strings.Contains(options, fmt.Sprintf("nr_inodes=%d", vm.SocketDirInodes)) {
+				t.Errorf("the socket directory %s is mounted as %s with %s, want a tmpfs of %d KiB and %d inodes", where, kind, options, vm.SocketDirKB, vm.SocketDirInodes)
+			}
+		}
+		if !found {
+			t.Errorf("the socket directory %s is not a mount of its own %s", machine.runDir, where)
+		}
+	}
 
 	// --- from inside, as the VM's user
 	other := filepath.Join(filepath.Dir(machine.runDir), "teploy-sbx-someone-else")
 	stats := []string{"/proc", "/sys", "/etc", "/etc/passwd", "/run/dbus", "/run/systemd", "/var", "/home", "/root", "/tmp", "/dev/net/tun", "/dev/vhost-net", "/dev/vhost-vsock", "/dev/udmabuf", "/dev/zvol", filepath.Dir(machine.zvol), other}
-	view := viewJail(t, machine.pid, machine.uid, machine.uid, kvmGroup, stats, []string{machine.node, "/dev/kvm", "/dev/urandom"})
+	runBlocks, runInodes := filesystemUse(t, filepath.Dir(machine.runDir))
+	view := viewJail(t, machine.pid, machine.uid, machine.uid, kvmGroup, stats, []string{machine.node, "/dev/kvm", "/dev/urandom"}, machine.runDir)
+	// --- the socket directory takes what its own filesystem has and no
+	// more, and the host's /run, which it is mounted on, takes nothing.
+	// The fill is still there when the host's use is read again.
+	blocksAfter, inodesAfter := filesystemUse(t, filepath.Dir(machine.runDir))
+	leftovers, _ := filepath.Glob(filepath.Join(machine.runDir, "name-*"))
+	for _, path := range append(leftovers, filepath.Join(machine.runDir, "fill")) {
+		_ = os.Remove(path)
+	}
+	fillOnce.Do(func() {
+		t.Logf("socket directory of %s, filled as uid %d from inside its jail: one file reached %d bytes (%s), then %d empty files (%s); the host's %s had %d blocks of 4 KiB and %d inodes in use before and %d and %d with the fill in place",
+			machine.name, machine.uid, view.fillBytes, view.fillError, view.fillFiles, view.fillNamesErr, filepath.Dir(machine.runDir), runBlocks, runInodes, blocksAfter, inodesAfter)
+	})
+	if view.fillBytes > vm.SocketDirKB<<10 || !strings.Contains(view.fillError, "no space left") {
+		t.Errorf("a file in the socket directory grew to %d bytes (%q), want at most %d KiB and then no space", view.fillBytes, view.fillError, vm.SocketDirKB)
+	}
+	if view.fillFiles >= vm.SocketDirInodes || !strings.Contains(view.fillNamesErr, "no space left") {
+		t.Errorf("%d files were made in the socket directory (%q), want fewer than its %d inodes", view.fillFiles, view.fillNamesErr, vm.SocketDirInodes)
+	}
+	// 64 MiB and 100000 names were asked for; other things on the host
+	// write a little to /run as well.
+	if blocksAfter-runBlocks > 8 || inodesAfter-runInodes > 8 {
+		t.Errorf("the host's %s grew by %d blocks and %d inodes while the socket directory was filled", filepath.Dir(machine.runDir), blocksAfter-runBlocks, inodesAfter-runInodes)
+	}
 	if view.uid != int(machine.uid) {
 		t.Fatalf("the look inside ran as uid %d, not the VM's %d", view.uid, machine.uid)
 	}
@@ -658,6 +789,9 @@ func (m confinedVM) assertGone(t *testing.T) {
 			t.Errorf("%s of %s left behind: %s (%v)", what, m.name, path, err)
 		}
 	}
+	if mounts, _ := os.ReadFile("/proc/self/mountinfo"); strings.Contains(string(mounts), m.runDir) {
+		t.Errorf("the socket filesystem of %s is still mounted", m.name)
+	}
 	entries, _ := os.ReadDir("/proc")
 	for _, entry := range entries {
 		if info, err := os.Stat(filepath.Join("/proc", entry.Name())); err == nil && entry.Name()[0] >= '0' && entry.Name()[0] <= '9' {
@@ -743,7 +877,8 @@ func TestVMConfinement(t *testing.T) {
 	// file can be is the VM's own runtime dir. (Without --landlock the
 	// same request succeeds; checked by hand.)
 	inside := filepath.Join(first.runDir, "extra.img")
-	if err := os.WriteFile(inside, make([]byte, 1<<20), 0o666); err != nil {
+	// As large as the directory's own filesystem lets a file be.
+	if err := os.WriteFile(inside, make([]byte, 32<<10), 0o666); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chown(inside, int(first.uid), int(first.uid)); err != nil {

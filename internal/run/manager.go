@@ -48,6 +48,10 @@ var (
 	// conflicts with the run's state, not missing runs.
 	ErrStopped = errors.New("run is stopped")
 	ErrRunning = errors.New("run is running")
+	// ErrAtCapacity: the daemon is running as many runs as it was told it
+	// may. Nothing is wrong with the request; another daemon, or a later
+	// attempt, can take it.
+	ErrAtCapacity = errors.New("at capacity")
 )
 
 // Network tiers. The wire accepts "egress" as an alias for

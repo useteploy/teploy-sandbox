@@ -109,6 +109,23 @@ type CreateAdmitter interface {
 	AdmitCreate(req CreateRequest) error
 }
 
+// WarmPoolReporter is implemented by a driver that keeps machines booted
+// ahead of creates (the VM driver's warm pool). Optional, like the two
+// above. WarmPool is nil when the driver has no pool configured.
+type WarmPoolReporter interface {
+	WarmPool() []WarmPoolSize
+}
+
+// WarmPoolSize is one size a warm pool keeps: how many it is to keep, how
+// many are booted and waiting, and how many are booting.
+type WarmPoolSize struct {
+	CPUs     int `json:"cpus"`
+	MemoryMB int `json:"memoryMb"`
+	Target   int `json:"target"`
+	Ready    int `json:"ready"`
+	Booting  int `json:"booting"`
+}
+
 // EgressNetwork is the INTERNAL bridge egress-opt-in runs join — a
 // dedicated network (never the `teploy` app network) with no NAT and no
 // default route; the daemon's allowlist proxy on its gateway is the only

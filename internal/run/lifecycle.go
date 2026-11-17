@@ -489,14 +489,27 @@ type Capacity struct {
 	Stopped  int
 	CPUs     float64
 	MemoryMB int
+	// WarmPool is the driver's warm pool, nil when it has none. Its VMs
+	// are in CPUs and MemoryMB: they hold that memory whether or not a
+	// run has claimed them yet.
+	WarmPool []WarmPoolSize
 }
 
-// Capacity sums the limits of every running run. Limits are ceilings, not
-// measurements: this is what is promised, not what is in use.
+// Capacity sums the limits of every running run, and of every machine a
+// warm pool holds. Limits are ceilings, not measurements: this is what is
+// promised, not what is in use.
 func (m *Manager) Capacity() Capacity {
+	var c Capacity
+	if reporter, ok := m.runtime.(WarmPoolReporter); ok {
+		c.WarmPool = reporter.WarmPool()
+		for _, size := range c.WarmPool {
+			held := size.Ready + size.Booting
+			c.CPUs += float64(held * size.CPUs)
+			c.MemoryMB += held * size.MemoryMB
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var c Capacity
 	for _, run := range m.runs {
 		if run.State == StateStopped {
 			c.Stopped++

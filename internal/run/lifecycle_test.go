@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -1158,24 +1159,24 @@ func TestDestroyStoppedRunDeletesRecordAndSnapshot(t *testing.T) {
 
 func TestCapacityCountsRunningLimitsOnly(t *testing.T) {
 	m, _, _ := newTestManager(t)
-	if got := m.Capacity(); got != (Capacity{}) {
+	if got := m.Capacity(); !reflect.DeepEqual(got, Capacity{}) {
 		t.Fatalf("empty registry: %+v", got)
 	}
 	mustCreate(t, m, CreateRequest{}) // defaults: 1 CPU, 1024 MB
 	mustCreate(t, m, CreateRequest{Limits: &Limits{MemoryMB: 4096, CPUs: 2.5}})
 	parked := mustCreate(t, m, CreateRequest{Limits: &Limits{MemoryMB: 8192, CPUs: 8}})
 
-	if got := m.Capacity(); got != (Capacity{Running: 3, CPUs: 11.5, MemoryMB: 13312}) {
+	if got := m.Capacity(); !reflect.DeepEqual(got, Capacity{Running: 3, CPUs: 11.5, MemoryMB: 13312}) {
 		t.Fatalf("three running: %+v", got)
 	}
 	mustStop(t, m, parked.ID)
-	if got := m.Capacity(); got != (Capacity{Running: 2, Stopped: 1, CPUs: 3.5, MemoryMB: 5120}) {
+	if got := m.Capacity(); !reflect.DeepEqual(got, Capacity{Running: 2, Stopped: 1, CPUs: 3.5, MemoryMB: 5120}) {
 		t.Fatalf("a stopped run is counted but allocates nothing: %+v", got)
 	}
 	if _, err := m.Resume(context.Background(), parked.ID, 0); err != nil {
 		t.Fatal(err)
 	}
-	if got := m.Capacity(); got != (Capacity{Running: 3, CPUs: 11.5, MemoryMB: 13312}) {
+	if got := m.Capacity(); !reflect.DeepEqual(got, Capacity{Running: 3, CPUs: 11.5, MemoryMB: 13312}) {
 		t.Fatalf("after resume: %+v", got)
 	}
 }

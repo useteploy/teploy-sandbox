@@ -244,7 +244,9 @@ create, a create that finds the size empty, and every resume and fork
   the new VM's cgroup limit plus `--vm-warm-headroom-mb` (default 1024);
   the pool logs once when it holds back. A failed boot is retried after
   a pause that doubles up to a minute. A pool VM that exits while it
-  waits is removed and replaced.
+  waits is removed and replaced, after the same kind of pause (it
+  doubles with every VM that dies waiting, until a create takes one):
+  a pool whose VMs boot and then die is not a boot loop.
 - **Restart and shutdown.** Pool VMs are VMs of the daemon's identity
   like any other, so the startup sweep finds and removes them with
   everything else a previous life left; the pool starts filling only

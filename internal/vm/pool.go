@@ -177,6 +177,7 @@ type warmPool struct {
 	peak     int
 	closed   bool
 	failures int
+	deaths   int
 	retryAt  time.Time
 	// held is set while a boot waits for memory, so that it is logged
 	// once and not every tick.
@@ -394,14 +395,15 @@ func (p *warmPool) boot(size WarmSize, name string) {
 		} else {
 			delete(p.owned, name)
 		}
-		stopping := p.closed
+		stopping, failures := p.closed, 0
 		if !stopping {
 			p.failures++
-			p.retryAt = time.Now().Add(min(p.retryBase<<min(p.failures-1, 6), time.Minute))
+			failures = p.failures
+			p.pauseLocked(p.failures)
 		}
 		p.mu.Unlock()
 		if !stopping {
-			p.log.Error("vm warm pool: a boot failed", "name", name, "size", size.String(), "failures", p.failures, "error", err)
+			p.log.Error("vm warm pool: a boot failed", "name", name, "size", size.String(), "failures", failures, "error", err)
 		}
 		p.poke()
 		return
@@ -427,8 +429,39 @@ func (p *warmPool) watch(vm *warmVM) {
 		// Claimed, or removed by the pool: not the pool's any more.
 		return
 	}
+	p.mu.Lock()
+	deaths := p.diedLocked()
+	p.mu.Unlock()
+	if deaths > 0 {
+		p.log.Warn("vm warm pool: a VM exited while it waited", "name", vm.name, "inARow", deaths)
+	}
 	p.remove(vm, "it exited while waiting in the pool")
 	p.poke()
+}
+
+// pauseLocked holds the pool's boots back after the n-th failure in a
+// row: retryBase, doubling, up to a minute. It never shortens a pause
+// that is already longer.
+func (p *warmPool) pauseLocked(n int) {
+	if until := time.Now().Add(min(p.retryBase<<min(n-1, 6), time.Minute)); until.After(p.retryAt) {
+		p.retryAt = until
+	}
+}
+
+// diedLocked counts a VM that exited while it waited in the pool, and
+// pauses the pool's boots as a failed boot does. A boot that succeeds
+// says nothing about these: a guest that powers off, or a host that
+// kills what it has no memory for, gives VMs that boot and then die, and
+// replacing each at once is a boot loop at the host's full speed. The
+// count starts again when a create takes a VM (take). Zero when the pool
+// is closed.
+func (p *warmPool) diedLocked() int {
+	if p.closed {
+		return 0
+	}
+	p.deaths++
+	p.pauseLocked(p.deaths)
+	return p.deaths
 }
 
 // unlist takes vm out of the pool, and reports whether it was in it.
@@ -487,10 +520,13 @@ func (p *warmPool) take(cpus, memoryMB int) *warmVM {
 		select {
 		case <-vm.machine.Exited():
 			dead = append(dead, vm)
+			p.diedLocked()
 			continue
 		default:
 		}
 		delete(p.owned, vm.name)
+		// A VM lived until it was wanted: the pool's VMs are not dying.
+		p.deaths = 0
 		return vm
 	}
 	return nil

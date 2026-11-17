@@ -307,8 +307,10 @@ func TestTheWarmPoolReplacesAVMThatDies(t *testing.T) {
 	machine.dead = true
 	close(machine.exited)
 	machine.mu.Unlock()
+	// After the pause a death in the pool is followed by.
 	waitPool(t, rig.driver, "replaced", func(status []run.WarmPoolSize) bool {
-		return full(status) && rig.warmVMs(1, 1024)[0] != first
+		names := rig.warmVMs(1, 1024)
+		return full(status) && len(names) == 1 && names[0] != first
 	})
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -348,7 +350,8 @@ func TestAFailedClaimDestroysThePoolVM(t *testing.T) {
 		t.Fatal("a VM whose claim failed is still running")
 	}
 	waitPool(t, rig.driver, "refilled", func(status []run.WarmPoolSize) bool {
-		return full(status) && rig.warmVMs(1, 1024)[0] != victim
+		names := rig.warmVMs(1, 1024)
+		return full(status) && len(names) == 1 && names[0] != victim
 	})
 	if ok, _ := rig.zfs.Exists(bg, testPool+"/"+victim); ok {
 		t.Fatal("the volume of a VM whose claim failed is still there")
@@ -485,4 +488,80 @@ func TestNoHeadroomIsNoHeadroom(t *testing.T) {
 			t.Errorf("headroom %d became %d, want %d", configured, got, want)
 		}
 	}
+}
+
+// A pool whose VMs boot and then exit (a golden image that powers off, a
+// host that kills them) must not boot one after another as fast as the
+// host can: every such boot is a clone, a cgroup, a jail and a
+// hypervisor. VMs that die waiting are replaced after a pause that
+// doubles, like boots that fail, until a create has taken one.
+func TestAPoolWhoseVMsDieIsNotABootLoop(t *testing.T) {
+	rig := newRig(t, nil)
+	// Every VM answers its agent once and is gone 5 ms later.
+	rig.hypervisor.onStart = func(machine *fakeMachine) {
+		go func() {
+			time.Sleep(5 * time.Millisecond)
+			machine.mu.Lock()
+			defer machine.mu.Unlock()
+			if !machine.dead {
+				machine.dead = true
+				close(machine.exited)
+			}
+		}()
+	}
+	rig.driver.setWarm(WarmConfig{Sizes: []WarmSize{{1, 1024, 2}}})
+	rig.driver.owner = t.Name()
+	rig.driver.hostMemory = func() (int, error) { return 1 << 20, nil }
+	t.Cleanup(func() { _ = rig.driver.Close(context.Background()) })
+	must(t, func() error { _, _, err := rig.driver.Sweep(bg); return err }())
+	time.Sleep(1500 * time.Millisecond)
+	rig.hypervisor.mu.Lock()
+	started := len(rig.hypervisor.started)
+	rig.hypervisor.mu.Unlock()
+	// The first two, and after a pause of a second the next two: the one
+	// after that is two seconds away.
+	if started > 4 {
+		t.Fatalf("%d VMs booted in 1.5 s by a pool of two whose VMs die", started)
+	}
+	pool := rig.driver.warmPool()
+	pool.mu.Lock()
+	deaths, pause := pool.deaths, time.Until(pool.retryAt)
+	pool.mu.Unlock()
+	if deaths == 0 || pause <= 0 {
+		t.Fatalf("deaths %d, next boot in %s: no pause after VMs died in the pool", deaths, pause)
+	}
+
+	// VMs that live again are claimed as ever, and a claim ends the pauses.
+	rig.hypervisor.mu.Lock()
+	rig.hypervisor.onStart = nil
+	rig.hypervisor.mu.Unlock()
+	waitPool(t, rig.driver, "full", full)
+	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage}); err != nil {
+		t.Fatal(err)
+	}
+	pool.mu.Lock()
+	deaths = pool.deaths
+	pool.mu.Unlock()
+	if deaths != 0 {
+		t.Fatalf("deaths still %d after a create took a VM", deaths)
+	}
+}
+
+// Boots that fail at the same moment (the bound on boots is two or more)
+// each report the count of failures; under the race detector this is the
+// check that they read it under the pool's lock.
+func TestBootsThatFailTogether(t *testing.T) {
+	rig := newRig(t, nil)
+	rig.hypervisor.startErr = errors.New("no kvm today")
+	rig.driver.setWarm(WarmConfig{Sizes: []WarmSize{{1, 1024, 8}}, Boots: 8})
+	rig.driver.owner = t.Name()
+	rig.driver.hostMemory = func() (int, error) { return 1 << 20, nil }
+	t.Cleanup(func() { _ = rig.driver.Close(context.Background()) })
+	must(t, func() error { _, _, err := rig.driver.Sweep(bg); return err }())
+	pool := rig.driver.warmPool()
+	waitPool(t, rig.driver, "eight failures", func([]run.WarmPoolSize) bool {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		return pool.failures >= 8
+	})
 }

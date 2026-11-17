@@ -1384,7 +1384,9 @@ filesystems as a run's; the check now leaves out what a pool holds).
   that are booting their own VM; never while `MemAvailable`, less what
   the boots under way may take, is short of the new VM's cgroup limit
   plus `--vm-warm-headroom-mb`. A failed boot backs off (1 s doubling to
-  a minute). A pool VM that exits is removed and replaced.
+  a minute). A pool VM that exits is removed and replaced, after the
+  same kind of pause (doubling with every VM that dies waiting, until a
+  create takes one).
 - **Restart and shutdown.** Pool VMs are VMs of the daemon's identity,
   named like any other, so the existing startup sweep removes them; the
   pool only starts after the sweep has succeeded. `Close` removes the

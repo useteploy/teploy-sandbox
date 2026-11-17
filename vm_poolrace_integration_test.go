@@ -157,8 +157,10 @@ func TestVMWarmPoolRaces(t *testing.T) {
 	waitWarm(t, driver, "full", settled)
 	nothingOfRunsLeft(t, config, baseline, "after pool VMs died under their claims")
 
-	// --- a burst over every tier, destroyed while the pool refills
-	const burst = 9
+	// --- a burst over every tier, destroyed while the pool refills: twice
+	// what the pool holds, so half are claims and half boot their own VM
+	// (no more than that at once: the suite's host is a small one)
+	const burst = 6
 	var wg sync.WaitGroup
 	created := make([]*run.Run, burst)
 	for i := range created {

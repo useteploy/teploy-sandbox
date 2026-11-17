@@ -1589,10 +1589,11 @@ now) passes with the pool on (`SBX_VM_WARM=1x512=2,1x1024=1`).
 
 - **One VM, one run.** A VM leaves the pool in `take`, under the pool's
   lock, and no path puts one back: a failed claim, a dead VM and a
-  closing pool all end in `discard`. Live: nine creates at once over
-  the three tiers against a pool of three got nine different VMs, none
-  of them still the pool's, each networked one a different address,
-  and none found another run's marker file.
+  closing pool all end in `discard`. Live: creates at once over the
+  three tiers against a pool of three (nine of them, and six in the
+  test as it is kept) each got a different VM, none of them still the
+  pool's, each networked one a different address, and none found
+  another run's marker file.
 - **A claim against everything else** (`TestVMWarmPoolRaces`, live). A
   caller that gives up 1 to 300 ms into a claim, nine times over two
   tiers: every create failed, no run was registered, and afterwards the

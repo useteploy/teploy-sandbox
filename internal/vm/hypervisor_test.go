@@ -41,6 +41,7 @@ func TestMachineArgsAreTheProvenCommandLine(t *testing.T) {
 		"--memory", "size=2048M",
 		"--vsock", "cid=7,socket=/run/sbx/abc/teploy-sbx-x/vsock.sock",
 		"--balloon", "size=0,free_page_reporting=on,deflate_on_oom=on",
+		"--rng", "src=/dev/urandom",
 		"--serial", "tty",
 		"--console", "off",
 		"--api-socket", "/run/sbx/abc/teploy-sbx-x/api.sock",
@@ -349,11 +350,11 @@ func TestStartAndKillManageTheProcessAndItsRuntimeDir(t *testing.T) {
 	if _, err := (&CloudHypervisor{Bin: script, RunDir: filepath.Join(root, "run")}).Start(ctx, MachineConfig{Name: "teploy-sbx-d"}); err == nil || !strings.Contains(err.Error(), "unconfined") {
 		t.Fatalf("a hypervisor without confinement: %v", err)
 	}
-	confined.fail["procAttr"] = errors.New("cannot drop privileges")
+	confined.fail["command"] = errors.New("cannot drop privileges")
 	if _, err := h.Start(ctx, MachineConfig{Name: "teploy-sbx-e", Disk: "/dev/null", CPUs: 1, MemoryMB: 64}); err == nil || len(confine.uids.held) != 0 {
 		t.Fatalf("a start that cannot be confined: %v (held %v)", err, confine.uids.held)
 	}
-	delete(confined.fail, "procAttr")
+	delete(confined.fail, "command")
 	long := &CloudHypervisor{Bin: script, RunDir: filepath.Join(root, strings.Repeat("d", 100)), confine: confine}
 	if _, err := long.Start(ctx, MachineConfig{Name: "teploy-sbx-c"}); err == nil || !strings.Contains(err.Error(), "too long") {
 		t.Fatalf("a runtime dir too long for a socket path: %v", err)

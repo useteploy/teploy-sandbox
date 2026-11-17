@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -174,6 +173,9 @@ func (h *CloudHypervisor) baseArgs(config MachineConfig, dir string, cid uint32)
 		// A zero-sized balloon that only reports free pages: memory the
 		// guest stops using goes back to the host. No policy sits on top.
 		"--balloon", "size=0,free_page_reporting=on,deflate_on_oom=on",
+		// The guest's entropy device. This is the hypervisor's default
+		// source, named because the jail holds this device and no other.
+		"--rng", "src=" + rngDevice,
 		// The console goes to the hypervisor's stdout, which Start reads
 		// into a bounded buffer. Never to a file: the guest decides how
 		// much it writes there, and the runtime dir is usually host memory.
@@ -215,8 +217,11 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 	// behind its own unix socket, so the number only has to be valid; one
 	// per VM keeps logs unambiguous.
 	cid := 3 + h.nextCID.Add(1)
-	// Not CommandContext: the VM outlives the request that created it.
-	cmd := exec.Command(h.Bin, h.machineArgs(config, dir, cid)...)
+	// Not a CommandContext: the VM outlives the request that created it.
+	cmd, err := confined.command(h.Bin, h.Kernel, h.machineArgs(config, dir, cid))
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("start hypervisor: %w", err), confined.release(cleanupCtx))
+	}
 	serial, output := &tailBuffer{limit: outputTail}, &tailBuffer{limit: outputTail}
 	cmd.Stdout, cmd.Stderr = serial, output
 	if config.Net != nil {
@@ -229,9 +234,7 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 	// Should anything else ever hold the output pipes open, the process
 	// exiting still counts as the VM being gone.
 	cmd.WaitDelay = 5 * time.Second
-	if cmd.SysProcAttr, err = confined.procAttr(); err == nil {
-		err = cmd.Start()
-	}
+	err = cmd.Start()
 	confined.started()
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("start hypervisor: %w", err), confined.release(cleanupCtx))

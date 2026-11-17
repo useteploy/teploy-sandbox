@@ -547,12 +547,21 @@ func New(ctx context.Context, config Config, log *slog.Logger) (*Driver, error) 
 	if err != nil {
 		return nil, err
 	}
+	libraries, err := hypervisorLibraries(hypervisor)
+	if err != nil {
+		return nil, err
+	}
+	if len(libraries) > 0 {
+		log.Warn("the hypervisor binary is dynamically linked: its jail also holds the host's library directories, read-only. A statically linked build (the upstream release's static binary) needs nothing of the host",
+			"hypervisor", hypervisor)
+	}
 	confine := &confinement{
-		uids:    newUIDPool(config.UIDBase),
-		groups:  groups,
-		cgroups: newCgroups(config.Cgroup, filepath.Join(config.Cgroup, config.ownerName())),
-		devDir:  config.devDir(),
-		sys:     realConfineSys(),
+		uids:      newUIDPool(config.UIDBase),
+		groups:    groups,
+		cgroups:   newCgroups(config.Cgroup, filepath.Join(config.Cgroup, config.ownerName())),
+		devDir:    config.devDir(),
+		libraries: libraries,
+		sys:       realConfineSys(),
 	}
 	plan, err := networkPlan(config, realHost(), func(string, ...any) {})
 	if err != nil {

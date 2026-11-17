@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -387,7 +389,9 @@ type confineLog struct {
 	nodes  map[string]uint64
 	// started is the UID, groups and cgroup of each process start.
 	started []string
-	fail    map[string]error
+	// jails is what each of them was to be confined to.
+	jails []jailSpec
+	fail  map[string]error
 }
 
 // newTestConfinement confines against a fake host under root: device
@@ -435,14 +439,22 @@ func newTestConfinement(t *testing.T, root string) (*confinement, *confineLog, *
 				log.mu.Unlock()
 				return failing("chown")
 			},
-			procAttr: func(uid, gid uint32, groups []uint32, cgroup *os.File) (*syscall.SysProcAttr, error) {
-				if err := failing("procAttr"); err != nil {
+			command: func(jail jailSpec, cgroup *os.File, bin string, args []string) (*exec.Cmd, error) {
+				if err := failing("command"); err != nil {
+					return nil, err
+				}
+				if _, err := jailArgs(jail, bin, args); err != nil {
 					return nil, err
 				}
 				log.mu.Lock()
-				log.started = append(log.started, fmt.Sprintf("uid=%d gid=%d groups=%v cgroup=%s", uid, gid, groups, cgroup.Name()))
+				log.started = append(log.started, fmt.Sprintf("uid=%d gid=%d groups=%v cgroup=%s", jail.UID, jail.GID, jail.Groups, cgroup.Name()))
+				log.jails = append(log.jails, jail)
 				log.mu.Unlock()
-				return &syscall.SysProcAttr{Setsid: true}, nil
+				// The program itself, unjailed: what is tested with this
+				// host is the handling of the process.
+				cmd := exec.Command(bin, args...)
+				cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+				return cmd, nil
 			},
 			openCgroup: os.Open,
 		},
@@ -483,8 +495,24 @@ func TestEnterGivesAVMItsOwnUserDeviceAndCgroup(t *testing.T) {
 	if got := cgroupFile(t, c.cgroups.path(config.Name), "memory.max"); got != fmt.Sprint(int64(MemoryLimitMB(1024))<<20) {
 		t.Fatalf("memory.max %q", got)
 	}
-	if _, err := first.procAttr(); err != nil {
+	if _, err := first.command("/opt/ch", "/boot/Image", []string{"--landlock"}); err != nil {
 		t.Fatal(err)
+	}
+	// Its jail holds the binary, the kernel, its own node, /dev/kvm and
+	// its own runtime dir, and is mounted beside the runtime dirs.
+	wantJail := jailSpec{Root: dir + jailRootSuffix, UID: 70000, GID: 70000, Groups: []uint32{993}, Paths: []jailPath{
+		{Path: "/opt/ch", Kind: jailFile, Exec: true},
+		{Path: "/boot/Image", Kind: jailFile},
+		{Path: node, Kind: jailDevice},
+		{Path: "/dev/kvm", Kind: jailDevice},
+		{Path: "/dev/urandom", Kind: jailDevice},
+		{Path: dir, Kind: jailDir, Write: true},
+	}}
+	if len(log.jails) != 1 || !reflect.DeepEqual(log.jails[0], wantJail) {
+		t.Fatalf("jail:\n%+v\nwant:\n%+v", log.jails, wantJail)
+	}
+	if entries, err := os.ReadDir(wantJail.Root); err != nil || len(entries) != 0 {
+		t.Fatalf("the jail's mount point: %v %v, want an empty directory", entries, err)
 	}
 	if want := fmt.Sprintf("uid=70000 gid=70000 groups=[993] cgroup=%s", c.cgroups.path(config.Name)); !slices.Equal(log.started, []string{want}) {
 		t.Fatalf("started %v, want %s", log.started, want)
@@ -504,7 +532,7 @@ func TestEnterGivesAVMItsOwnUserDeviceAndCgroup(t *testing.T) {
 	if err := first.release(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for _, gone := range []string{node, dir, c.cgroups.path(config.Name)} {
+	for _, gone := range []string{node, dir, dir + jailRootSuffix, c.cgroups.path(config.Name)} {
 		if _, err := os.Stat(gone); !os.IsNotExist(err) {
 			t.Errorf("%s left after release: %v", gone, err)
 		}

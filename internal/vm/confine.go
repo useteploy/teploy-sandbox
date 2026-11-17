@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,7 +16,7 @@ import (
 )
 
 // A hypervisor process is the one thing on the host that a guest talks to
-// directly, so it is run as if it were already hostile. Four layers, none
+// directly, so it is run as if it were already hostile. Five layers, none
 // of which depends on another holding:
 //
 //   - its own user. Each VM gets a UID (and matching GID) from a reserved
@@ -23,6 +24,10 @@ import (
 //     has no capabilities, and shares its identity with no other VM: file
 //     permissions alone keep it out of another run's disk and sockets, and
 //     it cannot signal another run's hypervisor.
+//   - its own file tree and process table (jail.go): a root that holds
+//     its binary, the kernel image, its disk node, /dev/kvm and its
+//     socket directory, and a PID namespace in which it is alone. No
+//     socket, file or process of the host has a name there.
 //   - its own device node. The run's volume is given to it as a private
 //     block device node that only that UID can open, in a directory udev
 //     does not manage. The node under /dev/zvol stays root's, so nothing
@@ -46,7 +51,10 @@ type confinement struct {
 	cgroups *cgroups
 	// devDir holds this daemon identity's private device nodes.
 	devDir string
-	sys    confineSys
+	// libraries is what the hypervisor binary needs in its jail besides
+	// itself: nothing, for a statically linked one.
+	libraries []jailPath
+	sys       confineSys
 }
 
 // confineSys is the host as confinement uses it; tests replace it.
@@ -56,8 +64,9 @@ type confineSys struct {
 	// mknod makes a block device node, mode 0600.
 	mknod func(path string, dev uint64) error
 	chown func(path string, uid, gid uint32) error
-	// procAttr is how the process is started: as uid, in the cgroup.
-	procAttr func(uid, gid uint32, groups []uint32, cgroup *os.File) (*syscall.SysProcAttr, error)
+	// command is the process that becomes the hypervisor bin with args:
+	// in the jail, as the jail's UID, in the cgroup.
+	command func(jail jailSpec, cgroup *os.File, bin string, args []string) (*exec.Cmd, error)
 	// openCgroup opens a cgroup directory to start a process in.
 	openCgroup func(dir string) (*os.File, error)
 	// socketOwner is the UID of the process listening at the other end
@@ -75,7 +84,7 @@ func realConfineSys() confineSys {
 			return nil
 		},
 		chown:       func(path string, uid, gid uint32) error { return os.Lchown(path, int(uid), int(gid)) },
-		procAttr:    confinedProcAttr,
+		command:     jailCommand,
 		openCgroup:  os.Open,
 		socketOwner: socketOwner,
 	}
@@ -107,6 +116,9 @@ type cell struct {
 	released bool
 }
 
+// jailRoot is the mount point of the VM's jail.
+func (c *cell) jailRoot() string { return c.dir + jailRootSuffix }
+
 // enter allocates a VM's confinement: a UID, a runtime dir and a device
 // node that belong to it, and a cgroup with its limits. Whatever it
 // allocated is released again if it fails.
@@ -130,6 +142,14 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 		return nil, err
 	}
 	if err = c.sys.chown(dir, uid, uid); err != nil {
+		return nil, err
+	}
+	// Where the VM's jail is mounted, in the VM's own mount namespace:
+	// on the host an empty directory of root's, and nothing more.
+	if err = os.Remove(current.jailRoot()); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	if err = os.Mkdir(current.jailRoot(), 0o700); err != nil {
 		return nil, err
 	}
 	dev, err := c.sys.deviceNumber(config.Disk)
@@ -158,10 +178,13 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 	return current, nil
 }
 
-// procAttr is how the VM's process must be started. The cgroup handle is
-// only needed until then: started closes it.
-func (c *cell) procAttr() (*syscall.SysProcAttr, error) {
-	return c.owner.sys.procAttr(c.uid, c.uid, c.owner.groups, c.cgroup)
+// command is the VM's process, not yet started: the hypervisor bin with
+// args, in a jail that holds it, the kernel image and what is this VM's.
+// The cgroup handle is only needed until it is started: started closes
+// it.
+func (c *cell) command(bin, kernel string, args []string) (*exec.Cmd, error) {
+	jail := jailFor(c.jailRoot(), c.uid, c.owner.groups, bin, kernel, c.disk, c.dir, c.owner.libraries)
+	return c.owner.sys.command(jail, c.cgroup, bin, args)
 }
 
 // dial connects to one of the VM's unix sockets and proves that the VM's
@@ -222,6 +245,9 @@ func (c *cell) release(ctx context.Context) error {
 		return err
 	}
 	if err := os.RemoveAll(c.dir); err != nil {
+		return err
+	}
+	if err := os.Remove(c.jailRoot()); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	c.owner.uids.release(c.uid)

@@ -529,3 +529,62 @@ func TestAddNetHandsTheTapOverTheAPISocket(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// What answers add-net is the VM's own process, and a guest that took it
+// over decides what it says. An answer that never ends must not become
+// the daemon's memory: the daemon reads a bounded amount and gives up.
+func TestAddNetReadsABoundedAnswer(t *testing.T) {
+	dir := shortDir(t)
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(dir, apiSocketName), Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	tap, err := os.CreateTemp(dir, "tap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tap.Close()
+	// The hostile answer: a status line with no end, as much of it as the
+	// daemon will take, up to 64 MiB.
+	const most = 64 << 20
+	sent := make(chan int, 1)
+	go func() {
+		conn, err := listener.AcceptUnix()
+		if err != nil {
+			sent <- 0
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 4096)
+		if _, _, _, _, err := conn.ReadMsgUnix(buf, make([]byte, 256)); err != nil {
+			sent <- 0
+			return
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(20 * time.Second))
+		total, _ := io.WriteString(conn, "HTTP/1.1 200 ")
+		chunk := []byte(strings.Repeat("a", 64<<10))
+		for total < most {
+			n, err := conn.Write(chunk)
+			total += n
+			if err != nil {
+				break
+			}
+		}
+		sent <- total
+	}()
+	cell := &cell{uid: 70123, owner: &confinement{sys: confineSys{socketOwner: func(net.Conn) (uint32, error) { return 70123, nil }}}}
+	machine := &chMachine{dir: dir, cell: cell}
+	start := time.Now()
+	if err := machine.AddNet(context.Background(), tap, "02:54:0a:d1:00:02"); err == nil {
+		t.Fatal("an answer that never ended was taken for a success")
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("AddNet read an endless answer for %s", took)
+	}
+	// What the daemon did not read stayed in the socket's buffers (a few
+	// hundred KiB at most) or was never written.
+	if total := <-sent; total > 4<<20 {
+		t.Fatalf("the daemon took %d bytes of an answer that never ended (it reads at most %d)", total, apiAnswerLimit)
+	}
+}

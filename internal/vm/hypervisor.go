@@ -133,6 +133,11 @@ const (
 	// hypervisor's own output, the daemon keeps for Diagnostics.
 	outputTail = 64 << 10
 
+	// apiAnswerLimit is the most the daemon reads of a hypervisor's
+	// answer to a request it wrote itself (AddNet); the real one is a few
+	// hundred bytes.
+	apiAnswerLimit = 64 << 10
+
 	// maxSocketPath is the usable length of a unix socket path on Linux
 	// (sun_path is 108 bytes, with its terminating NUL).
 	maxSocketPath = 107
@@ -336,7 +341,11 @@ func (m *chMachine) AddNet(ctx context.Context, tap *os.File, mac string) error 
 	if written != len(request) {
 		return fmt.Errorf("hypervisor vm.add-net: wrote %d of %d bytes", written, len(request))
 	}
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	// Bounded: what answers is the VM's own process, which a guest may
+	// have taken over, and an answer's status line and headers are read
+	// whole. Without a bound, a line that never ends is the daemon's
+	// memory for as long as the deadline lasts.
+	resp, err := http.ReadResponse(bufio.NewReader(io.LimitReader(conn, apiAnswerLimit)), nil)
 	if err != nil {
 		return fmt.Errorf("hypervisor vm.add-net: %w", err)
 	}

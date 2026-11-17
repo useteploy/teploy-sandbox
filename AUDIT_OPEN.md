@@ -1743,7 +1743,7 @@ daemon) and 503 (remote storage cannot be reached).
 | Failed resume / claim given back | Bucket says running by this daemon; run stopped here, `pending` | Upkeep writes "stopped"; until then other daemons need `takeover` |
 | Running run's destroy noted in the registry / its VM removed | A note for a run whose VM the startup sweep then removes | The note is written to the bucket by the upkeep; the run is not brought back |
 | "Destroyed" noted / written to the bucket | A pending entry in the registry file | Written on every upkeep round; a run with one is not adopted back |
-| Stopped run's "destroyed" written / record deleted locally | Registry lists a run the bucket says is destroyed | Sync drops it and its local copy |
+| Stopped run's "destroyed" written / record deleted locally | Registry lists a run the bucket says is destroyed | Sync drops it and its local copy when its local view is durable; a view that is not (its last stop never uploaded) keeps the unpublished snapshot — the only copy of that state — as superseded, forkable and deletable, until retention |
 | Fork's record written / child registered | A `forked` record of a run that does not exist | Sync writes "destroyed" for it |
 | Collection deleted a manifest / its chunks | Chunks nothing names | The next collection |
 | Takeover's claim written / registry file updated | As "resume's claim written" | The same |
@@ -1852,3 +1852,87 @@ identity, state directory and ZFS pool. Nothing in the path knows that.
   failure path, but it was not provoked).
 - No independent review of `internal/s3`, `internal/offhost` or the
   manager changes yet.
+
+## 2026-11-17 — off-host storage: first independent review
+
+Two reviewers who did not write the slice went through it against the
+fakes and the in-memory bucket (internal/s3 and internal/offhost for
+one, internal/run and internal/vm for the other), before the final
+gate held for the merge decision.
+
+Found and fixed, each with a test:
+
+- **A create from `snapshot:<id>` left the fetched snapshot on the
+  host forever.** The registry never named it — a created run has no
+  images — and every cleanup mechanism is scoped to what the registry
+  names: the sweep, the sync, the reclaim, the eviction. A boot that
+  failed leaked it; a successful one leaked it at destroy, and on a
+  host whose pool root differs the ref was not even reachable through
+  the API. What a fetch materializes is the run's to release: a failed
+  boot gives it back, a destroy drops it (the bucket keeps it), and a
+  snapshot the host already had stays — it may be one a caller owns.
+- **The give-back's publish went out with its caller.** f892889 made
+  publishHeld follow the caller's context; unclaimHeld passed it the
+  resume request's context, which is what had just run out — the very
+  reason the boot failed. The bucket kept saying "running by this
+  daemon" until the next maintenance round, and other daemons needed
+  takeover. Detached under its own deadline now, like the give-back
+  beside it.
+- **The S3 client followed redirects.** A 302 in front of the bucket
+  (an http→https upgrader) turned a PUT into a GET of the target that
+  reported the write as done. The client never follows one now; a 3xx
+  is an error like any other.
+- **A listing that repeated its continuation token ran forever**,
+  feeding the same page to a growing slice while the maintenance round
+  behind it waited. A repeated token, and a listing beyond 1000 pages
+  (S3's own bound), is an error.
+- **Collect aborted when a manifest vanished between its listing and
+  its read** — another collector's round, or a caller's delete. That
+  object is gone, not unreadable; the round continues. And a parent
+  chain that circles (one damaged manifest is enough) would have hung
+  every daemon's collector with no diagnostic: the walk is bounded now,
+  as Ensure's always was.
+- **`--remote-gc-grace 0` was accepted**, which deletes in the very
+  round a snapshot is first seen unreferenced — the mid-round race the
+  grace exists to cover. The flag must be positive.
+- **A Reclaim could take a base image a restore was receiving on.**
+  Between the receive's origin lookup and the clone existing, nothing
+  on the pool pinned the origin. A restore now holds its origin by name
+  until the receive ends, and Reclaim leaves what is held.
+- **Runs stopped before remote storage was configured were never
+  uploaded**: they carried no remote state, which is what publishPending
+  looked for. A stopped run with none is publishable; after the first
+  maintenance round of the upgraded daemon it is off the host.
+
+Noted, not fixed:
+
+- On a service without conditional writes, nothing fences a run's
+  FIRST record: two daemons writing generation 1 of the same fresh run
+  ID both believe they created it. No honest manager flow reaches this
+  (first records are written only for freshly minted run IDs); it is
+  the one hole in the unfenced mode's claim, and it stays open.
+- The start probe's object under `v1/probe/` is collected by nothing;
+  a cleanup delete that fails leaks it for good.
+- The default transport honours `HTTP(S)_PROXY`: signed requests
+  traverse a configured proxy.
+- A manifest is read under the 64 MiB object bound: at 16 MiB chunks a
+  stream above roughly 10 TiB cannot be restored. Consistent with
+  "disks of many GiB not run"; now it has a number.
+- A listing's LastModified that does not parse reads as the zero time,
+  which every age check takes for ancient. Provider trust, as before.
+- A RequestTimeTooSkewed answer now names the clock and the delta; the
+  failure itself is unchanged.
+
+Looked for and not found: credential or secret leakage anywhere in the
+two packages (URLs, errors, logs); nonce reuse; any TLS-verification
+opt-out; any stored field read before it is authenticated — the damage
+matrix (reordered, truncated, replaced, replayed, cross-kind objects)
+all fails closed into staged volumes that are then discarded; key
+confusion between purposes and places (HKDF info and the GCM
+associated data both bind them); a lost update or double release under
+two daemons interleaving on one bucket (the generation fence, the
+tombstone ordering and the release holder checks held under every
+interleaving built, including a takeover racing a failed boot and a
+give-back after a crash); an eviction that drops a snapshot a fork
+booted from. The crash table's rows were walked against the code;
+row 13's claim is narrowed above.

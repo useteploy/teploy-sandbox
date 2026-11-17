@@ -301,15 +301,23 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// netNames is what the driver names things for this suite's identity.
-type netNames struct{ tapPrefix, table, gatewayDev string }
+// netNames is what the driver names things for this suite's identity:
+// each run's network namespace, the tap inside it, the host's end of an
+// open run's link, and the host's table.
+type netNames struct{ nsPrefix, tapPrefix, linkPrefix, table string }
 
 func namesFor(config vm.Config) netNames {
-	return netNames{tapPrefix: "tv" + config.Owner[:6] + "-", table: "teploy_sbx_vm_" + config.Owner[:8], gatewayDev: "tvg" + config.Owner[:6]}
+	return netNames{nsPrefix: "tvn" + config.Owner[:6] + "-", tapPrefix: "tv" + config.Owner[:6] + "-",
+		linkPrefix: "tvh" + config.Owner[:6] + "-", table: "teploy_sbx_vm_" + config.Owner[:8]}
 }
 
-// taps lists the host's interfaces that are this suite's taps.
-func (n netNames) taps(t *testing.T) []string {
+// runTable is the name of the tables inside a run's namespace.
+const runTable = "guest"
+
+// links lists the host's interfaces that are this suite's: the host's
+// ends of open runs' links, and any tap, which no longer belongs on the
+// host at all.
+func (n netNames) links(t *testing.T) []string {
 	t.Helper()
 	interfaces, err := net.Interfaces()
 	if err != nil {
@@ -317,7 +325,7 @@ func (n netNames) taps(t *testing.T) []string {
 	}
 	var names []string
 	for _, each := range interfaces {
-		if strings.HasPrefix(each.Name, n.tapPrefix) {
+		if strings.HasPrefix(each.Name, n.linkPrefix) || strings.HasPrefix(each.Name, n.tapPrefix) {
 			names = append(names, each.Name)
 		}
 	}
@@ -325,10 +333,39 @@ func (n netNames) taps(t *testing.T) []string {
 	return names
 }
 
-// guestNIC is a guest's network device as the guest sees it, and its tap.
+// namespaces lists this suite's run namespaces.
+func (n netNames) namespaces(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir("/run/netns")
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), n.nsPrefix) {
+			names = append(names, entry.Name())
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// inNS runs a command in a network namespace.
+func inNS(t *testing.T, ns string, args ...string) string {
+	t.Helper()
+	return hostRun(t, "ip", append([]string{"netns", "exec", ns}, args...)...)
+}
+
+func tryNS(ns string, args ...string) (string, error) {
+	return hostTry("ip", append([]string{"netns", "exec", ns}, args...)...)
+}
+
+// guestNIC is a guest's network device as the guest sees it, and where
+// the host keeps its other end: the run's namespace, the tap in it, and
+// for an open run the host's end of the link out of it.
 type guestNIC struct {
 	dev, addr, mac, gateway, gatewayMAC string
-	tap, chain                          string
+	ns, tap, link                       string
 }
 
 func sh(t *testing.T, manager *run.Manager, id, cmd string) vmExec {
@@ -348,13 +385,26 @@ echo "$dev $(ip -4 -o addr show dev "$dev" | awk '{print $4}') $(cat /sys/class/
 	if !strings.HasSuffix(fields[1], "/32") {
 		t.Fatalf("the guest's address is %s, want a /32", fields[1])
 	}
-	route := hostRun(t, "ip", "-o", "route", "get", nic.addr)
-	match := regexp.MustCompile(` dev (\S+)`).FindStringSubmatch(route)
-	if match == nil {
-		t.Fatalf("no route to the guest: %s", route)
+	// The run's namespace is the one that routes the guest's address to
+	// a tap.
+	for _, ns := range namesFor(vmTestConfig(t)).namespaces(t) {
+		routes, _ := tryNS(ns, "ip", "-4", "-o", "route", "show", nic.addr)
+		if match := regexp.MustCompile(` dev (\S+)`).FindStringSubmatch(routes); match != nil {
+			nic.ns, nic.tap = ns, match[1]
+		}
 	}
-	nic.tap = match[1]
-	nic.chain = "tap" + nic.tap[strings.LastIndex(nic.tap, "-")+1:]
+	if nic.ns == "" {
+		t.Fatalf("no namespace routes the guest's address %s", nic.addr)
+	}
+	slot := nic.tap[strings.LastIndex(nic.tap, "-")+1:]
+	if want := namesFor(vmTestConfig(t)).nsPrefix + slot; nic.ns != want {
+		t.Fatalf("the tap %s is in %s, want %s", nic.tap, nic.ns, want)
+	}
+	nic.link = namesFor(vmTestConfig(t)).linkPrefix + slot
+	// The tap is in the run's namespace and not on the host.
+	if _, err := hostTry("ip", "link", "show", "dev", nic.tap); err == nil {
+		t.Fatalf("the tap %s is an interface of the host", nic.tap)
+	}
 	return nic
 }
 
@@ -410,34 +460,40 @@ func setElements(t *testing.T, names netNames, set string) string {
 }
 
 // assertNoNetworkLeft checks that nothing of any run is left on the host:
-// no tap, no admission, no ingress filter.
+// no namespace, no link, no admission, no route.
 func assertNoNetworkLeft(t *testing.T, names netNames) {
 	t.Helper()
-	if taps := names.taps(t); len(taps) != 0 {
-		t.Errorf("taps left behind: %v", taps)
+	if left := names.namespaces(t); len(left) != 0 {
+		t.Errorf("run namespaces left behind: %v", left)
 	}
-	for _, set := range []string{"open", "proxy"} {
-		if listing := setElements(t, names, set); strings.Contains(listing, "elements") {
-			t.Errorf("the %s set still admits something:\n%s", set, listing)
-		}
+	if left := names.links(t); len(left) != 0 {
+		t.Errorf("links or taps left behind on the host: %v", left)
 	}
-	if listing := hostRun(t, "nft", "list", "table", "netdev", names.table); strings.Contains(listing, "chain") {
-		t.Errorf("ingress filters left behind:\n%s", listing)
+	if listing := setElements(t, names, "open"); strings.Contains(listing, "elements") {
+		t.Errorf("the open set still admits something:\n%s", listing)
 	}
-	if routes := hostRun(t, "ip", "-4", "route", "show"); strings.Contains(routes, names.tapPrefix) {
-		t.Errorf("routes to taps left behind:\n%s", routes)
+	if _, err := hostTry("nft", "list", "table", "netdev", names.table); err == nil {
+		t.Errorf("a netdev table of the driver is on the host")
+	}
+	if routes := hostRun(t, "ip", "-4", "route", "show"); strings.Contains(routes, names.linkPrefix) || strings.Contains(routes, names.tapPrefix) {
+		t.Errorf("routes to guests left behind:\n%s", routes)
 	}
 }
 
 func setupTimings(t *testing.T, logs *syncBuffer) {
 	t.Helper()
 	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "vm proxy listener ready") {
+			if host := regexp.MustCompile(`hostSetup=(\S+)`).FindStringSubmatch(line); host != nil {
+				t.Logf("timing: an allowlist run's namespace and proxy listener, made before its VM: %s", host[1])
+			}
+		}
 		if strings.Contains(line, "vm network device ready") {
 			tier := regexp.MustCompile(`tier=(\S+)`).FindStringSubmatch(line)
 			host := regexp.MustCompile(`hostSetup=(\S+)`).FindStringSubmatch(line)
 			guest := regexp.MustCompile(`guestSetup=(\S+)`).FindStringSubmatch(line)
 			if tier != nil && host != nil && guest != nil {
-				t.Logf("timing: network setup for a %-9s run: host side (tap, sysctls, firewall, route) %s, guest side (address, routes, resolver) %s", tier[1], host[1], guest[1])
+				t.Logf("timing: network setup for a %-9s run: host side (namespace, tap, sysctls, rulesets, routes) %s, guest side (address, routes, resolver) %s", tier[1], host[1], guest[1])
 			}
 		}
 	}
@@ -488,9 +544,28 @@ func TestVMNetworkIsolation(t *testing.T) {
 	b := create(run.CreateRequest{Network: "open"})
 	c := create(run.CreateRequest{Network: "allowlist", EgressAllow: []string{fmt.Sprintf("%s:%d", peerAddr, peerHTTP)}})
 	nicA, nicB, nicC := inspectNIC(t, manager, a), inspectNIC(t, manager, b), inspectNIC(t, manager, c)
-	t.Logf("guest a %s on %s, guest b %s on %s, guest c (allowlist) %s on %s; gateway %s", nicA.addr, nicA.tap, nicB.addr, nicB.tap, nicC.addr, nicC.tap, nicA.gateway)
-	if nicA.addr == nicB.addr || nicA.tap == nicB.tap || nicA.mac == nicB.mac || nicA.gateway != nicB.gateway {
-		t.Fatalf("two runs share an address, a tap or a MAC: %+v %+v", nicA, nicB)
+	t.Logf("guest a %s in %s, guest b %s in %s, guest c (allowlist) %s in %s; gateway %s", nicA.addr, nicA.ns, nicB.addr, nicB.ns, nicC.addr, nicC.ns, nicA.gateway)
+	if nicA.addr == nicB.addr || nicA.ns == nicB.ns || nicA.mac == nicB.mac || nicA.gateway != nicB.gateway {
+		t.Fatalf("two runs share an address, a namespace or a MAC: %+v %+v", nicA, nicB)
+	}
+	// What is where: an open run's namespace has its tap and one link
+	// out; an allowlist run's has its tap and nothing else; the host has
+	// the open runs' links and no tap.
+	for nic, want := range map[guestNIC][]string{nicA: {"lo", nicA.tap, "uplink"}, nicB: {"lo", nicB.tap, "uplink"}, nicC: {"lo", nicC.tap}} {
+		var got []string
+		for _, line := range strings.Split(inNS(t, nic.ns, "ip", "-o", "link", "show"), "\n") {
+			if fields := strings.Fields(line); len(fields) > 1 {
+				got = append(got, strings.TrimSuffix(strings.Split(fields[1], "@")[0], ":"))
+			}
+		}
+		slices.Sort(got)
+		slices.Sort(want)
+		if !slices.Equal(got, want) {
+			t.Fatalf("interfaces in %s: %v, want %v", nic.ns, got, want)
+		}
+	}
+	if got, want := names.links(t), []string{nicA.link, nicB.link}; !slices.Equal(got, want) {
+		t.Fatalf("the suite's interfaces on the host: %v, want the two open runs' links %v", got, want)
 	}
 	hostAddr := hostAddress(t)
 	hostTargets := []string{nicA.gateway, hostAddr, peerHostAddr}
@@ -564,15 +639,15 @@ true`, nicB.addr, nicB.mac, nicA.dev, nicA.addr, nicA.mac, nicA.gateway, nicA.ga
 		if strings.TrimSpace(received.stdout) != "" {
 			t.Fatalf("%s: guest b received something from another guest:\n%s", when, received.stdout)
 		}
-		// The host's idea of who has which address did not move, and the
-		// attacked guest still has its network.
+		// The idea of who has which address, in each run's namespace, did
+		// not move, and the attacked guest still has its network.
 		for _, nic := range []guestNIC{nicA, nicB} {
-			if got, want := hostRun(t, "ip", "-4", "neigh", "show", "dev", nic.tap), nic.addr+" lladdr "+nic.mac+" PERMANENT"; strings.TrimSpace(got) != want {
-				t.Fatalf("%s: the host's neighbours on %s: %q, want only %q", when, nic.tap, got, want)
+			if got, want := inNS(t, nic.ns, "ip", "-4", "neigh", "show", "dev", nic.tap), nic.addr+" lladdr "+nic.mac+" PERMANENT"; strings.TrimSpace(got) != want {
+				t.Fatalf("%s: the neighbours on %s: %q, want only %q", when, nic.tap, got, want)
 			}
-			// No IPv6 on the host's side of a tap, whatever the guest sends.
-			if got := hostRun(t, "ip", "-6", "addr", "show", "dev", nic.tap); got != "" {
-				t.Fatalf("%s: the host has an IPv6 address on %s: %s", when, nic.tap, got)
+			// No IPv6 on the other side of a tap, whatever the guest sends.
+			if got := inNS(t, nic.ns, "ip", "-6", "addr", "show"); got != "" {
+				t.Fatalf("%s: there is an IPv6 address in %s: %s", when, nic.ns, got)
 			}
 		}
 		if !reaches(t, manager, b, peerAddr, false) {
@@ -643,7 +718,7 @@ $f %[7]s $gwmac %[8]s $peer $port spoofed-both
 $f %[5]s $gwmac %[6]s 127.0.0.1 %[11]d to-loopback
 $f %[5]s $gwmac 127.0.0.1 $peer $port from-loopback
 sleep 1`, nicA.dev, nicA.gatewayMAC, peerAddr, peerUDP, nicA.mac, nicA.addr, nicB.mac, nicB.addr, hostAddr, nicA.gateway, guard.port)
-	dropsBefore := ingressDrops(t, names, nicA.chain)
+	dropsBefore := ingressDrops(t, nicA.ns)
 	if out := sh(t, manager, a, spoof); out.code != 0 {
 		t.Fatalf("send frames: %s", out.stderr)
 	}
@@ -656,43 +731,77 @@ sleep 1`, nicA.dev, nicA.gatewayMAC, peerAddr, peerUDP, nicA.mac, nicA.addr, nic
 		t.Fatalf("a frame with a spoofed source reached the peer:\n%s", received)
 	}
 	// Nine of them were dropped at the tap's own hook; the frame for
-	// 127.0.0.1 is honest about its source and dies in the host's routing.
-	if drops := ingressDrops(t, names, nicA.chain) - dropsBefore; drops < 9 {
+	// 127.0.0.1 is honest about its source and dies in the namespace's routing.
+	if drops := ingressDrops(t, nicA.ns) - dropsBefore; drops < 9 {
 		t.Fatalf("the tap's ingress filter dropped %d frames, want the 9 with a wrong source", drops)
 	}
 	guard.untouched(t, "after spoofed frames")
 
-	// --- the tables removed under the daemon (a firewall reload that
-	// flushes everything): put back, and everything above still holds
-	hostRun(t, "nft", "delete", "table", "inet", names.table)
-	hostRun(t, "nft", "delete", "table", "netdev", names.table)
-	removed := time.Now()
-	for {
-		inet, inetErr := hostTry("nft", "list", "table", "inet", names.table)
-		netdev, _ := hostTry("nft", "list", "table", "netdev", names.table)
-		if inetErr == nil && strings.Contains(inet, nicA.addr) && strings.Contains(inet, nicB.addr) && strings.Contains(inet, nicC.addr+" . "+proxyPort) && strings.Contains(netdev, "chain "+nicA.chain+" {") && strings.Contains(netdev, "chain "+nicC.chain+" {") {
-			break
+	// --- the rules removed and changed under the daemon: put back, and
+	// everything above still holds. Twice: every table deleted (what a
+	// "flush ruleset" does, on the host and in each run's namespace), and
+	// every table left in place with nothing in it.
+	rulesOf := func() string {
+		// A table that is not there lists as an error, which is as
+		// different from the rules as written as anything.
+		listing, _ := hostTry("nft", "-s", "list", "table", "inet", names.table)
+		for _, nic := range []guestNIC{nicA, nicB, nicC} {
+			rules, _ := tryNS(nic.ns, "nft", "-s", "list", "ruleset")
+			listing += "\n" + rules
 		}
-		if time.Since(removed) > 20*time.Second {
-			t.Fatalf("the daemon did not put its firewall back:\n%s\n%s", inet, netdev)
+		return listing
+	}
+	intact := rulesOf()
+	for _, want := range []string{nicA.addr, nicB.addr, `"` + nicA.link + `"`, "tcp dport " + proxyPort + " accept", "hook ingress device \"" + nicC.tap + "\"", "tcp dport 25", "169.254.0.0/16"} {
+		if !strings.Contains(intact, want) {
+			t.Fatalf("the rules as written lack %q:\n%s", want, intact)
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
-	t.Logf("timing: firewall tables removed by hand were back after %s", time.Since(removed).Round(100*time.Millisecond))
-	if !strings.Contains(logs.String(), "removed by something else") {
-		t.Fatal("the daemon restored its firewall without saying so")
+	for how, damage := range map[string]func(){
+		"deleted": func() {
+			hostRun(t, "nft", "delete", "table", "inet", names.table)
+			for _, nic := range []guestNIC{nicA, nicB, nicC} {
+				inNS(t, nic.ns, "nft", "flush", "ruleset")
+			}
+		},
+		"emptied": func() {
+			hostRun(t, "nft", "flush", "table", "inet", names.table)
+			hostRun(t, "nft", "flush", "set", "inet", names.table, "open")
+			for _, nic := range []guestNIC{nicA, nicB, nicC} {
+				inNS(t, nic.ns, "nft", "flush", "table", "inet", runTable)
+				inNS(t, nic.ns, "nft", "flush", "table", "netdev", runTable)
+			}
+		},
+	} {
+		damage()
+		if rulesOf() == intact {
+			t.Fatalf("rules %s by hand are unchanged; nothing was tested", how)
+		}
+		removed := time.Now()
+		for rulesOf() != intact {
+			if time.Since(removed) > 20*time.Second {
+				t.Fatalf("the daemon did not put back the rules that were %s:\n%s\nwant:\n%s", how, rulesOf(), intact)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Logf("timing: every ruleset (the host's table and three runs' namespaces) %s by hand was back, identical, after %s", how, time.Since(removed).Round(100*time.Millisecond))
 	}
-	isolation("after the firewall was restored")
-	hostIsClosed("after the firewall was restored")
+	for _, said := range []string{"removed by something else", "changed by something else", "a run's ruleset was removed or changed"} {
+		if !strings.Contains(logs.String(), said) {
+			t.Fatalf("the daemon restored its rules without saying %q", said)
+		}
+	}
+	isolation("after the rules were restored")
+	hostIsClosed("after the rules were restored")
 	if !reaches(t, manager, a, peerAddr, false) || !reaches(t, manager, c, peerAddr, false) {
-		t.Fatal("after the firewall was restored the guests lost what their tiers allow")
+		t.Fatal("after the rules were restored the guests lost what their tiers allow")
 	}
 
 	// --- throughput, roughly: a 1 GiB download from the peer
 	hostSpeed := hostRun(t, "curl", "-s", "-o", "/dev/null", "-w", "%{speed_download}", fmt.Sprintf("http://%s:%d/blob", peerAddr, peerHTTP))
 	hostMB, _ := strconv.ParseFloat(hostSpeed, 64)
 	t.Logf("throughput: host to peer directly (the ceiling of this setup): %.0f MB/s", hostMB/(1<<20))
-	t.Logf("throughput: open tier, guest to peer (tap, forward, masquerade): %.0f MB/s", download(t, manager, a))
+	t.Logf("throughput: open tier, guest to peer (tap, the run's namespace, link, forward, masquerade): %.0f MB/s", download(t, manager, a))
 	t.Logf("throughput: allowlist tier, guest to peer through its proxy: %.0f MB/s", download(t, manager, c))
 	setupTimings(t, &logs)
 
@@ -710,20 +819,19 @@ sleep 1`, nicA.dev, nicA.gatewayMAC, peerAddr, peerUDP, nicA.mac, nicA.addr, nic
 			t.Errorf("the connection tracker still remembers %s:\n%s", nic.addr, tracked)
 		}
 	}
+	// The allowlist run's proxy listened in the run's namespace, and
+	// that is gone with everything else.
 	assertNoNetworkLeft(t, names)
-	if conn, err := net.DialTimeout("tcp", net.JoinHostPort(nicC.gateway, proxyPort), 2*time.Second); err == nil {
-		conn.Close()
-		t.Error("the allowlist run's proxy still listens after the run was destroyed")
-	}
 	if got := poolListing(t, config.Pool); !slices.Equal(got, baseline) {
 		t.Fatalf("volumes left behind: %v", got)
 	}
 }
 
-// ingressDrops is how many frames a tap's ingress filter has dropped.
-func ingressDrops(t *testing.T, names netNames, chain string) int {
+// ingressDrops is how many frames a run's tap's ingress filter has
+// dropped.
+func ingressDrops(t *testing.T, ns string) int {
 	t.Helper()
-	listing := hostRun(t, "nft", "list", "chain", "netdev", names.table, chain)
+	listing := inNS(t, ns, "nft", "list", "chain", "netdev", runTable, "ingress")
 	match := regexp.MustCompile(`counter packets (\d+) bytes \d+ drop`).FindStringSubmatch(listing)
 	if match == nil {
 		t.Fatalf("no drop counter in:\n%s", listing)
@@ -797,9 +905,17 @@ ip route del default; true`, peerEntry, nic.gateway, nic.dev, hostAddr, guard.po
 			t.Fatalf("%s: an allowlist run reached the host itself:\n%s", when, got)
 		}
 		guard.untouched(t, when)
-		// The kernel's own switch, beside the firewall.
-		if raw, err := os.ReadFile("/proc/sys/net/ipv4/conf/" + nic.tap + "/forwarding"); err != nil || strings.TrimSpace(string(raw)) != "0" {
-			t.Fatalf("%s: forwarding on an allowlist run's tap: %q %v", when, raw, err)
+		// The kernel's own switch, beside the firewall: nothing is routed
+		// in an allowlist run's namespace, and there is nowhere to route
+		// to (no link, no route but the guest's own).
+		if got := inNS(t, nic.ns, "cat", "/proc/sys/net/ipv4/ip_forward"); got != "0" {
+			t.Fatalf("%s: forwarding in an allowlist run's namespace: %q", when, got)
+		}
+		if routes := inNS(t, nic.ns, "ip", "-4", "route", "show"); strings.TrimSpace(routes) != nic.addr+" dev "+nic.tap+" scope link" {
+			t.Fatalf("%s: routes in an allowlist run's namespace:\n%s", when, routes)
+		}
+		if _, err := hostTry("ip", "link", "show", "dev", nic.link); err == nil {
+			t.Fatalf("%s: an allowlist run has a link to the host (%s)", when, nic.link)
 		}
 		return port, credential, nic
 	}
@@ -861,8 +977,9 @@ echo "raw=$(nc -z -w 5 example.com 443 >/dev/null 2>&1 && echo connected)"`
 	}
 
 	// --- the hypervisor of a VM with a network is confined exactly as one
-	// without: unprivileged, in a network namespace that holds nothing.
-	// The tap is the host's, and the hypervisor only has a descriptor.
+	// without: unprivileged, jailed, in a network namespace that holds
+	// nothing. The tap is in the run's namespace, which is not the
+	// hypervisor's, and the hypervisor only has a descriptor.
 	confined := inspectVM(t, config, manager, openID, cpus, memoryMB)
 	cmdline, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(confined.pid), "cmdline"))
 	args := strings.Split(string(cmdline), "\x00")
@@ -875,8 +992,13 @@ echo "raw=$(nc -z -w 5 example.com 443 >/dev/null 2>&1 && echo connected)"`
 	if strings.Contains(string(cmdline), "tap=") {
 		t.Fatalf("the hypervisor was told an interface name: %q", args)
 	}
-	if out := hostRun(t, "ip", "-o", "link", "show", "dev", openNIC.tap); !strings.Contains(out, "UP") {
-		t.Fatalf("the tap is not an interface of the host: %s", out)
+	if out := inNS(t, openNIC.ns, "ip", "-o", "link", "show", "dev", openNIC.tap); !strings.Contains(out, "UP") {
+		t.Fatalf("the tap is not up in the run's namespace: %s", out)
+	}
+	runNS, _ := os.Stat("/run/netns/" + openNIC.ns)
+	hypervisorNS, _ := os.Stat(filepath.Join("/proc", strconv.Itoa(confined.pid), "ns", "net"))
+	if runNS == nil || hypervisorNS == nil || os.SameFile(runNS, hypervisorNS) {
+		t.Fatalf("the hypervisor is in its run's network namespace (or one of them could not be read)")
 	}
 
 	// --- stop and resume: the tier, the entries and the limits stay; the
@@ -885,15 +1007,10 @@ echo "raw=$(nc -z -w 5 example.com 443 >/dev/null 2>&1 && echo connected)"`
 	if _, err := manager.Stop(ctx, allowID); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
-	if _, err := hostTry("ip", "link", "show", "dev", allowNIC.tap); err == nil {
-		t.Fatalf("the stopped run's tap %s is still there", allowNIC.tap)
-	}
-	if listing := setElements(t, names, "proxy"); strings.Contains(listing, "elements") {
-		t.Fatalf("a stopped run is still admitted to a proxy port:\n%s", listing)
-	}
-	if conn, err := net.DialTimeout("tcp", net.JoinHostPort(allowNIC.gateway, port1), 2*time.Second); err == nil {
-		conn.Close()
-		t.Fatal("a stopped run's proxy still listens")
+	// The namespace is gone, and with it the tap, the rules and the
+	// only place the run's proxy could be reached from.
+	if slices.Contains(names.namespaces(t), allowNIC.ns) {
+		t.Fatalf("the stopped run's namespace %s is still there", allowNIC.ns)
 	}
 	resumed, err := manager.Resume(ctx, allowID, 1800)
 	if err != nil {
@@ -919,7 +1036,7 @@ echo "raw=$(nc -z -w 5 example.com 443 >/dev/null 2>&1 && echo connected)"`
 		t.Fatalf("forked on %q", forked.Network)
 	}
 	port3, credential3, forkNIC := allowlist("forked allowlist run", forked.ID)
-	if forkNIC.addr == resumedNIC.addr || forkNIC.tap == resumedNIC.tap || forkNIC.mac == resumedNIC.mac || port3 == port2 || credential3 == credential2 {
+	if forkNIC.addr == resumedNIC.addr || forkNIC.ns == resumedNIC.ns || forkNIC.mac == resumedNIC.mac || port3 == port2 || credential3 == credential2 {
 		t.Fatalf("a fork shares its source's network: source %+v port %s, fork %+v port %s", resumedNIC, port2, forkNIC, port3)
 	}
 	// The source's proxy, with the source's own credential, from the fork:
@@ -955,18 +1072,253 @@ echo "raw=$(nc -z -w 5 example.com 443 >/dev/null 2>&1 && echo connected)"`
 		}
 	}
 	assertNoNetworkLeft(t, names)
-	for _, port := range []string{port2, port3} {
-		if conn, err := net.DialTimeout("tcp", net.JoinHostPort(forkNIC.gateway, port), 2*time.Second); err == nil {
-			conn.Close()
-			t.Errorf("proxy port %s still listens after its run was destroyed", port)
-		}
-	}
 	confined.assertGone(t)
 	if got := poolListing(t, config.Pool); !slices.Equal(got, baseline) {
 		t.Fatalf("volumes or snapshots left behind: %v", got)
 	}
 	if left := hypervisorProcesses(t, config.RunDir); len(left) != 0 {
 		t.Fatalf("hypervisor processes left behind: %v", left)
+	}
+}
+
+// TestVMNetworkFailsClosed is the driver with no firewall at all. The
+// daemon's upkeep is stopped first (as if it were dead), so nothing puts a
+// rule back; then every table it wrote is emptied, and then deleted, on
+// the host and inside every run's namespace, while three guests run.
+//
+// What a guest can reach then is what exists in its namespace: an
+// allowlist guest its own proxy, an open guest whatever its namespace's
+// routes lead to. No host service and no other guest is among either, so
+// none is reached, for as long as the rules stay away. Private ranges are
+// opened (--vm-open-private) so that the refusals have controls beside
+// them: the peer on another port and another address is reached, without
+// masquerading, because the peer happens to route back through the host.
+func TestVMNetworkFailsClosed(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Fatal("the vm suite needs root (zfs, /dev/kvm)")
+	}
+	config := vmTestConfig(t)
+	config.OpenPrivate = true
+	names := namesFor(config)
+	ctx := context.Background()
+	peer := startPeer(t)
+	guard := startCanary(t)
+	manager, driver, _, _ := newVMManager(t, config, t.TempDir())
+	baseline := poolListing(t, config.Pool)
+	create := func(req run.CreateRequest) string {
+		t.Helper()
+		req.Image, req.Limits = vm.GoldenImage, &run.Limits{MemoryMB: 512, CPUs: 1}
+		created, err := manager.Create(ctx, req)
+		if err != nil {
+			t.Fatalf("create %s: %v", req.Network, err)
+		}
+		t.Cleanup(func() { _ = manager.Destroy(context.Background(), created.ID) })
+		installTools(t, manager, created.ID)
+		return created.ID
+	}
+	a := create(run.CreateRequest{Network: "open"})
+	b := create(run.CreateRequest{Network: "open"})
+	c := create(run.CreateRequest{Network: "allowlist", EgressAllow: []string{fmt.Sprintf("%s:%d", peerAddr, peerHTTP)}})
+	d := create(run.CreateRequest{Network: "allowlist"})
+	nicA, nicB, nicC, nicD := inspectNIC(t, manager, a), inspectNIC(t, manager, b), inspectNIC(t, manager, c), inspectNIC(t, manager, d)
+	nics := []guestNIC{nicA, nicB, nicC, nicD}
+	hostAddr := hostAddress(t)
+	hostTargets := []string{nicA.gateway, hostAddr, peerHostAddr}
+	proxyOf := func(id string) (port, credential string) {
+		match := regexp.MustCompile(`^http://run:([0-9a-f]{64})@[0-9.]+:(\d+)$`).FindStringSubmatch(strings.TrimSpace(sh(t, manager, id, `printf %s "$HTTP_PROXY"`).stdout))
+		if match == nil {
+			t.Fatalf("the proxy URL of %s", id)
+		}
+		return match[2], match[1]
+	}
+	portC, _ := proxyOf(c)
+	portD, credentialD := proxyOf(d)
+
+	// --- controls, with the rules in place
+	if !reaches(t, manager, a, peerAddr, false) || !reaches(t, manager, b, peerAddr, false) || !reaches(t, manager, c, peerAddr, false) {
+		t.Fatal("control: a guest cannot reach the peer at all")
+	}
+	if out := sh(t, manager, b, `(setsid python3 /work/listen.py /work/recv.log 9000 >/dev/null 2>&1 &); for i in $(seq 50); do grep -q ready /work/recv.log 2>/dev/null && break; sleep 0.1; done; nc -z -w 2 `+nicB.addr+` 9000`); out.code != 0 {
+		t.Fatalf("control: guest b's listener: %+v", out)
+	}
+
+	// --- the daemon's upkeep stops. With VMs attached it removes
+	// nothing; from here no rule that goes away comes back.
+	if err := driver.Close(ctx); err != nil {
+		t.Fatalf("stop the driver's upkeep: %v", err)
+	}
+
+	// closed is everything that must hold with no rules, checked while
+	// they are away.
+	closed := func(when string, controls bool) {
+		t.Helper()
+		// Guest to guest: routed, at the other's MAC, to everyone, as
+		// the other guest's address, and over IPv6.
+		attack := fmt.Sprintf(`b=%[1]s; bmac=%[2]s; dev=%[3]s; me=%[4]s; mymac=%[5]s; gwmac=%[6]s
+(ping -c 2 -W 2 $b >/dev/null 2>&1 && echo "OPEN icmp") &
+(nc -z -w 3 $b 9000 >/dev/null 2>&1 && echo "OPEN tcp") &
+(echo routed | nc -u -w 1 $b 9000 >/dev/null 2>&1) &
+wait
+python3 /work/frame.py udp $dev $mymac $bmac $me $b 9000 direct-l2
+python3 /work/frame.py udp $dev $mymac ff:ff:ff:ff:ff:ff $me $b 9000 broadcast-l2
+python3 /work/frame.py udp $dev $mymac $gwmac $me $b 9000 via-the-gateway
+python3 /work/frame.py udp $dev $mymac $gwmac %[7]s $b 9000 spoofed-source
+python3 /work/frame.py udp $dev $mymac $gwmac $b %[8]s %[9]d as-the-other-guest
+ip addr add $b/32 dev $dev
+(nc -z -w 3 -s $b $b 9000 >/dev/null 2>&1 && echo "OPEN tcp from the other guest's address")
+(curl -s --interface $b --connect-timeout 3 --max-time 4 http://%[8]s:%[10]d/hello.txt >/dev/null 2>&1 && echo "OPEN as the other guest's address")
+ip addr del $b/32 dev $dev
+echo 0 > /proc/sys/net/ipv6/conf/$dev/disable_ipv6; sleep 3
+(ping -6 -c 2 -W 2 ff02::1%%$dev 2>/dev/null | grep "bytes from" | grep -v "from $(ip -6 -o addr show dev $dev scope link | awk '{print $4}' | cut -d/ -f1)" | sed 's/^/ANSWER all-nodes: /')
+echo 1 > /proc/sys/net/ipv6/conf/$dev/disable_ipv6
+true`, nicB.addr, nicB.mac, nicA.dev, nicA.addr, nicA.mac, nicA.gatewayMAC, hostAddr, peerAddr, peerUDP, peerHTTP)
+		if out := sh(t, manager, a, attack); strings.TrimSpace(out.stdout) != "" {
+			t.Fatalf("%s: open guest a reached open guest b, or sent as it:\n%s\n%s", when, out.stdout, out.stderr)
+		}
+		// From an allowlist guest, with whatever routes it gives itself:
+		// another guest, the peer, the internet.
+		out := sh(t, manager, c, fmt.Sprintf(`ip route replace default via %s dev %s
+for t in %s %s %s; do (ping -c 1 -W 2 $t >/dev/null 2>&1 && echo "OPEN icmp $t") & (nc -z -w 3 $t 9000 >/dev/null 2>&1 && echo "OPEN tcp $t:9000") & (nc -z -w 3 $t %d >/dev/null 2>&1 && echo "OPEN tcp $t:%d") & done; wait
+(curl -s --noproxy '*' --connect-timeout 3 --max-time 5 http://example.com/ >/dev/null 2>&1 && echo "OPEN the internet")
+ip route del default; true`, nicC.gateway, nicC.dev, nicB.addr, nicD.addr, peerAddr, peerHTTP, peerHTTP))
+		if strings.TrimSpace(out.stdout) != "" {
+			t.Fatalf("%s: allowlist guest c got out of its namespace:\n%s", when, out.stdout)
+		}
+		received := sh(t, manager, b, `sleep 1; grep -v -e ready -e "from `+nicB.addr+`" /work/recv.log; true`)
+		if strings.TrimSpace(received.stdout) != "" {
+			t.Fatalf("%s: guest b received something from another guest:\n%s", when, received.stdout)
+		}
+		if got := peer.received(); strings.Contains(got, "as-the-other-guest") || strings.Contains(got, "spoofed") {
+			t.Fatalf("%s: a frame with another guest's source address left the host:\n%s", when, got)
+		}
+		// Guest to the host itself: every address, the canary's port,
+		// SSH, UDP and ping. The gateway address is the namespace's own
+		// and nothing listens on it but a proxy.
+		for name, id := range map[string]string{"open guest a": a, "open guest b": b, "allowlist guest c": c, "allowlist guest d": d} {
+			if got := hostProbe(t, manager, id, guard, hostTargets); got != "" {
+				t.Fatalf("%s: %s reached the host itself:\n%s", when, name, got)
+			}
+		}
+		guard.untouched(t, when)
+		// A proxy port is its own run's: from the other allowlist guest
+		// and from the open guests, d's port is not there, with d's own
+		// credential or without.
+		for name, id := range map[string]string{"open guest a": a, "allowlist guest c": c} {
+			out := sh(t, manager, id, fmt.Sprintf(`(nc -z -w 3 %[1]s %[2]s >/dev/null 2>&1 && echo "OPEN %[2]s"); (curl -s --connect-timeout 3 --max-time 5 -x http://run:%[3]s@%[1]s:%[2]s http://example.com/ -o /dev/null -w '%%{http_code}' | grep -v 000); true`, nicA.gateway, portD, credentialD))
+			if strings.TrimSpace(out.stdout) != "" {
+				t.Fatalf("%s: %s reached another run's proxy port %s: %s", when, name, portD, out.stdout)
+			}
+		}
+		// An open guest's reach is still its tier: not link-local (where
+		// metadata services are), not port 25, not its private resolver
+		// beyond DNS; all by the namespace's routes.
+		if reaches(t, manager, a, "169.254.169.254", true) {
+			t.Fatalf("%s: an open guest reached the link-local metadata address", when)
+		}
+		if out := sh(t, manager, a, "nc -z -w 3 "+peerAddr+" 25"); out.code == 0 {
+			t.Fatalf("%s: an open guest connected to port 25", when)
+		}
+		if strings.Count(peer.received(), "tcp 25 from") != 1 {
+			t.Fatalf("%s: connections on port 25 at the peer:\n%s", when, peer.received())
+		}
+		if resolver := firstResolver(t); netip.MustParseAddr(resolver).IsPrivate() {
+			if out := sh(t, manager, a, fmt.Sprintf(`for p in 22 80 443; do (nc -z -w 2 %s $p >/dev/null 2>&1 && echo "OPEN $p") & done; wait`, resolver)); strings.TrimSpace(out.stdout) != "" {
+				t.Fatalf("%s: an open guest reached its private resolver beyond DNS: %s", when, out.stdout)
+			}
+		}
+		if !controls {
+			return
+		}
+		// The controls beside the refusals: what the tiers allow is still
+		// there where it does not need the host's rules. The allowlist
+		// guest reaches its allowlisted peer through its proxy; the open
+		// guest reaches the peer on its ordinary port (unmasqueraded: the
+		// peer's route back is through the host).
+		if !reaches(t, manager, c, peerAddr, false) {
+			t.Fatalf("%s: control: the allowlist guest lost its own proxy", when)
+		}
+		if out := sh(t, manager, c, "nc -z -w 3 "+nicC.gateway+" "+portC); out.code != 0 {
+			t.Fatalf("%s: control: the allowlist guest cannot connect to its own proxy port", when)
+		}
+		if !reaches(t, manager, a, peerAddr, true) {
+			t.Fatalf("%s: control: the open guest cannot reach the peer at all, so its refusals prove nothing", when)
+		}
+	}
+	// rules is every rule and set element in the daemon's tables, on the
+	// host and in the four namespaces; a chain's own line (its hook and
+	// policy) is not one.
+	rules := func() (found []string) {
+		listing, _ := hostTry("nft", "list", "table", "inet", names.table)
+		for _, nic := range nics {
+			listing += "\n" + inNS(t, nic.ns, "nft", "list", "ruleset")
+		}
+		for _, line := range strings.Split(listing, "\n") {
+			text := strings.TrimSpace(line)
+			if (strings.HasPrefix(line, "\t\t") && !strings.HasPrefix(text, "type ")) || strings.HasPrefix(text, "elements") {
+				found = append(found, text)
+			}
+		}
+		return found
+	}
+	if len(rules()) < 30 {
+		t.Fatalf("control: the rules as the daemon wrote them: %q", rules())
+	}
+
+	// --- flushed: every table and chain still there, with no rule in it.
+	// The chains in the namespaces drop by default, so the guests have no
+	// network at all; the host's chains accept by default, so the host's
+	// table now passes everything.
+	began := time.Now()
+	hostRun(t, "nft", "flush", "table", "inet", names.table)
+	hostRun(t, "nft", "flush", "set", "inet", names.table, "open")
+	for _, nic := range nics {
+		inNS(t, nic.ns, "nft", "flush", "table", "inet", runTable)
+		inNS(t, nic.ns, "nft", "flush", "table", "netdev", runTable)
+	}
+	if left := rules(); len(left) != 0 {
+		t.Fatalf("rules left after the flush: %q", left)
+	}
+	closed("with every table flushed", false)
+	if reaches(t, manager, a, peerAddr, true) || reaches(t, manager, c, peerAddr, false) {
+		t.Fatal("with every table flushed a guest still has a network: the namespaces' chains do not drop by default")
+	}
+
+	// --- deleted: no table of the daemon anywhere, so nothing is judged
+	// by a rule or a policy. What is reachable is what has a route.
+	hostRun(t, "nft", "delete", "table", "inet", names.table)
+	for _, nic := range nics {
+		inNS(t, nic.ns, "nft", "flush", "ruleset")
+	}
+	absent := func(when string) {
+		t.Helper()
+		if _, err := hostTry("nft", "list", "table", "inet", names.table); err == nil {
+			t.Fatalf("%s: the host's table is there", when)
+		}
+		for _, nic := range nics {
+			if listing := inNS(t, nic.ns, "nft", "list", "ruleset"); strings.TrimSpace(listing) != "" {
+				t.Fatalf("%s: %s has a ruleset:\n%s", when, nic.ns, listing)
+			}
+		}
+	}
+	absent("before the probes")
+	closed("with every table deleted", true)
+	absent("after the probes")
+	t.Logf("no rule of the daemon existed, on the host or in any of the four run namespaces, for %s (flushed, then deleted); in that time no guest reached a host service, another guest, or another run's proxy", time.Since(began).Round(time.Second))
+
+	// --- teardown works without the tables too
+	for _, id := range []string{a, b, c, d} {
+		if err := manager.Destroy(ctx, id); err != nil {
+			t.Fatalf("destroy: %v", err)
+		}
+	}
+	if left := names.namespaces(t); len(left) != 0 {
+		t.Fatalf("run namespaces left behind: %v", left)
+	}
+	if left := names.links(t); len(left) != 0 {
+		t.Fatalf("links left behind: %v", left)
+	}
+	if got := poolListing(t, config.Pool); !slices.Equal(got, baseline) {
+		t.Fatalf("volumes left behind: %v", got)
 	}
 }
 
@@ -991,8 +1343,9 @@ func firstResolver(t *testing.T) string {
 // TestVMNetworkAfterADaemonCrash: the daemon dies without tearing anything
 // down. Until a new one starts, the rules it left are exactly the run's
 // tier. From the first thing the new one does to the firewall the leftover
-// guest has no network at all; the sweep then removes the VM, its tap and
-// whatever else carries this daemon's name, and nothing that does not.
+// guest has no network at all; the sweep then removes the VM, its
+// namespace and whatever else carries this daemon's name, and nothing that
+// does not.
 func TestVMNetworkAfterADaemonCrash(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Fatal("the vm suite needs root (zfs, /dev/kvm)")
@@ -1017,30 +1370,49 @@ func TestVMNetworkAfterADaemonCrash(t *testing.T) {
 	}
 
 	// Things on the host that look like the daemon's, and things that are
-	// someone else's: a tap with this daemon's prefix that no VM holds
-	// (with an ingress filter), a tap and a table of another daemon
-	// identity, and an unrelated tap.
-	strayTap, otherTap, unrelatedTap := names.tapPrefix+"fe", "tvffffff-0", "tsbxother0"
+	// someone else's: a namespace and a link with this daemon's prefix
+	// that no VM holds, what a version of the driver that kept taps on
+	// the host would have left (a tap, a gateway device, a netdev table),
+	// a namespace, a link and a table of another daemon identity, and an
+	// unrelated namespace and tap.
+	strayNS, otherNS, unrelatedNS := names.nsPrefix+"fe", "tvnffffff-0", "tsbxother"
+	strayLink, otherLink := names.linkPrefix+"fe", "tvhffffff-0"
+	legacyTap, legacyGateway, unrelatedTap := names.tapPrefix+"fd", "tvg"+config.Owner[:6], "tsbxother0"
 	otherTable := "teploy_sbx_vm_ffffffff"
-	for _, tap := range []string{strayTap, otherTap, unrelatedTap} {
-		_, _ = hostTry("ip", "link", "del", tap)
-		hostRun(t, "ip", "tuntap", "add", "dev", tap, "mode", "tap")
-	}
-	_, _ = hostTry("nft", "delete", "table", "inet", otherTable)
-	hostRun(t, "nft", "add", "table", "inet", otherTable)
-	hostRun(t, "nft", "add", "chain", "inet", otherTable, "keep")
-	hostRun(t, "nft", "add", "chain", "netdev", names.table, "stray", fmt.Sprintf(`{ type filter hook ingress device "%s" priority 0; }`, strayTap))
-	t.Cleanup(func() {
-		for _, tap := range []string{strayTap, otherTap, unrelatedTap} {
-			_, _ = hostTry("ip", "link", "del", tap)
+	forget := func() {
+		for _, link := range []string{strayLink, otherLink, legacyTap, legacyGateway, unrelatedTap} {
+			_, _ = hostTry("ip", "link", "del", link)
+		}
+		for _, ns := range []string{strayNS, otherNS, unrelatedNS} {
+			_, _ = hostTry("ip", "netns", "del", ns)
 		}
 		_, _ = hostTry("nft", "delete", "table", "inet", otherTable)
-	})
+		_, _ = hostTry("nft", "delete", "table", "netdev", names.table)
+	}
+	forget()
+	t.Cleanup(forget)
+	for _, ns := range []string{strayNS, otherNS, unrelatedNS} {
+		hostRun(t, "ip", "netns", "add", ns)
+	}
+	hostRun(t, "ip", "link", "add", strayLink, "type", "veth", "peer", "name", "uplink", "netns", strayNS)
+	hostRun(t, "ip", "link", "add", otherLink, "type", "veth", "peer", "name", "uplink", "netns", otherNS)
+	for _, tap := range []string{legacyTap, unrelatedTap} {
+		hostRun(t, "ip", "tuntap", "add", "dev", tap, "mode", "tap")
+	}
+	hostRun(t, "ip", "link", "add", legacyGateway, "type", "dummy")
+	hostRun(t, "nft", "add", "table", "inet", otherTable)
+	hostRun(t, "nft", "add", "chain", "inet", otherTable, "keep")
+	hostRun(t, "nft", "add", "table", "netdev", names.table)
+	hostRun(t, "nft", "add", "chain", "netdev", names.table, "stray", fmt.Sprintf(`{ type filter hook ingress device "%s" priority 0; }`, legacyTap))
 
 	// --- the crash: nothing runs, so nothing changes. The run is admitted
-	// as an open run and as nothing more.
-	if listing := setElements(t, names, "open"); !strings.Contains(listing, fmt.Sprintf(`"%s" . %s`, nic.tap, nic.addr)) {
+	// as an open run and as nothing more, and the rules that say so are
+	// in its own namespace, which no daemon has to be alive for.
+	if listing := setElements(t, names, "open"); !strings.Contains(listing, fmt.Sprintf(`"%s" . %s`, nic.link, nic.addr)) {
 		t.Fatalf("the crashed daemon's rules:\n%s", listing)
+	}
+	if rules := inNS(t, nic.ns, "nft", "list", "ruleset"); !strings.Contains(rules, "tcp dport 25") || !strings.Contains(rules, "hook ingress device \""+nic.tap+"\"") {
+		t.Fatalf("the rules in the crashed daemon's run namespace:\n%s", rules)
 	}
 	if got := hostProbe(t, crashed, created.ID, guard, []string{nic.gateway, hostAddress(t)}); got != "" {
 		t.Fatalf("after the crash the guest reached the host itself:\n%s", got)
@@ -1069,17 +1441,24 @@ func TestVMNetworkAfterADaemonCrash(t *testing.T) {
 	if err != nil || processes != 1 {
 		t.Fatalf("sweep: %d processes, %v", processes, err)
 	}
-	if taps := names.taps(t); len(taps) != 0 {
-		t.Fatalf("taps of this daemon left after the sweep: %v", taps)
-	}
-	for _, tap := range []string{otherTap, unrelatedTap} {
-		if _, err := hostTry("ip", "link", "show", "dev", tap); err != nil {
-			t.Errorf("the sweep removed %s, which is not this daemon's", tap)
+	for _, link := range []string{otherLink, unrelatedTap} {
+		if _, err := hostTry("ip", "link", "show", "dev", link); err != nil {
+			t.Errorf("the sweep removed %s, which is not this daemon's", link)
 		}
+	}
+	for _, ns := range []string{otherNS, unrelatedNS} {
+		if _, err := os.Stat("/run/netns/" + ns); err != nil {
+			t.Errorf("the sweep removed the namespace %s, which is not this daemon's", ns)
+		}
+	}
+	if _, err := hostTry("ip", "link", "show", "dev", legacyGateway); err == nil {
+		t.Errorf("the sweep left the gateway device of an earlier version of the driver")
 	}
 	if listing, err := hostTry("nft", "list", "table", "inet", otherTable); err != nil || !strings.Contains(listing, "chain keep") {
 		t.Errorf("the sweep touched another daemon's table: %v\n%s", err, listing)
 	}
+	// Its own stray namespace and link, the leftover VM's, and the taps
+	// of an earlier version: all gone.
 	assertNoNetworkLeft(t, names)
 
 	// The crashed daemon's own teardown, arriving late, changes nothing of

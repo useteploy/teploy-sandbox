@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -307,6 +308,9 @@ var hostSockets = []string{
 	"/run/snapd-snap.socket",
 }
 
+// jailControls logs the control for the jail's missing sockets once.
+var jailControls sync.Once
+
 // jailView is what a process with the VM's identity finds in the VM's
 // namespaces.
 type jailView struct {
@@ -541,6 +545,22 @@ func inspectJail(t *testing.T, config vm.Config, machine confinedVM, kvmGroup ui
 			t.Errorf("the VM's %s is not in its jail", socket)
 		}
 	}
+	// The control: the same connects made here, on the host, are accepted
+	// by the services that run on it, so a socket that is missing inside
+	// is missing because of the jail.
+	var accepting []string
+	for _, path := range hostSockets {
+		if conn, err := net.DialTimeout("unix", path, time.Second); err == nil {
+			conn.Close()
+			accepting = append(accepting, path)
+		}
+	}
+	if len(accepting) == 0 {
+		t.Errorf("control: none of the host's sockets accepts a connection on the host itself; their absence in the jail proves nothing here")
+	}
+	jailControls.Do(func() {
+		t.Logf("control: on the host itself these accept a connection: %v", accepting)
+	})
 	for path, result := range view.connects {
 		if !strings.Contains(result, "no such file") {
 			t.Errorf("connect to the host's %s from inside the jail: %q, want it not to exist", path, result)

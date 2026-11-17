@@ -49,7 +49,8 @@ func goodHost() host {
 		addresses: func() (map[string][]netip.Prefix, error) {
 			return map[string][]netip.Prefix{"lo": {netip.MustParsePrefix("127.0.0.1/8")}, "eth0": {netip.MustParsePrefix("192.0.2.10/24")}}, nil
 		},
-		resolvers: func() []netip.Addr { return []netip.Addr{netip.MustParseAddr("192.0.2.53")} },
+		resolvers:      func() []netip.Addr { return []netip.Addr{netip.MustParseAddr("192.0.2.53")} },
+		probeNamespace: func(string) error { return nil },
 		subordinateIDs: func() ([]idRange, error) {
 			return []idRange{{file: "/etc/subuid", owner: "dev", start: 100000, count: 65536}}, nil
 		},
@@ -122,6 +123,14 @@ func TestPreflightNamesEachMissingPiece(t *testing.T) {
 		},
 		"the host's subordinate ID ranges, to check that none holds a VM UID: permission denied": func(_ *Config, h *host) {
 			h.subordinateIDs = func() ([]idRange, error) { return nil, errors.New("permission denied") }
+		},
+		"network namespaces as the driver uses them: a named namespace (`ip netns add`), a veth link into it, a routing rule that matches a port (Linux 4.17 or newer) and an nftables ruleset inside it; the trial failed: routing rules in a namespace: invalid argument": func(_ *Config, h *host) {
+			h.probeNamespace = func(name string) error {
+				if name != "tvn012345-probe" {
+					return errors.New("probed as " + name)
+				}
+				return errors.New("routing rules in a namespace: invalid argument")
+			}
 		},
 		"in a container that does not map them": func(_ *Config, h *host) {
 			h.mappedUIDs = func(uint32, uint32) (bool, error) { return false, nil }
@@ -268,6 +277,7 @@ func TestPreflightWithoutRootTouchesNothing(t *testing.T) {
 	h.prepareCgroup = func(string, string) error { touched = true; return nil }
 	h.prepareDevDir = func(string) error { touched = true; return nil }
 	h.udevProbes = func(context.Context, string) (bool, error) { touched = true; return false, nil }
+	h.probeNamespace = func(string) error { touched = true; return nil }
 	zfs := newFakeZFS()
 	err := preflight(context.Background(), goodConfig(), zfs, h)
 	if err == nil || strings.Count(err.Error(), ";") != 1 {

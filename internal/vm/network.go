@@ -26,26 +26,39 @@ import (
 // address and speak any protocol. Nothing here trusts what a guest does
 // with its network device; the host decides what leaves it.
 //
-//   - One tap per VM, in the host's network namespace, never on a bridge.
-//     There is no layer-2 path between two guests at all: a frame a guest
-//     sends reaches the host's own stack and nothing else.
+// And the host does not decide it with a firewall alone. A firewall that
+// is flushed (by an administrator, by another tool's reload, by anything
+// while the daemon is dead) lets everything through, so the rules are the
+// second layer here and the first is what exists at all:
+//
+//   - Every run with a network has a network namespace of its own, made
+//     by the daemon, and its tap is in that namespace and nowhere else.
+//     The host's services are not there: a socket bound to every address
+//     of the host is bound in the host's namespace. Another run's tap is
+//     not there either. There is no bridge and no shared segment.
+//   - An "allowlist" run's namespace has no link to anywhere. The one
+//     thing a guest can reach in it is the run's own proxy, which the
+//     daemon listens for with a socket made inside that namespace (the
+//     proxy's own connections leave from the host, as before). With no
+//     rule at all, that is still all there is.
+//   - An "open" run's namespace has one link to the host, which routes
+//     and masquerades what arrives on it. Inside the namespace the ranges
+//     that are not the public internet, the guests' subnet, the host's
+//     own addresses and port 25 have no route (unreachable routes and
+//     routing rules, not firewall rules).
+//   - The firewall says the same again, twice: a ruleset inside each
+//     run's namespace (which a "flush ruleset" on the host does not
+//     touch: nftables is per namespace), and one table on the host for
+//     the open runs' links. At the tap's ingress hook, before the
+//     namespace's ARP or IP code sees a frame: only the VM's MAC, only
+//     IPv4 from the VM's address, and only ARP that asks for the gateway.
 //   - The daemon creates the tap and hands the hypervisor the open file.
-//     The hypervisor stays unprivileged and in its empty network
+//     The hypervisor stays unprivileged and in its own empty network
 //     namespace; it never sees an interface, only a file descriptor. The
 //     tap is not persistent: it exists exactly as long as the hypervisor
 //     holds that descriptor.
-//   - At the tap's ingress hook (nftables, netdev family), before the
-//     host's ARP or IP code sees a frame: only the VM's MAC, only IPv4
-//     from the VM's address, and only ARP that asks for the gateway. IPv6
-//     and every other ethertype are dropped there.
-//   - Each VM has one address (a /32) routed to its tap, and a gateway
-//     address that is the same for all and lives on a dummy interface.
-//   - What a guest sends to the host itself is dropped, except TCP to its
-//     own run's proxy port on the gateway (the allowlist tier). What it
-//     sends through the host is dropped, unless the run's tier is "open":
-//     then it is masqueraded to the internet, without the address ranges
-//     that are not the public internet and without port 25. Nothing is
-//     forwarded to a guest that is not an answer.
+//   - The daemon compares every ruleset it wrote with what the kernel
+//     has, every watchInterval, and writes back what differs.
 //
 // Everything is named after the daemon identity, so the startup sweep
 // removes what this daemon left and nothing else.
@@ -69,6 +82,24 @@ var notPublic = []string{
 // ranges: loopback, link-local and metadata, multicast, reserved.
 var neverReachable = []string{"0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4"}
 
+const (
+	// uplinkDev is an open run's link to the host, as its namespace
+	// names it; uplinkHop is the next hop on it. The hop is an address
+	// nothing has: its hardware address is a permanent neighbour entry,
+	// so the link carries no ARP and the host's end needs no address.
+	uplinkDev = "uplink"
+	uplinkHop = "169.254.0.1"
+	// dnsTable is the routing table, in an open run's namespace, that
+	// only DNS to the configured resolvers is looked up in.
+	dnsTable = "100"
+	// runTable is the name of both nftables tables in a run's namespace.
+	runTable = "guest"
+	// proxyPortBase is the port of slot 0's proxy listener.
+	proxyPortBase = 20000
+	// netnsDir is where iproute2 keeps named network namespaces.
+	netnsDir = "/run/netns"
+)
+
 // netPlan is the network configuration, checked and resolved.
 type netPlan struct {
 	subnet  netip.Prefix
@@ -79,9 +110,11 @@ type netPlan struct {
 	// dns is what an open run's guest is told to resolve with.
 	dns         []netip.Addr
 	openPrivate bool
-	// tapPrefix starts every tap's name; gatewayDev holds the gateway
-	// address; table is the name of both nftables tables.
-	tapPrefix, gatewayDev, table string
+	// nsPrefix starts the name of every run's network namespace,
+	// tapPrefix that of the tap inside it and linkPrefix that of the
+	// host's end of an open run's link; table is the host's nftables
+	// table. legacyGateway is a device earlier versions made on the host.
+	nsPrefix, tapPrefix, linkPrefix, table, legacyGateway string
 }
 
 // planNetwork resolves the network part of a config. discovered is the
@@ -112,12 +145,14 @@ func planNetwork(config Config, discovered, local []netip.Addr) (netPlan, error)
 		subnet:      subnet,
 		gateway:     subnet.Addr().Next(),
 		openPrivate: config.OpenPrivate,
-		// An interface name has 15 characters: 2 + 6 + 1 leaves 6 for the
-		// slot. "g" is not a hex digit, so the gateway device can never
-		// be taken for a tap.
-		tapPrefix:  "tv" + owner[:6] + "-",
-		gatewayDev: "tvg" + owner[:6],
-		table:      "teploy_sbx_vm_" + owner[:8],
+		// An interface name has 15 characters: 3 + 6 + 1 leaves 5 for the
+		// slot. "n", "h" and "g" are not hex digits, so one kind of name
+		// can never be taken for another.
+		nsPrefix:      "tvn" + owner[:6] + "-",
+		tapPrefix:     "tv" + owner[:6] + "-",
+		linkPrefix:    "tvh" + owner[:6] + "-",
+		table:         "teploy_sbx_vm_" + owner[:8],
+		legacyGateway: "tvg" + owner[:6],
 	}
 	plan.first = plan.gateway.Next()
 	// Without the network address, the gateway and the broadcast address.
@@ -146,7 +181,9 @@ func planNetwork(config Config, discovered, local []netip.Addr) (netPlan, error)
 	return plan, nil
 }
 
-func (p netPlan) tapName(slot int) string { return fmt.Sprintf("%s%x", p.tapPrefix, slot) }
+func (p netPlan) nsName(slot int) string   { return fmt.Sprintf("%s%x", p.nsPrefix, slot) }
+func (p netPlan) tapName(slot int) string  { return fmt.Sprintf("%s%x", p.tapPrefix, slot) }
+func (p netPlan) linkName(slot int) string { return fmt.Sprintf("%s%x", p.linkPrefix, slot) }
 
 func (p netPlan) address(slot int) netip.Addr {
 	raw := p.first.As4()
@@ -155,11 +192,17 @@ func (p netPlan) address(slot int) netip.Addr {
 	return netip.AddrFrom4([4]byte{byte(value >> 24), byte(value >> 16), byte(value >> 8), byte(value)})
 }
 
-// macFor is a VM's MAC: locally administered, and a function of its
-// address, so the two are checked as a pair.
-func macFor(addr netip.Addr) string {
+// A hardware address is locally administered and a function of an IPv4
+// address, so the two are checked as a pair. macFor is a VM's own;
+// the others are the daemon's ends of the links it makes, set rather
+// than read so that every neighbour entry can be permanent.
+func macFor(addr netip.Addr) string        { return macWith(0x54, addr) }
+func gatewayMACFor(addr netip.Addr) string { return macWith(0x55, addr) }
+func linkMACFor(addr netip.Addr) string    { return macWith(0x56, addr) }
+func uplinkMACFor(addr netip.Addr) string  { return macWith(0x57, addr) }
+func macWith(kind byte, addr netip.Addr) string {
 	raw := addr.As4()
-	return fmt.Sprintf("02:54:%02x:%02x:%02x:%02x", raw[0], raw[1], raw[2], raw[3])
+	return fmt.Sprintf("02:%02x:%02x:%02x:%02x:%02x", kind, raw[0], raw[1], raw[2], raw[3])
 }
 
 // GuestNetwork is one VM's network device and what its guest is told.
@@ -177,10 +220,16 @@ type GuestNetwork struct {
 
 // Network gives VMs their network devices.
 type Network interface {
-	// Gateway is the address every guest reaches the host's proxies at.
+	// Gateway is the address every guest reaches its run's proxy at.
 	Gateway() netip.Addr
+	// Listen makes the place in the network of the VM that will have
+	// the given name, and a listener in it on the gateway address: the
+	// only thing an allowlist run's guest can connect to. Closing the
+	// listener gives the place back if no VM was ever attached to it.
+	Listen(ctx context.Context, name string) (net.Listener, error)
 	// Attach makes the device for a VM on a tier: run.NetworkAllowlist
-	// with the port of the run's proxy, or run.NetworkOpen.
+	// with the port of the run's proxy, which Listen made the listener
+	// for, or run.NetworkOpen.
 	Attach(ctx context.Context, name, tier string, proxyPort int) (*GuestNetwork, error)
 	// Detach removes a VM's device and everything that admitted it.
 	// Detaching what is not attached succeeds.
@@ -189,40 +238,74 @@ type Network interface {
 	// number of devices removed.
 	Sweep(ctx context.Context) (int, error)
 	// Close stops the network's upkeep and, when no VM is attached,
-	// removes its tables and gateway device.
+	// removes its table.
 	Close(ctx context.Context) error
 }
 
-// netSys is the host as the network uses it; tests replace it.
+// netSys is the host as the network uses it; tests replace it. Where a
+// function takes a namespace, the empty name is the host's own.
 type netSys struct {
 	// run runs ip, nft or conntrack and returns its stdout.
-	run func(ctx context.Context, name string, args ...string) ([]byte, error)
-	// nft applies a script as one transaction.
-	nft func(ctx context.Context, script string) error
+	run func(ctx context.Context, ns, name string, args ...string) ([]byte, error)
+	// nft applies a script as one transaction; ip applies a batch of ip
+	// commands, stopping at the first that fails.
+	nft func(ctx context.Context, ns, script string) error
+	ip  func(ctx context.Context, ns, batch string) error
 	// openTap creates a tap device, down, and returns it open.
-	openTap func(name string) (*os.File, error)
+	openTap func(ns, name string) (*os.File, error)
+	// listen makes a TCP listener that belongs to the namespace.
+	listen func(ns, addr string) (net.Listener, error)
 	// sysctl writes one value under /proc/sys.
-	sysctl func(key, value string) error
-	// links lists the host's interfaces, and linkMAC one's address.
-	links   func() ([]string, error)
-	linkMAC func(name string) (string, error)
+	sysctl func(ns, key, value string) error
+	// links lists the host's interfaces and namespaces the named network
+	// namespaces.
+	links      func() ([]string, error)
+	namespaces func() ([]string, error)
+	// addresses is the IPv4 addresses the host itself has.
+	addresses func() ([]netip.Addr, error)
 }
 
 func realNetSys() netSys {
+	command := func(ctx context.Context, ns string, stdin string, name string, args ...string) ([]byte, error) {
+		var stdout, stderr bytes.Buffer
+		cmd := exec.CommandContext(ctx, name, args...)
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if stdin != "" {
+			cmd.Stdin = strings.NewReader(stdin)
+		}
+		// Started from a thread that is in the namespace, the command is
+		// in it too.
+		if err := inNamespace(ns, cmd.Run); err != nil {
+			return nil, &CommandError{Command: strings.TrimSpace(name + " " + strings.Join(args, " ")), Stderr: strings.TrimSpace(stderr.String()), Err: err}
+		}
+		return stdout.Bytes(), nil
+	}
 	return netSys{
-		run: execCommander{}.Run,
-		nft: func(ctx context.Context, script string) error {
-			var stderr bytes.Buffer
-			cmd := exec.CommandContext(ctx, "nft", "-f", "-")
-			cmd.Stdin, cmd.Stderr = strings.NewReader(script), &stderr
-			if err := cmd.Run(); err != nil {
-				return &CommandError{Command: "nft -f", Stderr: strings.TrimSpace(stderr.String()), Err: err}
-			}
-			return nil
+		run: func(ctx context.Context, ns, name string, args ...string) ([]byte, error) {
+			return command(ctx, ns, "", name, args...)
 		},
-		openTap: openTap,
-		sysctl: func(key, value string) error {
-			return os.WriteFile("/proc/sys/"+key, []byte(value), 0)
+		nft: func(ctx context.Context, ns, script string) error {
+			_, err := command(ctx, ns, script, "nft", "-f", "-")
+			return err
+		},
+		ip: func(ctx context.Context, ns, batch string) error {
+			_, err := command(ctx, ns, batch, "ip", "-batch", "-")
+			return err
+		},
+		openTap: func(ns, name string) (tap *os.File, err error) {
+			return tap, inNamespace(ns, func() error {
+				tap, err = openTap(name)
+				return err
+			})
+		},
+		listen: func(ns, addr string) (listener net.Listener, err error) {
+			return listener, inNamespace(ns, func() error {
+				listener, err = net.Listen("tcp4", addr)
+				return err
+			})
+		},
+		sysctl: func(ns, key, value string) error {
+			return inNamespace(ns, func() error { return os.WriteFile("/proc/sys/"+key, []byte(value), 0) })
 		},
 		links: func() ([]string, error) {
 			interfaces, err := net.Interfaces()
@@ -235,21 +318,53 @@ func realNetSys() netSys {
 			}
 			return names, nil
 		},
-		linkMAC: func(name string) (string, error) {
-			raw, err := os.ReadFile("/sys/class/net/" + name + "/address")
-			return strings.TrimSpace(string(raw)), err
+		namespaces: func() ([]string, error) {
+			entries, err := os.ReadDir(netnsDir)
+			if os.IsNotExist(err) {
+				return nil, nil
+			}
+			names := make([]string, 0, len(entries))
+			for _, entry := range entries {
+				names = append(names, entry.Name())
+			}
+			return names, err
+		},
+		addresses: func() ([]netip.Addr, error) {
+			byInterface, err := hostAddresses()
+			if err != nil {
+				return nil, err
+			}
+			var found []netip.Addr
+			for _, prefixes := range byInterface {
+				for _, prefix := range prefixes {
+					found = append(found, prefix.Addr())
+				}
+			}
+			return found, nil
 		},
 	}
 }
 
-// attachment is one VM's place in the network.
+// attachment is one VM's place in the network: its namespace and what
+// is in it.
 type attachment struct {
-	name, tap, mac, tier string
-	slot                 int
-	addr                 netip.Addr
-	proxyPort            int
+	name, ns, tap, link, mac, tier string
+	slot                           int
+	addr                           netip.Addr
+	proxyPort                      int
+	// listener is an allowlist run's proxy listener, in the namespace.
+	listener net.Listener
+	// attached: a VM was given the tap. Until then the place is only
+	// held for one.
+	attached bool
 	// closing: no longer admitted, not yet cleaned up.
 	closing bool
+	// hostAddrs is the host's addresses the namespace has no route to.
+	hostAddrs []netip.Addr
+	// rules is the namespace's ruleset as the kernel listed it when it
+	// was last written; gone says its tap went with its VM.
+	rules string
+	gone  bool
 }
 
 // errSuperseded is what a network answers once another instance of this
@@ -262,8 +377,8 @@ type hostNetwork struct {
 	plan netPlan
 	sys  netSys
 	log  *slog.Logger
-	// instance marks the tables as written by this hostNetwork: a chain
-	// of that name exists in them.
+	// instance marks the host's table as written by this hostNetwork: a
+	// chain of that name exists in it.
 	instance string
 
 	mu         sync.Mutex
@@ -271,8 +386,11 @@ type hostNetwork struct {
 	slots      map[int]bool
 	next       int
 	superseded bool
-	stop       chan struct{}
-	stopped    sync.WaitGroup
+	// hostRules is the host's table as the kernel listed it when it was
+	// last written.
+	hostRules string
+	stop      chan struct{}
+	stopped   sync.WaitGroup
 }
 
 func newHostNetwork(plan netPlan, sys netSys, log *slog.Logger) *hostNetwork {
@@ -309,35 +427,22 @@ func (n *hostNetwork) claim() {
 	}
 }
 
-// start makes the gateway device and the tables, and begins watching
-// them. From here on a tap of this daemon identity that nothing admits is
-// dropped at every hook.
+// start writes the host's table and begins watching it. From here on a
+// link of this daemon identity that nothing admits is dropped at every
+// hook: whatever a previous daemon life left running has no way out.
 func (n *hostNetwork) start(ctx context.Context) error {
-	gateway := n.plan.gateway.String() + "/32"
-	if _, err := n.sys.run(ctx, "ip", "link", "add", n.plan.gatewayDev, "type", "dummy"); err != nil && !strings.Contains(err.Error(), "File exists") {
-		return fmt.Errorf("create the gateway device %s (is the dummy module available? `modprobe dummy`): %w", n.plan.gatewayDev, err)
-	}
-	if _, err := n.sys.run(ctx, "ip", "addr", "replace", gateway, "dev", n.plan.gatewayDev); err != nil {
-		return fmt.Errorf("give %s the gateway address: %w", n.plan.gatewayDev, err)
-	}
-	if _, err := n.sys.run(ctx, "ip", "link", "set", "dev", n.plan.gatewayDev, "up"); err != nil {
-		return err
-	}
 	n.claim()
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if err := n.sys.nft(ctx, n.rulesLocked()); err != nil {
-		return fmt.Errorf("install the firewall (nftables with the inet and netdev families is needed): %w", err)
-	}
-	if err := n.sys.nft(ctx, "add table netdev "+n.plan.table+"\n"); err != nil {
-		return fmt.Errorf("install the firewall (nftables with the netdev family is needed): %w", err)
+	if err := n.writeHostLocked(ctx); err != nil {
+		return fmt.Errorf("install the firewall (nftables with the inet family is needed): %w", err)
 	}
 	// An accept in this daemon's table does not overrule a drop in
 	// another's: every table on a hook has to let a packet pass.
-	if listing, err := n.sys.run(ctx, "nft", "list", "chains"); err == nil {
+	if listing, err := n.sys.run(ctx, "", "nft", "list", "chains"); err == nil {
 		for _, chain := range foreignDropChains(string(listing), n.plan.table) {
-			n.log.Warn("another firewall table drops by default on a hook guests' traffic passes; unless it allows that traffic, runs with a network will not reach their proxy (input) or the internet (forward)",
-				"chain", chain, "taps", n.plan.tapPrefix+"*", "subnet", n.plan.subnet.String())
+			n.log.Warn("another firewall table drops forwarded traffic by default; unless it allows what arrives on this daemon's links, runs with network \"open\" will not reach the internet",
+				"chain", chain, "links", n.plan.linkPrefix+"*", "subnet", n.plan.subnet.String())
 		}
 	}
 	n.stop = make(chan struct{})
@@ -346,8 +451,10 @@ func (n *hostNetwork) start(ctx context.Context) error {
 	return nil
 }
 
-// foreignDropChains finds, in the output of `nft list chains`, the input
-// and forward base chains of other tables whose policy is drop.
+// foreignDropChains finds, in the output of `nft list chains`, the
+// forward base chains of other tables whose policy is drop. Only the
+// open tier passes the host's firewall at all: an allowlist run reaches
+// its proxy inside its own namespace.
 func foreignDropChains(listing, ownTable string) []string {
 	var found []string
 	table, chain := "", ""
@@ -365,7 +472,7 @@ func foreignDropChains(listing, ownTable string) []string {
 					hook = fields[i+1]
 				}
 			}
-			if (hook == "input" || hook == "forward") && !strings.HasSuffix(table, " "+ownTable) {
+			if hook == "forward" && !strings.HasSuffix(table, " "+ownTable) {
 				found = append(found, "table "+table+" chain "+chain+" (hook "+hook+")")
 			}
 		}
@@ -373,37 +480,43 @@ func foreignDropChains(listing, ownTable string) []string {
 	return found
 }
 
-// rulesLocked is the whole inet table as one transaction that replaces
-// whatever is there. It is a function of the attached VMs alone, so it
-// can be applied again at any time, and a table that something else
-// removed is put back exactly.
+func (n *hostNetwork) blocked() []string {
+	if n.plan.openPrivate {
+		return neverReachable
+	}
+	return notPublic
+}
+
+func joinAddrs(addrs []netip.Addr) string {
+	text := make([]string, len(addrs))
+	for i, addr := range addrs {
+		text[i] = addr.String()
+	}
+	return strings.Join(text, ", ")
+}
+
+// rulesLocked is the host's whole table as one transaction that replaces
+// whatever is there. It is a function of the attached open runs alone,
+// so it can be applied again at any time, and a table that something
+// else removed or emptied is put back exactly.
+//
+// Only open runs' links exist on the host, so only they are judged here,
+// and what is said here is said again inside each run's namespace.
 func (n *hostNetwork) rulesLocked() string {
 	p := n.plan
-	var open, proxies []string
+	var open []string
 	for _, each := range n.attached {
-		if each.closing {
+		if each.closing || !each.attached || each.tier != run.NetworkOpen {
 			continue
 		}
-		switch each.tier {
-		case run.NetworkOpen:
-			open = append(open, fmt.Sprintf("%q . %s", each.tap, each.addr))
-		case run.NetworkAllowlist:
-			proxies = append(proxies, fmt.Sprintf("%q . %s . %d", each.tap, each.addr, each.proxyPort))
-		}
+		open = append(open, fmt.Sprintf("%q . %s", each.link, each.addr))
 	}
 	slices.Sort(open)
-	slices.Sort(proxies)
-	elements := func(list []string) string {
-		if len(list) == 0 {
-			return ""
-		}
-		return " elements = { " + strings.Join(list, ", ") + " }"
+	elements := ""
+	if len(open) > 0 {
+		elements = " elements = { " + strings.Join(open, ", ") + " }"
 	}
-	blocked := notPublic
-	if p.openPrivate {
-		blocked = neverReachable
-	}
-	taps := fmt.Sprintf("%q", p.tapPrefix+"*")
+	links := fmt.Sprintf("%q", p.linkPrefix+"*")
 	var b strings.Builder
 	line := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
 	// "add" first so that "delete" cannot fail on a table that is not
@@ -412,28 +525,18 @@ func (n *hostNetwork) rulesLocked() string {
 	line("add table inet %s", p.table)
 	line("delete table inet %s", p.table)
 	line("table inet %s {", p.table)
-	line("	set open { type ifname . ipv4_addr;%s }", elements(open))
-	line("	set proxy { type ifname . ipv4_addr . inet_service;%s }", elements(proxies))
+	line("	set open { type ifname . ipv4_addr;%s }", elements)
 	line("	chain %s { }", n.instance)
-	// What a guest sends to the host itself, on any of its addresses.
-	line("	chain guest_input {")
-	line("		meta nfproto ipv4 ip daddr %s meta l4proto tcp iifname . ip saddr . tcp dport @proxy accept", p.gateway)
-	line("		counter drop")
-	line("	}")
-	// What a guest sends through the host.
-	line("	chain guest_forward {")
+	// What an open run sends through the host.
+	line("	chain from_guest {")
 	line("		meta nfproto != ipv4 counter drop")
-	line("		oifname %s counter drop", taps)
+	line("		oifname %s counter drop", links)
 	line("		ip daddr %s counter drop", p.subnet)
 	line("		iifname . ip saddr != @open counter drop")
 	if len(p.dns) > 0 {
-		dns := make([]string, len(p.dns))
-		for i, addr := range p.dns {
-			dns[i] = addr.String()
-		}
-		line("		ip daddr { %s } meta l4proto { tcp, udp } th dport 53 accept", strings.Join(dns, ", "))
+		line("		ip daddr { %s } meta l4proto { tcp, udp } th dport 53 accept", joinAddrs(p.dns))
 	}
-	line("		ip daddr { %s } counter drop", strings.Join(blocked, ", "))
+	line("		ip daddr { %s } counter drop", strings.Join(n.blocked(), ", "))
 	line("		tcp dport 25 counter drop")
 	line("		accept")
 	line("	}")
@@ -442,49 +545,160 @@ func (n *hostNetwork) rulesLocked() string {
 	line("		ct state established,related accept")
 	line("		counter drop")
 	line("	}")
+	// What a guest sends to the host itself, on any of its addresses:
+	// nothing is for it there.
 	line("	chain input {")
 	line("		type filter hook input priority filter - 5; policy accept;")
-	line("		iifname %s jump guest_input", taps)
-	line("		iifname != \"lo\" ip daddr %s counter drop", p.subnet)
+	line("		iifname %s counter drop", links)
 	line("	}")
 	line("	chain forward {")
 	line("		type filter hook forward priority filter - 5; policy accept;")
-	line("		iifname %s jump guest_forward", taps)
-	line("		oifname %s jump to_guest", taps)
+	line("		iifname %s jump from_guest", links)
+	line("		oifname %s jump to_guest", links)
 	line("	}")
 	line("	chain postrouting {")
 	line("		type nat hook postrouting priority srcnat; policy accept;")
-	line("		iifname %s oifname != %s ip saddr %s masquerade", taps, taps, p.subnet)
+	line("		iifname %s oifname != %s ip saddr %s masquerade", links, links, p.subnet)
 	line("	}")
 	line("}")
 	return b.String()
 }
 
-func chainName(slot int) string { return fmt.Sprintf("tap%x", slot) }
-
-// ingressRules is the filter at one tap's ingress hook, where a frame is
-// judged before any of the host's protocol code runs on it.
-func (n *hostNetwork) ingressRules(a *attachment) string {
-	table, chain := n.plan.table, chainName(a.slot)
+// runRules is the whole ruleset of one run's namespace, as one
+// transaction that replaces whatever is there. With sealed, nothing
+// passes: the state of a namespace that has no VM (yet, or any more).
+//
+// Both base chains drop by default, so a rule that is missing closes
+// something rather than opening it.
+func (n *hostNetwork) runRules(a *attachment, sealed bool) string {
+	p := n.plan
 	var b strings.Builder
 	line := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
-	line("add table netdev %s", table)
-	line("add chain netdev %s %s { type filter hook ingress device %q priority -300; policy drop; }", table, chain, a.tap)
-	// ARP: only a question about the gateway, from the VM's own MAC and
-	// address. The host never has to ask a guest anything (its neighbour
-	// entry for the guest is permanent), so no answer is let in.
-	line("add rule netdev %s %s ether saddr %s ether type arp arp htype 1 arp ptype ip arp hlen 6 arp plen 4 arp operation request arp saddr ether %s arp saddr ip %s arp daddr ip %s accept",
-		table, chain, a.mac, a.mac, a.addr, n.plan.gateway)
-	line("add rule netdev %s %s ether saddr %s ether type ip ip saddr %s ip daddr != { 224.0.0.0/4, 255.255.255.255 } accept",
-		table, chain, a.mac, a.addr)
-	// Everything else: another MAC or source address, IPv6, VLAN tags,
-	// multicast, any other ethertype.
-	line("add rule netdev %s %s counter drop", table, chain)
+	for _, family := range []string{"inet", "netdev"} {
+		line("add table %s %s", family, runTable)
+		line("delete table %s %s", family, runTable)
+	}
+	if !sealed {
+		// At the tap's ingress hook a frame is judged before any of the
+		// namespace's protocol code runs on it.
+		line("table netdev %s {", runTable)
+		line("	chain ingress {")
+		line("		type filter hook ingress device %q priority -300; policy drop;", a.tap)
+		// ARP: only a question about the gateway, from the VM's own MAC
+		// and address. Nobody has to ask a guest anything (the neighbour
+		// entry for the guest is permanent), so no answer is let in.
+		line("		ether saddr %s ether type arp arp htype 1 arp ptype ip arp hlen 6 arp plen 4 arp operation request arp saddr ether %s arp saddr ip %s arp daddr ip %s accept",
+			a.mac, a.mac, a.addr, p.gateway)
+		line("		ether saddr %s ether type ip ip saddr %s ip daddr != { 224.0.0.0/4, 255.255.255.255 } accept", a.mac, a.addr)
+		// Everything else: another MAC or source address, IPv6, VLAN
+		// tags, multicast, any other ethertype.
+		line("		counter drop")
+		line("	}")
+		line("}")
+	}
+	line("table inet %s {", runTable)
+	// What the guest sends to the namespace itself: its proxy's port on
+	// the gateway address, if it has a proxy.
+	line("	chain input {")
+	line("		type filter hook input priority filter; policy drop;")
+	line("		meta nfproto != ipv4 counter drop")
+	if !sealed && a.tier == run.NetworkAllowlist {
+		line("		iifname %q ip saddr %s ip daddr %s tcp dport %d accept", a.tap, a.addr, p.gateway, a.proxyPort)
+	}
+	line("		counter drop")
+	line("	}")
+	line("	chain forward {")
+	line("		type filter hook forward priority filter; policy drop;")
+	line("		meta nfproto != ipv4 counter drop")
+	if !sealed && a.tier == run.NetworkOpen {
+		// To the guest: answers, nothing else.
+		line("		iifname %q oifname %q ct state established,related accept", uplinkDev, a.tap)
+		line("		iifname %q oifname %q ip saddr %s jump out", a.tap, uplinkDev, a.addr)
+	}
+	line("		counter drop")
+	line("	}")
+	if !sealed && a.tier == run.NetworkOpen {
+		line("	chain out {")
+		line("		ip daddr %s counter drop", p.subnet)
+		if len(a.hostAddrs) > 0 {
+			line("		ip daddr { %s } counter drop", joinAddrs(a.hostAddrs))
+		}
+		if len(p.dns) > 0 {
+			line("		ip daddr { %s } meta l4proto { tcp, udp } th dport 53 accept", joinAddrs(p.dns))
+		}
+		line("		ip daddr { %s } counter drop", strings.Join(n.blocked(), ", "))
+		line("		tcp dport 25 counter drop")
+		line("		accept")
+		line("	}")
+	}
+	line("}")
 	return b.String()
 }
 
-// tableState asks who wrote the tables: this instance, another one, or
-// nobody (they are gone).
+// openRoutes is the routing of an open run's namespace: where a packet
+// from the guest can go when no firewall rule is asked. The ranges that
+// are not the public internet, the guests' subnet and the host's own
+// addresses are unreachable routes; port 25 is an unreachable rule; DNS
+// to the configured resolvers, which may be in a private range, is
+// looked up in a table of its own that knows only the link.
+func (n *hostNetwork) openRoutes(a *attachment) string {
+	p := n.plan
+	var b strings.Builder
+	line := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
+	line("link set dev %s up", uplinkDev)
+	// Permanent: nothing is asked on the link and nothing sent on it can
+	// change the answer.
+	line("neigh replace %s lladdr %s dev %s nud permanent", uplinkHop, linkMACFor(a.addr), uplinkDev)
+	line("rule add pref 100 ipproto tcp dport 25 unreachable")
+	for i, resolver := range p.dns {
+		line("rule add pref %d to %s/32 ipproto udp dport 53 lookup %s", 200+2*i, resolver, dnsTable)
+		line("rule add pref %d to %s/32 ipproto tcp dport 53 lookup %s", 201+2*i, resolver, dnsTable)
+	}
+	line("route replace default via %s dev %s onlink table %s", uplinkHop, uplinkDev, dnsTable)
+	for _, blocked := range append(slices.Clone(n.blocked()), p.subnet.String()) {
+		line("route replace unreachable %s", blocked)
+	}
+	b.WriteString(hostRoutes(nil, a.hostAddrs))
+	line("route replace default via %s dev %s onlink", uplinkHop, uplinkDev)
+	return b.String()
+}
+
+// hostRoutes is the batch that moves a namespace's unreachable routes
+// for the host's own addresses from one set to another.
+func hostRoutes(old, current []netip.Addr) string {
+	var b strings.Builder
+	for _, addr := range old {
+		if !slices.Contains(current, addr) {
+			fmt.Fprintf(&b, "route del unreachable %s/32\n", addr)
+		}
+	}
+	for _, addr := range current {
+		fmt.Fprintf(&b, "route replace unreachable %s/32\n", addr)
+	}
+	return b.String()
+}
+
+// hostAddrsLocked is the host's own IPv4 addresses that an open run's
+// namespace must have no route to: every one that is not loopback (which
+// never has a route from a guest) or in the guests' subnet.
+func (n *hostNetwork) hostAddrsLocked() ([]netip.Addr, error) {
+	all, err := n.sys.addresses()
+	if err != nil {
+		return nil, fmt.Errorf("list the host's addresses: %w", err)
+	}
+	var addrs []netip.Addr
+	for _, addr := range all {
+		addr = addr.Unmap()
+		if addr.Is4() && !addr.IsLoopback() && !n.plan.subnet.Contains(addr) && !slices.Contains(addrs, addr) {
+			addrs = append(addrs, addr)
+		}
+	}
+	slices.SortFunc(addrs, netip.Addr.Compare)
+	return addrs, nil
+}
+
+// tableState asks who wrote the host's table: this instance, another
+// one, or nobody (it is gone).
 type tableState int
 
 const (
@@ -497,27 +711,68 @@ func (n *hostNetwork) tableStateLocked(ctx context.Context) tableState {
 	if n.superseded {
 		return tablesForeign
 	}
-	if _, err := n.sys.run(ctx, "nft", "list", "chain", "inet", n.plan.table, n.instance); err == nil {
+	if _, err := n.sys.run(ctx, "", "nft", "list", "chain", "inet", n.plan.table, n.instance); err == nil {
 		return tablesOurs
 	}
-	if _, err := n.sys.run(ctx, "nft", "list", "table", "inet", n.plan.table); err == nil {
+	if _, err := n.sys.run(ctx, "", "nft", "list", "table", "inet", n.plan.table); err == nil {
 		n.superseded = true
 		return tablesForeign
 	}
 	return tablesMissing
 }
 
-// applyLocked brings the inet table in line with the attached VMs.
+// listHost and listRun are a ruleset as the kernel has it, without its
+// counters: what is compared to find a change.
+func (n *hostNetwork) listHost(ctx context.Context) (string, error) {
+	out, err := n.sys.run(ctx, "", "nft", "-s", "list", "table", "inet", n.plan.table)
+	return string(out), err
+}
+
+func (n *hostNetwork) listRun(ctx context.Context, a *attachment) (string, error) {
+	out, err := n.sys.run(ctx, a.ns, "nft", "-s", "list", "ruleset")
+	return string(out), err
+}
+
+// writeHostLocked writes the host's table and remembers how the kernel
+// lists it.
+func (n *hostNetwork) writeHostLocked(ctx context.Context) error {
+	if err := n.sys.nft(ctx, "", n.rulesLocked()); err != nil {
+		return err
+	}
+	listing, err := n.listHost(ctx)
+	if err != nil {
+		return fmt.Errorf("read the firewall back: %w", err)
+	}
+	n.hostRules = listing
+	return nil
+}
+
+// writeRun writes a run's ruleset and remembers how the kernel lists it.
+func (n *hostNetwork) writeRun(ctx context.Context, a *attachment, sealed bool) error {
+	if err := n.sys.nft(ctx, a.ns, n.runRules(a, sealed)); err != nil {
+		return err
+	}
+	listing, err := n.listRun(ctx, a)
+	if err != nil {
+		return fmt.Errorf("read the ruleset back: %w", err)
+	}
+	a.rules = listing
+	return nil
+}
+
+// applyLocked brings the host's table in line with the attached VMs.
 func (n *hostNetwork) applyLocked(ctx context.Context) error {
 	if n.tableStateLocked(ctx) == tablesForeign {
 		return errSuperseded
 	}
-	return n.sys.nft(ctx, n.rulesLocked())
+	return n.writeHostLocked(ctx)
 }
 
-// watch puts the tables back when something else removed them. A host's
-// own firewall reload often starts with "flush ruleset", and without the
-// tables a guest's packets would be forwarded like anyone's.
+// watch puts back what something else removed or changed. A host's own
+// firewall reload often starts with "flush ruleset". That does not open
+// anything (see the top of this file), but it does take the open runs'
+// way out, and a rule that was changed by hand is not the rule that was
+// reviewed.
 func (n *hostNetwork) watch(stop <-chan struct{}) {
 	defer n.stopped.Done()
 	ticker := time.NewTicker(watchInterval)
@@ -534,9 +789,10 @@ func (n *hostNetwork) watch(stop <-chan struct{}) {
 	}
 }
 
-// check is one look at the tables; it reports whether to keep looking.
+// check is one look at every ruleset this network wrote; it reports
+// whether to keep looking.
 func (n *hostNetwork) check(ctx context.Context) bool {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -545,49 +801,89 @@ func (n *hostNetwork) check(ctx context.Context) bool {
 		return false
 	case tablesMissing:
 		n.log.Error("the vm firewall table was removed by something else; putting it back", "table", n.plan.table)
-		if err := n.sys.nft(ctx, n.rulesLocked()); err != nil {
+		if err := n.writeHostLocked(ctx); err != nil {
 			n.log.Error("restore the vm firewall table", "error", err)
 			return true
 		}
+	default:
+		if listing, err := n.listHost(ctx); err != nil || listing != n.hostRules {
+			n.log.Error("the vm firewall table was changed by something else; putting it back", "table", n.plan.table)
+			if err := n.writeHostLocked(ctx); err != nil {
+				n.log.Error("restore the vm firewall table", "error", err)
+				return true
+			}
+		}
 	}
-	chains, err := n.sys.run(ctx, "nft", "list", "table", "netdev", n.plan.table)
-	links, linksErr := n.sys.links()
+	hostAddrs, addrsErr := n.hostAddrsLocked()
 	for _, each := range n.attached {
-		if each.closing || (err == nil && strings.Contains(string(chains), "chain "+chainName(each.slot)+" {")) {
+		if each.closing || !each.attached || each.gone {
 			continue
 		}
-		if linksErr == nil && !slices.Contains(links, each.tap) {
+		if addrsErr == nil && each.tier == run.NetworkOpen && !slices.Equal(hostAddrs, each.hostAddrs) {
+			// The host got or lost an address: the namespace's routes
+			// and rules name the ones it has now.
+			if err := n.sys.ip(ctx, each.ns, hostRoutes(each.hostAddrs, hostAddrs)); err != nil {
+				n.log.Error("update a run's routes to the host's addresses", "namespace", each.ns, "error", err)
+				continue
+			}
+			each.hostAddrs = hostAddrs
+			if err := n.writeRun(ctx, each, false); err != nil {
+				n.log.Error("update a run's ruleset to the host's addresses", "namespace", each.ns, "error", err)
+			}
+			continue
+		}
+		if listing, err := n.listRun(ctx, each); err == nil && listing == each.rules {
+			continue
+		}
+		if _, err := n.sys.run(ctx, each.ns, "ip", "link", "show", "dev", each.tap); err != nil {
 			// The VM is gone (its guest powered off, or its hypervisor
 			// died) and took the tap along, and the kernel removed the
-			// filter with the device. There is nothing to filter and
-			// nothing to restore until the run is removed; a guest must
-			// not be able to make the daemon log an error every two
-			// seconds by shutting down.
+			// tap's filter with the device. There is nothing left to
+			// filter; the namespace is sealed until the run is removed.
+			// Said once: a guest must not be able to make the daemon log
+			// an error every two seconds by shutting down.
+			each.gone = true
+			if err := n.writeRun(ctx, each, true); err != nil && !isGone(err) {
+				n.log.Error("seal the namespace of a VM that is gone", "namespace", each.ns, "error", err)
+			}
 			continue
 		}
-		n.log.Error("a tap's ingress filter was removed by something else; putting it back", "tap", each.tap)
-		if err := n.sys.nft(ctx, n.ingressRules(each)); err != nil {
-			// The tap may be gone with its VM; the inet table still
-			// drops what it does not know.
-			n.log.Error("restore a tap's ingress filter", "tap", each.tap, "error", err)
+		n.log.Error("a run's ruleset was removed or changed by something else; putting it back", "namespace", each.ns, "tap", each.tap)
+		if err := n.writeRun(ctx, each, false); err != nil {
+			n.log.Error("restore a run's ruleset", "namespace", each.ns, "error", err)
 		}
 	}
 	return true
 }
 
-func (n *hostNetwork) Attach(ctx context.Context, name, tier string, proxyPort int) (_ *GuestNetwork, err error) {
-	switch {
-	case tier == run.NetworkAllowlist && (proxyPort < 1 || proxyPort > 65535):
-		return nil, errors.New("an allowlist run needs its proxy's port")
-	case tier != run.NetworkAllowlist && tier != run.NetworkOpen:
-		return nil, fmt.Errorf("no network device for tier %q", tier)
-	case tier == run.NetworkOpen && len(n.plan.dns) == 0:
-		return nil, errors.New("no DNS resolver to give an open run")
-	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
+// Sysctls of a run's namespace, set before anything is in it. No IPv6
+// at all: no link-local address, no neighbour discovery, no router
+// advertisements in either direction. A packet is only accepted from the
+// interface its source is routed to, which for the tap is the VM's one
+// address. Nothing is routed until a run is open, and the namespace's
+// own addresses do not answer a ping: the gateway address is where a
+// proxy listens and nothing else.
+var namespaceSysctls = [][2]string{
+	{"net/ipv4/icmp_echo_ignore_all", "1"},
+	{"net/ipv6/conf/all/disable_ipv6", "1"},
+	{"net/ipv6/conf/default/disable_ipv6", "1"},
+	{"net/ipv4/ip_forward", "0"},
+	{"net/ipv4/conf/all/rp_filter", "1"},
+	{"net/ipv4/conf/default/rp_filter", "1"},
+	{"net/ipv4/conf/all/accept_redirects", "0"},
+	{"net/ipv4/conf/default/accept_redirects", "0"},
+	{"net/ipv4/conf/all/send_redirects", "0"},
+	{"net/ipv4/conf/default/send_redirects", "0"},
+	{"net/ipv4/conf/all/proxy_arp", "0"},
+	{"net/ipv4/conf/default/proxy_arp", "0"},
+}
+
+// placeLocked makes the place of the VM that will be called name: a slot,
+// an address, and a namespace that holds the gateway address, lets
+// nothing in and leads nowhere.
+func (n *hostNetwork) placeLocked(ctx context.Context, name string) (_ *attachment, err error) {
 	if _, exists := n.attached[name]; exists {
-		return nil, fmt.Errorf("%s already has a network device", name)
+		return nil, fmt.Errorf("%s already has a place in the network", name)
 	}
 	if n.tableStateLocked(ctx) == tablesForeign {
 		return nil, errSuperseded
@@ -605,11 +901,128 @@ func (n *hostNetwork) Attach(ctx context.Context, name, tier string, proxyPort i
 	if slot < 0 {
 		return nil, fmt.Errorf("all %d guest addresses in %s are in use", n.plan.slots, n.plan.subnet)
 	}
-	a := &attachment{name: name, slot: slot, tap: n.plan.tapName(slot), addr: n.plan.address(slot), tier: tier, proxyPort: proxyPort}
+	a := &attachment{name: name, slot: slot, ns: n.plan.nsName(slot), tap: n.plan.tapName(slot), link: n.plan.linkName(slot), addr: n.plan.address(slot)}
 	a.mac = macFor(a.addr)
 	n.next = (slot + 1) % n.plan.slots
 	n.slots[slot] = true
 	n.attached[name] = a
+	defer func() {
+		if err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+			defer cancel()
+			// What cannot be cleaned up now stays known, and the Detach
+			// the caller makes on failure tries again.
+			err = errors.Join(err, n.detachLocked(cleanupCtx, name))
+		}
+	}()
+	// A namespace or a link of this name can only be a leftover: the slot
+	// was free.
+	if err = n.removeLocked(ctx, a); err != nil {
+		return nil, err
+	}
+	if _, err = n.sys.run(ctx, "", "ip", "netns", "add", a.ns); err != nil {
+		return nil, fmt.Errorf("create the network namespace %s: %w", a.ns, err)
+	}
+	for _, setting := range namespaceSysctls {
+		if err = n.sys.sysctl(a.ns, setting[0], setting[1]); err != nil && !(os.IsNotExist(err) && strings.Contains(setting[0], "ipv6")) {
+			return nil, fmt.Errorf("set %s in %s: %w", setting[0], a.ns, err)
+		}
+	}
+	// The rules before anything can arrive.
+	if err = n.writeRun(ctx, a, true); err != nil {
+		return nil, fmt.Errorf("seal %s: %w", a.ns, err)
+	}
+	// The gateway address is the namespace's own, on its loopback: it is
+	// there before the tap is, for the proxy to listen on.
+	if err = n.sys.ip(ctx, a.ns, fmt.Sprintf("link set dev lo up\naddr replace %s/32 dev lo\n", n.plan.gateway)); err != nil {
+		return nil, fmt.Errorf("give %s the gateway address: %w", a.ns, err)
+	}
+	return a, nil
+}
+
+func (n *hostNetwork) Listen(ctx context.Context, name string) (net.Listener, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	a, err := n.placeLocked(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	// The socket belongs to the namespace: it is reachable from the run's
+	// tap and from nowhere else, and what it accepts is served by the
+	// daemon, in the host's namespace. The port is the slot's own, so no
+	// two runs that exist at the same time have the same proxy address,
+	// and a port is not used again before the namespace that had it is
+	// gone.
+	listener, err := n.sys.listen(a.ns, net.JoinHostPort(n.plan.gateway.String(), fmt.Sprint(proxyPortBase+a.slot)))
+	if err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		return nil, errors.Join(fmt.Errorf("listen in %s: %w", a.ns, err), n.detachLocked(cleanupCtx, name))
+	}
+	a.tier, a.listener = run.NetworkAllowlist, listener
+	a.proxyPort = proxyPortBase + a.slot
+	return &placedListener{Listener: listener, network: n, place: a}, nil
+}
+
+// placedListener is a run's proxy listener. Closing it gives back the
+// place it was made in, unless a VM has it: then the place goes when the
+// VM is detached.
+type placedListener struct {
+	net.Listener
+	network *hostNetwork
+	place   *attachment
+	once    sync.Once
+}
+
+func (l *placedListener) Close() (err error) {
+	l.once.Do(func() {
+		err = l.Listener.Close()
+		n := l.network
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if n.attached[l.place.name] != l.place || l.place.attached {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if detachErr := n.detachLocked(ctx, l.place.name); detachErr != nil {
+			n.log.Error("give back the network place of a run that never started", "namespace", l.place.ns, "error", detachErr)
+		}
+	})
+	return err
+}
+
+func (n *hostNetwork) Attach(ctx context.Context, name, tier string, proxyPort int) (_ *GuestNetwork, err error) {
+	switch {
+	case tier == run.NetworkAllowlist && (proxyPort < 1 || proxyPort > 65535):
+		return nil, errors.New("an allowlist run needs its proxy's port")
+	case tier != run.NetworkAllowlist && tier != run.NetworkOpen:
+		return nil, fmt.Errorf("no network device for tier %q", tier)
+	case tier == run.NetworkOpen && len(n.plan.dns) == 0:
+		return nil, errors.New("no DNS resolver to give an open run")
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	a := n.attached[name]
+	switch {
+	case a != nil && (a.attached || a.closing):
+		return nil, fmt.Errorf("%s already has a network device", name)
+	case tier == run.NetworkAllowlist && (a == nil || a.listener == nil || a.proxyPort != proxyPort):
+		// The proxy is the tier, and it has to listen where this guest,
+		// and no other, can reach it.
+		return nil, fmt.Errorf("the proxy of %s does not listen on port %d in the run's own network namespace", name, proxyPort)
+	case tier == run.NetworkOpen && a != nil:
+		return nil, fmt.Errorf("%s holds a place in the network for a proxy, and an open run has none", name)
+	}
+	if n.tableStateLocked(ctx) == tablesForeign {
+		return nil, errSuperseded
+	}
+	if a == nil {
+		if a, err = n.placeLocked(ctx, name); err != nil {
+			return nil, err
+		}
+	}
+	a.tier, a.attached = tier, true
 
 	var tap *os.File
 	defer func() {
@@ -625,69 +1038,82 @@ func (n *hostNetwork) Attach(ctx context.Context, name, tier string, proxyPort i
 		}
 	}()
 
-	// A device of this name can only be a leftover: the slot was free.
-	_, _ = n.sys.run(ctx, "ip", "link", "del", a.tap)
-	if tap, err = n.sys.openTap(a.tap); err != nil {
-		return nil, fmt.Errorf("create tap %s: %w", a.tap, err)
-	}
-	// The device is down. Everything that decides what it may do is in
-	// place before it is brought up.
-	conf4, conf6 := "net/ipv4/conf/"+a.tap+"/", "net/ipv6/conf/"+a.tap+"/"
-	// No IPv6 on the host's side of the tap: no link-local address, no
-	// neighbour discovery, no router advertisements in either direction.
-	if err = n.sys.sysctl(conf6+"disable_ipv6", "1"); err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("turn IPv6 off on %s: %w", a.tap, err)
-	}
-	forwarding := "0"
 	if tier == run.NetworkOpen {
-		forwarding = "1"
-	}
-	// The kernel's own switch, beside the firewall's: nothing that
-	// arrives on an allowlist run's tap is routed anywhere.
-	for _, setting := range [][2]string{{"forwarding", forwarding}, {"proxy_arp", "0"}, {"send_redirects", "0"}, {"accept_redirects", "0"}} {
-		if err = n.sys.sysctl(conf4+setting[0], setting[1]); err != nil {
-			return nil, fmt.Errorf("set %s on %s: %w", setting[0], a.tap, err)
-		}
-	}
-	// Whatever the connection tracker remembers about this address
-	// belongs to a VM that is gone.
-	if err = n.forgetConnections(ctx, a.addr); err != nil {
-		return nil, err
-	}
-	_, _ = n.sys.run(ctx, "nft", "delete", "chain", "netdev", n.plan.table, chainName(slot))
-	if err = n.sys.nft(ctx, n.ingressRules(a)); err != nil {
-		return nil, fmt.Errorf("install the ingress filter of %s: %w", a.tap, err)
-	}
-	if err = n.sys.nft(ctx, n.rulesLocked()); err != nil {
-		return nil, fmt.Errorf("admit %s: %w", a.tap, err)
-	}
-	for _, args := range [][]string{
-		{"link", "set", "dev", a.tap, "up"},
-		{"route", "replace", a.addr.String() + "/32", "dev", a.tap},
-		// Permanent: the host never asks the guest who has its address,
-		// and nothing the guest sends can change the answer.
-		{"neigh", "replace", a.addr.String(), "lladdr", a.mac, "dev", a.tap, "nud", "permanent"},
-	} {
-		if _, err = n.sys.run(ctx, "ip", args...); err != nil {
+		if a.hostAddrs, err = n.hostAddrsLocked(); err != nil {
 			return nil, err
 		}
+		// Whatever the host's connection tracker remembers about this
+		// address belongs to a VM that is gone.
+		if err = n.forgetConnections(ctx, a.addr); err != nil {
+			return nil, err
+		}
+		// The link: one end on the host, the other in the namespace,
+		// both down, with addresses that are set rather than learned.
+		if _, err = n.sys.run(ctx, "", "ip", "link", "add", a.link, "address", linkMACFor(a.addr),
+			"type", "veth", "peer", "name", uplinkDev, "address", uplinkMACFor(a.addr), "netns", a.ns); err != nil {
+			return nil, fmt.Errorf("create the link %s: %w", a.link, err)
+		}
+		conf4, conf6 := "net/ipv4/conf/"+a.link+"/", "net/ipv6/conf/"+a.link+"/"
+		if err = n.sys.sysctl("", conf6+"disable_ipv6", "1"); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("turn IPv6 off on %s: %w", a.link, err)
+		}
+		for _, setting := range [][2]string{{"forwarding", "1"}, {"rp_filter", "1"}, {"proxy_arp", "0"}, {"send_redirects", "0"}, {"accept_redirects", "0"}} {
+			if err = n.sys.sysctl("", conf4+setting[0], setting[1]); err != nil {
+				return nil, fmt.Errorf("set %s on %s: %w", setting[0], a.link, err)
+			}
+		}
 	}
-	hostMAC, err := n.sys.linkMAC(a.tap)
-	if err != nil {
-		return nil, fmt.Errorf("read the address of %s: %w", a.tap, err)
+	if tap, err = n.sys.openTap(a.ns, a.tap); err != nil {
+		return nil, fmt.Errorf("create tap %s in %s: %w", a.tap, a.ns, err)
 	}
-	guest := &GuestNetwork{Tap: tap, MAC: a.mac, HostMAC: hostMAC, Address: a.addr, Gateway: n.plan.gateway, Tier: tier}
+	// The devices are down. Everything that decides what they may do is
+	// in place before they are brought up: the namespace's ruleset, the
+	// host's table, the routes.
+	if err = n.sys.ip(ctx, a.ns, fmt.Sprintf("link set dev %s address %s\n", a.tap, gatewayMACFor(n.plan.gateway))); err != nil {
+		return nil, fmt.Errorf("set the address of %s: %w", a.tap, err)
+	}
+	if err = n.writeRun(ctx, a, false); err != nil {
+		return nil, fmt.Errorf("install the ruleset of %s: %w", a.ns, err)
+	}
+	var routes strings.Builder
+	fmt.Fprintf(&routes, "link set dev %s up\n", a.tap)
+	fmt.Fprintf(&routes, "route replace %s/32 dev %s\n", a.addr, a.tap)
+	// Permanent: the guest is never asked who has its address, and
+	// nothing it sends can change the answer.
+	fmt.Fprintf(&routes, "neigh replace %s lladdr %s dev %s nud permanent\n", a.addr, a.mac, a.tap)
+	if tier == run.NetworkOpen {
+		if err = n.writeHostLocked(ctx); err != nil {
+			return nil, fmt.Errorf("admit %s: %w", a.link, err)
+		}
+		routes.WriteString(n.openRoutes(a))
+	}
+	if err = n.sys.ip(ctx, a.ns, routes.String()); err != nil {
+		return nil, fmt.Errorf("route %s: %w", a.ns, err)
+	}
+	if tier == run.NetworkOpen {
+		// Last: the kernel's own switch in the namespace, and the host's
+		// end of the link.
+		if err = n.sys.sysctl(a.ns, "net/ipv4/ip_forward", "1"); err != nil {
+			return nil, fmt.Errorf("turn forwarding on in %s: %w", a.ns, err)
+		}
+		if err = n.sys.ip(ctx, "", fmt.Sprintf("link set dev %[1]s up\nroute replace %[2]s/32 dev %[1]s\nneigh replace %[2]s lladdr %[3]s dev %[1]s nud permanent\n",
+			a.link, a.addr, uplinkMACFor(a.addr))); err != nil {
+			return nil, fmt.Errorf("route %s on the host: %w", a.link, err)
+		}
+	}
+	guest := &GuestNetwork{Tap: tap, MAC: a.mac, HostMAC: gatewayMACFor(n.plan.gateway), Address: a.addr, Gateway: n.plan.gateway, Tier: tier}
 	if tier == run.NetworkOpen {
 		guest.DNS = slices.Clone(n.plan.dns)
 	}
 	return guest, nil
 }
 
-// forgetConnections deletes the connection tracker's entries that began
-// at addr. Without it, whoever a VM was talking to could keep sending to
-// the next VM that gets the address, as "answers".
+// forgetConnections deletes the host's connection tracker's entries that
+// began at addr. Without it, whoever a VM was talking to could keep
+// sending to the next VM that gets the address, as "answers". (What a
+// run's own namespace tracked goes with the namespace.)
 func (n *hostNetwork) forgetConnections(ctx context.Context, addr netip.Addr) error {
-	_, err := n.sys.run(ctx, "conntrack", "-D", "-s", addr.String())
+	_, err := n.sys.run(ctx, "", "conntrack", "-D", "-s", addr.String())
 	var failed *CommandError
 	// It exits 1 with this message when there was nothing to delete.
 	if err != nil && !(errors.As(err, &failed) && strings.Contains(failed.Stderr, "0 flow entries")) {
@@ -702,6 +1128,18 @@ func (n *hostNetwork) Detach(ctx context.Context, name string) error {
 	return n.detachLocked(ctx, name)
 }
 
+// removeLocked removes a place's link and namespace, and with the
+// namespace everything in it. Both may be gone already.
+func (n *hostNetwork) removeLocked(ctx context.Context, a *attachment) error {
+	if _, err := n.sys.run(ctx, "", "ip", "link", "del", a.link); err != nil && !isGone(err) {
+		return fmt.Errorf("remove the link %s: %w", a.link, err)
+	}
+	if _, err := n.sys.run(ctx, "", "ip", "netns", "del", a.ns); err != nil && !isGone(err) {
+		return fmt.Errorf("remove the network namespace %s: %w", a.ns, err)
+	}
+	return nil
+}
+
 // detachLocked can be repeated: every step succeeds on what is already
 // gone, and the VM's slot is only free once all of them have.
 func (n *hostNetwork) detachLocked(ctx context.Context, name string) error {
@@ -709,23 +1147,27 @@ func (n *hostNetwork) detachLocked(ctx context.Context, name string) error {
 	if !ok {
 		return nil
 	}
-	// First the admission: from here the tap is one the tables do not
-	// know, and they drop everything from it.
+	// First the admission: from here the link is one the host's table
+	// does not know, and it drops everything from it.
 	a.closing = true
-	if err := n.applyLocked(ctx); err != nil && !errors.Is(err, errSuperseded) {
-		return fmt.Errorf("revoke %s: %w", a.tap, err)
+	if a.tier == run.NetworkOpen && a.attached {
+		if err := n.applyLocked(ctx); err != nil && !errors.Is(err, errSuperseded) {
+			return fmt.Errorf("revoke %s: %w", a.link, err)
+		}
 	}
 	if !n.superseded {
-		if _, err := n.sys.run(ctx, "nft", "delete", "chain", "netdev", n.plan.table, chainName(a.slot)); err != nil && !isGone(err) {
-			return fmt.Errorf("remove the ingress filter of %s: %w", a.tap, err)
-		}
-		// The tap goes with the hypervisor that held it; this is for one
-		// that is somehow still there.
-		if _, err := n.sys.run(ctx, "ip", "link", "del", a.tap); err != nil && !isGone(err) {
-			return fmt.Errorf("remove tap %s: %w", a.tap, err)
-		}
-		if err := n.forgetConnections(ctx, a.addr); err != nil {
+		// The tap goes with the hypervisor that held it. The namespace
+		// goes here, and its rules, routes and connection tracking with
+		// it. Should a hypervisor that could not be killed still hold
+		// the tap, the kernel keeps the namespace for it, without a
+		// name and without the link: it leads nowhere.
+		if err := n.removeLocked(ctx, a); err != nil {
 			return err
+		}
+		if a.tier == run.NetworkOpen && a.attached {
+			if err := n.forgetConnections(ctx, a.addr); err != nil {
+				return err
+			}
 		}
 	}
 	delete(n.attached, name)
@@ -749,31 +1191,46 @@ func (n *hostNetwork) Sweep(ctx context.Context) (int, error) {
 	if n.tableStateLocked(ctx) == tablesForeign {
 		return 0, errSuperseded
 	}
-	names, err := n.sys.links()
-	if err != nil {
-		return 0, fmt.Errorf("list interfaces: %w", err)
-	}
 	live := map[string]bool{}
 	for _, each := range n.attached {
-		live[each.tap] = true
+		live[each.ns], live[each.link] = true, true
 	}
 	removed := 0
-	for _, name := range names {
-		if !strings.HasPrefix(name, n.plan.tapPrefix) || live[name] {
+	namespaces, err := n.sys.namespaces()
+	if err != nil {
+		return 0, fmt.Errorf("list network namespaces: %w", err)
+	}
+	for _, name := range namespaces {
+		if !strings.HasPrefix(name, n.plan.nsPrefix) || live[name] {
 			continue
 		}
-		if _, err := n.sys.run(ctx, "ip", "link", "del", name); err != nil && !isGone(err) {
-			return removed, fmt.Errorf("remove leftover tap %s: %w", name, err)
+		if _, err := n.sys.run(ctx, "", "ip", "netns", "del", name); err != nil && !isGone(err) {
+			return removed, fmt.Errorf("remove leftover network namespace %s: %w", name, err)
 		}
 		removed++
 	}
-	if len(n.attached) == 0 {
-		// Ingress filters of taps that are gone.
-		if err := n.sys.nft(ctx, fmt.Sprintf("add table netdev %[1]s\ndelete table netdev %[1]s\nadd table netdev %[1]s\n", n.plan.table)); err != nil {
-			return removed, err
+	links, err := n.sys.links()
+	if err != nil {
+		return removed, fmt.Errorf("list interfaces: %w", err)
+	}
+	for _, name := range links {
+		// The links of open runs, and what a version of this driver that
+		// kept guests' taps on the host left there.
+		legacy := strings.HasPrefix(name, n.plan.tapPrefix) || name == n.plan.legacyGateway
+		if !(strings.HasPrefix(name, n.plan.linkPrefix) || legacy) || live[name] {
+			continue
+		}
+		if _, err := n.sys.run(ctx, "", "ip", "link", "del", name); err != nil && !isGone(err) {
+			return removed, fmt.Errorf("remove leftover interface %s: %w", name, err)
+		}
+		if legacy && name != n.plan.legacyGateway {
+			removed++
 		}
 	}
-	return removed, n.sys.nft(ctx, n.rulesLocked())
+	if err := n.sys.nft(ctx, "", fmt.Sprintf("add table netdev %[1]s\ndelete table netdev %[1]s\n", n.plan.table)); err != nil {
+		return removed, err
+	}
+	return removed, n.writeHostLocked(ctx)
 }
 
 func (n *hostNetwork) Close(ctx context.Context) error {
@@ -788,17 +1245,43 @@ func (n *hostNetwork) Close(ctx context.Context) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if len(n.attached) > 0 || n.tableStateLocked(ctx) != tablesOurs {
-		// A VM that could not be torn down keeps the tables that confine
-		// it; tables another instance wrote are that instance's.
+		// A VM that could not be torn down keeps the table that judges
+		// its link; a table another instance wrote is that instance's.
 		return nil
 	}
 	n.superseded = true
-	script := fmt.Sprintf("add table netdev %[1]s\ndelete table netdev %[1]s\nadd table inet %[1]s\ndelete table inet %[1]s\n", n.plan.table)
-	if err := n.sys.nft(ctx, script); err != nil {
+	return n.sys.nft(ctx, "", fmt.Sprintf("add table inet %[1]s\ndelete table inet %[1]s\n", n.plan.table))
+}
+
+// probeNamespace makes, and removes again, a network namespace with
+// everything a run's is made of: the namespace itself, a link into it, a
+// routing rule that matches a port, a ruleset and a tap. It is how a
+// host that cannot do one of these is found before the first create.
+func probeNamespace(ctx context.Context, sys netSys, name string) (err error) {
+	link := "tvp" + strings.TrimPrefix(strings.TrimSuffix(name, "-probe"), "tvn")
+	remove := func() {
+		_, _ = sys.run(ctx, "", "ip", "link", "del", link)
+		_, _ = sys.run(ctx, "", "ip", "netns", "del", name)
+	}
+	remove()
+	defer remove()
+	if _, err := sys.run(ctx, "", "ip", "netns", "add", name); err != nil {
 		return err
 	}
-	if _, err := n.sys.run(ctx, "ip", "link", "del", n.plan.gatewayDev); err != nil && !isGone(err) {
-		return err
+	if _, err := sys.run(ctx, "", "ip", "link", "add", link, "type", "veth", "peer", "name", uplinkDev, "netns", name); err != nil {
+		return fmt.Errorf("a veth link into a namespace: %w", err)
+	}
+	if err := sys.ip(ctx, name, "rule add pref 100 ipproto tcp dport 25 unreachable\nroute replace unreachable 192.0.2.0/24\n"); err != nil {
+		return fmt.Errorf("routing rules in a namespace: %w", err)
+	}
+	tap, err := sys.openTap(name, "probe")
+	if err != nil {
+		return fmt.Errorf("a tap in a namespace: %w", err)
+	}
+	defer tap.Close()
+	rules := fmt.Sprintf("table netdev %[1]s {\n chain ingress { type filter hook ingress device \"probe\" priority -300; policy drop; }\n}\ntable inet %[1]s {\n chain forward { type filter hook forward priority filter; policy drop; ct state established,related accept; }\n}\n", runTable)
+	if err := sys.nft(ctx, name, rules); err != nil {
+		return fmt.Errorf("an nftables ruleset in a namespace (the inet and netdev families and connection tracking are needed): %w", err)
 	}
 	return nil
 }

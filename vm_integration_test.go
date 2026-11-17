@@ -130,7 +130,7 @@ func newVMManagerLogging(t *testing.T, config vm.Config, stateDir string, logs i
 	manager := run.NewManager(driver, log)
 	manager.SandboxUser = ""
 	if gateway, ok := driver.Gateway(); ok {
-		pool := &egress.Pool{Base: egress.DefaultAllowlist, Bind: gateway, Log: log, Private: true}
+		pool := &egress.Pool{Base: egress.DefaultAllowlist, Bind: gateway, Log: log, Private: true, Listen: driver.ProxyListener}
 		t.Cleanup(pool.Shutdown)
 		manager.Egress = pool
 	}

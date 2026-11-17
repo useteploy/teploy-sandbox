@@ -414,7 +414,8 @@ type bootResult struct {
 	cachePath   string
 }
 
-func containerName(id string) string { return "teploy-sbx-" + strings.ToLower(id) }
+// ContainerName is the name a run's container (or VM) is created under.
+func ContainerName(id string) string { return "teploy-sbx-" + strings.ToLower(id) }
 
 // boot starts the container for b: warm volume, per-run proxy, container,
 // snapshot seed. On failure it gives back everything it took — except when
@@ -426,7 +427,7 @@ func (m *Manager) boot(ctx context.Context, b bootRequest) (res bootResult, left
 		return res, "", fmt.Errorf("%w: this daemon has no egress proxy, so egressAllow cannot be honoured", ErrBadRequest)
 	}
 	spec := CreateSpec{
-		Name:     containerName(b.id),
+		Name:     ContainerName(b.id),
 		Image:    b.image,
 		Env:      b.env,
 		MemoryMB: b.limits.MemoryMB,
@@ -661,6 +662,12 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 	}
 	m.mu.Unlock()
 	// Revoke egress immediately; keep the volume/registry until removal succeeds.
+	// The port a closed proxy had does not become another run's door for
+	// the run that is still being removed: under the Docker driver the
+	// host firewall admits a port only while its own proxy listens, and
+	// every private proxy asks for its own credential; under the VM
+	// driver a proxy's port exists only inside its run's own network
+	// namespace, and is not given out again while that namespace does.
 	m.closeEgress(id)
 	attempt, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()

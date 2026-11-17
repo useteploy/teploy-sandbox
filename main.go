@@ -257,8 +257,8 @@ func serve(args []string) error {
 			return err
 		}
 		defer func() {
-			// After every run is gone: with no VM left, the firewall
-			// tables and the gateway device go too.
+			// After every run is gone: with no VM left, the host's
+			// firewall table goes too.
 			closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			if err := driver.Close(closeCtx); err != nil {
@@ -276,13 +276,13 @@ func serve(args []string) error {
 		if processes > 0 || volumes > 0 {
 			log.Info("swept orphaned run VMs from a previous daemon life", "processes", processes, "volumes", volumes)
 		}
-		// Every allowlist run gets a proxy and a credential of its own, on
-		// the address guests reach the host at. There is no shared
-		// listener: a guest is admitted to its own run's port and no other.
+		// Every allowlist run gets a proxy and a credential of its own.
+		// There is no shared listener: each proxy listens inside its
+		// run's own network namespace, where no other guest is.
 		if gateway, ok := driver.Gateway(); ok {
 			allow := append(egress.Allowlist{}, egress.DefaultAllowlist...)
 			allow = append(allow, deployAllow...)
-			pool = &egress.Pool{Base: allow, Bind: gateway, Log: log, Private: true}
+			pool = &egress.Pool{Base: allow, Bind: gateway, Log: log, Private: true, Listen: driver.ProxyListener}
 			defer pool.Shutdown()
 		}
 		backend = driver

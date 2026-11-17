@@ -116,6 +116,9 @@ type host struct {
 	addresses func() (map[string][]netip.Prefix, error)
 	// resolvers is the IPv4 resolvers the host itself uses.
 	resolvers func() []netip.Addr
+	// probeNamespace makes and removes a network namespace of the given
+	// name with everything a run's has.
+	probeNamespace func(name string) error
 	// subordinateIDs is the ranges /etc/subuid and /etc/subgid hand out.
 	subordinateIDs func() ([]idRange, error)
 }
@@ -155,9 +158,14 @@ func realHost() host {
 			raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
 			return strings.TrimSpace(string(raw)) == "1", err
 		},
-		openTun:        tunAvailable,
-		addresses:      hostAddresses,
-		resolvers:      func() []netip.Addr { return hostResolvers(os.ReadFile) },
+		openTun:   tunAvailable,
+		addresses: hostAddresses,
+		resolvers: func() []netip.Addr { return hostResolvers(os.ReadFile) },
+		probeNamespace: func(name string) error {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			return probeNamespace(ctx, realNetSys(), name)
+		},
 		subordinateIDs: func() ([]idRange, error) { return subordinateIDs(os.ReadFile) },
 		lookPath:       exec.LookPath,
 		stat:           os.Stat,
@@ -536,13 +544,21 @@ func preflight(ctx context.Context, config Config, zfs ZFS, host host) error {
 // the network configuration. Each thing the host lacks is reported through
 // miss; an error is a configuration that cannot be used at all.
 func networkPlan(config Config, host host, miss func(format string, args ...any)) (netPlan, error) {
+	tools := true
 	for tool, why := range map[string]string{
-		"ip":        "iproute2: taps, routes and neighbour entries for guests",
-		"nft":       "nftables: the firewall between guests, the host and the network",
+		"ip":        "iproute2: each run's network namespace, its routes and neighbour entries",
+		"nft":       "nftables: the firewall in each run's network namespace and on the host",
 		"conntrack": "conntrack-tools: forgetting a VM's connections when its address is given up",
 	} {
 		if _, err := host.lookPath(tool); err != nil {
 			miss("the %q command (%s)", tool, why)
+			tools = false
+		}
+	}
+	if tools && host.euid() == 0 && len(config.Owner) >= 8 {
+		// Everything a run's network is made of, made once and removed.
+		if err := host.probeNamespace("tvn" + config.Owner[:6] + "-probe"); err != nil {
+			miss("network namespaces as the driver uses them: a named namespace (`ip netns add`), a veth link into it, a routing rule that matches a port (Linux 4.17 or newer) and an nftables ruleset inside it; the trial failed: %v (scripts/install-host.sh checks the same)", err)
 		}
 	}
 	if err := host.openTun(); err != nil {
@@ -568,7 +584,9 @@ func networkPlan(config Config, host host, miss func(format string, args ...any)
 		return plan, fmt.Errorf("a usable guest subnet and resolvers (--vm-subnet / SBX_VM_SUBNET, --vm-dns / SBX_VM_DNS): %w", err)
 	}
 	for name, prefixes := range addresses {
-		if name == plan.gatewayDev || strings.HasPrefix(name, plan.tapPrefix) {
+		if name == plan.legacyGateway || strings.HasPrefix(name, plan.tapPrefix) {
+			// What an earlier version of the driver left; the sweep
+			// removes it.
 			continue
 		}
 		for _, prefix := range prefixes {

@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -297,7 +298,7 @@ func (d *Driver) proxyPort(proxyURL string) (int, error) {
 		return 0, errors.New("the egress proxy URL names no port")
 	}
 	if gateway := d.network.Gateway().String(); parsed.Hostname() != gateway {
-		return 0, fmt.Errorf("the egress proxy listens on %s, which no guest can reach (guests reach the host at %s)", parsed.Hostname(), gateway)
+		return 0, fmt.Errorf("the egress proxy listens on %s, which no guest can reach (a guest reaches its proxy at %s)", parsed.Hostname(), gateway)
 	}
 	return port, nil
 }
@@ -540,7 +541,8 @@ func (d *Driver) RemoveImage(ctx context.Context, imageRef string) error {
 // this daemon identity owns is a leftover of a previous daemon life —
 // running runs do not survive a restart, and stopped ones have neither.
 // Processes go first; a volume cannot be destroyed while one has it open,
-// and a tap is only removed once the VM behind it is dead.
+// and a run's network namespace is only removed once the VM behind its
+// tap is dead.
 func (d *Driver) Sweep(ctx context.Context) (processes, volumes int, err error) {
 	if processes, err = d.hypervisor.Sweep(ctx); err != nil {
 		return processes, 0, fmt.Errorf("sweep vm processes: %w", err)
@@ -560,8 +562,28 @@ func (d *Driver) Sweep(ctx context.Context) (processes, volumes int, err error) 
 	return processes, volumes, nil
 }
 
-// Gateway is the address guests reach the host at: where the daemon's
-// per-run proxies must listen. False when the driver has no networking.
+// ProxyListener is the listener of the proxy of the run with the given
+// ID: a socket in the network namespace the run's VM will be in, on the
+// gateway address. It is how egress.Pool listens under this driver (its
+// Listen field). Only that run's guest can connect to it; closing it
+// before a VM was created gives its place in the network back.
+func (d *Driver) ProxyListener(runID string) (net.Listener, error) {
+	if d.network == nil {
+		return nil, unsupported("has no guest networking on this daemon")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	listener, err := d.network.Listen(ctx, run.ContainerName(runID))
+	if err != nil {
+		return nil, err
+	}
+	d.log.Info("vm proxy listener ready", "name", run.ContainerName(runID), "addr", listener.Addr().String(), "hostSetup", time.Since(start).String())
+	return listener, nil
+}
+
+// Gateway is the address a guest reaches its run's proxy at, in every
+// run's own network namespace. False when the driver has no networking.
 func (d *Driver) Gateway() (string, bool) {
 	if d.network == nil {
 		return "", false
@@ -570,7 +592,7 @@ func (d *Driver) Gateway() (string, bool) {
 }
 
 // Close stops the driver's upkeep of the host's network and removes its
-// firewall tables when no VM is left. It does not touch VMs.
+// firewall table when no VM is left. It does not touch VMs.
 func (d *Driver) Close(ctx context.Context) error {
 	if d.network == nil {
 		return nil

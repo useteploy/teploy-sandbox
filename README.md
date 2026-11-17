@@ -296,7 +296,12 @@ The layers are independent; each is checked by the live suite.
   disk is opened (measured: under 20 MiB/s a guest wrote at 19.6 and
   read at 20.2 MiB/s against 349 and 580 without; under 500 operations
   per second it made 494 and 505 against 3946 and 5383). The limits are the daemon's, for every run; a create cannot
-  change them. A guest that uses all of its memory
+  change them. They are for a VM that is alive: I/O the kernel holds
+  back for the limit cannot be taken back, a killed process does not
+  end while it has any, and the guest chooses how much it queues, so a
+  VM that was killed keeps its limits for 3 seconds and then has them
+  lifted (what is left of its queue reaches the volume at the volume's
+  speed, once). A guest that uses all of its memory
   stays inside that (measured: at most 7 MiB over the guest's size); a
   hypervisor that grows past it is killed by the host's kernel and the
   run reports its VM gone. The group is removed with the VM, and a

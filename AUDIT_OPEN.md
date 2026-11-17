@@ -1213,3 +1213,112 @@ Live, on the real hypervisor:
   a dynamically linked hypervisor was not run with a hypervisor; a
   udev rule file that honours neither flag; the per-identity
   directories that are never swept.
+
+
+## 2026-11-16 — VM driver: independent review of the filter, the socket filesystem and the limits
+
+A review of the entry above by someone who did not write it, on the
+same arm64 host. Three defects, each fixed with a test; the whole
+`vmintegration` suite passes afterwards (thirteen tests), and CI's
+`vm-root` job passes on x86-64.
+
+### Found and fixed
+
+- **A guest could keep its own removal waiting, for as long as it
+  liked.** I/O the kernel holds back for `io.max` cannot be taken back,
+  and a killed process does not end while it has any (it waits in the
+  kernel for its asynchronous I/O to finish). How much is queued is the
+  guest's choice. On the real hypervisor, under `--vm-disk-mbps 2`: a
+  guest that wrote `1048576` to its disk's `max_sectors_kb` and started
+  48 direct writes of 16 MiB had about 760 MiB queued; after the kill
+  its hypervisor stayed for 6 min 20 s, with its memory, volume, cgroup
+  and UID, and every destroy in that time failed with `hypervisor
+  process … did not exit`. With the stock setting and 10 MiB/s a destroy
+  took 14.7 s of the 15 it has. A guest with a block driver of its own
+  can queue far more than its memory (one request may name the same
+  pages many times), so the default of 256 MiB/s was minutes too; a
+  daemon that restarted meanwhile would have failed its startup sweep.
+  Now a killed VM keeps its limits for `DrainGrace` (3 s) and then has
+  them lifted, in `Kill`, in the removal of a cgroup and in the sweep.
+  The same guest: destroyed in 3.6 to 4.1 s
+  (`TestVMDestroyIsNotHeldByQueuedIO`, live;
+  `TestAKilledGroupIsNotHeldByItsDiskLimit`, unit). The price: what is
+  left of a killed VM's queue reaches the volume at the volume's speed,
+  once. A caller that creates, queues and destroys in a loop gets that
+  much unlimited I/O per VM it boots; the alternative was a VM that
+  cannot be removed.
+- **CI's `vm-root` job passed when a test failed.** The step piped the
+  test binary into `tee`, and a step's shell is `bash -e` without
+  `pipefail` unless a shell is named (the job's log shows `shell:
+  /usr/bin/bash -e {0}`), so the step ended with `tee`'s status. Only a
+  failure of one of the four tests whose `PASS` line is looked for
+  failed the job. It also only looked for skips of `TestJail*` and
+  `TestSocketDir*`. Now `set -o pipefail`, and any skip fails it (none
+  of the package's tests skips as root on the runner).
+  `TestCIStepsThatPipeFailWithTheirTests` reads the workflow.
+- **The filter did not name the newer mount calls.** `open_tree_attr`
+  (Linux 6.15; `open_tree` and `mount_setattr` in one call), `statmount`
+  and `listmount` (6.8; what is mounted where and from what, which a
+  jail without `/proc` otherwise keeps to itself). Without the filter
+  each reaches the kernel from a jailed process (`bad address`, on
+  x86-64 in CI and, for the two that 6.8 has, on arm64 here); with it,
+  `EPERM`. No hypervisor allowlist has them, so this is for the time
+  before that filter is installed and for a version that would add
+  them. Every number in both tables was compared with the kernel's
+  (`arch/x86/entry/syscalls/syscall_64.tbl` and `scripts/syscall.tbl`
+  of v6.17) by a script: 66 on amd64 and 58 on arm64, no difference.
+
+### Checked and found sound
+
+- **The filter.** The architecture is checked before anything else and
+  x32 before any number is compared. `clone`'s flags and a socket's
+  family are read from the low half of the argument, which is all the
+  kernel reads of either (`lower_32_bits(clone_flags)`, `int family`):
+  nothing in the high half changes what the kernel does. Neither
+  architecture has `socketcall` in its 64-bit table; the 32-bit table
+  that has it is the one that kills. A later filter cannot weaken an
+  answer (the kernel takes the strictest; a user notification ranks
+  below `EPERM`). The helper is locked to one thread from before
+  `no_new_privs` to the exec.
+- **`io.max` on a ZFS volume**, by hand on a scratch volume under
+  10 MiB/s: buffered writes with and without `fsync` 10.5 MB/s,
+  buffered reads 10.5, direct 10.5 each way, `BLKZEROOUT` of 60 MiB
+  6.0 s. A discard is charged as one operation and 512 bytes whatever
+  its length (`blkdiscard` of 256 MiB: 0.13 s), so it is bounded by the
+  operations limit only; 100 discards under 20 operations per second
+  took 4.9 s, and a synchronous write counts as two.
+- **`ct count`.** A flood of new flows that the rule or a later one
+  drops (195,000 packets per second for 40 s, here, and again in the
+  first minute after a boot) leaves nothing behind: the kernel's list
+  of counted connections did not grow and the host's slab did not move.
+- **The socket filesystem.** Mounted before the chown and the bind, in
+  a tree the helper has made private; removed after the cgroup is
+  empty; the sweep unmounts only inside this daemon identity's runtime
+  dir and never follows a link.
+- **The watch.** The host's table is written in one transaction with
+  the mark in it, so a table without a mark is never another
+  instance's.
+
+### What remains, beyond the entry above
+
+- **With io_uring refused, every VM's disk depends on Linux AIO, and
+  `fs.aio-max-nr` is one number for the host** (65536 by default; a VM
+  takes 128). A hypervisor that was taken over can take all of it with
+  one `io_setup`. Tried here from another UID: VMs created meanwhile
+  boot and work (the hypervisor falls back to synchronous I/O), slower.
+  Not fixed: a filter cannot count, and a larger sysctl only moves the
+  number.
+- **The connection count times the number of runs** is what the host's
+  connection table and the daemon's descriptors (two per proxied
+  connection) have to hold: at the default of 4096, 64 open runs fill a
+  table of 262144, and about as many allowlist runs a descriptor limit
+  of 524288. Size `nf_conntrack_max` and `LimitNOFILE` for the runs a
+  host is to carry, or lower `--vm-net-connections`.
+- **What an allowlist run sends** could be given a rate without the
+  proxy: a policer on the tap's ingress (`tc filter … action police`)
+  is on a device and covers both tiers. Not done.
+- **The watch's two questions are not one.** Between asking whose the
+  table is and comparing it, another instance may write it; the older
+  one then writes its own back and the newer one stands down. It takes
+  two daemons with one identity and a window of milliseconds; it was
+  there before this change.

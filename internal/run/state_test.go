@@ -481,9 +481,9 @@ func TestSnapshotNotesDecode(t *testing.T) {
 	for name, bad := range map[string]string{
 		"not this daemon's": `{"version":1,"snapshotNotes":[{"ref":"elsewhere","state":"waiting"}]}`,
 		"unknown state":     `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","state":"gone"}]}`,
-		"duplicate":        `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","state":"waiting"},{"ref":"tank/sbx/teploy-snap-1","state":"deleting"}]}`,
-		"not a run id":     `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","run":"nope","state":"waiting"}]}`,
-		"foreign base":     `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","base":"elsewhere","state":"waiting"}]}`,
+		"duplicate":         `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","state":"waiting"},{"ref":"tank/sbx/teploy-snap-1","state":"deleting"}]}`,
+		"not a run id":      `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","run":"nope","state":"waiting"}]}`,
+		"foreign base":      `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","base":"elsewhere","state":"waiting"}]}`,
 	} {
 		if _, _, _, _, err := decodeState([]byte(bad), owns); err == nil {
 			t.Fatalf("a malformed note (%s) must refuse the registry file", name)

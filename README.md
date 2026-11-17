@@ -625,7 +625,8 @@ the unit tests in `internal/vm`):
 `CGO_ENABLED=0 go test -c -tags vmintegration -o vm.test . && sudo ./vm.test -test.run TestVM -test.v`
 (with `SBX_VM_WARM=1x512=2,1x1024=1` the whole suite runs with a warm
 pool, and the network and lifecycle tests then get pool VMs; the
-`TestVMWarmPool` test brings its own pool either way)
+`TestVMWarmPool` and `TestVMWarmPoolRaces` tests bring their own pool
+either way)
 
 ## Writable leases
 

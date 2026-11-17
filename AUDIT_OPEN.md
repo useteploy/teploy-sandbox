@@ -1532,3 +1532,117 @@ VMs among the leftovers.
   never settles gets its device later or not at all (the setup gives up
   after about 15 s and the create fails).
 - Unchanged from the entries above: everything they list as open.
+
+
+## 2026-11-16 — VM driver: independent review of the warm pool and the hot-plugged network device
+
+A second reader went through the entry above (`1dbafef..bb42790`) with
+the code, the unit suite and the same nested arm64 host. Five defects,
+each fixed with a test in its own commit; none of them let one run reach
+another, or a run reach the host. One new live test,
+`TestVMWarmPoolRaces`. The whole `vmintegration` suite (fifteen tests
+now) passes with the pool on (`SBX_VM_WARM=1x512=2,1x1024=1`).
+
+### Defects found and fixed
+
+- **The answer to `vm.add-net` was read without a bound.** `AddNet`
+  writes its request by hand (the descriptor has to travel with it) and
+  read the answer with `http.ReadResponse` straight off the socket,
+  which reads a status line and headers of any length. What answers is
+  the VM's own process. A resume or a fork boots a tenant's disk before
+  the device is plugged in, so a guest that takes its hypervisor over
+  during boot is what answers: a status line that never ends was the
+  daemon's memory until the 15 s deadline (64 MiB in 50 ms on a unix
+  socket, in the test). The daemon reads at most 64 KiB of the answer
+  now. (`Pause` and `Resume` go through `http.Client`, which bounds
+  headers itself, and bound the body.) Shown against a real unix socket
+  in the unit test, not with a live hypervisor.
+- **`--vm-warm-headroom-mb 0` kept the default headroom.** The pool's
+  defaults were applied twice, when the driver was made ("none" became
+  zero) and when the pool was (zero became 1024 MiB). The flag's "0 is
+  none" was never true, and on a small host the pool did not fill.
+- **A pool whose VMs die was a boot loop.** A pool VM that exited while
+  it waited was replaced at once, and a boot that succeeded cleared the
+  pause after boots that failed. VMs that boot, answer once and then
+  exit (a golden image that powers off, a host that kills what it has
+  no memory for) were cloned, jailed and booted one after another as
+  fast as the host could, for ever: 522 boots in 1.5 s against the
+  fakes. A death in the pool now pauses the pool's boots as a failed
+  boot does, doubling up to a minute, until a create takes a VM. In the
+  same code, a failed boot logged the failure count after giving up the
+  pool's lock: a data race between two boots failing together (the race
+  detector shows it with eight).
+- **A size the host has no memory for held back every size after it.**
+  The refill stopped at the first size the memory guard refused, so
+  with `--vm-warm 4x8192=1,1x512=4` on a host short of the large one's
+  memory, the small ones were never booted. Each size is held back, and
+  logged, on its own.
+- **A full daemon did the work of a create before refusing it.**
+  `--vm-max-runs` was looked at in `Create`, after the manager had
+  opened the run's proxy: for an allowlist run a network namespace, its
+  ruleset and a listener, taken down again for the 503, under the
+  network's lock. `AdmitCreate` asks first now; `Create` still decides.
+  (A resume or a fork of an allowlist run at capacity still opens its
+  proxy before it is refused: they do not pass `AdmitCreate`.)
+
+### Checked and found sound
+
+- **One VM, one run.** A VM leaves the pool in `take`, under the pool's
+  lock, and no path puts one back: a failed claim, a dead VM and a
+  closing pool all end in `discard`. Live: nine creates at once over
+  the three tiers against a pool of three got nine different VMs, none
+  of them still the pool's, each networked one a different address,
+  and none found another run's marker file.
+- **A claim against everything else** (`TestVMWarmPoolRaces`, live). A
+  caller that gives up 1 to 300 ms into a claim, nine times over two
+  tiers: every create failed, no run was registered, and afterwards the
+  host held the pool and nothing else (no hypervisor, volume, namespace,
+  link or admission). The three pool VMs killed at the moment three
+  creates took them, on each tier: a create either got a whole run (a
+  VM booted for it, when the pool's was already dead) or failed with
+  the VM destroyed; nothing half made was left or reachable. The driver
+  closed with four claims under way: the pool was gone in 0.1 to 0.3 s, the
+  creates finished, and the next start's sweep left the host clean.
+- **The descriptor goes to the VM it is for.** `AddNet` dials through
+  the same `cell.dial` as every other call, so the `SO_PEERCRED` check
+  of who listens is made on the very connection the descriptor is then
+  sent on; a socket another UID listens on is sent nothing (unit test).
+  The descriptor is the tap the daemon itself just made in the run's
+  own namespace, found by the run's name, which the guest and the
+  hypervisor have no part in. A VM's UID is its own until its cell is
+  released, which is after its process is gone. Descriptors a
+  hypervisor might send back are never received: the daemon reads the
+  socket without a control buffer.
+- **Before the device.** A VM has no network device from its boot to
+  the claim, and its hypervisor is in a namespace with no interface.
+  The tap is handed over only after `Attach` has returned, which is
+  after the namespace's ruleset, the shaping, the routes and (open) the
+  host's admission are in place, as before. A run is registered, and
+  can be given a command, only after the claim has returned.
+- **Restart, shutdown, the reaper.** Pool VMs are swept at start by the
+  command line and cgroup that every VM of the identity has; the pool
+  starts only after the sweep; the registry never holds one. The HTTP
+  contract only gains (`warmPool` in capacity when a pool is
+  configured, 503 `at-capacity` when `--vm-max-runs` is set); the
+  Docker driver implements neither interface and is untouched.
+
+### What remains, beyond the entry above
+
+- **A create whose pool VM dies under it fails.** It is not retried
+  with a VM booted for it; the caller gets a 500 and may ask again. The
+  window is the claim itself.
+- **One caller can keep the pool empty.** Every create that takes a
+  pool VM costs the host a boot, whether the run is kept, destroyed at
+  once or abandoned mid-claim (a claim whose caller gives up destroys
+  the VM). There is no fairness between callers: the others then wait
+  for a cold boot, as with no pool.
+- **A closing daemon removes its pool one VM at a time** under the 15 s
+  it has for the driver (about 0.1 s each here). What is not removed in
+  time keeps running until the next start's sweep, like a run's VM
+  whose removal failed. A create still under way when the daemon closes
+  can finish after it, and its VM is the next sweep's too (so before
+  this change).
+- **The counts in `--vm-warm` are checked one size at a time** against
+  the 4096 UIDs, not together, and not against the guest addresses.
+- **Not run:** x86-64, bare metal, and a hostile hypervisor against
+  `AddNet` on a live VM (the bound is unit-tested on a real socket).

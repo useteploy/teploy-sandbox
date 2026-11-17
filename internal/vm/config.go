@@ -116,6 +116,8 @@ type host struct {
 	addresses func() (map[string][]netip.Prefix, error)
 	// resolvers is the IPv4 resolvers the host itself uses.
 	resolvers func() []netip.Addr
+	// subordinateIDs is the ranges /etc/subuid and /etc/subgid hand out.
+	subordinateIDs func() ([]idRange, error)
 }
 
 func realHost() host {
@@ -153,11 +155,12 @@ func realHost() host {
 			raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
 			return strings.TrimSpace(string(raw)) == "1", err
 		},
-		openTun:   tunAvailable,
-		addresses: hostAddresses,
-		resolvers: func() []netip.Addr { return hostResolvers(os.ReadFile) },
-		lookPath:  exec.LookPath,
-		stat:      os.Stat,
+		openTun:        tunAvailable,
+		addresses:      hostAddresses,
+		resolvers:      func() []netip.Addr { return hostResolvers(os.ReadFile) },
+		subordinateIDs: func() ([]idRange, error) { return subordinateIDs(os.ReadFile) },
+		lookPath:       exec.LookPath,
+		stat:           os.Stat,
 		mkdirAll: func(path string, mode os.FileMode) error {
 			if err := os.MkdirAll(path, mode); err != nil {
 				return err
@@ -274,6 +277,42 @@ func passwdUIDs() ([]uint32, error) {
 	return uids, nil
 }
 
+// idRange is one line of /etc/subuid or /etc/subgid: the IDs an account
+// may map into its user namespaces.
+type idRange struct {
+	file, owner  string
+	start, count uint64
+}
+
+// subordinateIDs reads /etc/subuid and /etc/subgid. A VM's UID is also
+// its GID, so a range in either file counts. A file that is not there
+// hands out nothing.
+func subordinateIDs(read func(path string) ([]byte, error)) ([]idRange, error) {
+	var ranges []idRange
+	for _, path := range []string{"/etc/subuid", "/etc/subgid"} {
+		raw, err := read(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			fields := strings.Split(strings.TrimSpace(line), ":")
+			if len(fields) != 3 || strings.HasPrefix(fields[0], "#") {
+				continue
+			}
+			start, startErr := strconv.ParseUint(fields[1], 10, 64)
+			count, countErr := strconv.ParseUint(fields[2], 10, 64)
+			if startErr != nil || countErr != nil || count == 0 {
+				continue
+			}
+			ranges = append(ranges, idRange{file: path, owner: fields[0], start: start, count: count})
+		}
+	}
+	return ranges, nil
+}
+
 // uidsMapped reports whether [base, base+count) exists in the daemon's
 // user namespace. In the initial one everything does; inside a container
 // with a narrower map the VM UIDs would not, and no process could be
@@ -386,6 +425,19 @@ func preflight(ctx context.Context, config Config, zfs ZFS, host host) error {
 				if uid >= config.UIDBase && uid-config.UIDBase < UIDCount {
 					miss("a VM UID range no account is in: uid %d is an account, and %d to %d are for VMs (--vm-uid-base / SBX_VM_UID_BASE)",
 						uid, config.UIDBase, config.UIDBase+UIDCount-1)
+					break
+				}
+			}
+		}
+		if ranges, err := host.subordinateIDs(); err != nil {
+			miss("the host's subordinate ID ranges, to check that none holds a VM UID: %v", err)
+		} else {
+			for _, each := range ranges {
+				if each.start < uint64(config.UIDBase)+UIDCount && each.start+each.count > uint64(config.UIDBase) {
+					// A user namespace of that account maps these IDs: a
+					// process in it could run as a VM's UID or GID.
+					miss("a VM UID range no subordinate ID range overlaps: %s gives %q the IDs %d to %d, and %d to %d are for VMs (--vm-uid-base / SBX_VM_UID_BASE)",
+						each.file, each.owner, each.start, each.start+each.count-1, config.UIDBase, config.UIDBase+UIDCount-1)
 					break
 				}
 			}

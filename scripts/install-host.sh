@@ -20,7 +20,8 @@
 #      Every VM's hypervisor runs under a UID of its own from a reserved
 #      range (default 1879048192 and the 4095 after it, --vm-uid-base)
 #      with that one supplementary group. No account is created; the
-#      script checks that no account already has a UID in the range.
+#      script checks that no account already has a UID in the range and
+#      that no subordinate ID range (/etc/subuid, /etc/subgid) holds one.
 #   3. cgroup v2 with the cpu, memory and pids controllers passed down to
 #      the group the daemon keeps its VMs in (--vm-cgroup). Each VM gets
 #      its own group there with a memory, task and CPU limit.
@@ -126,6 +127,16 @@ elif [ "$UID_BASE" -lt 65536 ] || [ $((UID_BASE + UID_COUNT)) -gt 2147483648 ]; 
 else
     ok "no account has a UID in the range"
 fi
+# A subordinate range lets an account's user namespaces use these IDs.
+for file in /etc/subuid /etc/subgid; do
+    [ -f "$file" ] || continue
+    overlap="$(awk -F: -v lo="$UID_BASE" -v n="$UID_COUNT" '!/^#/ && NF == 3 && $3 > 0 && $2 < lo + n && $2 + $3 > lo { print $1 "(" $2 "+" $3 ")" }' "$file" | tr '\n' ' ')"
+    if [ -n "$overlap" ]; then
+        fail "$file hands out IDs in the VM range: $overlap- remove the entry or choose another range with SBX_VM_UID_BASE / --vm-uid-base"
+    else
+        ok "no range in $file overlaps"
+    fi
+done
 
 echo "cgroups: $CGROUP with cpu, memory and pids"
 if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then

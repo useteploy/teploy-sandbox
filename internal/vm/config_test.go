@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +50,9 @@ func goodHost() host {
 			return map[string][]netip.Prefix{"lo": {netip.MustParsePrefix("127.0.0.1/8")}, "eth0": {netip.MustParsePrefix("192.0.2.10/24")}}, nil
 		},
 		resolvers: func() []netip.Addr { return []netip.Addr{netip.MustParseAddr("192.0.2.53")} },
+		subordinateIDs: func() ([]idRange, error) {
+			return []idRange{{file: "/etc/subuid", owner: "dev", start: 100000, count: 65536}}, nil
+		},
 	}
 }
 
@@ -103,6 +107,21 @@ func TestPreflightNamesEachMissingPiece(t *testing.T) {
 		"a VM UID range above every account's": func(c *Config, _ *host) { c.UIDBase = 1000 },
 		"uid 1879048200 is an account": func(_ *Config, h *host) {
 			h.accountUIDs = func() ([]uint32, error) { return []uint32{0, 1879048200}, nil }
+		},
+		// A subordinate ID range hands the VMs' UIDs (or GIDs: they are the
+		// same numbers) to an account's user namespaces.
+		`/etc/subuid gives "builder" the IDs 1879048000 to 1879113535`: func(_ *Config, h *host) {
+			h.subordinateIDs = func() ([]idRange, error) {
+				return []idRange{{file: "/etc/subuid", owner: "builder", start: 1879048000, count: 65536}}, nil
+			}
+		},
+		`/etc/subgid gives "builder" the IDs 1879052287 to 1879052296`: func(_ *Config, h *host) {
+			h.subordinateIDs = func() ([]idRange, error) {
+				return []idRange{{file: "/etc/subgid", owner: "builder", start: 1879052287, count: 10}}, nil
+			}
+		},
+		"the host's subordinate ID ranges, to check that none holds a VM UID: permission denied": func(_ *Config, h *host) {
+			h.subordinateIDs = func() ([]idRange, error) { return nil, errors.New("permission denied") }
 		},
 		"in a container that does not map them": func(_ *Config, h *host) {
 			h.mappedUIDs = func(uint32, uint32) (bool, error) { return false, nil }
@@ -329,5 +348,40 @@ func TestConfigDefaultsAndLayout(t *testing.T) {
 	// runtimes allocate, and fits in a signed 32-bit id.
 	if DefaultUIDBase < 600100000+65536 || uint64(DefaultUIDBase)+UIDCount > 1<<31 {
 		t.Fatalf("default UID base %d", DefaultUIDBase)
+	}
+}
+
+func TestSubordinateIDsReadsBothFiles(t *testing.T) {
+	files := map[string]string{
+		"/etc/subuid": "# comment\ndev:100000:65536\nbroken:line\nci:1879048192:4096\nempty:5:0\n",
+		"/etc/subgid": "dev:100000:65536\n",
+	}
+	read := func(path string) ([]byte, error) {
+		if content, ok := files[path]; ok {
+			return []byte(content), nil
+		}
+		return nil, os.ErrNotExist
+	}
+	got, err := subordinateIDs(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []idRange{
+		{file: "/etc/subuid", owner: "dev", start: 100000, count: 65536},
+		{file: "/etc/subuid", owner: "ci", start: 1879048192, count: 4096},
+		{file: "/etc/subgid", owner: "dev", start: 100000, count: 65536},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ranges: %+v", got)
+	}
+	// A host without the files hands out nothing; one whose files cannot
+	// be read is not assumed to.
+	delete(files, "/etc/subuid")
+	delete(files, "/etc/subgid")
+	if got, err := subordinateIDs(read); err != nil || len(got) != 0 {
+		t.Fatalf("no files: %v %v", got, err)
+	}
+	if _, err := subordinateIDs(func(string) ([]byte, error) { return nil, os.ErrPermission }); err == nil {
+		t.Fatal("unreadable files were taken for empty ones")
 	}
 }

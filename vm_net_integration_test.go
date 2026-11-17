@@ -454,6 +454,22 @@ func hostAddress(t *testing.T) string {
 	return match[1]
 }
 
+// hostBroadcasts is the broadcast addresses the host's kernel takes for
+// its own, loopback's aside: one per subnet the host is on.
+func hostBroadcasts(t *testing.T) []string {
+	t.Helper()
+	var found []string
+	for _, line := range strings.Split(hostRun(t, "ip", "-4", "route", "show", "table", "local", "type", "broadcast"), "\n") {
+		if fields := strings.Fields(line); len(fields) >= 2 && fields[0] == "broadcast" && !strings.HasPrefix(fields[1], "127.") && !slices.Contains(found, fields[1]) {
+			found = append(found, fields[1])
+		}
+	}
+	if len(found) < 2 {
+		t.Fatalf("the host's broadcast addresses (its own subnet's and the peer link's): %v", found)
+	}
+	return found
+}
+
 func setElements(t *testing.T, names netNames, set string) string {
 	t.Helper()
 	return hostRun(t, "nft", "list", "set", "inet", names.table, set)
@@ -1123,7 +1139,9 @@ func TestVMNetworkFailsClosed(t *testing.T) {
 	nicA, nicB, nicC, nicD := inspectNIC(t, manager, a), inspectNIC(t, manager, b), inspectNIC(t, manager, c), inspectNIC(t, manager, d)
 	nics := []guestNIC{nicA, nicB, nicC, nicD}
 	hostAddr := hostAddress(t)
-	hostTargets := []string{nicA.gateway, hostAddr, peerHostAddr}
+	// The broadcast addresses of the host's subnets are the host too: a
+	// datagram to one is read by every socket bound to all addresses.
+	hostTargets := append([]string{nicA.gateway, hostAddr, peerHostAddr}, hostBroadcasts(t)...)
 	proxyOf := func(id string) (port, credential string) {
 		match := regexp.MustCompile(`^http://run:([0-9a-f]{64})@[0-9.]+:(\d+)$`).FindStringSubmatch(strings.TrimSpace(sh(t, manager, id, `printf %s "$HTTP_PROXY"`).stdout))
 		if match == nil {

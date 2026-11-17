@@ -261,7 +261,8 @@ type netSys struct {
 	// namespaces.
 	links      func() ([]string, error)
 	namespaces func() ([]string, error)
-	// addresses is the IPv4 addresses the host itself has.
+	// addresses is every IPv4 destination the host takes for itself: its
+	// own addresses and the broadcast addresses of their subnets.
 	addresses func() ([]netip.Addr, error)
 }
 
@@ -337,7 +338,7 @@ func realNetSys() netSys {
 			var found []netip.Addr
 			for _, prefixes := range byInterface {
 				for _, prefix := range prefixes {
-					found = append(found, prefix.Addr())
+					found = append(found, ownDestinations(prefix)...)
 				}
 			}
 			return found, nil
@@ -678,9 +679,10 @@ func hostRoutes(old, current []netip.Addr) string {
 	return b.String()
 }
 
-// hostAddrsLocked is the host's own IPv4 addresses that an open run's
-// namespace must have no route to: every one that is not loopback (which
-// never has a route from a guest) or in the guests' subnet.
+// hostAddrsLocked is the IPv4 destinations the host takes for itself
+// (its addresses and its subnets' broadcast addresses) that an open
+// run's namespace must have no route to: every one that is not loopback
+// (which never has a route from a guest) or in the guests' subnet.
 func (n *hostNetwork) hostAddrsLocked() ([]netip.Addr, error) {
 	all, err := n.sys.addresses()
 	if err != nil {
@@ -1310,6 +1312,32 @@ func hostResolvers(read func(path string) ([]byte, error)) []netip.Addr {
 		}
 	}
 	return nil
+}
+
+// ownDestinations is every IPv4 destination the host's kernel delivers to
+// its own sockets because of one address on one of its interfaces: the
+// address itself, and the broadcast address of its subnet. The second is
+// easy to miss: a datagram to the broadcast address of any subnet the
+// host is on is the host's own whichever interface it arrives on, an
+// open run's link included, and every UDP socket bound to all addresses
+// gets it. The subnet's first address is the older spelling of the same
+// (kernels before 5.14 take it as a broadcast too). A /31 and a /32 have
+// neither.
+func ownDestinations(prefix netip.Prefix) []netip.Addr {
+	addr := prefix.Addr().Unmap()
+	if !addr.Is4() {
+		return nil
+	}
+	own := []netip.Addr{addr}
+	if bits := prefix.Bits(); bits >= 0 && bits <= 30 {
+		raw := addr.As4()
+		value := uint32(raw[0])<<24 | uint32(raw[1])<<16 | uint32(raw[2])<<8 | uint32(raw[3])
+		mask := ^uint32(0) << (32 - bits)
+		for _, each := range []uint32{value | ^mask, value & mask} {
+			own = append(own, netip.AddrFrom4([4]byte{byte(each >> 24), byte(each >> 16), byte(each >> 8), byte(each)}))
+		}
+	}
+	return own
 }
 
 // hostAddresses is every address on the host's interfaces, by interface.

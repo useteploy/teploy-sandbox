@@ -292,7 +292,9 @@ How it is built:
 - **An open run's namespace has one link to the host,** which routes
   and masquerades what arrives on it. Inside the namespace the ranges
   that are not the public internet, the guests' subnet and each of the
-  host's own addresses are unreachable routes, port 25 is an
+  host's own addresses (with the broadcast address of each subnet the
+  host is on, which the host's kernel also takes for itself) are
+  unreachable routes, port 25 is an
   unreachable routing rule, and DNS to the configured resolvers is
   looked up in a table of its own. These are routes, not firewall
   rules: they hold with no nftables table anywhere. The daemon follows

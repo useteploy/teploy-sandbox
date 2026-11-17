@@ -1078,6 +1078,47 @@ func TestCheckSealsTheNamespaceOfAVMThatIsGone(t *testing.T) {
 	must(t, network.Detach(bg, "run-a"))
 }
 
+// A datagram to the broadcast address of a subnet the host is on is the
+// host's own, on whichever interface it arrives: an open run's namespace
+// must have no route to those either. (Seen live before this was so: with
+// no firewall rule left, an open guest's datagram to the broadcast
+// address of the host's subnet was read by a socket on the host bound to
+// every address.)
+func TestTheHostsBroadcastAddressesAreItsOwn(t *testing.T) {
+	text := func(prefix string) string {
+		return joinAddrs(ownDestinations(netip.MustParsePrefix(prefix)))
+	}
+	for prefix, want := range map[string]string{
+		"192.0.2.15/24":   "192.0.2.15, 192.0.2.255, 192.0.2.0",
+		"172.30.77.1/30":  "172.30.77.1, 172.30.77.3, 172.30.77.0",
+		"10.1.2.3/8":      "10.1.2.3, 10.255.255.255, 10.0.0.0",
+		"198.51.100.4/31": "198.51.100.4",
+		"198.51.100.7/32": "198.51.100.7",
+		"2001:db8::1/64":  "",
+	} {
+		if got := text(prefix); got != want {
+			t.Errorf("what the host takes for itself because of %s: %q, want %q", prefix, got, want)
+		}
+	}
+	// And they end up where the addresses do: in an open run's routes and
+	// in its ruleset.
+	network, fake := startedNetwork(t, nil)
+	fake.mu.Lock()
+	fake.addrs = ownDestinations(netip.MustParsePrefix("198.51.100.10/24"))
+	fake.mu.Unlock()
+	_, err := network.Attach(bg, "run-a", run.NetworkOpen, 0)
+	must(t, err)
+	space := fake.space("tvn012345-0")
+	for _, want := range []string{"route replace unreachable 198.51.100.10/32", "route replace unreachable 198.51.100.255/32", "route replace unreachable 198.51.100.0/32"} {
+		if !slices.Contains(space.ip, want) {
+			t.Errorf("the namespace was not told %q:\n%s", want, strings.Join(space.ip, "\n"))
+		}
+	}
+	if !strings.Contains(space.rules, "ip daddr { 198.51.100.0, 198.51.100.10, 198.51.100.255 } counter drop") {
+		t.Errorf("the ruleset does not name the host's broadcast addresses:\n%s", space.rules)
+	}
+}
+
 // The host's addresses are not fixed for the life of a run. When they
 // change, an open run's namespace is told: the new ones get no route, and
 // the old ones get theirs back.

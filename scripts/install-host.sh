@@ -29,16 +29,24 @@
 #      disks for partitions.
 #
 #   5. Guest networking: the ip, nft and conntrack commands, /dev/net/tun,
-#      the dummy interface type, and IPv4 forwarding (persisted in
-#      /etc/sysctl.d). Each VM with a network gets a tap of its own that
-#      the daemon creates and filters; forwarding is what carries the
-#      traffic of runs with network "open". Note that it makes the host
-#      route between all of its interfaces, not only for guests.
+#      network namespaces with veth links, routing rules that match a
+#      port and nftables inside them, and IPv4 forwarding (persisted in
+#      /etc/sysctl.d). Each VM with a network gets a network namespace of
+#      its own, with its tap in it; a run with network "open" also gets a
+#      link from that namespace to the host, and forwarding is what
+#      carries its traffic on. Note that forwarding makes the host route
+#      between all of its interfaces, not only for guests.
+#
+# Nothing has to be installed for the jail every hypervisor is started
+# in (mount and PID namespaces, pivot_root): the daemon does that itself.
+# A statically linked hypervisor binary keeps the jail free of the host's
+# libraries; the script says which kind it finds.
 #
 # It also reports whether the kernel has Landlock, which the daemon
 # requires and this script cannot install.
 #
-# Environment: SBX_VM_UID_BASE and SBX_VM_CGROUP, as for the daemon.
+# Environment: SBX_VM_UID_BASE, SBX_VM_CGROUP and SBX_VM_HYPERVISOR, as
+# for the daemon.
 set -euo pipefail
 
 POOL="${1:-${SBX_VM_POOL:-sbx}}"
@@ -182,7 +190,7 @@ else
     did "zfs set volmode=dev $POOL"
 fi
 
-echo "network: taps, nftables and IPv4 forwarding for guests"
+echo "network: namespaces, taps, nftables and IPv4 forwarding for guests"
 for tool in ip:iproute2 nft:nftables conntrack:conntrack; do
     if command -v "${tool%%:*}" >/dev/null 2>&1; then
         ok "the ${tool%%:*} command"
@@ -196,35 +204,38 @@ if [ -c /dev/net/tun ]; then
 else
     fail "/dev/net/tun does not exist: the kernel has no tun/tap driver (modprobe tun)"
 fi
-if command -v ip >/dev/null 2>&1; then
-    # The gateway address guests reach the host at lives on a dummy
-    # interface; make and remove one to see that the kernel can.
-    probe="tvprobe$$"
-    if ip link add "$probe" type dummy 2>/dev/null; then
-        ip link del "$probe"
-        ok "dummy interfaces"
+if command -v ip >/dev/null 2>&1 && command -v nft >/dev/null 2>&1; then
+    # What every run with a network is given, made once and removed: a
+    # named network namespace, a veth link into it, a routing rule that
+    # matches a port (how port 25 is closed without a firewall rule;
+    # Linux 4.17 or newer), and a ruleset inside it.
+    probe_ns="tvnprobe$$"
+    probe_link="tvpprobe$$"
+    probe_step=""
+    try() { probe_step="$1"; shift; "$@" >/dev/null 2>&1; }
+    if try "create a network namespace (ip netns add)" ip netns add "$probe_ns" &&
+       try "make a veth link into it (modprobe veth)" ip link add "${probe_link:0:15}" type veth peer name uplink netns "$probe_ns" &&
+       try "add a routing rule that matches a port (Linux 4.17 or newer)" ip -n "$probe_ns" rule add pref 100 ipproto tcp dport 25 unreachable &&
+       try "add an unreachable route" ip -n "$probe_ns" route replace unreachable 192.0.2.0/24 &&
+       try "hook a device's ingress with nftables inside it (nf_tables with the netdev family)" ip netns exec "$probe_ns" nft "add table netdev guest; add chain netdev guest ingress { type filter hook ingress device uplink priority -300; policy drop; }" &&
+       try "track connections with nftables inside it (nf_conntrack)" ip netns exec "$probe_ns" nft "add table inet guest; add chain inet guest forward { type filter hook forward priority filter; policy drop; }; add rule inet guest forward ct state established,related accept"; then
+        ok "network namespaces with veth links, port-matching routing rules and nftables"
     else
-        fail "the kernel cannot create a dummy interface (modprobe dummy)"
+        fail "this kernel cannot $probe_step"
     fi
-fi
-if command -v nft >/dev/null 2>&1; then
-    probe="teploy_sbx_probe_$$"
-    if nft "add table netdev $probe; add chain netdev $probe c { type filter hook ingress device lo priority 0; }" 2>/dev/null; then
-        nft delete table netdev "$probe"
-        ok "nftables with ingress hooks"
-    else
-        nft delete table netdev "$probe" 2>/dev/null || true
-        fail "nftables cannot hook a device's ingress (the kernel needs nf_tables with the netdev family)"
-    fi
-    # Not something this script can fix: another firewall that drops by
-    # default has to be told to let guests' traffic through.
-    foreign="$(nft list chains 2>/dev/null | awk '$1 == "table" { t = $2 " " $3 } $1 == "chain" { c = $2 } /policy drop/ && (/hook input/ || /hook forward/) && t !~ /teploy_sbx_vm_/ { print "table " t " chain " c }' | tr '\n' ';')"
+    ip link del "${probe_link:0:15}" 2>/dev/null || true
+    ip netns del "$probe_ns" 2>/dev/null || true
+    # Not something this script can fix: another firewall that drops
+    # forwarded traffic by default has to be told to let open runs' through.
+    # (An allowlist run does not pass the host's firewall at all: its
+    # proxy listens inside the run's own namespace.)
+    foreign="$(nft list chains 2>/dev/null | awk '$1 == "table" { t = $2 " " $3 } $1 == "chain" { c = $2 } /policy drop/ && /hook forward/ && t !~ /teploy_sbx_vm_/ { print "table " t " chain " c }' | tr '\n' ';')"
     if [ -n "$foreign" ]; then
-        echo "  note:    another firewall drops by default (${foreign%;}). Allow traffic arriving on the daemon's taps (tv*) there: to the gateway address for the allowlist tier, forwarded for the open tier."
+        echo "  note:    another firewall drops forwarded traffic by default (${foreign%;}). Allow what arrives on the daemon's links (tvh*) there, or runs with network \"open\" will not reach the internet."
     fi
 fi
 if write_file "$SYSCTL_FILE" "# Installed by teploy-sandbox scripts/install-host.sh. The vm driver routes
-# the traffic of runs with network \"open\" from their taps.
+# the traffic of runs with network \"open\" from their links.
 net.ipv4.ip_forward = 1"; then
     did "wrote $SYSCTL_FILE"
 fi
@@ -233,6 +244,38 @@ if [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ]; then
 else
     echo 1 > /proc/sys/net/ipv4/ip_forward
     did "net.ipv4.ip_forward is now 1"
+fi
+
+echo "hypervisor: what its jail has to hold"
+HYPERVISOR="${SBX_VM_HYPERVISOR:-cloud-hypervisor}"
+hypervisor_path="$(command -v "$HYPERVISOR" 2>/dev/null || true)"
+if [ -z "$hypervisor_path" ]; then
+    echo "  note:    $HYPERVISOR is not installed, or not on PATH (set SBX_VM_HYPERVISOR to check a path)"
+elif [ "$(dd if="$hypervisor_path" bs=1 skip=1 count=3 2>/dev/null)" != ELF ]; then
+    fail "$hypervisor_path is not an ELF binary: the daemon executes it directly inside a jail, where no interpreter exists"
+else
+    # A program header of type 3 (PT_INTERP) names a loader: the binary is
+    # dynamically linked. Read straight from the file (64-bit,
+    # little-endian, which is every host this driver runs on), so that
+    # no binutils are needed.
+    field() { od -An -v -t u"$3" -j "$2" -N "$3" "$1" | tr -d ' \n'; }
+    linkage=unknown
+    if [ "$(field "$hypervisor_path" 4 1)" = 2 ] && [ "$(field "$hypervisor_path" 5 1)" = 1 ]; then
+        phoff="$(field "$hypervisor_path" 32 8)"
+        phentsize="$(field "$hypervisor_path" 54 2)"
+        phnum="$(field "$hypervisor_path" 56 2)"
+        linkage=static
+        i=0
+        while [ "$i" -lt "$phnum" ]; do
+            [ "$(field "$hypervisor_path" $((phoff + i * phentsize)) 4)" = 3 ] && linkage=dynamic
+            i=$((i + 1))
+        done
+    fi
+    case "$linkage" in
+        static)  ok "$hypervisor_path is statically linked: its jail holds nothing of the host but the binary itself" ;;
+        dynamic) echo "  note:    $hypervisor_path is dynamically linked: its jail will also hold the host's library directories, read-only. The upstream static build needs nothing of the host." ;;
+        *)       echo "  note:    cannot tell how $hypervisor_path is linked; the daemon says so in its log at start if the jail has to hold the host's libraries" ;;
+    esac
 fi
 
 echo "kernel: Landlock"

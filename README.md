@@ -21,7 +21,7 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 | `POST /v1/runs/{id}/stop` | Capture the filesystem, remove the container, keep the run → the run, `state: "stopped"` (see Persistent runs) |
 | `POST /v1/runs/{id}/resume` | `{ttlSec?}` → the same run, same `id`, `state: "running"`, new deadline |
 | `POST /v1/runs/{id}/fork` | `{ttlSec?, labels?, onExpire?}` → 201, a new run started from this one's filesystem and settings, with `forkedFrom` |
-| `GET /v1/capacity` | `{server, driver, runtime, cpus, memoryMb, runs: {running, stopped}, allocated: {cpus, memoryMb}}` — the host's size and the sum of running runs' limits |
+| `GET /v1/capacity` | `{server, driver, runtime, cpus, memoryMb, runs: {running, stopped}, allocated: {cpus, memoryMb}, warmPool?}` — the host's size and the sum of running runs' limits (and of the VM driver's warm pool, when it has one) |
 | `GET /v1/runs`, `GET /health` | List; `{status, version}` |
 
 Run IDs are ULIDs and every response carries a `server` field — nothing
@@ -136,8 +136,9 @@ What is refused with a 400 rather than faked:
   on its hypervisor is the driver's, not the caller's);
 - an `image` that is neither `golden` nor a snapshot this driver took.
 
-Also not built yet: a pool of pre-booted VMs (every create is a cold
-boot), nested virtualisation inside a run, and memory reclaim policy.
+Also not built yet: nested virtualisation inside a run, and memory
+reclaim policy. A warm pool of pre-booted VMs is there, off by default
+(see Warm pool below).
 
 Host setup: `sudo scripts/install-host.sh [POOL]` prepares a host and can
 be run again at any time; a second run changes nothing. It installs the
@@ -193,7 +194,94 @@ there is one:
   that is not on the host itself (`--vm-dns`, default: the host's own
   resolvers). These are required whatever tiers you use.
 
-`GET /v1/capacity` reports `driver` and `nestedVirt`.
+`GET /v1/capacity` reports `driver` and `nestedVirt`, and `warmPool`
+when one is configured (below).
+
+`--vm-max-runs N` (`SBX_VM_MAX_RUNS`, default 0: no limit) caps the VMs
+runs may have at once; a create beyond it gets a 503 (`at-capacity`).
+It is also the number the host's sizing is checked against (Host sizing
+below).
+
+### Warm pool
+
+`--vm-warm 2x2048=3,4x8192=1` (`SBX_VM_WARM`; default empty, no pool)
+keeps that many VMs of each size booted: `CPUSxMEMORY=COUNT`, whole
+virtual CPUs and the guest's MiB. A create on `image: "golden"` whose CPU
+limit rounds up to CPUS and whose memory limit is MEMORY exactly takes
+the oldest waiting VM of that size instead of booting one; any other
+create, a create that finds the size empty, and every resume and fork
+(they boot their own disk) boots as before.
+
+- **What a pool VM is.** A VM booted exactly as a run's VM is: a volume
+  cloned from the golden snapshot, the same jail, its own UID, both
+  seccomp filters, Landlock, the cgroup limits of its size, its own
+  socket filesystem. It has no network device, no environment and no
+  run data, and nothing has been run in its guest: the daemon has only
+  asked its agent whether it is up. Nobody else can reach it.
+- **What a claim does.** Everything that is the run's happens when a
+  create takes the VM, and is what happens to a VM booted for a run:
+  the run's network namespace and tier (made before, with the proxy's
+  listener, as always), the tap handed to the running VM, and in the
+  guest the PCI rescan, the address, routes and resolvers, and the
+  clock. A claim that fails destroys the VM.
+- **Once.** A VM leaves the pool once, under the pool's lock, to one
+  run or to be destroyed, and never comes back: a VM a run has had,
+  however briefly, is never another run's. The run's container ID is
+  the VM's own name (its volume, cgroup, device node and runtime dir
+  already carry it, and none of them is renamed under a running
+  hypervisor); the run's network place keeps the run's name.
+- **What a run can tell.** The same PCI devices in the same slots, the
+  same interface name and the same kernel command line as a VM booted
+  for it (checked live). What differs is how long the guest has been
+  up, and whatever its guest logged while it waited.
+- **Refill.** In the background once a claim is done (not during it:
+  a boot takes the CPU the claim needs), and every two seconds, one
+  boot per short size in turn. At most `--vm-warm-boots`
+  (default 2) boots are under way when the pool starts one, counting
+  creates that are booting their own VM, so a burst of creates is not
+  followed by a burst of pool boots. A boot starts only while the host's
+  `MemAvailable`, less what the boots under way may still take, covers
+  the new VM's cgroup limit plus `--vm-warm-headroom-mb` (default 1024);
+  the pool logs once when it holds back. A failed boot is retried after
+  a pause that doubles up to a minute. A pool VM that exits while it
+  waits is removed and replaced.
+- **Restart and shutdown.** Pool VMs are VMs of the daemon's identity
+  like any other, so the startup sweep finds and removes them with
+  everything else a previous life left; the pool starts filling only
+  after the sweep. A daemon that shuts down removes its pool. The reaper
+  never sees a pool VM: it is in no registry.
+- **Capacity.** `GET /v1/capacity` gains `warmPool: {sizes: [{cpus,
+  memoryMb, target, ready, booting}]}`, and the VMs the pool holds,
+  ready or booting, are counted in `allocated`.
+
+Measured on the nested arm64 test host (Cloud Hypervisor v54.1, a 1 vCPU
+512 MiB guest; create through the manager until the run's first exec
+has answered, ten of each): from the pool, a median of 34 ms on `none`,
+369 ms on `allowlist` and 379 ms on `open` (worst 108, 433 and 460 ms);
+a cold boot took 6 to 15 s across the runs. What a networked claim
+spends is mostly the guest's own setup (the PCI rescan, waiting for the
+device and its name, the `ip` commands); the host's part (namespace,
+tap, rules, routes, the hand-over) is tens of milliseconds. AUDIT_OPEN.md
+has the figures.
+
+### Host sizing
+
+Three limits on the host are shared by every VM and are the operator's
+to set. The daemon compares each with its configuration at start and
+warns, without refusing, when one is too small; `install-host.sh`
+reports the same from `SBX_VM_MAX_RUNS`, `SBX_VM_NET_CONNECTIONS` and
+`SBX_VM_WARM`:
+
+| Limit | Needs at least | Because |
+|---|---|---|
+| `net.netfilter.nf_conntrack_max` | runs × connections | an open run's connections through its link are tracked by the host's table, up to `--vm-net-connections` each |
+| the daemon's `RLIMIT_NOFILE` (`LimitNOFILE=`) | runs × connections × 2 + (runs + pool) × 8 + 1024 | an allowlist run's connections through its proxy are two of the daemon's open files each; a few more per VM and for the daemon itself |
+| `fs.aio-max-nr` | (runs + pool) × 128 | every VM's disk takes 128 of the host's asynchronous I/O (measured; io_uring is refused, so the hypervisor uses Linux AIO) |
+
+runs is `--vm-max-runs`; pool is the warm pool's VMs. With no
+`--vm-max-runs` only the pool's AIO can be checked, and the log says so.
+At the defaults (4096 connections), 64 runs need a connection table of
+262144 and an open file limit of about 525000.
 
 Confinement of the hypervisor. The hypervisor process is what a guest
 talks to, so each one is run as if a guest had already taken it over.
@@ -209,8 +297,9 @@ The layers are independent; each is checked by the live suite.
   makes that the root with `pivot_root`, detaches the old root so that
   no path, descriptor or working directory leads back to the host's
   tree, drops to the VM's UID and executes the hypervisor in its place.
-  The hypervisor starts with its input, its two outputs and its tap
-  open and nothing else: every other descriptor is closed at the exec,
+  The hypervisor starts with its input and its two outputs open and
+  nothing else (a run's tap reaches it later, over its API socket):
+  every other descriptor is closed at the exec,
   including any the daemon itself was started with and knows nothing
   of.
   The root is read-only; everything is `nosuid`, everything but the
@@ -354,12 +443,18 @@ How it is built:
   looked up in a table of its own. These are routes, not firewall
   rules: they hold with no nftables table anywhere. The daemon follows
   the host's addresses and updates the routes when they change.
-- **The tap is handed over as a descriptor.** The daemon creates it in
-  the run's namespace and gives the hypervisor the open file
-  (`--net fd=3`). The hypervisor stays unprivileged, in its jail and in
-  its own empty network namespace: it has a file descriptor, not an
-  interface. The tap is not persistent, so it exists exactly as long as
-  its hypervisor does.
+- **The tap is handed over as a descriptor, to the running VM.** Every
+  VM boots without a network device. The daemon creates the run's tap
+  in the run's namespace and gives the hypervisor the open file with
+  its `vm.add-net` request, as an `SCM_RIGHTS` message on the VM's API
+  socket (after the same check of who listens there as for every other
+  call); the guest finds the new device on its PCI bus. The hypervisor
+  stays unprivileged, in its jail and in its own empty network
+  namespace: it has a file descriptor, not an interface. The tap is not
+  persistent, so it exists exactly as long as its hypervisor does. A VM
+  booted for its run and one taken from the warm pool get their device
+  the same way, so a guest sees the same PCI slots and the same
+  interface name either way.
 - **In the namespace, no IPv6 at all** (disabled, not filtered), strict
   reverse-path filtering (a packet is only accepted from the interface
   its source address is routed to, which for the tap is the VM's one
@@ -526,6 +621,9 @@ CI has none of it and only vets the suite; what CI does run as root, on
 x86-64, is the jail, the seccomp filter and the socket filesystem from
 the unit tests in `internal/vm`):
 `CGO_ENABLED=0 go test -c -tags vmintegration -o vm.test . && sudo ./vm.test -test.run TestVM -test.v`
+(with `SBX_VM_WARM=1x512=2,1x1024=1` the whole suite runs with a warm
+pool, and the network and lifecycle tests then get pool VMs; the
+`TestVMWarmPool` test brings its own pool either way)
 
 ## Writable leases
 

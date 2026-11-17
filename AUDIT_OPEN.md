@@ -1322,3 +1322,211 @@ same arm64 host. Three defects, each fixed with a test; the whole
   one then writes its own back and the newer one stands down. It takes
   two daemons with one identity and a window of milliseconds; it was
   there before this change.
+
+
+## 2026-11-16 — VM driver: a warm pool of pre-booted VMs, and host sizing
+
+A create used to be a cold boot: 8 to 25 s on the nested arm64 test host
+(Cloud Hypervisor v54.1, Linux 6.8, OpenZFS 2.2.2). The driver can now
+keep VMs booted ahead of creates (`--vm-warm`, off by default), and warns
+at start when the host's shared limits are too small for the runs it is
+configured for. Same host; the whole `vmintegration` suite (fourteen
+tests) passes on it with the pool on (`SBX_VM_WARM=1x512=2,1x1024=1`)
+and with it off, one run each with the final code (an earlier run with
+the pool on failed one check, which counted the pool's socket
+filesystems as a run's; the check now leaves out what a pool holds).
+
+### Design, and why
+
+- **A pool VM is a run's VM that has not been given to a run.** It is
+  booted by the same code as a cold create (`Driver.boot`): a volume
+  cloned from the golden snapshot, the jail, a UID of its own, both
+  seccomp filters, Landlock, the cgroup limits of its size, its socket
+  filesystem. Then nothing: no network device, no environment, nothing
+  run in the guest; the daemon only pings its agent. A create on the
+  golden image whose size matches takes the oldest one, and the claim
+  (`Driver.claim`) does everything that is the run's, which is also all
+  that happens to a VM booted for a run: the run's network namespace
+  and tier (made before, as always, with the proxy's listener), the tap,
+  and in the guest the PCI rescan, address, routes, resolvers and clock.
+- **Every VM now boots without a network device; a run's is plugged
+  in.** This is what makes the two kinds of VM the same. The tap goes to
+  Cloud Hypervisor's `vm.add-net` as an `SCM_RIGHTS` descriptor sent
+  with the request on the VM's API socket, after the `SO_PEERCRED`
+  check every API call already has; v54.1 takes it under its own
+  seccomp filter, Landlock and the daemon's filter (no new socket, no
+  path: a descriptor arrives on a unix socket it already has). The
+  arm64 guest boots from a device tree, so it is not told of a
+  hot-plugged device and rescans its PCI bus; the setup script then
+  waits for the guest's device manager to finish naming the interface,
+  so it ends up with the name it would have had at boot. Checked live: a
+  claimed VM and a VM booted for its run show the same PCI devices in
+  the same slots (`0000:00:05.0` is the network device in both), the
+  same interface name (`enp0s5`) and the same kernel command line. The
+  alternative considered first, booting pool VMs with a tap and moving
+  it into the run's namespace at claim, would have left a pool VM with a
+  device that existed before its run, in a namespace that was not the
+  run's; and pinning the hot-plugged device to the slot a boot-time one
+  would have had is not possible on this VMM (that slot holds another
+  device). The hypervisor is now started with its three standard
+  descriptors and nothing else.
+- **Once, under a lock.** A VM leaves the pool in `take`, under the
+  pool's mutex, to one create; nothing puts a VM back, and a claim that
+  fails destroys it. The run's container ID is the VM's own name, so
+  nothing is renamed under a running hypervisor (its volume, cgroup,
+  device node, runtime dir and the hypervisor's own command line all
+  carry it); the run's network place keeps the run's name, which is
+  what the proxy listener was made under before the create. The
+  registry never holds a pool VM, so the reaper cannot see one.
+- **Bounded refill.** One boot per short size in turn, after every
+  claim (once the claim is done with the CPU) and every two seconds;
+  never while `--vm-warm-boots` boots are under way, counting creates
+  that are booting their own VM; never while `MemAvailable`, less what
+  the boots under way may take, is short of the new VM's cgroup limit
+  plus `--vm-warm-headroom-mb`. A failed boot backs off (1 s doubling to
+  a minute). A pool VM that exits is removed and replaced.
+- **Restart and shutdown.** Pool VMs are VMs of the daemon's identity,
+  named like any other, so the existing startup sweep removes them; the
+  pool only starts after the sweep has succeeded. `Close` removes the
+  pool. A second driver of the same identity in one process (the suite's
+  "crash") makes the first pool stop booting before it sweeps.
+- **Not a memory snapshot.** A pool restored from one saved VM would
+  start every guest with the same kernel random state, the same
+  addresses for ASLR and the same boot ID. Each pool VM here is its own
+  boot.
+- **`--vm-max-runs`** caps the VMs runs may have (503 `at-capacity`
+  beyond it): the number the sizing below is checked against.
+- **Host sizing.** The daemon warns at start, and `install-host.sh`
+  reports, when `nf_conntrack_max` < runs × connections, the daemon's
+  `RLIMIT_NOFILE` < runs × connections × 2 + (runs + pool) × 8 + 1024,
+  or `fs.aio-max-nr` < (runs + pool) × 128. The 128 per VM was measured
+  (`fs.aio-nr` with three and four VMs running: 384 and 512).
+
+### Measured (nested arm64; not a statement about bare metal)
+
+Create through the manager until the run's first exec has answered, a 1
+vCPU 512 MiB guest, ten of each, pool of two refilled between samples:
+
+| | `none` | `allowlist` | `open` |
+|---|---|---|---|
+| from the pool, median | 34 ms | 369 ms | 379 ms |
+| from the pool, worst | 108 ms | 433 ms | 460 ms |
+| cold boot, median | 10.6 s | 11.2 s (3) | 11.5 s (3) |
+| cold boot, worst | 10.8 s | 11.2 s (3) | 11.8 s (3) |
+
+(The full run with the pool on. In the full run with it off,
+`TestVMWarmPool` brings its own pool, and on a quieter hour of the same
+host gave 14, 277 and 202 ms median, 27, 384 and 445 ms worst, against
+cold boots of 6.1, 6.6 and 6.7 s median; there the host's part was 19
+to 30 ms (allowlist) and 39 to 109 ms (open) and the guest's 123 to
+322 ms. In the run before both, which started
+the refill's boot at the moment of the claim rather than after it, the
+pool's medians were 37, 462 and 485 ms and the worst 57, 639 and
+678 ms; cold, 12.1 s median and 15.4 s worst. The change to refill after
+the claim came from those figures.)
+
+What a networked claim spends: the host's part (namespace already made
+for allowlist runs; tap, ruleset, routes, the hand-over) is 25 to 37 ms
+for an allowlist run and 70 to 104 ms for an open one (its link, the
+host's table and some thirty routes); the rest is the guest's own setup,
+190 to 375 ms, which is the PCI rescan,
+waiting for the device and its final name, and the `ip` commands
+(timed by hand inside three guests just after their boot, the device
+plugged in the way the driver does it: the `vm.add-net` call 3 to 4 ms,
+the PCI rescan 157 to 168 ms, `udevadm settle` 48 to 87 ms, the four
+`ip` commands 71 to 81 ms). A cold boot is dominated by the guest's
+boot itself.
+On a real host a cold boot is an order of magnitude shorter than here
+and the guest's setup should shrink with it; that is inferred, not run.
+
+A burst of five creates against a pool of two with `--vm-warm-boots 2`:
+two claimed, three booted their own VM, and the pool never started a
+boot with two already under way (the most it was seen booting at once
+was two). With four VMs running (a pool of three 512 MiB and 1 GiB
+guests, and one run) the test host's MemAvailable was about 6.1 of 7.9
+GiB and `fs.aio-nr` 512.
+
+### How it was verified
+
+Unit (`internal/vm/pool_test.go`, `hypervisor_test.go`, on every push):
+the pool fills to its targets and a pool VM is untouched (no device,
+no setup, no exec); a create claims the oldest, gets its device and
+setup at claim, and the pool refills with a new VM; ten concurrent
+creates against a pool of three never share a VM; the bound on boots
+with hung boots and a burst of creates; the memory headroom; a VM that
+dies in the pool is removed, replaced, and never handed out; a failed
+claim destroys the VM; a failed boot backs off; a restart's sweep
+removes the old pool and the old pool stops booting; capacity and the
+reaper; `--vm-max-runs`; the sizing arithmetic; and `AddNet` on the
+wire (the descriptor travels with the request, the body names only the
+device and MAC, a socket another UID listens on is sent nothing).
+
+Live (`TestVMWarmPool`, and the whole suite with
+`SBX_VM_WARM=1x512=2,1x1024=1`): a pool VM before any claim has its
+size's `memory.max` and `cpu.max`, one process, a non-zero UID,
+`NoNewPrivs`, `Seccomp: 2`, no capabilities, no tap descriptor, a
+network namespace that is not the host's, and no network device in its
+hypervisor's own config. A claim on each tier: `none` has no device and
+the host's time; `allowlist` reaches its `egressAllow` entry through its
+proxy and nothing around it, has no default route, does not reach the
+host, has only its own route in its namespace, and passes the whole
+confinement and jail inspection; `open` reaches the internet, none of
+the six non-public peer addresses and not the host. The claimed VM and a
+VM booted for its run look the same from inside. Refill after claims
+with VMs no run had; the burst; the empty-pool fallback; capacity over
+HTTP (`warmPool` and `allocated` including the pool); a restart whose
+sweep removed exactly the two pool VMs (processes, volumes, cgroups)
+and filled a new pool; the pool gone after `Close`. In the suite with
+the pool on, the network and lifecycle tests were served from the pool
+wherever their sizes matched (claims per daemon: lifecycle 1, console
+flood 1, cgroup limit 1, isolation 2, tiers 2, fails-closed 3, crash 1,
+the pool test 35), and every existing check
+held: TestVMNetworkTiers, FailsClosed, Isolation and the crash test
+with pool VMs on every tier, and the restart sweeps counting the pool's
+VMs among the leftovers.
+
+### Deviations from what was asked, and why
+
+- **The tap is hot-plugged for every run, not only for pooled ones.**
+  Above: one way for both is what makes a pooled VM indistinguishable
+  from a booted one, and it took the tap off the hypervisor's command
+  line and out of its inherited descriptors.
+- **Nothing is renamed at claim.** The registry keys the run on the
+  VM's name instead; renaming a mounted socket directory, a cgroup with
+  a process in it or a volume a hypervisor has open is either refused
+  by the kernel or a window for mistakes, for no gain.
+- **`--vm-max-runs` is new.** "The configured number of runs" had no
+  flag; a number the daemon enforces is a better thing to size a host
+  against than one it only reads.
+- **Cold creates are not held back by `--vm-warm-boots`;** only the
+  pool is. Holding a create would turn a burst into a queue whose
+  waiting nobody asked for.
+- **The guest's hostname and machine ID are not set at claim:** a VM
+  booted for its run does not get them either (they are the golden
+  image's), and setting them only for pooled VMs would make the two
+  distinguishable.
+
+### What remains
+
+- **x86-64 and bare metal.** Hot-plug is run-checked on arm64 only; on
+  x86-64 Cloud Hypervisor announces a hot-plugged device through ACPI,
+  and the rescan is then a no-op (inferred). The latencies are nested
+  arm64 figures.
+- **A pool VM can be distinguished by its uptime,** and by whatever
+  its guest logged while it waited (its own timers ran, with no
+  network, and its clock was the guest's own until the claim set it).
+  Nothing else a run can read was found to differ; not every file of a
+  guest was compared.
+- **A pool VM ages.** It waits with no limit on how long; the guest's
+  own timers run meanwhile (with no network). Recycling after an age is
+  not done.
+- **The memory guard reads `MemAvailable`,** which counts what a waiting
+  VM has touched, not what its cgroup allows it; a host can be
+  overcommitted by runs and pool together, as it could by runs alone.
+- **The pool's VMs count against the 4096 VM UIDs and against
+  `fs.aio-max-nr`,** like runs' VMs; not against `--vm-max-runs`.
+- **Hot-plug needs the guest's PCI rescan and its device manager.** A
+  golden image without sysfs PCI rescan or with a device manager that
+  never settles gets its device later or not at all (the setup gives up
+  after about 15 s and the create fails).
+- Unchanged from the entries above: everything they list as open.

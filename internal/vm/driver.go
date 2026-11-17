@@ -132,6 +132,21 @@ func (d *Driver) AdmitCreate(req run.CreateRequest) error {
 	if req.Image != GoldenImage && !d.volumes.OwnsRef(req.Image) {
 		return unsupported("boots its golden image (image %q) or one of its own snapshots; %q is neither", GoldenImage, req.Image)
 	}
+	// A daemon that is full says so here, before the run is given a
+	// proxy and a place in the network only to have both taken down
+	// again: a caller that keeps asking a full daemon costs it nothing
+	// but the answer. Create decides (admit); this is the same question
+	// asked early.
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.fullLocked()
+}
+
+// fullLocked is ErrAtCapacity when runs have as many VMs as they may.
+func (d *Driver) fullLocked() error {
+	if has := len(d.machines) + d.creating; d.MaxRuns > 0 && has >= d.MaxRuns {
+		return fmt.Errorf("%w: this daemon runs at most %d VMs at once (--vm-max-runs), and has %d", run.ErrAtCapacity, d.MaxRuns, has)
+	}
 	return nil
 }
 
@@ -282,8 +297,8 @@ func (d *Driver) admit(name string) (func(), error) {
 	if _, exists := d.machines[name]; exists {
 		return nil, fmt.Errorf("a vm named %s already exists", name)
 	}
-	if d.MaxRuns > 0 && len(d.machines)+d.creating >= d.MaxRuns {
-		return nil, fmt.Errorf("%w: this daemon runs at most %d VMs at once (--vm-max-runs), and has %d", run.ErrAtCapacity, d.MaxRuns, len(d.machines)+d.creating)
+	if err := d.fullLocked(); err != nil {
+		return nil, err
 	}
 	d.creating++
 	return func() {

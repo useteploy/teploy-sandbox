@@ -580,3 +580,22 @@ func TestASizeThatDoesNotFitDoesNotHoldBackTheOthers(t *testing.T) {
 		t.Fatalf("a VM the host has no memory for was booted: %+v", status)
 	}
 }
+
+// A full daemon refuses a create before anything is made for it: an
+// allowlist run's proxy and its network namespace used to be set up, and
+// taken down again, for every create it then refused.
+func TestAFullDaemonRefusesBeforeItMakesAnything(t *testing.T) {
+	rig, network, egress := newNetworkedRig(t)
+	rig.driver.MaxRuns = 1
+	_, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage})
+	must(t, err)
+	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Network: run.NetworkAllowlist}); !errors.Is(err, run.ErrAtCapacity) {
+		t.Fatalf("a second run: %v", err)
+	}
+	egress.mu.Lock()
+	opened := len(egress.opened)
+	egress.mu.Unlock()
+	if opened != 0 || len(network.attached) != 0 || len(rig.hypervisor.started) != 1 {
+		t.Fatalf("a refused create was given %d proxies and %d places in the network; %d VMs booted", opened, len(network.attached), len(rig.hypervisor.started))
+	}
+}

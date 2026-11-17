@@ -29,6 +29,7 @@ type remoteFlags struct {
 	accessKey     *string
 	secretKeyFile *string
 	keyFile       *string
+	previousKeys  *string
 	chunkMB       *int
 	parallel      *int
 	maxChain      *int
@@ -55,6 +56,8 @@ func addRemoteFlags(flags *flag.FlagSet) *remoteFlags {
 			"remote storage: a file holding the secret key (or set SBX_REMOTE_SECRET_KEY / AWS_SECRET_ACCESS_KEY)"),
 		keyFile: flags.String("remote-key-file", envOr("SBX_REMOTE_KEY_FILE", ""),
 			"remote storage: a file holding the 32-byte master key (raw, base64 or hex) every daemon sharing the storage is given; everything uploaded is encrypted under keys it wraps (or set SBX_REMOTE_KEY)"),
+		previousKeys: flags.String("remote-previous-key-file", envOr("SBX_REMOTE_PREVIOUS_KEY_FILE", ""),
+			"remote storage: comma-separated files holding master keys this daemon still opens but no longer wraps with (the state while a key rotation runs); POST /v1/remote/rotate re-wraps what they still protect"),
 		chunkMB: flags.Int("remote-chunk-mb", int(envFloat("SBX_REMOTE_CHUNK_MB", offhost.DefaultChunkBytes>>20)),
 			"remote storage: the size of one uploaded object, in MiB"),
 		parallel: flags.Int("remote-parallel", int(envFloat("SBX_REMOTE_PARALLEL", offhost.DefaultParallel)),
@@ -168,6 +171,25 @@ func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, sta
 	keys, err := offhost.NewKeyring(master)
 	if err != nil {
 		return nil, err
+	}
+	// Master keys this daemon still opens but no longer wraps with: the
+	// state while a rotation runs. Given as files, comma-separated,
+	// because a key on a command line is a key in a process listing.
+	for _, path := range strings.Split(*f.previousKeys, ",") {
+		if path = strings.TrimSpace(path); path == "" {
+			continue
+		}
+		previous, err := secretFrom(path)
+		if err != nil {
+			return nil, fmt.Errorf("remote-previous-key-file: %w", err)
+		}
+		master, err := offhost.ParseMasterKey(previous)
+		if err != nil {
+			return nil, fmt.Errorf("remote-previous-key-file %s: %w", path, err)
+		}
+		if err := keys.AddPrevious(master); err != nil {
+			return nil, fmt.Errorf("remote-previous-key-file %s: %w", path, err)
+		}
 	}
 	client, err := s3.New(s3.Config{
 		Endpoint:  *f.endpoint,

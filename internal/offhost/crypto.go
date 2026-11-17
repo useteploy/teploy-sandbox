@@ -46,6 +46,10 @@ type Keyring struct {
 	// id names the master key in what it wraps (a digest, not the key),
 	// so the wrong key is reported as that and not as corruption.
 	id string
+	// previous are masters this keyring still opens but no longer wraps
+	// with: rotation's half-done state, and a daemon's read path during
+	// one. Wrapping always uses master.
+	previous map[string]cipher.AEAD
 }
 
 // ParseMasterKey reads a master key: 32 raw bytes, or their base64 or hex
@@ -74,22 +78,51 @@ func newAEAD(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
+// masterKey derives the wrapping AEAD and the id of one master key.
+func masterKey(master []byte) (cipher.AEAD, string, error) {
+	// The master key is used for one thing, under its own derived key.
+	wrapping, err := hkdf.Key(sha256.New, master, nil, label+"wrap", KeySize)
+	if err != nil {
+		return nil, "", err
+	}
+	aead, err := newAEAD(wrapping)
+	if err != nil {
+		return nil, "", err
+	}
+	digest := sha256.Sum256(append([]byte(label+"key-id/"), master...))
+	return aead, hex.EncodeToString(digest[:6]), nil
+}
+
 // NewKeyring makes a keyring from a master key.
 func NewKeyring(master []byte) (*Keyring, error) {
 	if len(master) != KeySize {
 		return nil, fmt.Errorf("a master key is %d bytes, got %d", KeySize, len(master))
 	}
-	// The master key is used for one thing, under its own derived key.
-	wrapping, err := hkdf.Key(sha256.New, master, nil, label+"wrap", KeySize)
+	aead, id, err := masterKey(master)
 	if err != nil {
 		return nil, err
 	}
-	aead, err := newAEAD(wrapping)
-	if err != nil {
-		return nil, err
+	return &Keyring{master: aead, id: id}, nil
+}
+
+// AddPrevious lets the keyring open, never wrap with, another master:
+// the state between a rotation's start and its end.
+func (k *Keyring) AddPrevious(master []byte) error {
+	if len(master) != KeySize {
+		return fmt.Errorf("a master key is %d bytes, got %d", KeySize, len(master))
 	}
-	digest := sha256.Sum256(append([]byte(label+"key-id/"), master...))
-	return &Keyring{master: aead, id: hex.EncodeToString(digest[:6])}, nil
+	aead, id, err := masterKey(master)
+	if err != nil {
+		return err
+	}
+	if id == k.id {
+		return errors.New("a previous master key is the current one")
+	}
+	if k.previous == nil {
+		k.previous = map[string]cipher.AEAD{}
+	}
+	k.previous[id] = aead
+	return nil
 }
 
 // Key is one run's data key: every chunk, manifest and record of the run
@@ -123,25 +156,63 @@ func (k *Keyring) NewKey(owner string) (Key, error) {
 	return Key{Owner: owner, Wrapped: k.id + "." + base64.RawStdEncoding.EncodeToString(sealed), raw: raw}, nil
 }
 
-// Open unwraps a stored key. It fails for a key wrapped for another owner.
+// Open unwraps a stored key. It fails for a key wrapped for another
+// owner, and for a master this keyring has neither as its current one
+// nor among its previous ones.
 func (k *Keyring) Open(owner, wrapped string) (Key, error) {
 	id, encoded, ok := strings.Cut(wrapped, ".")
 	if !ok {
 		return Key{}, fmt.Errorf("%w: malformed wrapped key", ErrCorrupt)
 	}
+	aead := k.master
 	if id != k.id {
-		return Key{}, fmt.Errorf("%w (key %s, this daemon has %s)", ErrWrongKey, id, k.id)
+		var known bool
+		aead, known = k.previous[id]
+		if !known {
+			return Key{}, fmt.Errorf("%w (key %s, this daemon has %s)", ErrWrongKey, id, k.id)
+		}
 	}
 	sealed, err := base64.RawStdEncoding.DecodeString(encoded)
-	if err != nil || len(sealed) < k.master.NonceSize() {
+	if err != nil || len(sealed) < aead.NonceSize() {
 		return Key{}, fmt.Errorf("%w: malformed wrapped key", ErrCorrupt)
 	}
-	nonce, ciphertext := sealed[:k.master.NonceSize()], sealed[k.master.NonceSize():]
-	raw, err := k.master.Open(nil, nonce, ciphertext, []byte(label+"key/"+owner))
+	nonce, ciphertext := sealed[:aead.NonceSize()], sealed[aead.NonceSize():]
+	raw, err := aead.Open(nil, nonce, ciphertext, []byte(label+"key/"+owner))
 	if err != nil || len(raw) != KeySize {
 		return Key{}, fmt.Errorf("%w: the wrapped key of %s does not open", ErrCorrupt, owner)
 	}
 	return Key{Owner: owner, Wrapped: wrapped, raw: raw}, nil
+}
+
+// Wrap wraps a data key this daemon already has the raw bytes of, under
+// the current master: what rotation does with every key it opens.
+func (k *Keyring) Wrap(owner string, raw []byte) (Key, error) {
+	if len(raw) != KeySize {
+		return Key{}, fmt.Errorf("a data key is %d bytes, got %d", KeySize, len(raw))
+	}
+	nonce := make([]byte, k.master.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return Key{}, err
+	}
+	sealed := k.master.Seal(nonce, nonce, raw, []byte(label+"key/"+owner))
+	return Key{Owner: owner, Wrapped: k.id + "." + base64.RawStdEncoding.EncodeToString(sealed), raw: bytes.Clone(raw)}, nil
+}
+
+// Current says whether a wrapped key is already under the master this
+// keyring wraps with.
+func (k *Keyring) Current(key Key) bool {
+	id, _, ok := strings.Cut(key.Wrapped, ".")
+	return ok && id == k.id
+}
+
+// Rewrap takes an opened key and returns it wrapped under the current
+// master, raw bytes unchanged: every object sealed under the key still
+// decrypts, and only the wrapped spelling moves.
+func (k *Keyring) Rewrap(key Key) (Key, error) {
+	if k.Current(key) {
+		return key, nil
+	}
+	return k.Wrap(key.Owner, key.raw)
 }
 
 // derive is the key for one purpose under a data key: a key is never used

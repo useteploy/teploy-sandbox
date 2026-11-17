@@ -92,6 +92,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /v1/warmcache/{repo...}", s.auth(s.handleWarmDrop))
 	mux.Handle("POST /v1/remote/sync", s.auth(s.handleRemoteSync))
 	mux.Handle("POST /v1/remote/collect", s.auth(s.handleRemoteCollect))
+	mux.Handle("POST /v1/remote/rotate", s.auth(s.handleRemoteRotate))
 	mux.Handle("PUT /v1/runs/{id}/files/{path...}", s.auth(s.handlePutFile))
 	mux.Handle("GET /v1/runs/{id}/files/{path...}", s.auth(s.handleGetFile))
 	return mux
@@ -300,6 +301,23 @@ func (s *Server) handleRemoteCollect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleRemoteRotate re-wraps remote storage's keys under the current
+// master now: the half of key rotation that is not a daemon's own
+// writes.
+func (s *Server) handleRemoteRotate(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.Manager.RotateRemote(r.Context())
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"manifestsRewrapped": stats.Manifests, "manifestsCurrent": stats.ManifestsCurrent,
+		"recordsRewrapped": stats.Records, "recordsCurrent": stats.RecordsCurrent,
+		"recordsRunning": stats.RecordsRunning, "recordsConflicted": stats.RecordsConflicted,
+		"recordsUnfenced": stats.RecordsUnfenced, "recordsDestroyed": stats.RecordsDestroyed,
+	})
 }
 
 func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {

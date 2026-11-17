@@ -807,6 +807,14 @@ func (m *Manager) CollectRemote(ctx context.Context) error {
 	return m.OffHost.Collect(ctx)
 }
 
+// RotateRemote re-wraps the bucket's keys under the current master.
+func (m *Manager) RotateRemote(ctx context.Context) (RotateStats, error) {
+	if m.OffHost == nil {
+		return RotateStats{}, fmt.Errorf("%w: this daemon has no remote storage", ErrBadRequest)
+	}
+	return m.OffHost.Rotate(ctx)
+}
+
 // DefaultRemoteSyncInterval and DefaultRemoteGCInterval pace the upkeep
 // of remote storage.
 const (

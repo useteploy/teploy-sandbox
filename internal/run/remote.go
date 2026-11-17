@@ -126,6 +126,22 @@ type UploadResult struct {
 	Took    time.Duration
 }
 
+// RotateStats is what one master-key rotation pass did. Nothing was
+// re-uploaded: the data keys themselves did not change, only the master
+// each is wrapped by. A pass that ends with RecordsRunning or
+// RecordsConflicted is not the whole fleet, but is not unsafe either:
+// every previous master the daemons were given still opens everything.
+type RotateStats struct {
+	Manifests         int `json:"manifestsRewrapped"`
+	ManifestsCurrent  int `json:"manifestsCurrent"`
+	Records           int `json:"recordsRewrapped"`
+	RecordsCurrent    int `json:"recordsCurrent"`
+	RecordsRunning    int `json:"recordsRunning"`
+	RecordsConflicted int `json:"recordsConflicted"`
+	RecordsUnfenced   int `json:"recordsUnfenced"`
+	RecordsDestroyed  int `json:"recordsDestroyed"`
+}
+
 // OffHost is remote storage as the manager uses it.
 type OffHost interface {
 	// Fenced is whether storage can decide between two daemons (it has
@@ -155,6 +171,10 @@ type OffHost interface {
 	DeleteSnapshot(ctx context.Context, ref string) error
 	// Collect deletes what nothing refers to any more.
 	Collect(ctx context.Context) error
+	// Rotate re-wraps the bucket's keys under the current master: every
+	// manifest, and every stopped run's record as a new generation with
+	// the state and the owner unchanged. Chunks do not move.
+	Rotate(ctx context.Context) (RotateStats, error)
 	// Pressure is whether local storage is short enough that copies
 	// which are safe in remote storage should go.
 	Pressure(ctx context.Context) (bool, error)

@@ -152,6 +152,12 @@ func (s *Service) Upload(ctx context.Context, req run.UploadRequest) (run.Upload
 	if err != nil {
 		return run.UploadResult{}, err
 	}
+	// Wrapped with the previous master during a rotation's half-done
+	// state: re-wrapped here, so the manifest this upload writes and the
+	// key the caller keeps are both under the current one.
+	if key, err = s.store.Keys().Rewrap(key); err != nil {
+		return run.UploadResult{}, err
+	}
 	guid, ok, err := s.snaps.Stat(ctx, id)
 	if err != nil {
 		return run.UploadResult{}, err
@@ -483,6 +489,11 @@ func (s *Service) Advance(ctx context.Context, record run.RemoteRecord) (string,
 	if err != nil {
 		return "", err
 	}
+	// As in Upload: a key wrapped with a previous master is re-wrapped
+	// by the write, not left to a later rotation pass.
+	if key, err = s.store.Keys().Rewrap(key); err != nil {
+		return "", err
+	}
 	stored := Record{Run: record.Run, Generation: record.Generation, State: record.State, Payload: record.Payload}
 	if record.Snapshot != "" {
 		if stored.Snapshot, err = s.id(record.Snapshot); err != nil {
@@ -506,6 +517,28 @@ func (s *Service) Collect(ctx context.Context) error {
 	s.log.Info("remote storage collected", "snapshotsDeleted", stats.Snapshots, "objectsDeleted", stats.Objects,
 		"bytesDeleted", stats.Bytes, "snapshotsKept", stats.Kept, "took", time.Since(start).String())
 	return nil
+}
+
+// Rotate re-wraps the bucket's keys under the current master. The
+// daemon's own writes already re-wrap as they go (Upload and Advance);
+// this covers what is standing still: stopped runs' records and every
+// manifest.
+func (s *Service) Rotate(ctx context.Context) (run.RotateStats, error) {
+	start := time.Now()
+	stats, err := s.store.Rotate(ctx, s.config.Daemon, s.config.Unfenced)
+	out := run.RotateStats{
+		Manifests: stats.Manifests, ManifestsCurrent: stats.ManifestsCurrent,
+		Records: stats.Records, RecordsCurrent: stats.RecordsCurrent, RecordsRunning: stats.RecordsRunning,
+		RecordsConflicted: stats.RecordsConflicted, RecordsUnfenced: stats.RecordsUnfenced, RecordsDestroyed: stats.RecordsDestroyed,
+	}
+	if err != nil {
+		return out, err
+	}
+	s.log.Info("remote storage keys rotated", "manifestsRewrapped", stats.Manifests, "manifestsCurrent", stats.ManifestsCurrent,
+		"recordsRewrapped", stats.Records, "recordsCurrent", stats.RecordsCurrent, "recordsRunning", stats.RecordsRunning,
+		"recordsConflicted", stats.RecordsConflicted, "recordsUnfenced", stats.RecordsUnfenced,
+		"recordsDestroyed", stats.RecordsDestroyed, "took", time.Since(start).String())
+	return out, nil
 }
 
 // Pressure reports whether the local pool has less free space than the

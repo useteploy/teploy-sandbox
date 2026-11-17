@@ -88,6 +88,11 @@ type Config struct {
 	// zero means the default and a negative value no limit.
 	DiskMBPerSecond, DiskIOPS int
 	NetMbit, NetConnections   int
+	// MaxRuns is how many VMs runs may have at once; zero is no limit.
+	MaxRuns int
+	// Warm is the warm pool: VMs booted ahead of creates. No sizes is
+	// no pool.
+	Warm WarmConfig
 }
 
 // host is what Preflight asks of the machine; a struct of functions so the
@@ -690,5 +695,8 @@ func New(ctx context.Context, config Config, log *slog.Logger) (*Driver, error) 
 	if config.BootTimeout > 0 {
 		driver.BootTimeout = config.BootTimeout
 	}
+	driver.MaxRuns = max(config.MaxRuns, 0)
+	driver.warm = config.Warm.withDefaults()
+	driver.owner = config.Owner
 	return driver, nil
 }

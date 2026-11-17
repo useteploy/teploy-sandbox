@@ -1,7 +1,9 @@
 package vm
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,26 +34,17 @@ type Agent interface {
 
 // MachineConfig is one VM to start.
 type MachineConfig struct {
-	// Name is the run's container name; it names the VM's runtime dir.
+	// Name is the VM's name; it names the VM's runtime dir, cgroup,
+	// device node and volume.
 	Name string
 	// Disk is the block device the VM boots from.
 	Disk     string
 	CPUs     int
 	MemoryMB int
-	// Net is the VM's network device; nil is a VM with none.
-	Net *NetDevice
 }
 
-// NetDevice is a tap the daemon made for a VM, handed over open.
-type NetDevice struct {
-	Tap *os.File
-	// MAC is the address the guest's device is given.
-	MAC string
-}
-
-// tapFD is the descriptor number the tap has in the hypervisor process:
-// the first after stdin, stdout and stderr.
-const tapFD = 3
+// netDeviceID is the hypervisor's name for a VM's one network device.
+const netDeviceID = "net0"
 
 // Machine is a started VM.
 type Machine interface {
@@ -62,6 +55,10 @@ type Machine interface {
 	// Kill ends the VM process and waits for it to be gone. Killing a
 	// machine that already exited is not an error.
 	Kill(ctx context.Context) error
+	// AddNet gives the running VM its network device: tap, open, becomes
+	// a virtio-net device with the given MAC. The daemon keeps its own
+	// descriptor for tap and closes it when it likes.
+	AddNet(ctx context.Context, tap *os.File, mac string) error
 	// Exited is closed once the VM process is gone.
 	Exited() <-chan struct{}
 	// Diagnostics is what the VM left behind for a human: the end of its
@@ -144,19 +141,11 @@ const (
 func (h *CloudHypervisor) machineDir(name string) string { return filepath.Join(h.RunDir, name) }
 
 // machineArgs is the cloud-hypervisor command line for a VM — pure, so it
-// is testable without a hypervisor.
+// is testable without a hypervisor. It never names a network device: every
+// VM boots without one, and a run that has a network is given its device
+// afterwards (AddNet), whether its VM was booted for it or kept booted in
+// the warm pool. One way for both, so that a run cannot tell which it got.
 func (h *CloudHypervisor) machineArgs(config MachineConfig, dir string, cid uint32) []string {
-	args := h.baseArgs(config, dir, cid)
-	if config.Net != nil {
-		// The tap as an inherited descriptor, never by name: the
-		// hypervisor is in a network namespace that has no interfaces,
-		// and it neither creates nor configures one.
-		args = append(args, "--net", fmt.Sprintf("fd=%d,mac=%s", tapFD, config.Net.MAC))
-	}
-	return args
-}
-
-func (h *CloudHypervisor) baseArgs(config MachineConfig, dir string, cid uint32) []string {
 	return []string{
 		"--kernel", h.Kernel,
 		"--cmdline", h.Cmdline,
@@ -219,12 +208,8 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 	// per VM keeps logs unambiguous.
 	cid := 3 + h.nextCID.Add(1)
 	// Not a CommandContext: the VM outlives the request that created it.
-	var files []*os.File
-	if config.Net != nil {
-		// Descriptor tapFD in the hypervisor.
-		files = append(files, config.Net.Tap)
-	}
-	cmd, err := confined.command(h.Bin, h.Kernel, h.machineArgs(config, dir, cid), files...)
+	// It is handed no descriptor beyond its standard three.
+	cmd, err := confined.command(h.Bin, h.Kernel, h.machineArgs(config, dir, cid))
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("start hypervisor: %w", err), confined.release(cleanupCtx))
 	}
@@ -302,6 +287,63 @@ func (m *chMachine) call(ctx context.Context, action string) error {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		return fmt.Errorf("hypervisor %s: %s: %s", action, resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// AddNet hot-plugs the VM's network device: the open tap goes to the
+// hypervisor with its add-net request, as an SCM_RIGHTS message on its API
+// socket, the way the hypervisor's own client hands it descriptors. The
+// hypervisor gets a descriptor and never a name, as before: it is in a
+// network namespace that has no interfaces, and it neither creates nor
+// configures one. The guest finds the device on its PCI bus.
+func (m *chMachine) AddNet(ctx context.Context, tap *os.File, mac string) error {
+	conn, err := m.cell.dial(ctx, filepath.Join(m.dir, apiSocketName))
+	if err != nil {
+		return fmt.Errorf("hypervisor vm.add-net: %w", err)
+	}
+	defer conn.Close()
+	unixConn, ok := conn.(*net.UnixConn)
+	if !ok {
+		return errors.New("hypervisor vm.add-net: the API socket is not a unix socket")
+	}
+	deadline := time.Now().Add(pauseTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+	body, err := json.Marshal(map[string]string{"id": netDeviceID, "mac": mac})
+	if err != nil {
+		return err
+	}
+	request := fmt.Appendf(nil, "PUT /api/v1/vm.add-net HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	raw, err := tap.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var written int
+	var writeErr error
+	// The descriptor travels with the first byte of the request: the
+	// hypervisor takes the files a request arrived with.
+	if err := raw.Control(func(fd uintptr) {
+		written, _, writeErr = unixConn.WriteMsgUnix(request, syscall.UnixRights(int(fd)), nil)
+	}); err != nil {
+		return err
+	}
+	if writeErr != nil {
+		return fmt.Errorf("hypervisor vm.add-net: %w", writeErr)
+	}
+	if written != len(request) {
+		return fmt.Errorf("hypervisor vm.add-net: wrote %d of %d bytes", written, len(request))
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		return fmt.Errorf("hypervisor vm.add-net: %w", err)
+	}
+	defer resp.Body.Close()
+	answer, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("hypervisor vm.add-net: %s: %s", resp.Status, strings.TrimSpace(string(answer)))
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -362,8 +363,14 @@ type fakeHypervisor struct {
 	bootErr error
 	// dieOnBoot makes the next machine exit before its agent answers.
 	dieOnBoot bool
-	swept     int
-	sweepErr  error
+	// bootGate, when set, holds every new machine's agent silent until
+	// it is closed: a boot that takes as long as the test likes.
+	bootGate chan struct{}
+	// booting counts machines whose agent has not answered yet, and
+	// peak the most there were at once.
+	booting, peak int
+	swept         int
+	sweepErr      error
 	// onStart is called with each new machine before it is returned.
 	onStart func(*fakeMachine)
 	// zfsCallsAtSweep is how many zfs mutations had happened when the
@@ -384,8 +391,10 @@ func (h *fakeHypervisor) Start(_ context.Context, config MachineConfig) (Machine
 	h.started = append(h.started, config)
 	machine := &fakeMachine{
 		config: config, zfs: h.zfs, volume: strings.TrimPrefix(config.Disk, h.deviceDir+"/"),
-		exited: make(chan struct{}), pingErr: h.bootErr,
+		exited: make(chan struct{}), pingErr: h.bootErr, gate: h.bootGate, hypervisor: h,
 	}
+	h.booting++
+	h.peak = max(h.peak, h.booting)
 	if h.dieOnBoot {
 		machine.pingErr = errors.New("connection refused")
 		close(machine.exited)
@@ -430,9 +439,14 @@ func (h *fakeHypervisor) running() []string {
 }
 
 type fakeMachine struct {
-	config MachineConfig
-	zfs    *fakeZFS
-	volume string
+	config     MachineConfig
+	zfs        *fakeZFS
+	volume     string
+	hypervisor *fakeHypervisor
+	// gate holds the agent silent until it is closed; up records that it
+	// has answered once.
+	gate chan struct{}
+	up   bool
 
 	mu       sync.Mutex
 	dead     bool
@@ -445,6 +459,12 @@ type fakeMachine struct {
 	// paused the VM, and the answer was lost.
 	pauseLands bool
 	syncErr    error
+	// netMAC is the MAC of the network device the machine was given,
+	// netTap whether the tap was open when it was handed over, and
+	// addNetErr what AddNet answers.
+	netMAC    string
+	netTap    bool
+	addNetErr error
 	// events is the order of sync, pause, resume and kill calls.
 	events []string
 	// execs records each exec's merged environment; setups is the guest
@@ -495,6 +515,24 @@ func (m *fakeMachine) Resume(context.Context) error {
 	return nil
 }
 
+func (m *fakeMachine) AddNet(_ context.Context, tap *os.File, mac string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.addNetErr != nil {
+		return m.addNetErr
+	}
+	if m.dead {
+		return errors.New("connection refused: vm is gone")
+	}
+	if m.netMAC != "" {
+		return errors.New("the vm already has a network device")
+	}
+	_, statErr := tap.Stat()
+	m.netMAC, m.netTap = mac, statErr == nil
+	m.events = append(m.events, "add-net")
+	return nil
+}
+
 func (m *fakeMachine) Kill(context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -505,6 +543,12 @@ func (m *fakeMachine) Kill(context.Context) error {
 	if !m.dead {
 		m.dead = true
 		close(m.exited)
+		if !m.up && m.hypervisor != nil {
+			m.up = true
+			m.hypervisor.mu.Lock()
+			m.hypervisor.booting--
+			m.hypervisor.mu.Unlock()
+		}
 	}
 	return nil
 }
@@ -526,12 +570,31 @@ func (a *fakeAgent) alive() error {
 	return nil
 }
 
-func (a *fakeAgent) Ping(context.Context) (string, error) {
+func (a *fakeAgent) Ping(ctx context.Context) (string, error) {
+	if a.gate != nil {
+		select {
+		case <-a.gate:
+		case <-a.exited:
+			return "", errors.New("connection refused: vm is gone")
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 	if a.pingErr != nil {
 		return "", a.pingErr
 	}
 	if err := a.alive(); err != nil {
 		return "", err
+	}
+	m := (*fakeMachine)(a)
+	m.mu.Lock()
+	first := !m.up
+	m.up = true
+	m.mu.Unlock()
+	if first && m.hypervisor != nil {
+		m.hypervisor.mu.Lock()
+		m.hypervisor.booting--
+		m.hypervisor.mu.Unlock()
 	}
 	return "fake-agent", nil
 }

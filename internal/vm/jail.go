@@ -77,7 +77,8 @@ type jailSpec struct {
 	Paths []jailPath `json:"paths"`
 	// Descriptors is how many open files the program is given, counted
 	// from 0: its input and two outputs, and whatever the daemon hands it
-	// after those (a tap). No other descriptor the helper was started
+	// after those (none, for a hypervisor: a VM's tap reaches it later,
+	// over its API socket). No other descriptor the helper was started
 	// with reaches the program. An open directory of the host would be a
 	// way out of the jail's root for whoever holds it, and the daemon
 	// cannot know what it was itself started with: a lock file a wrapper
@@ -141,8 +142,8 @@ const (
 // jailFor is the jail of one VM: the hypervisor's binary (and what it is
 // linked against, if anything), the kernel image, the VM's own disk
 // node, /dev/kvm and /dev/urandom, and the directory its two sockets are
-// made in. The tap, if there is one, is a descriptor and needs no path:
-// whoever hands it over raises Descriptors by one.
+// made in. A tap is a descriptor and needs no path: the daemon hands it
+// over the VM's API socket once the VM runs (AddNet).
 func jailFor(root string, uid uint32, groups []uint32, bin, kernel, disk, dir string, libraries []jailPath) jailSpec {
 	paths := []jailPath{
 		{Path: bin, Kind: jailFile, Exec: true},

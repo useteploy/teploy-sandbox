@@ -1485,19 +1485,22 @@ func TestNetworkTiersThroughTheManager(t *testing.T) {
 		t.Fatalf("network: %q", created.Network)
 	}
 	name := containerName(created.ID)
-	started := rig.hypervisor.started[0]
 	guest := network.attached[name]
-	if started.Net == nil || started.Net.MAC != guest.MAC || network.ports[name] != 40001 {
-		t.Fatalf("the VM was not started on its device: %+v, port %d", started.Net, network.ports[name])
+	machine := rig.hypervisor.machine(name)
+	if machine.netMAC != guest.MAC || !machine.netTap || network.ports[name] != 40001 {
+		t.Fatalf("the VM was not given its device: %q (open %t), port %d", machine.netMAC, machine.netTap, network.ports[name])
+	}
+	// Given to the running VM, before its guest was set up.
+	if !slices.Equal(machine.events, []string{"add-net"}) || len(machine.setups) != 1 {
+		t.Fatalf("events %v, setups %d", machine.events, len(machine.setups))
 	}
 	// The daemon does not keep the tap open: it must die with the VM.
 	if _, err := guest.Tap.Stat(); err == nil {
-		t.Fatal("the daemon still holds the tap after the hypervisor started")
+		t.Fatal("the daemon still holds the tap after the hypervisor has it")
 	}
 	if extra, ok := egress.opened[created.ID]; !ok || len(extra) != 0 {
 		t.Fatalf("an allowlist run without entries of its own still gets its own proxy: %v", egress.opened)
 	}
-	machine := rig.hypervisor.machine(name)
 	// The guest was told to bring its device up, once, and that is not
 	// one of the run's own execs.
 	if len(machine.setups) != 1 || !strings.Contains(machine.setups[0], "addr="+guest.Address.String()) || len(machine.execs) != 0 {
@@ -1562,7 +1565,7 @@ func TestNetworkTiersThroughTheManager(t *testing.T) {
 	// --- none: no device at all
 	none, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage})
 	must(t, err)
-	if network.attached[containerName(none.ID)] != nil || rig.hypervisor.started[len(rig.hypervisor.started)-1].Net != nil {
+	if network.attached[containerName(none.ID)] != nil || rig.hypervisor.machine(containerName(none.ID)).netMAC != "" {
 		t.Fatal("a run on \"none\" was given a network device")
 	}
 	// Its guest is still given the time, and nothing about a network.
@@ -1626,16 +1629,29 @@ func TestAnAllowlistRunNeedsAProxyAGuestCanReach(t *testing.T) {
 func TestNetworkFailuresRollBackCompletely(t *testing.T) {
 	rig, network, egress := newNetworkedRig(t)
 
-	// The device cannot be made: no VM, no volume, and the proxy is closed.
+	// The device cannot be made: the VM (booted first, with none) is
+	// killed, its volume goes, and the proxy is closed.
 	network.attachErr = errors.New("no tap for you")
 	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Network: "allowlist"}); err == nil || !strings.Contains(err.Error(), "no tap for you") {
 		t.Fatalf("create: %v", err)
 	}
-	if len(rig.hypervisor.started) != 0 || len(egress.closed) != 1 {
-		t.Fatalf("after a failed attach: started=%v closed=%v", rig.hypervisor.started, egress.closed)
+	if len(rig.hypervisor.running()) != 0 || len(egress.closed) != 1 {
+		t.Fatalf("after a failed attach: running=%v closed=%v", rig.hypervisor.running(), egress.closed)
 	}
 	assertPool(t, rig.zfs, pristine...)
 	network.attachErr = nil
+
+	// The hypervisor refuses the device: the same, and the device is
+	// given back.
+	rig.hypervisor.onStart = func(machine *fakeMachine) { machine.addNetErr = errors.New("add-net: 500") }
+	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Network: "open"}); err == nil || !strings.Contains(err.Error(), "add-net: 500") {
+		t.Fatalf("create with a hypervisor that refuses the device: %v", err)
+	}
+	rig.hypervisor.onStart = nil
+	if len(network.attached) != 0 || len(rig.hypervisor.running()) != 0 {
+		t.Fatalf("left behind: %v %v", network.attached, rig.hypervisor.running())
+	}
+	assertPool(t, rig.zfs, pristine...)
 
 	// The guest cannot configure its device: the run is not handed over
 	// with a network that does not work.

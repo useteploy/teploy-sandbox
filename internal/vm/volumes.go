@@ -172,8 +172,12 @@ func (v *Volumes) CreateRun(ctx context.Context, name, ref string) (string, erro
 		source = ref
 	}
 	volume := v.runVolume(name)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
 	if err := v.zfs.Clone(ctx, source, volume, v.props(kindRun)); err != nil {
-		return "", fmt.Errorf("clone %s: %w", source, err)
+		// A clone that was killed at the caller's deadline (a pool that
+		// is closing cancels its boots) may still have happened.
+		return "", errors.Join(fmt.Errorf("clone %s: %w", source, err), v.removeVolume(cleanupCtx, volume))
 	}
 	device := v.DevicePath(name)
 	err := v.waitDevice(ctx, device)
@@ -181,8 +185,6 @@ func (v *Volumes) CreateRun(ctx context.Context, name, ref string) (string, erro
 		err = v.checkDevice(device)
 	}
 	if err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-		defer cancel()
 		return "", errors.Join(fmt.Errorf("volume device %s: %w", device, err), v.removeVolume(cleanupCtx, volume))
 	}
 	return device, nil

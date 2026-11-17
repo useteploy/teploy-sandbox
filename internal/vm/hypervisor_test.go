@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -51,18 +52,13 @@ func TestMachineArgsAreTheProvenCommandLine(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("args:\n%q\nwant:\n%q", got, want)
 	}
-	// No network device of any kind: the "none" tier is the absence of
-	// one, not a firewall in front of one.
-	if joined := strings.Join(got, " "); strings.Contains(joined, "--net") {
-		t.Fatalf("a VM was given a network device: %s", joined)
-	}
-	// A networked VM is the same command line with the tap as an inherited
-	// descriptor: never an interface name, which would have the hypervisor
-	// open (or create) a device itself.
-	networked := h.machineArgs(MachineConfig{Name: "teploy-sbx-x", Disk: "/dev/zvol/tank/teploy-sbx-x", CPUs: 2, MemoryMB: 2048,
-		Net: &NetDevice{MAC: "02:54:0a:d1:00:02"}}, "/run/sbx/abc/teploy-sbx-x", 7)
-	if !slices.Equal(networked, append(slices.Clone(want), "--net", "fd=3,mac=02:54:0a:d1:00:02")) {
-		t.Fatalf("networked args: %q", networked)
+	// No network device of any kind, ever: the "none" tier is the absence
+	// of one, not a firewall in front of one, and a run with a network is
+	// given its device once its VM runs (AddNet), as a descriptor over the
+	// API socket. Every VM boots from the same command line, so a VM kept
+	// in the warm pool is booted exactly as one booted for a run.
+	if joined := strings.Join(got, " "); strings.Contains(joined, "--net") || strings.Contains(joined, "tap") {
+		t.Fatalf("a VM was given a network device at boot: %s", joined)
 	}
 }
 
@@ -436,5 +432,100 @@ func TestTailBufferKeepsTheEnd(t *testing.T) {
 	}
 	if got := (&tailBuffer{limit: 8}).Tail(8); got != "" {
 		t.Fatalf("empty tail = %q", got)
+	}
+}
+
+// AddNet speaks the hypervisor's add-net call: the tap travels as an
+// SCM_RIGHTS descriptor with the request itself, the body names the
+// device and its MAC and nothing else (no interface name, no path), and
+// only the VM's own UID is told anything.
+func TestAddNetHandsTheTapOverTheAPISocket(t *testing.T) {
+	dir := shortDir(t)
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(dir, apiSocketName), Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	tap, err := os.CreateTemp(dir, "tap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tap.Close()
+	tapInfo, _ := tap.Stat()
+
+	type received struct {
+		request  string
+		sameFile bool
+		files    int
+	}
+	answers := make(chan received, 2)
+	var status atomic.Value
+	status.Store("200 OK")
+	go func() {
+		for {
+			conn, err := listener.AcceptUnix()
+			if err != nil {
+				return
+			}
+			buf, oob := make([]byte, 4096), make([]byte, 256)
+			n, oobn, _, _, err := conn.ReadMsgUnix(buf, oob)
+			if err != nil {
+				conn.Close()
+				continue
+			}
+			got := received{request: string(buf[:n])}
+			if messages, err := syscall.ParseSocketControlMessage(oob[:oobn]); err == nil {
+				for _, message := range messages {
+					fds, _ := syscall.ParseUnixRights(&message)
+					got.files += len(fds)
+					for _, fd := range fds {
+						file := os.NewFile(uintptr(fd), "received")
+						info, _ := file.Stat()
+						got.sameFile = got.sameFile || os.SameFile(info, tapInfo)
+						file.Close()
+					}
+				}
+			}
+			answers <- got
+			_, _ = io.WriteString(conn, "HTTP/1.1 "+status.Load().(string)+"\r\nContent-Length: 2\r\n\r\n{}")
+			conn.Close()
+		}
+	}()
+	owner := uint32(70123)
+	cell := &cell{uid: 70123, owner: &confinement{sys: confineSys{socketOwner: func(net.Conn) (uint32, error) { return owner, nil }}}}
+	machine := &chMachine{dir: dir, cell: cell}
+
+	if err := machine.AddNet(context.Background(), tap, "02:54:0a:d1:00:02"); err != nil {
+		t.Fatal(err)
+	}
+	got := <-answers
+	head, body, _ := strings.Cut(got.request, "\r\n\r\n")
+	if !strings.HasPrefix(head, "PUT /api/v1/vm.add-net HTTP/1.1\r\n") || body != `{"id":"net0","mac":"02:54:0a:d1:00:02"}` {
+		t.Fatalf("request:\n%s", got.request)
+	}
+	if got.files != 1 || !got.sameFile {
+		t.Fatalf("descriptors with the request: %d, the tap among them: %t", got.files, got.sameFile)
+	}
+	// The daemon's own descriptor is still its own to close.
+	if _, err := tap.Stat(); err != nil {
+		t.Fatalf("AddNet closed the caller's tap: %v", err)
+	}
+
+	// A refusal is an error, with the hypervisor's words.
+	status.Store("500 Internal Server Error")
+	if err := machine.AddNet(context.Background(), tap, "02:54:0a:d1:00:02"); err == nil || !strings.Contains(err.Error(), "500") {
+		t.Fatalf("a refused add-net: %v", err)
+	}
+	<-answers
+
+	// Something else listening there is told nothing, the tap least of all.
+	owner = 0
+	if err := machine.AddNet(context.Background(), tap, "02:54:0a:d1:00:02"); err == nil || !strings.Contains(err.Error(), "not this VM's uid") {
+		t.Fatalf("add-net to a socket another UID listens on: %v", err)
+	}
+	select {
+	case got := <-answers:
+		t.Fatalf("a socket of another UID was sent %q with %d descriptors", got.request, got.files)
+	case <-time.After(100 * time.Millisecond):
 	}
 }

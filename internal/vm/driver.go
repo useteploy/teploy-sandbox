@@ -62,16 +62,32 @@ type Driver struct {
 	log     *slog.Logger
 	// BootTimeout bounds the wait for a new VM's agent.
 	BootTimeout time.Duration
+	// MaxRuns is how many VMs runs may have at once; zero is no limit.
+	MaxRuns int
+	// warm is the warm pool's configuration; the pool itself starts
+	// after the startup sweep (Sweep).
+	warm  WarmConfig
+	owner string
+	// hostMemory is the host's available memory in MiB for the warm
+	// pool; nil reads /proc/meminfo.
+	hostMemory func() (int, error)
 
 	mu       sync.Mutex
 	machines map[string]*instance
+	// creating counts creates under way, for MaxRuns.
+	creating int
+	pool     *warmPool
 }
 
-// instance is one run's VM.
+// instance is one run's VM, under the VM's name.
 type instance struct {
 	machine Machine
 	// env is the run's create-time environment, laid under every exec's.
 	env map[string]string
+	// network is the name the run's place in the network is under: the
+	// run's own container name, which is the VM's name unless the VM came
+	// from the warm pool.
+	network string
 }
 
 var (
@@ -152,9 +168,20 @@ func vcpus(limit float64) int {
 	return int(math.Ceil(limit))
 }
 
-// Create clones the run's volume and boots it. The returned container ID
-// is the spec's name; a non-empty ID alongside an error means something
-// of that name could not be cleaned up (the Runtime contract).
+// Create gives a run its VM and hands it over. A fresh run on the golden
+// image whose size the warm pool keeps takes a VM that was booted ahead of
+// time; every other create (the pool is empty or off, the size is not
+// kept, or the run boots its own disk: a resume or a fork) boots one. From
+// then on the two are the same: the VM is claimed for the run, which is
+// where everything that belongs to the run happens (its network device,
+// its guest's network and clock), and nothing of that is done before.
+//
+// The returned container ID is the VM's name: the spec's name for a VM
+// booted here, the pool's name for one taken from it (its volume, cgroup,
+// device node and runtime dir are already called that, and none of them
+// is renamed under a running hypervisor). A non-empty ID alongside an
+// error means something of that name could not be cleaned up (the Runtime
+// contract).
 func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error) {
 	networked := spec.Network != "" && spec.Network != run.NetworkNone
 	proxyPort := 0
@@ -179,13 +206,6 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 		}
 		ref = spec.Image
 	}
-	d.mu.Lock()
-	_, exists := d.machines[spec.Name]
-	d.mu.Unlock()
-	if exists {
-		return "", fmt.Errorf("a vm named %s already exists", spec.Name)
-	}
-
 	if spec.Network == run.NetworkAllowlist {
 		// The proxy is the tier: without one there is nothing to admit
 		// the run to, and it would be a run on "none" that says otherwise.
@@ -194,79 +214,152 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 			return "", err
 		}
 	}
-
-	device, err := d.volumes.CreateRun(ctx, spec.Name, ref)
-	if errors.Is(err, ErrNoSnapshot) {
-		return "", fmt.Errorf("%w: %v", run.ErrBadRequest, err)
-	}
+	admitted, err := d.admit(spec.Name)
 	if err != nil {
 		return "", err
 	}
+	defer admitted()
+
 	// Rollbacks run under a fresh deadline: the request's may be what
 	// just expired.
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	config := MachineConfig{Name: spec.Name, Disk: device, CPUs: vcpus(spec.CPUs), MemoryMB: spec.MemoryMB}
-	var guestNet *GuestNetwork
-	var attachTook, guestTook time.Duration
-	if networked {
-		start := time.Now()
-		guestNet, err = d.network.Attach(ctx, spec.Name, spec.Network, proxyPort)
-		attachTook = time.Since(start)
+	cpus := vcpus(spec.CPUs)
+	start := time.Now()
+	name, source := spec.Name, "boot"
+	var machine Machine
+	if pool := d.warmPool(); pool != nil && ref == "" {
+		if warm := pool.take(cpus, spec.MemoryMB); warm != nil {
+			name, machine, source = warm.name, warm.machine, "warm pool"
+		}
+	}
+	if machine == nil {
+		booted := d.warmPool().coldBoot()
+		var leftover bool
+		machine, leftover, err = d.boot(ctx, name, ref, cpus, spec.MemoryMB)
+		booted()
+		if errors.Is(err, ErrNoSnapshot) {
+			err = fmt.Errorf("%w: %v", run.ErrBadRequest, err)
+		}
 		if err != nil {
-			err = fmt.Errorf("network device for %s: %w", spec.Name, err)
-			cleanupErr := d.network.Detach(cleanupCtx, spec.Name)
-			if cleanupErr == nil {
-				cleanupErr = d.volumes.RemoveRun(cleanupCtx, spec.Name)
+			if !leftover {
+				return "", err
 			}
-			if cleanupErr != nil {
-				return spec.Name, errors.Join(err, cleanupErr)
-			}
-			return "", err
-		}
-		config.Net = &NetDevice{Tap: guestNet.Tap, MAC: guestNet.MAC}
-	}
-	machine, err := d.hypervisor.Start(ctx, config)
-	if guestNet != nil {
-		// The hypervisor has its own copy now, or was never started. The
-		// tap lives exactly as long as a process holds it, and the
-		// daemon must not be one of them.
-		_ = guestNet.Tap.Close()
-	}
-	if err == nil {
-		if err = d.waitReady(ctx, machine); err != nil {
-			err = fmt.Errorf("vm %s did not come up: %w", spec.Name, err)
-		}
-	}
-	if err == nil {
-		start := time.Now()
-		if err = prepareGuest(ctx, machine, guestNet); err != nil {
-			err = fmt.Errorf("vm %s: %w", spec.Name, err)
-		}
-		guestTook = time.Since(start)
-	}
-	if err != nil {
-		var cleanupErr error
-		if machine != nil {
-			cleanupErr = machine.Kill(cleanupCtx)
-		}
-		if cleanupErr == nil && d.network != nil {
-			cleanupErr = d.network.Detach(cleanupCtx, spec.Name)
-		}
-		if cleanupErr == nil {
-			cleanupErr = d.volumes.RemoveRun(cleanupCtx, spec.Name)
-		}
-		if cleanupErr != nil {
-			// Track it, so the Remove the manager retries finds the machine.
 			if machine != nil {
-				d.mu.Lock()
-				d.machines[spec.Name] = &instance{machine: machine}
-				d.mu.Unlock()
+				// Tracked, so the Remove the manager retries finds it.
+				d.track(name, &instance{machine: machine, network: spec.Name})
 			}
-			return spec.Name, errors.Join(err, cleanupErr)
+			return name, err
+		}
+	}
+	booted := time.Since(start)
+
+	// From here the VM is this run's, and only this run's: a VM that was
+	// claimed is never handed to another run, nor put back in the pool.
+	env, err := d.claim(ctx, name, machine, spec, proxyPort)
+	if err != nil {
+		cleanupErr := d.discard(cleanupCtx, name, machine, spec.Name)
+		if cleanupErr != nil {
+			d.track(name, &instance{machine: machine, network: spec.Name})
+			return name, errors.Join(err, cleanupErr)
 		}
 		return "", err
 	}
+	d.track(name, &instance{machine: machine, env: env, network: spec.Name})
+	d.log.Info("vm handed to its run", "name", name, "run", spec.Name, "from", source, "tier", spec.Network,
+		"vm", booted.String(), "total", time.Since(start).String())
+	return name, nil
+}
+
+// admit counts a create against the daemon's limit on VMs, until the
+// returned function is called. A VM a run has, and one that could not be
+// removed, both count.
+func (d *Driver) admit(name string) (func(), error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, exists := d.machines[name]; exists {
+		return nil, fmt.Errorf("a vm named %s already exists", name)
+	}
+	if d.MaxRuns > 0 && len(d.machines)+d.creating >= d.MaxRuns {
+		return nil, fmt.Errorf("%w: this daemon runs at most %d VMs at once (--vm-max-runs), and has %d", run.ErrAtCapacity, d.MaxRuns, len(d.machines)+d.creating)
+	}
+	d.creating++
+	return func() {
+		d.mu.Lock()
+		d.creating--
+		d.mu.Unlock()
+	}, nil
+}
+
+func (d *Driver) track(name string, current *instance) {
+	d.mu.Lock()
+	d.machines[name] = current
+	d.mu.Unlock()
+}
+
+// boot clones a VM's volume (from the golden snapshot, or from ref) and
+// boots it with nothing of a run's: no network device, no environment,
+// nothing run in its guest. It returns once the guest's agent answers. On
+// failure everything is given back, and leftover says when something could
+// not be: then machine is the VM if one was started, and the volume is
+// still called name.
+func (d *Driver) boot(ctx context.Context, name, ref string, cpus, memoryMB int) (machine Machine, leftover bool, err error) {
+	device, err := d.volumes.CreateRun(ctx, name, ref)
+	if err != nil {
+		return nil, false, err
+	}
+	machine, err = d.hypervisor.Start(ctx, MachineConfig{Name: name, Disk: device, CPUs: cpus, MemoryMB: memoryMB})
+	if err == nil {
+		if err = d.waitReady(ctx, machine); err != nil {
+			err = fmt.Errorf("vm %s did not come up: %w", name, err)
+		}
+	}
+	if err == nil {
+		return machine, false, nil
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	var cleanupErr error
+	if machine != nil {
+		cleanupErr = machine.Kill(cleanupCtx)
+	}
+	if cleanupErr == nil {
+		cleanupErr = d.volumes.RemoveRun(cleanupCtx, name)
+	}
+	if cleanupErr != nil {
+		return machine, true, errors.Join(err, cleanupErr)
+	}
+	return nil, false, err
+}
+
+// claim makes a booted VM the run's: its network device on the run's tier
+// in the run's own network namespace, handed to the running hypervisor;
+// then, in the guest, the clock and the device's address and routes. It
+// returns the environment every exec of the run starts from.
+func (d *Driver) claim(ctx context.Context, name string, machine Machine, spec run.CreateSpec, proxyPort int) (map[string]string, error) {
+	var guestNet *GuestNetwork
+	var attachTook, guestTook time.Duration
+	if spec.Network == run.NetworkAllowlist || spec.Network == run.NetworkOpen {
+		start := time.Now()
+		var err error
+		if guestNet, err = d.network.Attach(ctx, spec.Name, spec.Network, proxyPort); err != nil {
+			return nil, fmt.Errorf("network device for %s: %w", spec.Name, err)
+		}
+		err = machine.AddNet(ctx, guestNet.Tap, guestNet.MAC)
+		// The hypervisor has its own copy now, or never will. The tap
+		// lives exactly as long as a process holds it, and the daemon
+		// must not be one of them.
+		_ = guestNet.Tap.Close()
+		attachTook = time.Since(start)
+		if err != nil {
+			return nil, fmt.Errorf("vm %s: %w", name, err)
+		}
+	}
+	start := time.Now()
+	if err := prepareGuest(ctx, machine, guestNet); err != nil {
+		return nil, fmt.Errorf("vm %s: %w", name, err)
+	}
+	guestTook = time.Since(start)
 	env := maps.Clone(spec.Env)
 	if spec.Network == run.NetworkAllowlist {
 		// Under the caller's own, which may override it, as with Docker.
@@ -274,13 +367,30 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 		maps.Copy(env, spec.Env)
 	}
 	if guestNet != nil {
-		d.log.Info("vm network device ready", "name", spec.Name, "tier", spec.Network, "address", guestNet.Address.String(),
+		d.log.Info("vm network device ready", "name", name, "run", spec.Name, "tier", spec.Network, "address", guestNet.Address.String(),
 			"hostSetup", attachTook.String(), "guestSetup", guestTook.String())
 	}
-	d.mu.Lock()
-	d.machines[spec.Name] = &instance{machine: machine, env: env}
-	d.mu.Unlock()
-	return spec.Name, nil
+	return env, nil
+}
+
+// discard removes a VM that is not, or no longer, a run's: its process,
+// the network place made for the run it was meant for (network, which may
+// be ""), and its volume. It can be repeated.
+func (d *Driver) discard(ctx context.Context, name string, machine Machine, network string) error {
+	if machine != nil {
+		if err := machine.Kill(ctx); err != nil {
+			return err
+		}
+	}
+	if d.network != nil && network != "" {
+		if err := d.network.Detach(ctx, network); err != nil {
+			return fmt.Errorf("remove network device of %s: %w", network, err)
+		}
+	}
+	if err := d.volumes.RemoveRun(ctx, name); err != nil {
+		return fmt.Errorf("remove volume of %s: %w", name, err)
+	}
+	return nil
 }
 
 // proxyPort is the port of an allowlist run's proxy, which must listen on
@@ -435,18 +545,13 @@ func (d *Driver) Remove(ctx context.Context, containerID string) error {
 	d.mu.Lock()
 	current := d.machines[containerID]
 	d.mu.Unlock()
+	var machine Machine
+	network := containerID
 	if current != nil {
-		if err := current.machine.Kill(ctx); err != nil {
-			return err
-		}
+		machine, network = current.machine, current.network
 	}
-	if d.network != nil {
-		if err := d.network.Detach(ctx, containerID); err != nil {
-			return fmt.Errorf("remove network device of %s: %w", containerID, err)
-		}
-	}
-	if err := d.volumes.RemoveRun(ctx, containerID); err != nil {
-		return fmt.Errorf("remove volume of %s: %w", containerID, err)
+	if err := d.discard(ctx, containerID, machine, network); err != nil {
+		return err
 	}
 	d.mu.Lock()
 	if d.machines[containerID] == current {
@@ -540,10 +645,19 @@ func (d *Driver) RemoveImage(ctx context.Context, imageRef string) error {
 // Sweep is the startup cleanup: every VM process and every run volume
 // this daemon identity owns is a leftover of a previous daemon life —
 // running runs do not survive a restart, and stopped ones have neither.
-// Processes go first; a volume cannot be destroyed while one has it open,
-// and a run's network namespace is only removed once the VM behind its
-// tap is dead.
+// The warm pool's VMs are among them: they are VMs of this identity like
+// any other, with run volumes, cgroups and runtime dirs of the same kind,
+// so the same sweep finds and removes them. Processes go first; a volume
+// cannot be destroyed while one has it open, and a run's network
+// namespace is only removed once the VM behind its tap is dead.
+//
+// Once it has succeeded, the warm pool (if one is configured) starts
+// filling: never before, or the sweep would take its VMs for leftovers.
 func (d *Driver) Sweep(ctx context.Context) (processes, volumes int, err error) {
+	// A driver of the same identity in this process (a test's daemon that
+	// "crashed") stops filling its pool first: it could otherwise boot a
+	// VM behind the sweep's back.
+	standDownWarmPools(d.owner, d)
 	if processes, err = d.hypervisor.Sweep(ctx); err != nil {
 		return processes, 0, fmt.Errorf("sweep vm processes: %w", err)
 	}
@@ -559,6 +673,7 @@ func (d *Driver) Sweep(ctx context.Context) (processes, volumes int, err error) 
 	if volumes, err = d.volumes.Sweep(ctx); err != nil {
 		return processes, volumes, fmt.Errorf("sweep vm volumes: %w", err)
 	}
+	d.startWarmPool()
 	return processes, volumes, nil
 }
 
@@ -591,11 +706,19 @@ func (d *Driver) Gateway() (string, bool) {
 	return d.network.Gateway().String(), true
 }
 
-// Close stops the driver's upkeep of the host's network and removes its
-// firewall table when no VM is left. It does not touch VMs.
+// Close removes the warm pool's VMs, stops the driver's upkeep of the
+// host's network and removes its firewall table when no VM is left. It
+// does not touch the VMs runs have.
 func (d *Driver) Close(ctx context.Context) error {
-	if d.network == nil {
-		return nil
+	var err error
+	d.mu.Lock()
+	pool := d.pool
+	d.mu.Unlock()
+	if pool != nil {
+		err = pool.close(ctx)
 	}
-	return d.network.Close(ctx)
+	if d.network == nil {
+		return err
+	}
+	return errors.Join(err, d.network.Close(ctx))
 }

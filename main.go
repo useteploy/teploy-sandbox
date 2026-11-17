@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -65,6 +66,7 @@ Usage:
                        [--vm-dev-dir /dev/teploy-sandbox]
                        [--vm-subnet 10.209.0.0/16] [--vm-dns 192.0.2.53,...] [--vm-open-private]
                        [--vm-disk-mbps 256] [--vm-disk-iops 16000] [--vm-net-mbit 200] [--vm-net-connections 4096]
+                       [--vm-max-runs 0] [--vm-warm 2x2048=3,...] [--vm-warm-boots 2] [--vm-warm-headroom-mb 1024]
   teploy-sandbox version`)
 }
 
@@ -120,6 +122,14 @@ func serve(args []string) error {
 		"vm driver: what each run with a network may send, and what it may receive, in megabits per second; 0 is no limit")
 	vmNetConnections := flags.Int("vm-net-connections", int(envFloat("SBX_VM_NET_CONNECTIONS", vm.DefaultNetConnections)),
 		"vm driver: how many connections each run with a network may have tracked at once; 0 is no limit")
+	vmMaxRuns := flags.Int("vm-max-runs", int(envFloat("SBX_VM_MAX_RUNS", 0)),
+		"vm driver: how many VMs runs may have at once (a create beyond it is refused with 503); 0 is no limit. The host's connection table, open file limit and AIO limit are checked against it at start")
+	vmWarm := flags.String("vm-warm", envOr("SBX_VM_WARM", ""),
+		"vm driver: VMs to keep booted ahead of creates, as CPUSxMEMORY=COUNT[,...] (e.g. 2x2048=3,4x8192=1); a create on the golden image whose CPUs round up to CPUS and whose memory is MEMORY MiB takes one. Empty is no pool")
+	vmWarmBoots := flags.Int("vm-warm-boots", int(envFloat("SBX_VM_WARM_BOOTS", vm.DefaultWarmBoots)),
+		"vm driver: the most boots under way at once for which the warm pool starts another (creates that boot their own VM count)")
+	vmWarmHeadroom := flags.Int("vm-warm-headroom-mb", int(envFloat("SBX_VM_WARM_HEADROOM_MB", vm.DefaultWarmHeadroomMB)),
+		"vm driver: host memory (MemAvailable, MiB) the warm pool leaves free beyond a new VM's limit before it boots one; 0 is none")
 	vmBootTimeout := flags.Duration("vm-boot-timeout", envDuration("SBX_VM_BOOT_TIMEOUT", vm.DefaultBootTimeout),
 		"vm driver: how long a new VM may take to answer")
 	if err := flags.Parse(args); err != nil {
@@ -132,6 +142,16 @@ func serve(args []string) error {
 		*vmGolden = *vmPool + "/golden-guestd@v1"
 	}
 	warmUnavailable := false
+	warmSizes, err := vm.ParseWarmSizes(*vmWarm)
+	if err != nil {
+		return fmt.Errorf("vm-warm: %w", err)
+	}
+	if *driverName != driverVM && len(warmSizes) > 0 {
+		return errors.New("vm-warm: the warm pool is the vm driver's (--driver vm)")
+	}
+	if *vmMaxRuns < 0 || *vmWarmBoots < 1 || *vmWarmHeadroom < 0 {
+		return errors.New("vm-max-runs and vm-warm-headroom-mb must not be negative, and vm-warm-boots must be at least 1")
+	}
 	if *vmUIDBase > 1<<31 {
 		return fmt.Errorf("vm-uid-base: %d is not a usable UID", *vmUIDBase)
 	}
@@ -266,6 +286,12 @@ func serve(args []string) error {
 			DiskIOPS:        vmLimit(*vmDiskIOPS),
 			NetMbit:         vmLimit(*vmNetMbit),
 			NetConnections:  vmLimit(*vmNetConnections),
+			MaxRuns:         *vmMaxRuns,
+			Warm: vm.WarmConfig{
+				Sizes:      warmSizes,
+				Boots:      *vmWarmBoots,
+				HeadroomMB: vmLimit(*vmWarmHeadroom),
+			},
 		}, log)
 		if err != nil {
 			return err
@@ -303,7 +329,8 @@ func serve(args []string) error {
 		runtimeName = "cloud-hypervisor"
 		log.Warn("vm driver is experimental: runs run as root in the guest, and warm caches are unavailable",
 			"pool", *vmPool, "golden", *vmGolden, "kernel", *vmKernel, "subnet", *vmSubnet, "openPrivate", *vmOpenPrivate,
-			"diskMBps", *vmDiskMBps, "diskIOPS", *vmDiskIOPS, "netMbit", *vmNetMbit, "netConnections", *vmNetConnections)
+			"diskMBps", *vmDiskMBps, "diskIOPS", *vmDiskIOPS, "netMbit", *vmNetMbit, "netConnections", *vmNetConnections,
+			"maxRuns", *vmMaxRuns, "warm", *vmWarm)
 		if warmUnavailable {
 			log.Info("warm repo cache is not available under the vm driver; --cache-root is ignored")
 		}

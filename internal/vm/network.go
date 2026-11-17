@@ -1490,23 +1490,32 @@ func guestNetScript(n *GuestNetwork) string {
 	line := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
 	line("set -eu")
 	line("mac=%s addr=%s gw=%s gwmac=%s", n.MAC, n.Address, n.Gateway, n.HostMAC)
-	// The device is found by its address: its name is the guest's choice.
-	// It can appear a moment after the agent does.
-	line(`dev="" tries=0`)
+	// The device was plugged into the running VM. A guest booted with a
+	// device tree (arm64) is not told of that, so it looks; one that is
+	// told (ACPI) finds nothing new.
+	line(`echo 1 > /sys/bus/pci/rescan 2>/dev/null || true`)
+	// The device is found by its address: its name is the guest's choice,
+	// and the guest's device manager may still be renaming it (an
+	// interface that is up can no longer be renamed, so it is waited
+	// for: the device ends up with the name it would have had at boot).
+	// Each attempt finds it again, so a rename between two commands only
+	// costs a retry.
+	line(`find_dev() { for d in /sys/class/net/*; do if [ "$(cat "$d/address" 2>/dev/null)" = "$mac" ]; then dev="${d##*/}"; return 0; fi; done; return 1; }`)
+	line(`configure() {`)
+	line(`  echo 1 > "/proc/sys/net/ipv6/conf/$dev/disable_ipv6" 2>/dev/null || true`)
+	line(`  ip link set dev "$dev" up && ip addr replace "$addr/32" dev "$dev" && ip route replace "$gw/32" dev "$dev" && ip neigh replace "$gw" lladdr "$gwmac" dev "$dev" nud permanent`)
+	line(`}`)
+	line(`dev="" err="" tries=0`)
 	line(`while :; do`)
-	line(`  for d in /sys/class/net/*; do`)
-	line(`    if [ "$(cat "$d/address" 2>/dev/null)" = "$mac" ]; then dev="${d##*/}"; break; fi`)
-	line(`  done`)
-	line(`  [ -z "$dev" ] || break`)
+	line(`  if command -v udevadm >/dev/null 2>&1; then udevadm settle -t 5 >/dev/null 2>&1 || true; fi`)
+	line(`  if find_dev && err=$(configure 2>&1); then break; fi`)
 	line(`  tries=$((tries + 1))`)
-	line(`  [ "$tries" -le 150 ] || { echo "no network device with the address $mac appeared" >&2; exit 1; }`)
+	line(`  if [ "$tries" -gt 150 ]; then`)
+	line(`    [ -n "$dev" ] || echo "no network device with the address $mac appeared" >&2`)
+	line(`    echo "$err" >&2; exit 1`)
+	line(`  fi`)
 	line(`  sleep 0.1`)
 	line(`done`)
-	line(`echo 1 > "/proc/sys/net/ipv6/conf/$dev/disable_ipv6" 2>/dev/null || true`)
-	line(`ip link set dev "$dev" up`)
-	line(`ip addr replace "$addr/32" dev "$dev"`)
-	line(`ip route replace "$gw/32" dev "$dev"`)
-	line(`ip neigh replace "$gw" lladdr "$gwmac" dev "$dev" nud permanent`)
 	if n.Tier == run.NetworkOpen {
 		dns := make([]string, len(n.DNS))
 		for i, addr := range n.DNS {

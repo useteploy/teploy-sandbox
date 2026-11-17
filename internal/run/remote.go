@@ -54,12 +54,17 @@ type RemoteState struct {
 	// Generation is the generation of the run's remote record this
 	// daemon last wrote or read.
 	Generation uint64 `json:"generation,omitempty"`
+	// Snapshot is the name the stop's snapshot has in remote storage,
+	// the same on every daemon.
+	Snapshot string `json:"snapshot,omitempty"`
 	// Local is whether this host has a copy of the snapshot. A resume
 	// without one restores it from remote storage first.
 	Local bool `json:"local"`
-	// StoredBytes is what the last upload added to remote storage, and
-	// Incremental whether it was sent against the run's previous upload.
+	// StoredBytes is what the last upload added to remote storage,
+	// UploadMs how long it took, and Incremental whether it was sent
+	// against the run's previous upload.
 	StoredBytes int64      `json:"storedBytes,omitempty"`
+	UploadMs    int64      `json:"uploadMs,omitempty"`
 	Incremental bool       `json:"incremental,omitempty"`
 	DurableAt   *time.Time `json:"durableAt,omitempty"`
 	// Error is why the last publish failed.
@@ -83,8 +88,10 @@ type RemoteRecord struct {
 	// Mine is whether this daemon wrote it.
 	Mine  bool
 	Owner string
-	// Snapshot is the local reference of the snapshot the record names.
-	Snapshot string
+	// Snapshot is the local reference of the snapshot the record names,
+	// and SnapshotID its name in remote storage (set on a record read).
+	Snapshot   string
+	SnapshotID string
 	// Payload is the run as the registry file holds a stopped run.
 	Payload []byte
 	// Key is the run's wrapped data key ("" to have one minted).

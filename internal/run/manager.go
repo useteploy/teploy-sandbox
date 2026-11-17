@@ -729,6 +729,10 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 	// driver a proxy's port exists only inside its run's own network
 	// namespace, and is not given out again while that namespace does.
 	m.closeEgress(id)
+	// A run that has a record in remote storage is noted as destroyed
+	// before its VM goes: a daemon that dies in between must not take it
+	// for a run a crash lost, and bring it back from its last stop.
+	owed := m.noteRemoteGone(current)
 	attempt, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	err := m.runtime.Remove(attempt, current.ContainerID)
@@ -737,9 +741,16 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 		delete(m.runs, id)
 	} else {
 		current.removing = false
+		if owed {
+			// Still running: nothing is owed after all.
+			delete(m.tombstones, id)
+		}
 	}
 	m.mu.Unlock()
 	if err != nil {
+		if owed {
+			m.persist()
+		}
 		return err
 	}
 	m.releaseWarm(current)
@@ -749,8 +760,12 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 		m.releaseImages(append(slices.Clone(current.images), current.base))
 		m.persist()
 	}
-	// A run that has a record in remote storage is destroyed there too.
-	m.remoteGone(ctx, current)
+	if owed {
+		// Now that the run is gone, say so in remote storage.
+		attempt, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		m.flushTombstones(attempt)
+	}
 	return nil
 }
 

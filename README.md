@@ -19,9 +19,10 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 | `PUT/GET /v1/runs/{id}/files/{path}` | Confined to `/work`; traversal rejected. PUT takes the lease credential as `?owner=&generation=` query and is fenced like exec; GET is open, lease or not |
 | `DELETE /v1/runs/{id}` | Destroy now (the reaper enforces TTLs regardless, default 30 min); on a stopped run, deletes the record and its snapshot |
 | `POST /v1/runs/{id}/stop` | Capture the filesystem, remove the container, keep the run → the run, `state: "stopped"` (see Persistent runs) |
-| `POST /v1/runs/{id}/resume` | `{ttlSec?}` → the same run, same `id`, `state: "running"`, new deadline |
+| `POST /v1/runs/{id}/resume` | `{ttlSec?, takeover?}` → the same run, same `id`, `state: "running"`, new deadline (`takeover`: see Off-host storage) |
 | `POST /v1/runs/{id}/fork` | `{ttlSec?, labels?, onExpire?}` → 201, a new run started from this one's filesystem and settings, with `forkedFrom` |
 | `GET /v1/capacity` | `{server, driver, runtime, cpus, memoryMb, runs: {running, stopped}, allocated: {cpus, memoryMb}, warmPool?}` — the host's size and the sum of running runs' limits (and of the VM driver's warm pool, when it has one) |
+| `POST /v1/remote/sync`, `POST /v1/remote/collect` | Only with remote storage (400 without): look for runs stopped on other daemons now → `{remote, changed}`; garbage-collect the bucket now → 204 |
 | `GET /v1/runs`, `GET /health` | List; `{status, version}` |
 
 Run IDs are ULIDs and every response carries a `server` field — nothing
@@ -127,7 +128,9 @@ it changed.
 What works, through the same HTTP API: create, exec (stdout, stderr, exit
 code, env, cwd, timeout), file write and read, snapshot, stop, resume
 after a daemon restart, fork of a running run, destroy, and the three
-network tiers with `egressAllow` (see Guest networking below).
+network tiers with `egressAllow` (see Guest networking below). With
+remote storage configured a stopped run also resumes on another host
+(see Off-host storage below).
 
 What is refused with a 400 rather than faked:
 
@@ -627,6 +630,149 @@ the unit tests in `internal/vm`):
 pool, and the network and lifecycle tests then get pool VMs; the
 `TestVMWarmPool` and `TestVMWarmPoolRaces` tests bring their own pool
 either way)
+
+### Off-host storage
+
+With `--remote-endpoint` a stopped run's disk is also kept in an
+S3-compatible bucket, so the host that ran it is disposable: any daemon
+given the same bucket, prefix and master key can resume or fork the run.
+It is the VM driver's (a stop snapshot is a ZFS send stream); off unless
+configured, and nothing changes for a daemon without it.
+
+```
+serve --driver vm --state-dir /var/lib/teploy-sandbox/state \
+  --remote-endpoint https://s3.example.com --remote-bucket sandbox-runs \
+  --remote-access-key ID --remote-secret-key-file /etc/teploy/s3-secret \
+  --remote-key-file /etc/teploy/remote.key
+```
+
+| Flag (env) | Default | |
+|---|---|---|
+| `--remote-endpoint` (`SBX_REMOTE_ENDPOINT`) | none | The service's URL. Empty: no remote storage |
+| `--remote-bucket`, `--remote-prefix` | | Daemons that share both share their stopped runs |
+| `--remote-region`, `--remote-path-style` | `us-east-1`, off | Signing region; `endpoint/bucket/key` instead of `bucket.endpoint/key` |
+| `--remote-access-key` (`SBX_REMOTE_ACCESS_KEY`, `AWS_ACCESS_KEY_ID`) | | |
+| `--remote-secret-key-file` (or `SBX_REMOTE_SECRET_KEY`, `AWS_SECRET_ACCESS_KEY`) | | The secret is never a flag value |
+| `--remote-key-file` (or `SBX_REMOTE_KEY`) | required | The 32-byte master key: raw, base64 or hex. The same on every daemon |
+| `--remote-chunk-mb`, `--remote-parallel` | 16, 4 | Object size and objects in flight; a transfer holds about (parallel + 1) chunks in memory, whatever the disk's size |
+| `--remote-max-chain` | 8 | Incremental uploads in a row before one is sent against the base image again |
+| `--remote-local` | `keep` | `keep` a durable snapshot's local copy for a fast resume here, or `drop` it at once |
+| `--remote-pool-reserve` | 15 | Percent of the pool to keep free; below it, local copies of durable snapshots go, oldest stop first |
+| `--remote-sync-interval`, `--remote-gc-interval`, `--remote-gc-grace` | 1m, 1h, 24h | |
+| `--remote-unfenced` | off | See "Without conditional writes" |
+
+It needs `--state-dir` (the daemon's identity among those sharing the
+bucket is a random name kept there) and a reachable bucket: a daemon that
+cannot reach its storage at start does not start.
+
+**What is stored.** Under the prefix:
+
+```
+v1/snap/<id>/<attempt>/<index>   one encrypted chunk of a snapshot's stream
+v1/snap/<id>/manifest            the snapshot: its chunks (size and SHA-256
+                                 of each), the stream's SHA-256, and the
+                                 snapshot the stream is incremental against
+v1/run/<run id>/<generation>     one generation of a run's record
+```
+
+A stop sends `zfs send -c` of the stop snapshot, cut into chunks as it is
+produced; nothing is held whole in memory or written to the host's disk.
+The stream is incremental against the run's previous upload while this
+host still has it, and otherwise against the golden image the run's disk
+descends from, which is uploaded once (as `base-<its ZFS guid>`) by the
+first daemon that needs it there. A daemon whose own golden image is that
+very snapshot uses it; any other receives it from the bucket, so daemons
+do not have to be provisioned with the same golden. After
+`--remote-max-chain` incremental uploads the next is sent against the
+base again: a restore never fetches more than the base, one stream
+against it and that many increments. A fork's first stop is sent against
+the snapshot it was forked from.
+
+**Encryption.** Every chunk is AES-256-GCM, encrypted on the host, under
+a key derived (HKDF-SHA256) per snapshot from the run's data key; the
+chunk's place (snapshot, upload attempt, index) is authenticated with it.
+Manifests and run records (which hold the run's env) are sealed the same
+way, bound to the name they are stored under. The run's data key is
+random, and stored only wrapped by the master key. The storage provider
+sees object sizes, counts and times, and the IDs in key names; never
+guest data or run settings. Losing the master key loses every stopped
+run that is only in the bucket; there is no rotation yet.
+
+**Durable means** the manifest and then the run's record are in the
+bucket. `POST /stop` uploads before it answers, and the run then carries
+
+```
+"remote": {"state": "durable", "generation": 3, "snapshot": "<id>", "local": true,
+           "storedBytes": 7130112, "uploadMs": 66, "incremental": true, "durableAt": "..."}
+```
+
+`state` is `durable`; `pending` or `failed` (stopped here, **not** off
+the host: the snapshot stays on this host and the upload is retried on
+every upkeep round, `error` says why); or `superseded` (below). The stop
+itself answers 200 either way: the run is stopped. A local copy is only
+ever dropped once `state` is `durable`. A stop made by the reaper
+(`onExpire: "stop"`) or at shutdown is published by the upkeep, not in
+line.
+
+**Resuming anywhere.** Each daemon lists the bucket every
+`--remote-sync-interval` (and on `POST /v1/remote/sync`), and a resume,
+fork or delete of an ID it does not know looks the run up first. A run
+stopped elsewhere appears in `GET /v1/runs` as `stopped` with
+`remote.local: false`; `capacity.runs.stoppedRemote` counts those. Resume
+fetches the manifests, verifies every chunk (size and SHA-256 against the
+manifest, then the authentication tag) before any of it reaches the
+pool, receives the streams into volumes marked as a restore, and only
+when the last one is in makes the snapshot usable. A chunk that is
+missing, altered, cut short or out of place fails the resume with
+nothing left in the pool and the run still stopped.
+
+**One running copy.** A run's record is a series of numbered
+generations, each an object written once with `If-None-Match: *`. To
+resume, a daemon creates the next generation ("running", by me); of two
+daemons that try, the service lets exactly one, and the other answers
+409. No clocks, no heartbeat, no controller. The cost: a daemon cannot
+tell a dead holder from a slow one, so a run whose holder died stays
+held until someone says so. `POST /resume {"takeover": true}` on another
+daemon is that statement: it resumes the run **from its last durable
+stop**. If the old holder was alive after all, its copy keeps running
+but can no longer become the run: its next stop is kept on its host as
+`remote.state: "superseded"`, which can be forked or deleted, not
+resumed. A daemon that restarts finds the runs it was running (lost with
+their VMs, as always) back as stopped at their last durable stop.
+Resume, and delete of a stopped run, need the bucket: when it cannot be
+reached they answer 503 rather than act on a run that may have moved.
+
+**Without conditional writes.** The daemon tests the service at start. If
+`If-None-Match` is not honoured, uploads, restores and forks work as
+above, but a daemon only resumes or deletes runs whose record it wrote
+last itself (409 otherwise): nothing in the bucket could stop two
+daemons. `--remote-unfenced` lifts that for deployments where a
+controller already sends each run to one daemon at a time.
+
+**Retention and garbage.** `--stopped-retention` applies to the bucket:
+whichever daemon's reaper gets there first destroys the run in it.
+Destroying a run writes a last generation ("destroyed"). Every
+`--remote-gc-interval` each daemon deletes snapshots no run's newest
+record names, no caller owns and no needed snapshot builds on; chunks no
+manifest names (failed or interrupted uploads); the records of destroyed
+runs; and old generations. Nothing is deleted before it has been garbage
+for `--remote-gc-grace`, and nothing at all in a round that could not
+read every record and manifest. `POST /v1/remote/collect` runs a round
+now.
+
+**Caller snapshots.** `POST /snapshot` uploads too and adds
+`"remote": {"state", "id", ...}` to its answer; `image: "snapshot:<id>"`
+on create boots it on any daemon. A failed upload is reported there and
+not retried: the snapshot is then on that host only.
+
+Requirements of the service: SigV4, PUT/GET/HEAD/DELETE, ListObjectsV2,
+and read-after-write consistency of objects and listings. Run live
+against versitygw 1.11 (POSIX backend); no other service has been tried.
+
+Live suite: `TestVMOffHost` in the `vmintegration` suite, with
+`SBX_S3_TEST_ENDPOINT`, `SBX_S3_TEST_BUCKET`, `SBX_S3_TEST_ACCESS_KEY` and
+`SBX_S3_TEST_SECRET_KEY` (skipped without them); the client alone:
+`go test -tags s3integration ./internal/s3`.
 
 ## Writable leases
 

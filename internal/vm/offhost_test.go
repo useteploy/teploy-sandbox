@@ -200,6 +200,13 @@ func TestAStoppedRunResumesOnAnotherHost(t *testing.T) {
 	if !foundBase {
 		t.Fatalf("host-b has no base image of host-a's: %v", b.zfs.names())
 	}
+	// It is in use, so asking for unused ones back leaves it.
+	if err := b.driver.Transfer().Reclaim(bg); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := b.driver.Transfer().Stat(bg, "base-"+a.zfs.snapshots[testGolden].guid); !ok {
+		t.Fatal("a base image a running run descends from was reclaimed")
+	}
 
 	// host-a learns that the run moved, and lets go of its copy.
 	a.sync(t)
@@ -228,6 +235,16 @@ func TestAStoppedRunResumesOnAnotherHost(t *testing.T) {
 	if touched := a.zfs.callsTouching(testPool + "/golden"); len(touched) > 0 {
 		t.Fatalf("the golden image was changed: %v", touched)
 	}
+	// host-b no longer has the run. The base image it received stays for
+	// the next restore, until it is asked for back.
+	b.sync(t)
+	if _, ok, _ := b.driver.Transfer().Stat(bg, "base-"+a.zfs.snapshots[testGolden].guid); !ok {
+		t.Fatal("a received base image went with the run")
+	}
+	if err := b.driver.Transfer().Reclaim(bg); err != nil {
+		t.Fatal(err)
+	}
+	assertPool(t, b.zfs, pristine...)
 }
 
 func TestTheChainIsCapped(t *testing.T) {

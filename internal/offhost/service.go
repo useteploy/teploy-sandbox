@@ -39,6 +39,9 @@ type Snapshots interface {
 	Discard(ctx context.Context, staged []string) error
 	// Space is the free and total bytes of the local pool.
 	Space(ctx context.Context) (free, size int64, err error)
+	// Reclaim removes what the driver keeps only to make the next
+	// restore cheaper (base images no run here descends from).
+	Reclaim(ctx context.Context) error
 }
 
 const baseIDPrefix = "base-"
@@ -454,6 +457,7 @@ func (s *Service) record(record *Record, key Key) run.RemoteRecord {
 	}
 	if validID(record.Snapshot) && !IsBaseID(record.Snapshot) {
 		out.Snapshot = s.snaps.Ref(record.Snapshot)
+		out.SnapshotID = record.Snapshot
 	}
 	return out
 }
@@ -510,9 +514,21 @@ func (s *Service) Pressure(ctx context.Context) (bool, error) {
 	if s.config.ReservePercent <= 0 {
 		return false, nil
 	}
-	free, size, err := s.snaps.Space(ctx)
-	if err != nil || size <= 0 {
+	short := func() (bool, error) {
+		free, size, err := s.snaps.Space(ctx)
+		if err != nil || size <= 0 {
+			return false, err
+		}
+		return free*100 < size*int64(s.config.ReservePercent), nil
+	}
+	pressed, err := short()
+	if err != nil || !pressed {
 		return false, err
 	}
-	return free*100 < size*int64(s.config.ReservePercent), nil
+	// What the driver keeps for its own convenience goes before any
+	// run's local copy does.
+	if err := s.snaps.Reclaim(ctx); err != nil {
+		s.log.Warn("unused base images not reclaimed", "error", err)
+	}
+	return short()
 }

@@ -339,8 +339,8 @@ func (v *Volumes) destroyWhole(ctx context.Context, volume string) error {
 	return v.zfs.Destroy(ctx, volume)
 }
 
-// collectBase removes a received base image nothing is cloned from any
-// more. One that still has clones stays whole.
+// collectBase removes a received base image nothing is cloned from. One
+// that has clones stays whole.
 func (v *Volumes) collectBase(ctx context.Context, volume string) error {
 	snapshots, err := v.zfs.Snapshots(ctx, volume)
 	if err != nil {
@@ -356,9 +356,8 @@ func (v *Volumes) collectBase(ctx context.Context, volume string) error {
 
 // sweepTransfers is the startup half of a restore's cleanup: volumes
 // still marked as a restore belong to one a previous daemon life did not
-// finish, and a base image without clones to runs that are gone. A
-// restore's volumes are clones of one another, so they go in as many
-// passes as it takes.
+// finish. A restore's volumes are clones of one another, so they go in
+// as many passes as it takes.
 func (v *Volumes) sweepTransfers(ctx context.Context) error {
 	for {
 		volumes, err := v.zfs.Volumes(ctx, v.root)
@@ -385,6 +384,16 @@ func (v *Volumes) sweepTransfers(ctx context.Context) error {
 			return fmt.Errorf("remove an unfinished restore: %w", last)
 		}
 	}
+	return nil
+}
+
+// Reclaim removes the received base images nothing is cloned from. They
+// are kept until asked: a base image is most of what a restore fetches,
+// and the next run restored here most likely descends from the same one.
+func (t *Transfer) Reclaim(ctx context.Context) error {
+	v := t.volumes
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	volumes, err := v.zfs.Volumes(ctx, v.root)
 	if err != nil {
 		return err

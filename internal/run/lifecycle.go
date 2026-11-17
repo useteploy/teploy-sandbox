@@ -205,8 +205,9 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool, pu
 	m.log.Info("run stopped", "id", id, "snapshot", ref, "retainUntil", retainUntil)
 	if m.OffHost != nil && publish {
 		// Its outcome is in the run, not in the error: the run is
-		// stopped either way.
-		_ = m.publishHeld(ctx, id)
+		// stopped either way. Detached from the caller: a client that
+		// hangs up must not leave a stop half published.
+		_ = m.publishHeld(context.WithoutCancel(ctx), id)
 		return m.Get(id)
 	}
 	return view, nil
@@ -421,6 +422,16 @@ func (m *Manager) Fork(ctx context.Context, id string, req ForkRequest) (*Run, e
 		if err := m.ensureLocal(ctx, image); err != nil {
 			return nil, err
 		}
+		if source.Remote != nil && !source.Remote.Local {
+			// The snapshot is on this host now, fetched for the child.
+			m.mu.Lock()
+			if live, ok := m.runs[id]; ok && live.Remote != nil {
+				state := *live.Remote
+				state.Local = true
+				live.Remote = &state
+			}
+			m.mu.Unlock()
+		}
 		if source.Remote != nil && source.Remote.State == RemoteDurable {
 			base = image
 		}
@@ -459,20 +470,20 @@ func (m *Manager) Fork(ctx context.Context, id string, req ForkRequest) (*Run, e
 		// from being collected when the other run lets go of it. If the
 		// record cannot be written the child simply builds on nothing.
 		key, err := m.OffHost.Advance(ctx, RemoteRecord{Run: childID, Generation: 1, State: RecordForked, Snapshot: base})
+		written := err == nil
 		has := false
 		if err == nil {
 			has, err = m.OffHost.HasRemote(ctx, base)
 		}
-		switch {
-		case err != nil || !has:
+		if written {
+			// The record is written: the child has one from here on,
+			// whatever becomes of the base.
+			child.remoteGen, child.remoteHeld, child.remoteKey = 1, true, key
+		}
+		if err != nil || !has {
 			m.log.Warn("fork will upload in full: its source's snapshot could not be kept as a base", "from", id, "error", err)
-			if key != "" {
-				m.mu.Lock()
-				m.tombstones[childID] = 2
-				m.mu.Unlock()
-			}
-		default:
-			child.base, child.remoteGen, child.remoteHeld, child.remoteKey = base, 1, true, key
+		} else {
+			child.base = base
 		}
 	}
 	created, err := m.launch(ctx, bootRequest{

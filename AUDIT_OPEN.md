@@ -1655,3 +1655,200 @@ two minutes; it is six creates now.
   the 4096 UIDs, not together, and not against the guest addresses.
 - **Not run:** x86-64, bare metal, and a hostile hypervisor against
   `AddNet` on a live VM (the bound is unit-tested on a real socket).
+
+## 2026-11-17 — VM driver: stopped runs in object storage (off-host durability)
+
+Added, off unless `--remote-endpoint` is given: `internal/s3` (an S3
+client on the standard library), `internal/offhost` (encrypted chunked
+snapshots, run records, garbage collection), `internal/vm/transfer.go`
+(snapshots as ZFS send streams), and in `internal/run` the lifecycle
+around them. `go.mod` still has no dependencies. The Docker driver is
+unchanged. On the wire everything is additive: `remote` on a run,
+`takeover` in the resume body, `remote` in the snapshot answer,
+`runs.stoppedRemote` in capacity (only with remote storage),
+`image: "snapshot:<id>"` on create, `POST /v1/remote/sync` and
+`POST /v1/remote/collect`, and two new answers on existing routes that
+only a daemon with remote storage gives: 409 (the run is held by another
+daemon) and 503 (remote storage cannot be reached).
+
+### Design, and why
+
+- **Objects.** `v1/snap/<id>/<attempt>/<index>` chunks,
+  `v1/snap/<id>/manifest`, `v1/run/<id>/<generation>` records. Chunks of
+  one fixed size (16 MiB by default), each its own object, a few in
+  flight: memory is (parallel + 1) chunks whatever the disk's size,
+  nothing touches the host's disk, a failed chunk is retried alone, and
+  a snapshot is deleted by deleting its manifest first. The manifest is
+  written last, in one request; until it is there the snapshot does not
+  exist. Each upload writes under its own attempt name, so a retry or a
+  second uploader never overwrites a chunk a reader may be fetching.
+- **Streams.** `zfs send -c`, incremental (`-i`) against the run's
+  previous upload, which the manager now keeps on the host while the run
+  runs (it used to be destroyed at resume); otherwise against the golden
+  image the volume descends from, found by walking origins. That image
+  is uploaded once as `base-<guid>` and received by any daemon whose own
+  golden image is a different snapshot. A true full stream of a run is
+  the golden image again (866 MiB here) for every run; this is why "full"
+  became "against the base image".
+- **Chain.** No consolidation in the bucket (it would need a pool).
+  Instead the chain is capped: after `--remote-max-chain` increments the
+  next upload is against the base again. On restore the streams are
+  received as clones of one another and the intermediate ones released,
+  which the driver's existing promote-and-destroy unwinding turns into
+  one volume.
+- **Encryption.** AES-256-GCM per chunk, random nonce, key =
+  HKDF-SHA256(run key, snapshot ID), associated data = snapshot, attempt
+  and index. Manifests and records sealed the same way with the object's
+  name as associated data. The run key is random, stored wrapped
+  (AES-256-GCM) by a master key that itself is only used through an HKDF
+  step. SHA-256 of each stored chunk and of the whole stream are in the
+  (authenticated) manifest. Reordered, truncated, replaced and replayed
+  objects fail before any byte of them reaches `zfs receive`.
+- **Restore.** Streams go into volumes marked `teploy:kind=restore`,
+  which nothing in the driver takes for a snapshot; the final one is
+  marked a snapshot last. A failure removes what that restore created;
+  a crash leaves volumes the startup sweep removes.
+- **Registry and ownership.** A run record is numbered generations, each
+  created once with `If-None-Match: *`; the newest is the run's state
+  (`stopped`, `running` by a daemon, `forked`, `destroyed`). Every state
+  change is "create generation N+1 while N is the newest", checked by a
+  read back (a retried conditional write is refused by its own first
+  attempt) and a second listing (the slot of a pruned generation is
+  empty again). This was chosen over a lease with expiry because it
+  needs no clocks and no heartbeat, and over leaving it to a controller
+  because it then holds without one. Its price is that a dead holder is
+  not noticed: `takeover` is explicit. Daemons learn of runs by listing
+  `v1/run/`; a run in step costs nothing beyond the listing.
+- **No conditional writes.** Found by a probe at start. Then a daemon
+  changes only runs it wrote last (`--remote-unfenced` lifts it).
+- **Garbage.** Mark from every run's newest record and every caller
+  snapshot, through parents; sweep what is unmarked and older than the
+  grace, manifests before chunks. A fork writes a `forked` record naming
+  the snapshot it will build on before it boots, which is what keeps
+  that snapshot when its source is destroyed.
+
+### Every place a crash between two steps leaves state, and what recovers it
+
+| Between | Left behind | Recovered by |
+|---|---|---|
+| Stop recorded locally / chunks uploading | Run `pending`, snapshot on the host, chunks without a manifest | Next start's upkeep uploads again (a new attempt); the old chunks go at collection after the grace |
+| Manifest written / record written | Manifest nothing names; run `pending` locally | The retry finds the manifest and only writes the record |
+| Record written / registry file updated | Bucket says stopped, registry says `pending` | The retry's write conflicts, reads the record, sees its own write for the same snapshot, marks the run durable |
+| Run durable / previous upload released locally | One extra snapshot on the host, still named by the registry | Released on the same path as above; a registry entry naming a snapshot that is gone is skipped |
+| Durable / local copy dropped (`drop`, or pressure) | `remote.local` says true and the copy is gone, or the reverse | Nothing reads the flag to decide: a resume asks the pool |
+| Resume's claim written / registry file updated | Bucket says running by this daemon, registry says stopped at the generation before | Sync: the run stays stopped here, held, `pending`; the upkeep writes "stopped" again |
+| Claim / restore finished | The above, and volumes marked as a restore | The above; the startup sweep removes the volumes |
+| Restore received / committed | Volumes marked as a restore, some already released | Startup sweep: restore volumes destroyed newest first, released ones by the existing unwinding |
+| Booted / registry file updated | As every running run at a crash: the VM is swept | Sync: the run comes back stopped at its last durable stop |
+| Failed resume / claim given back | Bucket says running by this daemon; run stopped here, `pending` | Upkeep writes "stopped"; until then other daemons need `takeover` |
+| Running run's destroy noted in the registry / its VM removed | A note for a run whose VM the startup sweep then removes | The note is written to the bucket by the upkeep; the run is not brought back |
+| "Destroyed" noted / written to the bucket | A pending entry in the registry file | Written on every upkeep round; a run with one is not adopted back |
+| Stopped run's "destroyed" written / record deleted locally | Registry lists a run the bucket says is destroyed | Sync drops it and its local copy |
+| Fork's record written / child registered | A `forked` record of a run that does not exist | Sync writes "destroyed" for it |
+| Collection deleted a manifest / its chunks | Chunks nothing names | The next collection |
+| Takeover's claim written / registry file updated | As "resume's claim written" | The same |
+
+### Measured (nested arm64, one VM; daemon, pool and S3 service on the same machine)
+
+Two runs of `TestVMOffHost`, 300 MiB of random guest data (309.7 MiB as
+stored), 16 MiB chunks, 4 in flight, versitygw 1.11 on a local
+directory over loopback. These are not network figures: they bound what
+the daemon itself costs (zfs send, SHA-256 twice, AES-GCM, signing).
+
+- Upload of the base image, 865.7 MiB stored: 2.0 to 4.2 s.
+- Upload of the stop with 300 MiB: 0.52 to 0.71 s (440 to 590 MiB/s);
+  the whole stop 0.66 to 0.91 s.
+- Stop after 4 MiB changed in the guest: 6.8 MiB stored, 65 ms. After a
+  few bytes changed: 3.5 MiB.
+- Restore on a host with nothing, base image and two streams
+  (1182 MiB): 3.0 s; with three streams (1186 MiB): 5.7 s. Boot after
+  it 5.5 s. Time to resume from the bucket: 8.6 to 11.2 s, of which the
+  boot is the same 5.5 s a local resume takes.
+- Restore with the base image already on the host: see the report of
+  the run in the pull request; about 320 MiB in under 1 s.
+- Collection of six snapshots, 103 objects, 1.19 GiB: 40 ms.
+
+### How it was verified
+
+Unit (`go test ./...`, `-race`): the signer against AWS's published
+SigV4 suite and the S3 reference's worked examples; the client against
+an in-process service that recomputes every signature; chunk damage of
+every kind; manifests and records moved, altered or under another key;
+24 writers for one generation; a stale write into a pruned generation;
+collection, including that it deletes nothing when a record cannot be
+read. And the whole path on fakes (`internal/vm/offhost_test.go`): two
+or three managers on the VM driver, each with a fake pool and its own
+golden image, on one in-memory bucket.
+
+Live (`TestVMOffHost`, Cloud Hypervisor 54.1, ZFS 2.2, versitygw 1.11
+with conditional writes): stop with 300 MiB uploaded; no object holds a
+marker the guest wrote 20000 times, a chunk does not compress, an
+unsigned `curl` of it is a 403; incremental stop; two daemons resuming
+one run at once end with one hypervisor process and one 409; the first
+daemon's pool destroyed (`zpool destroy`), then both its stopped runs
+resumed on the second with the same SHA-256, and again through a fork;
+a flipped bit and a deleted chunk each fail the resume with the pool
+listing unchanged and the run still stopped and durable; destroy and
+collect leave the bucket prefix empty and the standing pool as found.
+The client's own live suite (`-tags s3integration`): objects, listing,
+a three-part multipart upload, 16 writers racing one conditional put.
+The rest of the vm suite still passes.
+
+The "second host" is a second daemon on the same VM with its own
+identity, state directory and ZFS pool. Nothing in the path knows that.
+
+### Deviations from what was asked, and why
+
+- **Multipart upload is in the client and not in the snapshot path.**
+  Fixed-size chunk objects give the bounded memory multipart is for,
+  plus per-chunk retry, hashes that can be checked before decryption
+  and deletion without an upload to abort. Multipart is tested live.
+- **"Full" uploads are against a shared base image**, above.
+- **Chains are capped, not consolidated.**
+- **A stop whose upload fails answers 200** with `remote.state:
+  "failed"`: the run is stopped, the container is gone, and failing the
+  call would say otherwise. The durable/not-durable answer is the field.
+- **A received base image is kept** after the last run descending from
+  it is gone, until the pool is short: it is most of what a restore
+  fetches. A restore that fails removes even that, so that a failed
+  restore leaves the pool exactly as it was.
+
+### What remains
+
+- **A dead holder is not detected.** A run that was running on a host
+  that died is resumable elsewhere only with `takeover`, by someone who
+  knows the host is dead. A superseded copy that is still running is
+  not killed.
+- **Remote storage is in the path of resume and of deleting a stopped
+  run**, and a daemon does not start without it. A deployment that
+  wants local resumes through a storage outage does not have them.
+- **The storage provider can delete or roll back** objects. Tampering
+  is detected; a record or snapshot removed is a run that is gone, and
+  generations removed from the top roll a run back to an older state if
+  its snapshot is still there. Use a bucket only the daemons can write.
+- **The master key** is one key for the fleet, with no rotation and no
+  recovery. Each run's key is wrapped separately, so rotation is
+  re-wrapping, but it is not built.
+- **Scale.** Every daemon lists every run record each sync and every
+  object each collection, and holds every stopped run of the fleet
+  (with its env) in its registry. Fine for thousands; not designed for
+  more. Collection is safe to run from many daemons but all of them do.
+- **Caller snapshots**: a failed upload is reported and not retried,
+  and nothing lists the snapshots in the bucket.
+- **Docker driver: not built.** It would need the driver's side
+  (`offhost.Snapshots`) for images: `docker save` as the stream and
+  `docker load` to receive works with what is here but uploads every
+  layer every time; doing it properly means storing layers as their own
+  content-addressed objects and a manifest of layer digests, plus the
+  warm volume baked into the snapshot image as today. The manager,
+  store, records and collection would not change.
+- **Not run:** a second physical host; any hosted S3 service (only
+  versitygw); virtual-host addressing against a real service (unit
+  only); a service without conditional writes, takeover, the run that
+  comes back after a daemon crash, eviction under pool pressure and a
+  storage outage during a stop (all on fakes only); disks of many GiB;
+  x86-64; a receiving pool that lacks a feature the sending pool's
+  stream uses (`zfs receive` refuses the stream, which is the clean
+  failure path, but it was not provoked).
+- No independent review of `internal/s3`, `internal/offhost` or the
+  manager changes yet.

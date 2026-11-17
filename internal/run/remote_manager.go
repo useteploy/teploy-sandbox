@@ -61,7 +61,8 @@ func setRemoteLocked(live *Run, state RemoteState) {
 // the previous upload. Any failure leaves the run stopped here with its
 // snapshot, marked as not durable, to be retried.
 //
-// The caller holds the run's exclusivity.
+// The caller holds the run's exclusivity, and decides with ctx how long
+// the upload may take: an upload that is cut off is a failed one.
 func (m *Manager) publishHeld(ctx context.Context, id string) error {
 	m.mu.Lock()
 	live, ok := m.runs[id]
@@ -75,9 +76,7 @@ func (m *Manager) publishHeld(ctx context.Context, id string) error {
 	payload := m.remotePayloadLocked(live)
 	m.mu.Unlock()
 
-	// Detached from the caller: a client that hangs up must not leave a
-	// stop half published.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.publishTimeout())
+	ctx, cancel := context.WithTimeout(ctx, m.publishTimeout())
 	defer cancel()
 	uploaded, err := m.OffHost.Upload(ctx, UploadRequest{Run: id, Ref: snapshot, Base: base, Key: key, Purpose: PurposeStop})
 	if err == nil {
@@ -106,7 +105,8 @@ func (m *Manager) publishHeld(ctx context.Context, id string) error {
 		live.remoteGen = generation + 1
 		live.remoteHeld = false
 		live.remoteKey = key
-		setRemoteLocked(live, RemoteState{State: RemoteDurable, Local: local, StoredBytes: uploaded.StoredBytes, Incremental: uploaded.Incremental, DurableAt: &now})
+		setRemoteLocked(live, RemoteState{State: RemoteDurable, Snapshot: uploaded.ID, Local: local, StoredBytes: uploaded.StoredBytes,
+			UploadMs: uploaded.Took.Milliseconds(), Incremental: uploaded.Incremental, DurableAt: &now})
 		// The next upload builds on this one; the one before is done.
 		if live.base != "" && live.base != live.snapshot {
 			released = append(released, live.base)
@@ -261,7 +261,7 @@ func (m *Manager) adopt(ctx context.Context, record RemoteRecord, held bool) (*R
 	adopted.remoteGen = record.Generation
 	adopted.remoteHeld = held
 	adopted.remoteKey = record.Key
-	state := RemoteState{State: RemoteDurable, Local: m.hasLocal(ctx, record.Snapshot)}
+	state := RemoteState{State: RemoteDurable, Snapshot: record.SnapshotID, Local: m.hasLocal(ctx, record.Snapshot)}
 	if held {
 		state.State = RemotePending
 	} else {
@@ -381,7 +381,7 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		m.mu.Lock()
 		live := m.runs[id]
 		live.remoteGen, live.remoteHeld, live.remoteKey = latest.Generation, false, latest.Key
-		setRemoteLocked(live, RemoteState{State: RemoteDurable, Local: true, DurableAt: &at})
+		setRemoteLocked(live, RemoteState{State: RemoteDurable, Snapshot: latest.SnapshotID, Local: true, DurableAt: &at})
 		released := live.base
 		live.base = ""
 		m.mu.Unlock()
@@ -597,6 +597,10 @@ func (m *Manager) unclaimHeld(ctx context.Context, id string) {
 	}
 	local := live.Remote == nil || live.Remote.Local
 	uploaded := live.Remote != nil && live.Remote.State == RemoteDurable
+	name := ""
+	if live.Remote != nil {
+		name = live.Remote.Snapshot
+	}
 	snapshot, key, generation := live.snapshot, live.remoteKey, live.remoteGen
 	payload := m.remotePayloadLocked(live)
 	setRemoteLocked(live, RemoteState{State: RemotePending, Local: local})
@@ -620,7 +624,7 @@ func (m *Manager) unclaimHeld(ctx context.Context, id string) {
 	m.mu.Lock()
 	if live, ok := m.runs[id]; ok {
 		live.remoteGen, live.remoteHeld, live.remoteKey = generation+1, false, key
-		setRemoteLocked(live, RemoteState{State: RemoteDurable, Local: local, DurableAt: &now})
+		setRemoteLocked(live, RemoteState{State: RemoteDurable, Snapshot: name, Local: local, DurableAt: &now})
 	}
 	m.mu.Unlock()
 	m.persist()
@@ -631,24 +635,38 @@ func (m *Manager) unclaimHeld(ctx context.Context, id string) {
 // run is remembered as destroyed, so that it is not taken for a run that
 // was lost and brought back.
 func (m *Manager) remoteGone(ctx context.Context, gone *Run) {
-	if m.OffHost == nil || gone.remoteGen == 0 || (gone.Remote != nil && gone.Remote.State == RemoteSuperseded) {
+	if !m.noteRemoteGone(gone) {
 		return
 	}
-	m.mu.Lock()
-	m.tombstones[gone.ID] = gone.remoteGen + 1
-	m.mu.Unlock()
-	m.persist()
 	attempt, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 	m.flushTombstones(attempt)
 }
 
-// flushTombstones writes the "destroyed" records still owed.
+// noteRemoteGone writes down, in the registry file, that a run with a
+// record in remote storage is being destroyed here. False when the run
+// has no record this daemon could change.
+func (m *Manager) noteRemoteGone(gone *Run) bool {
+	if m.OffHost == nil || gone.remoteGen == 0 || (gone.Remote != nil && gone.Remote.State == RemoteSuperseded) {
+		return false
+	}
+	m.mu.Lock()
+	m.tombstones[gone.ID] = gone.remoteGen + 1
+	m.mu.Unlock()
+	m.persist()
+	return true
+}
+
+// flushTombstones writes the "destroyed" records still owed. A run that
+// is still in the registry is still being removed, and is left for the
+// round after it is gone.
 func (m *Manager) flushTombstones(ctx context.Context) {
 	m.mu.Lock()
 	pending := make(map[string]uint64, len(m.tombstones))
 	for id, generation := range m.tombstones {
-		pending[id] = generation
+		if _, removing := m.runs[id]; !removing {
+			pending[id] = generation
+		}
 	}
 	m.mu.Unlock()
 	changed := false

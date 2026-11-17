@@ -404,11 +404,9 @@ func (v *Volumes) collect(ctx context.Context, start string, remove bool) error 
 			// A restore in progress: its own to finish or remove.
 			continue
 		case kindBase:
-			// A received base image goes whole, once nothing is cloned
-			// from it; its snapshot is never destroyed on its own.
-			if err := v.collectBase(ctx, dataset.Name); err != nil {
-				return err
-			}
+			// A received base image is kept like a golden image: the
+			// next run restored here descends from it too. It goes
+			// whole, and only when the pool is short (Reclaim).
 			continue
 		}
 		snapshots, err := v.zfs.Snapshots(ctx, dataset.Name)

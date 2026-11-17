@@ -51,8 +51,14 @@
 # requires and this script cannot install, and whether unprivileged
 # processes can create user namespaces, which it leaves as it finds.
 #
-# Environment: SBX_VM_UID_BASE, SBX_VM_CGROUP and SBX_VM_HYPERVISOR, as
-# for the daemon.
+# Last, it reports whether the host's connection table, the daemon's open
+# file limit and the kernel's asynchronous I/O limit are large enough for
+# the runs and the warm pool it is configured for, and changes none of
+# them.
+#
+# Environment: SBX_VM_UID_BASE, SBX_VM_CGROUP, SBX_VM_HYPERVISOR,
+# SBX_VM_MAX_RUNS, SBX_VM_NET_CONNECTIONS and SBX_VM_WARM, as for the
+# daemon.
 set -euo pipefail
 
 POOL="${1:-${SBX_VM_POOL:-sbx}}"
@@ -328,6 +334,49 @@ elif [ "$(sysctl_value kernel/apparmor_restrict_unprivileged_userns)" = 1 ]; the
     ok "AppArmor confines the user namespaces of unprivileged processes (kernel.apparmor_restrict_unprivileged_userns = 1)"
 else
     echo "  note:    unprivileged processes can create user namespaces. If nothing on this host needs them (rootless containers and browser sandboxes do), turn them off: sysctl -w user.max_user_namespaces=0, and persist it in /etc/sysctl.d."
+fi
+
+# Reported, never changed, and never a problem: the numbers belong to the
+# operator, and a host may be meant for fewer runs than the daemon's
+# flags allow. The daemon warns at start about the same arithmetic.
+#
+#   connection table (net.netfilter.nf_conntrack_max) >= runs x connections
+#   daemon's open files (RLIMIT_NOFILE, LimitNOFILE= in its unit)
+#                       >= runs x connections x 2 + (runs + pool) x 8 + 1024
+#   asynchronous I/O (fs.aio-max-nr) >= (runs + pool) x 128
+#
+# runs is SBX_VM_MAX_RUNS (--vm-max-runs), connections SBX_VM_NET_CONNECTIONS
+# (--vm-net-connections, default 4096; 0 is no limit, and nothing to size),
+# pool the sum of the counts in SBX_VM_WARM (--vm-warm).
+echo "host sizing: shared limits against the runs it is to carry"
+MAX_RUNS="${SBX_VM_MAX_RUNS:-0}"
+CONNECTIONS="${SBX_VM_NET_CONNECTIONS:-4096}"
+WARM_VMS=0
+IFS=',' read -r -a warm_sizes <<< "${SBX_VM_WARM:-}"
+for size in "${warm_sizes[@]}"; do
+    count="${size##*=}"
+    case "$count" in ''|*[!0-9]*) [ -z "${size// /}" ] || fail "SBX_VM_WARM: \"$size\" is not CPUSxMEMORY=COUNT" ;; *) WARM_VMS=$((WARM_VMS + count)) ;; esac
+done
+case "$MAX_RUNS$CONNECTIONS" in *[!0-9]*) fail "SBX_VM_MAX_RUNS and SBX_VM_NET_CONNECTIONS must be whole numbers"; MAX_RUNS=0 ;; esac
+size_check() { # NAME HAVE NEED FIX
+    if [ -z "$2" ]; then
+        echo "  note:    $1 cannot be read"
+    elif [ "$2" -ge "$3" ]; then
+        ok "$1 = $2, enough for $3"
+    else
+        echo "  note:    $1 = $2, and this configuration needs $3: $4"
+    fi
+}
+aio_need=$(( (MAX_RUNS + WARM_VMS) * 128 ))
+size_check "fs.aio-max-nr" "$(sysctl_value fs/aio-max-nr)" "$aio_need" "raise it (sysctl -w fs.aio-max-nr=$aio_need, and persist it); a VM that cannot have asynchronous I/O for its disk falls back to synchronous I/O"
+if [ "$MAX_RUNS" -gt 0 ] && [ "$CONNECTIONS" -gt 0 ]; then
+    conntrack_need=$((MAX_RUNS * CONNECTIONS))
+    files_need=$((MAX_RUNS * CONNECTIONS * 2 + (MAX_RUNS + WARM_VMS) * 8 + 1024))
+    modprobe nf_conntrack 2>/dev/null || true
+    size_check "net.netfilter.nf_conntrack_max" "$(sysctl_value net/netfilter/nf_conntrack_max)" "$conntrack_need" "raise it, or lower --vm-net-connections or --vm-max-runs"
+    echo "  note:    the daemon's open file limit must be at least $files_need (LimitNOFILE= in its systemd unit; this shell's hard limit is $(ulimit -Hn))"
+elif [ "$CONNECTIONS" -gt 0 ]; then
+    echo "  note:    no SBX_VM_MAX_RUNS: each run may hold $CONNECTIONS tracked connections and $((CONNECTIONS * 2)) of the daemon's open files; set it to have the connection table and the open file limit checked"
 fi
 
 echo

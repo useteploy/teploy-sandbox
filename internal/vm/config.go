@@ -89,6 +89,7 @@ type Config struct {
 	DiskMBPerSecond, DiskIOPS int
 	NetMbit, NetConnections   int
 	// MaxRuns is how many VMs runs may have at once; zero is no limit.
+	// It is also what the host's sizing is checked against at start.
 	MaxRuns int
 	// Warm is the warm pool: VMs booted ahead of creates. No sizes is
 	// no pool.
@@ -698,5 +699,8 @@ func New(ctx context.Context, config Config, log *slog.Logger) (*Driver, error) 
 	driver.MaxRuns = max(config.MaxRuns, 0)
 	driver.warm = config.Warm.withDefaults()
 	driver.owner = config.Owner
+	for _, warning := range sizingWarnings(config, realSizingHost()) {
+		log.Warn("host sizing: "+warning.text, warning.attrs...)
+	}
 	return driver, nil
 }

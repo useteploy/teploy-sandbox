@@ -202,6 +202,10 @@ The layers are independent; each is checked by the live suite.
   makes that the root with `pivot_root`, detaches the old root so that
   no path, descriptor or working directory leads back to the host's
   tree, drops to the VM's UID and executes the hypervisor in its place.
+  The hypervisor starts with its input, its two outputs and its tap
+  open and nothing else: every other descriptor is closed at the exec,
+  including any the daemon itself was started with and knows nothing
+  of.
   The root is read-only; everything is `nosuid`, everything but the
   binary `noexec`, everything but the three devices `nodev`, and only
   the socket directory is writable. There is no `/proc`, no `/sys`, no

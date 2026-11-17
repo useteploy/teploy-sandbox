@@ -852,3 +852,131 @@ the host; the devices it needs open inside).
 - Still open from the entry above: a udev rule file that honours neither
   flag; the per-identity directories that are never swept.
 - Not built for this driver: x86-64 was not run, nor bare metal.
+
+
+## 2026-11-16 — VM driver: independent review of the jail and the per-run namespaces
+
+A third reader went through the eight commits of the entry above (the
+jail helper, the per-run network namespaces, the proxy listener hook,
+the subordinate ID check, the host script), against a guest that has
+taken over its hypervisor process. Same host (Cloud Hypervisor v54.1,
+Linux 6.8, arm64, nested KVM).
+
+Found and fixed:
+
+- **The daemon did not compile for linux/amd64.** `internal/vm` named
+  `syscall.SYS_SETNS`, which the `syscall` package has on arm64 and not
+  on amd64. Every package of the daemon is one binary, so the Docker
+  driver did not build on x86-64 either, and CI (an x86-64 runner) could
+  not have passed. Found by cross-compiling; the gates that had been run
+  compile for the machine's own architecture. The number is now the
+  driver's own per architecture, and CI builds and vets both
+  architectures with every build tag. amd64 is still only compiled, not
+  run.
+- **A hypervisor inherited whatever descriptors the daemon was started
+  with.** The daemon's own files are close-on-exec; what its parent left
+  open is not, and it passed through the helper into every jail. A
+  descriptor is not stopped by a root that has no path to its file: an
+  open directory of the host is the host's tree again, for `openat` and
+  for a `connect` by relative path, which is what the jail exists to
+  take away. Shown on a real hypervisor: with the suite started as
+  `exec 8</; exec 9</etc; ./vm.test`, every hypervisor had descriptor 8
+  on `/` and 9 on `/etc`; and in the unit test's real jail the jailed
+  program read a file of the host through such a descriptor. The helper
+  now marks every descriptor above the ones the program is handed (its
+  standard three, and the tap) close-on-exec just before the exec, and
+  fails closed if it cannot. The live suite holds a stray descriptor on
+  `/` for its whole run and checks every hypervisor's descriptors.
+- **An open guest could send UDP to the host through a broadcast
+  address, with the rules gone.** The namespace had an unreachable route
+  for each address of the host, and none for the broadcast addresses of
+  the host's subnets, which the host's kernel also delivers to itself on
+  whichever interface they arrive. Shown live, with every table of the
+  daemon deleted: a datagram from an open guest to the broadcast address
+  of the host's own subnet, and one to that of another link of the host,
+  were each read by a UDP socket on the host bound to every address
+  (TCP and ping to the same addresses got nothing). With the rules in
+  place the host's table dropped them. The addresses the host takes for
+  itself are now each address, its subnet's broadcast address and its
+  subnet's first address; `TestVMNetworkFailsClosed` probes them and
+  fails on the driver as it was (`udp datagrams 5`, want 1).
+
+Looked at and found sound:
+
+- The helper before it gives up root. It resolves five paths that only
+  root can change (the binary, the kernel image, the device directory,
+  `/dev/kvm`, `/dev/urandom`) and the socket directory, which belongs
+  to a UID that owns no process until the helper itself takes it (a UID
+  is released only after its cgroup is empty). The mount tree is made
+  private before the first mount; the root is entered with `pivot_root`
+  and the old one detached, and `/proc/PID/mountinfo` of a hypervisor
+  lists the root and its six binds and nothing else. The environment is one
+  `PATH`. Order: bounding set, groups, GID, UID, a check that no ID is
+  0, `no_new_privs`, descriptors, exec. Read from a live hypervisor:
+  all five capability sets empty, `NoNewPrivs: 1`, `Seccomp: 2`.
+- The hypervisor's seccomp filters, read out of a live process
+  (`PTRACE_SECCOMP_GET_FILTER`) and evaluated per thread. The threads a
+  guest drives (vCPU, the virtio queues, vsock) may not `clone`, open a
+  socket other than the vsock thread's unix one, `mount`, `unshare`,
+  `setns`, `ptrace`, `bpf`, `keyctl`, `execve` or change a tap's
+  persistence. No thread may `unshare`, `setns`, `mount`, `ptrace`,
+  `execve`, `keyctl` or `bpf`. See below for what the main thread may.
+- The network threads. A goroutine that enters a namespace keeps its
+  thread to itself and ends with it; the Go runtime starts new threads
+  from a clean one when the current one is locked, so no other
+  goroutine lands in a guest's namespace.
+- Port 25 and fragments. A routing rule that matches a port does not
+  match a fragment (the kernel does not read ports out of one), and
+  with every table deleted a SYN to port 25 sent as two fragments did
+  leave the host and was answered by the peer. The answer never reached
+  the guest (three retransmitted SYN-ACKs seen on the host's end of the
+  link, none delivered; the same exchange on port 8080 completed). As
+  the kernel's source reads, that is reverse-path filtering in the
+  namespace: it looks the reply's source up with the ports swapped and
+  finds the unreachable rule. So no connection to port 25 was made that
+  way; one-way fragments can be sent.
+- The Docker driver's path through the proxy pool is what it was: with
+  no `Listen` hook the pool binds as before.
+
+Open, and what closing each would take:
+
+- **The hypervisor's main thread may make namespaces.** Its seccomp
+  filter (the hypervisor's own, not the daemon's) allows `clone` with
+  any flags, `clone3`, `io_uring_setup` and `AF_INET` and `AF_NETLINK`
+  sockets. Threads share memory, so code execution in any thread is,
+  with more work, code execution under that filter. On a host that lets
+  unprivileged processes create user namespaces, that is a new user,
+  network and mount namespace with full capabilities inside: nothing of
+  the host comes into reach by it (the jail's mounts stay locked, the
+  cgroup files stay root's), but the kernel's namespaced subsystems
+  (netfilter above all) become attack surface from inside a jail. Not
+  exercised: it needs code execution in the hypervisor. On the host
+  this was run on, AppArmor confines such a namespace
+  (`kernel.apparmor_restrict_unprivileged_userns = 1`; writing the UID
+  map as a VM's UID failed). Closing it for every host: a seccomp filter
+  of the daemon's own, installed by the helper under the hypervisor's
+  (no `clone` with a namespace flag, `clone3` answered with `ENOSYS`, no
+  `unshare`, no `setns`), or `user.max_user_namespaces = 0` on a host
+  that runs nothing else. `install-host.sh` does neither.
+- **The watch gives up for good if it mistakes its table for another
+  instance's.** It asks for its marker chain and, when that fails, for
+  the table; a marker that cannot be listed beside a table that can is
+  read as "another daemon instance took over", after which nothing is
+  watched, attached or removed until a restart. A failed `nft` (no
+  memory, no process slot) at the first step is enough. Fail-closed for
+  new runs, and existing runs keep their rules, routes and namespaces;
+  what is lost is the upkeep. Telling the two cases apart needs the
+  other instance's marker to be looked for, not the absence of one's
+  own.
+- **The session keyring of the daemon is the hypervisor's too.** No
+  hypervisor thread may call `keyctl`, so it is not reachable today; a
+  helper that joined a new session keyring would not depend on that.
+- **Local routes that are not addresses.** What the host takes for
+  itself is derived from its interfaces' addresses. A host with a
+  `local` route for a whole prefix (an "any IP" setup) has destinations
+  the namespaces' routes do not know; the host's table still drops
+  everything a guest sends to the host itself.
+- Still open from the entry above, unchanged: an open guest can be sent
+  to with both rulesets gone; the socket directory is on the host's
+  `/run`; the jail of a dynamically linked hypervisor was not run with a
+  hypervisor; x86-64 and bare metal were not run.

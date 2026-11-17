@@ -179,9 +179,9 @@ type warmPool struct {
 	failures int
 	deaths   int
 	retryAt  time.Time
-	// held is set while a boot waits for memory, so that it is logged
-	// once and not every tick.
-	held bool
+	// held has the sizes whose next boot waits for memory, so that each
+	// is logged once and not every tick.
+	held map[warmKey]bool
 	// leftovers are pool VMs whose removal failed; retried at close.
 	leftovers []*warmVM
 	// owned is the name of every VM the pool owns, from before its volume
@@ -204,6 +204,7 @@ func newWarmPool(driver *Driver, config WarmConfig) *warmPool {
 		ready:   map[warmKey][]*warmVM{},
 		booting: map[warmKey]int{},
 		owned:   map[string]bool{},
+		held:    map[warmKey]bool{},
 	}
 }
 
@@ -340,7 +341,8 @@ func (p *warmPool) fillLocked() {
 				return
 			}
 			if !p.memoryAllowsLocked(size) {
-				return
+				// This size, not the pool: a smaller one may fit.
+				continue
 			}
 			p.booting[key]++
 			p.bootingMB += MemoryLimitMB(size.MemoryMB)
@@ -363,12 +365,13 @@ func (p *warmPool) fillLocked() {
 func (p *warmPool) memoryAllowsLocked(size WarmSize) bool {
 	available, err := p.memAvailable()
 	need := MemoryLimitMB(size.MemoryMB) + p.config.HeadroomMB
+	key := size.key()
 	if err == nil && available-p.bootingMB >= need {
-		p.held = false
+		delete(p.held, key)
 		return true
 	}
-	if !p.held {
-		p.held = true
+	if !p.held[key] {
+		p.held[key] = true
 		if err != nil {
 			p.log.Error("vm warm pool: cannot read the host's available memory; not booting", "error", err)
 		} else {

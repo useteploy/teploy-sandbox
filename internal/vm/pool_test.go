@@ -565,3 +565,18 @@ func TestBootsThatFailTogether(t *testing.T) {
 		return pool.failures >= 8
 	})
 }
+
+// A size the host has no memory for must not keep the sizes after it in
+// --vm-warm from being booted: each size is held back on its own.
+func TestASizeThatDoesNotFitDoesNotHoldBackTheOthers(t *testing.T) {
+	rig := newRig(t, nil)
+	rig.driver.hostMemory = func() (int, error) { return 4096, nil }
+	rig.driver.setWarm(WarmConfig{Sizes: []WarmSize{{4, 8192, 1}, {1, 512, 1}}, HeadroomMB: 1024})
+	rig.driver.owner = t.Name()
+	t.Cleanup(func() { _ = rig.driver.Close(context.Background()) })
+	must(t, func() error { _, _, err := rig.driver.Sweep(bg); return err }())
+	status := waitPool(t, rig.driver, "the small size ready", func(status []run.WarmPoolSize) bool { return status[1].Ready == 1 })
+	if status[0].Ready != 0 || status[0].Booting != 0 {
+		t.Fatalf("a VM the host has no memory for was booted: %+v", status)
+	}
+}

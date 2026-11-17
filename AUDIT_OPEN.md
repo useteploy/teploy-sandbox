@@ -1826,9 +1826,10 @@ identity, state directory and ZFS pool. Nothing in the path knows that.
   is detected; a record or snapshot removed is a run that is gone, and
   generations removed from the top roll a run back to an older state if
   its snapshot is still there. Use a bucket only the daemons can write.
-- **The master key** is one key for the fleet, with no rotation and no
-  recovery. Each run's key is wrapped separately, so rotation is
-  re-wrapping, but it is not built.
+- **The master key** is one key for the fleet. Rotation is built now
+  (see the rotation entry below); recovery is not: losing the current
+  master with no backup loses every stopped run that is only in the
+  bucket.
 - **Scale.** Every daemon lists every run record each sync and every
   object each collection, and holds every stopped run of the fleet
   (with its env) in its registry. Fine for thousands; not designed for
@@ -1936,3 +1937,47 @@ interleaving built, including a takeover racing a failed boot and a
 give-back after a crash); an eviction that drops a snapshot a fork
 booted from. The crash table's rows were walked against the code;
 row 13's claim is narrowed above.
+
+## 2026-11-17 — off-host storage: master-key rotation
+
+The wrapped spelling of every run's data key — in each manifest and
+record envelope — is what a master key protects; the chunks are under
+keys derived from the data key itself and never move in a rotation.
+Built:
+
+- A keyring opens what its previous masters wrapped
+  (`--remote-previous-key-file`, comma-separated files) and always
+  wraps with the current one. The id embedded in every wrapped key
+  says which master opens it, so a wrong key is still reported as
+  that and not as corruption.
+- A daemon's own writes re-wrap: Service.Upload and Service.Advance
+  open the run's key, and if a previous master wrapped it, the
+  manifest/record they write and the wrapped key they hand back are
+  under the current master.
+- `POST /v1/remote/rotate` re-wraps what is standing still: every
+  manifest, overwritten in place exactly as a second upload of the
+  same snapshot is; and every stopped run's record as its next
+  generation, with the state and the owner unchanged (rotation must
+  not move ownership, which the unfenced store and a daemon's own
+  conflict recovery go by). A record that moved while the pass read
+  it is skipped and counted, not raced; a running run's record is
+  left to its next write; a destroyed run's is left for collection.
+  Collect prunes the generations a pass replaces, and with them the
+  last object an old master protects.
+- The pass takes the same lock as Collect, and a partial pass is
+  safe: every previous master the daemons were given still opens
+  everything it opened before.
+
+Verified on the fakes and the in-memory bucket: a fleet under one
+master with a stopped run, a caller snapshot and a base image moves to
+a new master; the daemon carrying both re-wraps its own resume/stop
+without any pass; one pass re-wraps the rest while the chunk objects
+stay byte for byte (only manifest envelopes change) and the record's
+owner stays who it was; a daemon given only the new master then syncs,
+resumes the run and boots the caller snapshot; a second pass has
+nothing left except the running record it is designed to leave.
+
+Not done: an unfenced store rotates only the records its own daemon
+wrote last (the same rule as its resumes); no recovery — a master key
+lost with no copy loses what only it opens; the rotation is one pass
+on demand, not a fleet-coordinated procedure with a checklist.

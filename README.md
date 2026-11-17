@@ -22,7 +22,7 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 | `POST /v1/runs/{id}/resume` | `{ttlSec?, takeover?}` → the same run, same `id`, `state: "running"`, new deadline (`takeover`: see Off-host storage) |
 | `POST /v1/runs/{id}/fork` | `{ttlSec?, labels?, onExpire?}` → 201, a new run started from this one's filesystem and settings, with `forkedFrom` |
 | `GET /v1/capacity` | `{server, driver, runtime, cpus, memoryMb, runs: {running, stopped}, allocated: {cpus, memoryMb}, warmPool?}` — the host's size and the sum of running runs' limits (and of the VM driver's warm pool, when it has one) |
-| `POST /v1/remote/sync`, `POST /v1/remote/collect` | Only with remote storage (400 without): look for runs stopped on other daemons now → `{remote, changed}`; garbage-collect the bucket now → 204 |
+| `POST /v1/remote/sync`, `POST /v1/remote/collect`, `POST /v1/remote/rotate` | Only with remote storage (400 without): look for runs stopped on other daemons now → `{remote, changed}`; garbage-collect the bucket now → 204; re-wrap the bucket's keys under the current master → `{manifestsRewrapped, recordsRewrapped, …}` |
 | `GET /v1/runs`, `GET /health` | List; `{status, version}` |
 
 Run IDs are ULIDs and every response carries a `server` field — nothing
@@ -654,6 +654,7 @@ serve --driver vm --state-dir /var/lib/teploy-sandbox/state \
 | `--remote-access-key` (`SBX_REMOTE_ACCESS_KEY`, `AWS_ACCESS_KEY_ID`) | | |
 | `--remote-secret-key-file` (or `SBX_REMOTE_SECRET_KEY`, `AWS_SECRET_ACCESS_KEY`) | | The secret is never a flag value |
 | `--remote-key-file` (or `SBX_REMOTE_KEY`) | required | The 32-byte master key: raw, base64 or hex. The same on every daemon |
+| `--remote-previous-key-file` | none | Comma-separated files of master keys this daemon still opens but no longer wraps with (the state while a rotation runs) |
 | `--remote-chunk-mb`, `--remote-parallel` | 16, 4 | Object size and objects in flight; a transfer holds about (parallel + 1) chunks in memory, whatever the disk's size |
 | `--remote-max-chain` | 8 | Incremental uploads in a row before one is sent against the base image again |
 | `--remote-local` | `keep` | `keep` a durable snapshot's local copy for a fast resume here, or `drop` it at once |
@@ -759,6 +760,19 @@ runs; and old generations. Nothing is deleted before it has been garbage
 for `--remote-gc-grace`, and nothing at all in a round that could not
 read every record and manifest. `POST /v1/remote/collect` runs a round
 now.
+
+**Key rotation.** Every daemon is given a new master key and, while
+the rotation runs, the old one under `--remote-previous-key-file`. A
+daemon's own writes re-wrap as they go: a run's key it opens under the
+old master is stored and answered under the new one. `POST
+/v1/remote/rotate` covers what is standing still: every manifest, and
+every stopped run's record as a new generation with the state and the
+owner unchanged. No data key changes, so no chunk moves and nothing is
+re-uploaded — only the wrapped spelling of each key does. When a pass
+reports nothing left to move and the next collection has pruned the
+generations it replaced, the old master key can be retired everywhere.
+Losing the current master with no backup still loses every stopped run
+that is only in the bucket; there is no recovery from that.
 
 **Caller snapshots.** `POST /snapshot` uploads too and adds
 `"remote": {"state", "id", ...}` to its answer; `image: "snapshot:<id>"`

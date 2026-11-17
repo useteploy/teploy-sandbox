@@ -37,6 +37,13 @@ type hostOption func(*offhost.Config, *run.Manager)
 // after the startup sweep.
 func newHost(t *testing.T, bucket *offhosttest.Memory, name string, previous *remoteHost, options ...hostOption) *remoteHost {
 	t.Helper()
+	return newHostKeys(t, bucket, name, previous, nil, options...)
+}
+
+// newHostKeys is newHost with the daemon's keyring chosen by the test:
+// a rotation's half-done state, or a fleet that has moved on.
+func newHostKeys(t *testing.T, bucket *offhosttest.Memory, name string, previous *remoteHost, keyring *offhost.Keyring, options ...hostOption) *remoteHost {
+	t.Helper()
 	h := &remoteHost{name: name, bucket: bucket, stateDir: t.TempDir()}
 	var rig *testRig
 	if previous != nil {
@@ -50,9 +57,13 @@ func newHost(t *testing.T, bucket *offhosttest.Memory, name string, previous *re
 		rig.zfs.snapshots[testGolden].guid = rig.zfs.newGUID()
 	}
 	h.testRig = rig
-	keys, err := offhost.NewKeyring(bytes.Repeat([]byte{7}, offhost.KeySize))
-	if err != nil {
-		t.Fatal(err)
+	keys := keyring
+	if keys == nil {
+		var err error
+		keys, err = offhost.NewKeyring(bytes.Repeat([]byte{7}, offhost.KeySize))
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	h.store = offhost.NewStore(bucket, "fleet", keys, quietLog())
 	h.store.ChunkBytes = 96
@@ -1033,5 +1044,109 @@ func TestAnInterruptedRestoreIsSweptAtStart(t *testing.T) {
 	assertPool(t, b.zfs, pristine...)
 	if _, err := b.manager.Resume(bg, created.ID, 0); err != nil {
 		t.Fatalf("resume after the restart: %v", err)
+	}
+}
+
+// A fleet moves to a new master key: what the old one still protects is
+// re-wrapped, the chunks do not move, and a daemon given only the new
+// key can then resume everything.
+func TestMasterKeysRotateWithoutTheOldOne(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	a := newHost(t, bucket, "host-a", nil)
+	data := payload(t, 400)
+	first := a.startRun(t, data)
+	a.stop(t, first.ID)
+	second := a.startRun(t, data)
+	_, remote, err := a.manager.SnapshotRemote(bg, second.ID)
+	if err != nil || remote == nil || remote.ID == "" {
+		t.Fatalf("snapshot: %+v %v", remote, err)
+	}
+
+	// Every daemon is given the new master and, for the transition, the
+	// old one to still read. One of them rotates.
+	newMaster := bytes.Repeat([]byte{9}, offhost.KeySize)
+	rotatedKeys, err := offhost.NewKeyring(newMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rotatedKeys.AddPrevious(bytes.Repeat([]byte{7}, offhost.KeySize)); err != nil {
+		t.Fatal(err)
+	}
+	b := newHostKeys(t, bucket, "host-b", nil, rotatedKeys)
+	// Before any pass: a daemon carrying both keys re-wraps as it
+	// writes. b resumes the run (its key still wrapped by the old
+	// master) and stops it again, and the record that leaves is under
+	// the new one — a daemon holding only that master can read it.
+	onlyKeys, err := offhost.NewKeyring(newMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newHostKeys(t, bucket, "host-c", nil, onlyKeys)
+	b.sync(t)
+	if _, err := b.manager.Resume(bg, first.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.manager.Stop(bg, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := c.store.Latest(bg, first.ID); err != nil {
+		t.Fatalf("a daemon's own write did not rewrap its key: %v", err)
+	}
+	var chunksBefore []string
+	for _, key := range bucket.Keys("fleet/v1/snap/") {
+		if !strings.HasSuffix(key, "/manifest") {
+			chunksBefore = append(chunksBefore, key)
+		}
+	}
+	stats, err := b.manager.RotateRemote(bg)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if stats.Records+stats.RecordsCurrent != 1 || stats.Manifests == 0 || stats.RecordsRunning != 0 || stats.RecordsConflicted != 0 {
+		t.Fatalf("what one rotation pass did: %+v", stats)
+	}
+	// The holder of the record it rewrote is who it was.
+	latest, _, err := b.store.Latest(bg, first.ID)
+	if err != nil || latest.Owner != "host-b" {
+		t.Fatalf("rotation moved a run's ownership: %+v %v", latest, err)
+	}
+	// The chunks did not move; only the manifest envelopes changed.
+	var chunksAfter []string
+	for _, key := range bucket.Keys("fleet/v1/snap/") {
+		if !strings.HasSuffix(key, "/manifest") {
+			chunksAfter = append(chunksAfter, key)
+		}
+	}
+	if !slices.Equal(chunksBefore, chunksAfter) {
+		t.Fatalf("the chunks moved: %v -> %v", chunksBefore, chunksAfter)
+	}
+
+	// The old master is now gone for good: the daemon given only the new
+	// one syncs, resumes the stopped run and boots the caller snapshot.
+	c.sync(t)
+	resumed, err := c.manager.Resume(bg, first.ID, 0)
+	if err != nil {
+		t.Fatalf("resume under the new master only: %v", err)
+	}
+	if !bytes.Equal(c.read(t, resumed.ID), data) {
+		t.Fatal("bytes differ")
+	}
+	booted, err := c.manager.Create(bg, run.CreateRequest{Image: "snapshot:" + remote.ID})
+	if err != nil {
+		t.Fatalf("create from a caller snapshot under the new master only: %v", err)
+	}
+	if !bytes.Equal(c.read(t, booted.ID), data) {
+		t.Fatal("bytes differ")
+	}
+
+	// A second pass has nothing to do. The one record it did not count
+	// as current is host-c's resume: a running run's record is left to
+	// its next write, which wraps with the current master anyway.
+	stats, err = b.manager.RotateRemote(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Records != 0 || stats.Manifests != 0 || stats.ManifestsCurrent == 0 || stats.RecordsRunning != 1 {
+		t.Fatalf("everything is already under the new master: %+v", stats)
 	}
 }

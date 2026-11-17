@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -450,5 +451,102 @@ func TestCollectToleratesAManifestThatVanishesMidRound(t *testing.T) {
 	}
 	if has, _ := store.HasSnapshot(bg, "child"); !has {
 		t.Fatal("the surviving snapshot was deleted")
+	}
+}
+
+func TestRotationRewrapsWithoutMovingAnything(t *testing.T) {
+	store, bucket := testStore(t)
+	key, err := store.Keys().NewKey("run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := randomBytes(t, 2500)
+	if _, err := store.Upload(bg, Manifest{ID: "snap-1", Purpose: PurposeSnapshot, GUID: "1", Run: "run-1"}, key, bytes.NewReader(stream)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Advance(bg, Record{Run: "run-1", Generation: 1, State: RecordStopped, Snapshot: "snap-1"}, key, "daemon-a", false); err != nil {
+		t.Fatal(err)
+	}
+	chunk := func() []string {
+		var out []string
+		for _, key := range bucket.Keys("fleet/v1/snap/snap-1/") {
+			if !strings.HasSuffix(key, "/manifest") {
+				out = append(out, key)
+			}
+		}
+		return out
+	}
+	chunksBefore := chunk()
+	rawBefore := bucket.Raw(chunksBefore[0])
+
+	// The fleet's new master, with the old one along to read during the
+	// transition.
+	next, err := NewKeyring(bytes.Repeat([]byte{2}, KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := next.AddPrevious(bytes.Repeat([]byte{1}, KeySize)); err != nil {
+		t.Fatal(err)
+	}
+	rotated := NewStore(bucket, "fleet", next, quiet())
+	rotated.ChunkBytes = store.ChunkBytes
+	if err := rotated.Probe(bg); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := rotated.Rotate(bg, "daemon-b", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Records != 1 || stats.Manifests != 1 {
+		t.Fatalf("one record and one manifest to rewrap: %+v", stats)
+	}
+	if !slices.Equal(chunksBefore, chunk()) || !bytes.Equal(rawBefore, bucket.Raw(chunksBefore[0])) {
+		t.Fatal("a chunk moved or changed")
+	}
+	// The rewritten record keeps its state and its owner.
+	latest, _, err := rotated.Latest(bg, "run-1")
+	if err != nil || latest.Owner != "daemon-a" || latest.State != RecordStopped || latest.Generation != 2 || latest.Snapshot != "snap-1" {
+		t.Fatalf("the rotated record: %+v %v", latest, err)
+	}
+
+	// A daemon with only the new master reads everything.
+	only, err := NewKeyring(bytes.Repeat([]byte{2}, KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := NewStore(bucket, "fleet", only, quiet())
+	if err := moved.Probe(bg); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := moved.Manifest(bg, "snap-1"); err != nil {
+		t.Fatalf("the manifest under the new master only: %v", err)
+	}
+	if _, _, err := moved.Latest(bg, "run-1"); err != nil {
+		t.Fatalf("the record under the new master only: %v", err)
+	}
+
+	// The store itself does not re-wrap a key it is handed: a record
+	// written with the old wrapped spelling stays old until a pass moves
+	// it. (The service above the store re-wraps its own writes; that is
+	// asserted in the vm suite.)
+	oldKey, err := store.Keys().NewKey("run-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rotated.Advance(bg, Record{Run: "run-2", Generation: 1, State: RecordStopped}, oldKey, "daemon-b", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := moved.Latest(bg, "run-2"); err == nil {
+		t.Fatal("a store-level write rewrapped, which is not the store's to do")
+	}
+	stats, err = rotated.Rotate(bg, "daemon-b", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Records != 1 || stats.RecordsCurrent != 1 {
+		t.Fatalf("one record left to move, one already moved: %+v", stats)
+	}
+	if _, _, err := moved.Latest(bg, "run-2"); err != nil {
+		t.Fatalf("the moved record under the new master only: %v", err)
 	}
 }

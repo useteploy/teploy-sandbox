@@ -44,6 +44,8 @@ func problem(status int, detail string) Problem {
 		suffix, title = "not-found", "Not Found"
 	case http.StatusConflict:
 		suffix, title = "conflict", "Conflict"
+	case http.StatusServiceUnavailable:
+		suffix, title = "at-capacity", "Service Unavailable"
 	}
 	return Problem{Type: "https://neutron.dev/errors/" + suffix, Title: title, Status: status, Detail: detail}
 }
@@ -57,8 +59,15 @@ type Server struct {
 	// nothing assumes "this box").
 	ServerName string
 	// Runtime is the OCI runtime runs use (SBX_RUNTIME); empty is
-	// Docker's default. Reported by GET /v1/capacity.
+	// Docker's default. Under the VM driver it names the hypervisor.
+	// Reported by GET /v1/capacity.
 	Runtime string
+	// Driver is the active run driver, "docker" or "vm"; empty is
+	// "docker". Reported by GET /v1/capacity.
+	Driver string
+	// NestedVirt is whether a run on this daemon can itself start virtual
+	// machines. Reported by GET /v1/capacity.
+	NestedVirt bool
 }
 
 func (s *Server) Handler() http.Handler {
@@ -116,6 +125,8 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		errors.Is(err, run.ErrStopped),
 		errors.Is(err, run.ErrRunning):
 		s.writeProblem(w, problem(http.StatusConflict, err.Error()))
+	case errors.Is(err, run.ErrAtCapacity):
+		s.writeProblem(w, problem(http.StatusServiceUnavailable, err.Error()))
 	default:
 		s.Log.Error("request failed", "error", err)
 		s.writeProblem(w, problem(http.StatusInternalServerError, err.Error()))
@@ -213,17 +224,28 @@ func (s *Server) handleCapacity(w http.ResponseWriter, _ *http.Request) {
 	if runtimeName == "" {
 		runtimeName = "default"
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
-		"driver":   "docker",
-		"runtime":  runtimeName,
-		"cpus":     runtime.NumCPU(),
-		"memoryMb": hostMemoryMB(),
-		"runs":     map[string]int{"running": load.Running, "stopped": load.Stopped},
+	driver := s.Driver
+	if driver == "" {
+		driver = "docker"
+	}
+	body := map[string]any{
+		"driver":     driver,
+		"nestedVirt": s.NestedVirt,
+		"runtime":    runtimeName,
+		"cpus":       runtime.NumCPU(),
+		"memoryMb":   hostMemoryMB(),
+		"runs":       map[string]int{"running": load.Running, "stopped": load.Stopped},
 		"allocated": map[string]any{
 			"cpus":     load.CPUs,
 			"memoryMb": load.MemoryMB,
 		},
-	})
+	}
+	if load.WarmPool != nil {
+		// Only from a driver with a warm pool configured; "allocated"
+		// above already counts its machines.
+		body["warmPool"] = map[string]any{"sizes": load.WarmPool}
+	}
+	s.writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {

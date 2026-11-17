@@ -16,10 +16,64 @@ jobs:
         with:
           go-version: "1.26.x"
       - name: Tests and vet
-        run: go test ./... && go vet ./... && go test -race ./...
+        run: go test ./... && go vet ./... && go vet -tags vmintegration ./... && go test -race ./...
       - name: Build
         run: go build ./...
+      - name: Both architectures compile, with every build tag
+        # The vm driver makes system calls by number and the syscall
+        # package does not name the same ones everywhere: code written
+        # on one architecture has failed to compile on the other.
+        run: |
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch go build ./...
+            GOOS=linux GOARCH=$arch go vet ./...
+            GOOS=linux GOARCH=$arch go vet -tags integration ./...
+            GOOS=linux GOARCH=$arch go vet -tags vmintegration ./...
+          done
       - name: Isolated Docker and Linux network acceptance
         run: |
           CGO_ENABLED=0 go test -c -tags integration -o "$RUNNER_TEMP/sandbox-integration.test" .
           sudo "$RUNNER_TEMP/sandbox-integration.test" -test.v
+
+  # The vm driver's jail is built by root, so the tests that enter a real
+  # one skip themselves for anyone else. Here they run as root, on
+  # x86-64: the jail, the seccomp filter (every refused call made under
+  # it by a jailed process, against the same calls without it) and the
+  # socket directory's filesystem. No hypervisor is involved.
+  vm-root:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - name: Unit tests of the vm driver, as root
+        run: |
+          # The tests' output goes through a pipe, and a step's shell is
+          # "bash -e" without pipefail unless a shell is named: without
+          # this line the step would end with tee's status, and a test
+          # that failed would only show in the log.
+          set -o pipefail
+          # Statically linked, as the jail needs it, and somewhere a
+          # process of any UID can start it.
+          CGO_ENABLED=0 go test -c -o vm-unit.test ./internal/vm/
+          sudo install -D -m 0755 vm-unit.test /opt/teploy-test/vm-unit.test
+          sudo /opt/teploy-test/vm-unit.test -test.v 2>&1 | tee vm-unit.log
+          # A test that skipped itself proved nothing: as root on this
+          # runner none of the package's tests has a reason to.
+          if grep -E -- '--- SKIP' vm-unit.log; then
+            echo "a test was skipped" >&2
+            exit 1
+          fi
+          for name in TestJailHoldsNothingOfTheHost TestJailRefusesTheCallsTheFilterNames TestSocketDirIsBounded TestSeccompNumbersAreThisArchitectures; do
+            grep -q -- "--- PASS: $name" vm-unit.log || { echo "$name did not run" >&2; exit 1; }
+          done
+      - name: What this runner has of what the vm driver needs
+        # Informational: no pool and no hypervisor are installed here, so
+        # the script ends with problems; what it says about the kernel
+        # (cgroup controllers, nftables' ct count, tbf, seccomp, tmpfs,
+        # Landlock, /dev/kvm) is what is read.
+        run: |
+          ls -l /dev/kvm || true
+          sudo apt-get install -y -q conntrack >/dev/null 2>&1 || true
+          sudo scripts/install-host.sh || true

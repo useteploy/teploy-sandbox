@@ -1,0 +1,659 @@
+//go:build vmintegration
+
+// Live suite for the VM driver against a real hypervisor and a real ZFS
+// pool. It needs root, /dev/kvm, cloud-hypervisor, a guest kernel and a
+// golden snapshot built by scripts/build-golden.sh, so it has its own
+// build tag and CI (which has no KVM) does not run it:
+//
+//	sudo scripts/install-host.sh POOL
+//	CGO_ENABLED=0 go test -c -tags vmintegration -o vm.test .
+//	sudo SBX_VM_HYPERVISOR=... SBX_VM_KERNEL=... SBX_VM_POOL=... SBX_VM_GOLDEN=... ./vm.test -test.v
+//
+// The variables are the daemon's own, with the daemon's defaults.
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/useteploy/teploy-sandbox/internal/egress"
+	"github.com/useteploy/teploy-sandbox/internal/run"
+	"github.com/useteploy/teploy-sandbox/internal/vm"
+)
+
+// vmTestConfig is the host config for the suite. The owner is fixed, so
+// whatever a crashed earlier attempt left behind is this suite's to sweep
+// and nobody else's.
+func vmTestConfig(t *testing.T) vm.Config {
+	t.Helper()
+	holdStrayDescriptor(t)
+	owner := sha256.Sum256([]byte("teploy-sandbox vmintegration suite"))
+	pool := envOr("SBX_VM_POOL", vm.DefaultPool)
+	// SBX_VM_WARM runs the whole suite with a warm pool, as the daemon's
+	// --vm-warm: every test then gets pool VMs wherever its sizes match.
+	warm, err := vm.ParseWarmSizes(os.Getenv("SBX_VM_WARM"))
+	if err != nil {
+		t.Fatalf("SBX_VM_WARM: %v", err)
+	}
+	return vm.Config{
+		Warm:       vm.WarmConfig{Sizes: warm, Boots: int(envFloat("SBX_VM_WARM_BOOTS", vm.DefaultWarmBoots))},
+		Hypervisor: envOr("SBX_VM_HYPERVISOR", vm.DefaultHypervisor),
+		Kernel:     envOr("SBX_VM_KERNEL", vm.DefaultKernel),
+		Cmdline:    envOr("SBX_VM_CMDLINE", vm.DefaultCmdline()),
+		Pool:       pool,
+		Golden:     envOr("SBX_VM_GOLDEN", pool+"/golden-guestd@v1"),
+		RunDir:     envOr("SBX_VM_RUN_DIR", "/run/teploy-vmtest"),
+		Cgroup:     envOr("SBX_VM_CGROUP", vm.DefaultCgroup),
+		Owner:      hex.EncodeToString(owner[:]),
+	}
+}
+
+// poolListing is every dataset and snapshot in the pool, sorted, except
+// the volumes of warm pool VMs: those come and go on their own, and are
+// nobody's run.
+func poolListing(t *testing.T, pool string) []string {
+	t.Helper()
+	out, err := exec.Command("zfs", "list", "-H", "-r", "-t", "all", "-o", "name", pool).Output()
+	if err != nil {
+		t.Fatalf("zfs list: %v", err)
+	}
+	var names []string
+	for _, name := range strings.Fields(string(out)) {
+		if !vm.WarmPoolHolds(filepath.Base(name)) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// hypervisorProcesses lists the pids whose command line names an API
+// socket under dir: the suite's own VMs, except those a warm pool holds.
+func hypervisorProcesses(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pids []string
+	for _, entry := range entries {
+		raw, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		args := strings.Split(string(raw), "\x00")
+		at := slices.Index(args, "--api-socket")
+		if at < 0 || at+1 >= len(args) || !strings.HasPrefix(args[at+1], dir+"/") {
+			continue
+		}
+		if !vm.WarmPoolHolds(filepath.Base(filepath.Dir(args[at+1]))) {
+			pids = append(pids, entry.Name())
+		}
+	}
+	return pids
+}
+
+// settledWarmPool waits until the driver's warm pool is full and nothing
+// of it is booting, and returns how many VMs it holds: 0 with no pool.
+// A test that is about to restart its daemon calls it, so that it knows
+// how many VMs the new daemon's sweep will find besides the runs'.
+func settledWarmPool(t *testing.T, driver *vm.Driver) int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Minute)
+	for {
+		ready, settled := 0, true
+		for _, size := range driver.WarmPool() {
+			ready += size.Ready
+			settled = settled && size.Ready == size.Target && size.Booting == 0
+		}
+		if settled {
+			return ready
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the warm pool did not fill: %+v", driver.WarmPool())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+type vmExec struct {
+	stdout, stderr string
+	code           int
+	timedOut       bool
+}
+
+// vmRun execs through the manager, exactly as the HTTP handler does.
+func vmRun(t *testing.T, manager *run.Manager, id, cmd, cwd string, env map[string]string, timeout time.Duration) vmExec {
+	t.Helper()
+	session, err := manager.BeginExec(id, run.LeaseCredential{})
+	if err != nil {
+		t.Fatalf("begin exec %q: %v", cmd, err)
+	}
+	var stdout, stderr bytes.Buffer
+	code, timedOut, err := session.Exec(context.Background(), cmd, cwd, env, timeout, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("exec %q: %v", cmd, err)
+	}
+	return vmExec{stdout: stdout.String(), stderr: stderr.String(), code: code, timedOut: timedOut}
+}
+
+func newVMManager(t *testing.T, config vm.Config, stateDir string) (*run.Manager, *vm.Driver, int, int) {
+	t.Helper()
+	return newVMManagerLogging(t, config, stateDir, io.Discard)
+}
+
+// newVMManagerLogging is a manager on the VM driver, wired as serve wires
+// it, with the daemon's log going to logs.
+func newVMManagerLogging(t *testing.T, config vm.Config, stateDir string, logs io.Writer) (*run.Manager, *vm.Driver, int, int) {
+	t.Helper()
+	claims := &claimCounter{w: logs}
+	log := slog.New(slog.NewTextHandler(claims, nil))
+	driver, err := vm.New(context.Background(), config, log)
+	if err != nil {
+		t.Fatalf("vm driver: %v", err)
+	}
+	// With no VM left this removes the driver's firewall tables and its
+	// gateway device; a driver that a later one replaced touches nothing.
+	t.Cleanup(func() { _ = driver.Close(context.Background()) })
+	// What serve does, in serve's order: sweep, then load the registry.
+	processes, volumes, err := driver.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	manager := run.NewManager(driver, log)
+	manager.SandboxUser = ""
+	if gateway, ok := driver.Gateway(); ok {
+		pool := &egress.Pool{Base: egress.DefaultAllowlist, Bind: gateway, Log: log, Private: true, Listen: driver.ProxyListener}
+		t.Cleanup(pool.Shutdown)
+		manager.Egress = pool
+	}
+	if _, err := manager.LoadState(context.Background(), stateDir); err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if len(config.Warm.Sizes) > 0 {
+		// A full pool, so that every create of a size it keeps is a
+		// claim, and the test says how many there were.
+		settledWarmPool(t, driver)
+		t.Cleanup(func() { t.Logf("runs given a warm pool VM by this daemon: %d", claims.n.Load()) })
+	}
+	return manager, driver, processes, volumes
+}
+
+// claimCounter passes the daemon's log on and counts the runs it hands a
+// warm pool VM.
+type claimCounter struct {
+	w io.Writer
+	n atomic.Int64
+}
+
+func (c *claimCounter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(`from="warm pool"`)) {
+		c.n.Add(1)
+	}
+	return c.w.Write(p)
+}
+
+func TestVMLifecycle(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Fatal("the vm suite needs root (zfs, /dev/kvm)")
+	}
+	config := vmTestConfig(t)
+	stateDir := t.TempDir()
+	ctx := context.Background()
+	timings := map[string]time.Duration{}
+	timed := func(name string, start time.Time) { timings[name] = time.Since(start) }
+
+	// Clear whatever an aborted earlier attempt left, then take the
+	// baseline everything is compared against at the end.
+	newVMManager(t, config, t.TempDir())
+	baseline := poolListing(t, config.Pool)
+	if !slices.Contains(baseline, config.Golden) {
+		t.Fatalf("golden snapshot %s is not in the pool", config.Golden)
+	}
+	if left := hypervisorProcesses(t, config.RunDir); len(left) > 0 {
+		t.Fatalf("hypervisor processes before the suite started: %v", left)
+	}
+	manager, driver, _, _ := newVMManager(t, config, stateDir)
+	// No volume of a run may ever show its partitions to the host: with
+	// them come the guest's filesystem labels, which a host mount by label
+	// can pick up. Checked wherever a volume has just been made.
+	partitionsBefore := zvolPartitions(t)
+	noGuestPartitions := func(when string) {
+		t.Helper()
+		if got := zvolPartitions(t); !slices.Equal(got, partitionsBefore) {
+			t.Fatalf("%s: the host has partition devices for guest disks: %v (before the suite: %v)", when, got, partitionsBefore)
+		}
+	}
+
+	// Refusals come first and cost nothing: no VM is booted for them.
+	for name, req := range map[string]run.CreateRequest{
+		"a pids limit":                           {Image: vm.GoldenImage, Limits: &run.Limits{Pids: 64}},
+		"egressAllow without the allowlist tier": {Image: vm.GoldenImage, Network: "open", EgressAllow: []string{"example.com"}},
+		"warm":                                   {Image: vm.GoldenImage, Warm: &run.WarmRequest{Repo: "example/repo"}},
+		"an OCI image":                           {Image: "debian:bookworm-slim"},
+	} {
+		start := time.Now()
+		if _, err := manager.Create(ctx, req); !errors.Is(err, run.ErrBadRequest) {
+			t.Fatalf("create with %s: %v, want a bad request", name, err)
+		}
+		if time.Since(start) > 2*time.Second {
+			t.Fatalf("refusing %s took %s: something was allocated first", name, time.Since(start))
+		}
+	}
+	if got := poolListing(t, config.Pool); !slices.Equal(got, baseline) {
+		t.Fatalf("a refused create left volumes: %v", got)
+	}
+
+	// --- create
+	start := time.Now()
+	created, err := manager.Create(ctx, run.CreateRequest{
+		Image:  vm.GoldenImage,
+		TTLSec: 1800,
+		Env:    map[string]string{"FROM_CREATE": "create value", "SHADOWED": "create"},
+		Limits: &run.Limits{MemoryMB: 1024, CPUs: 1},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	timed("create (clone + cold boot to agent ready)", start)
+	noGuestPartitions("after create")
+	id := created.ID
+	defer manager.Destroy(context.Background(), id)
+	if created.State != run.StateRunning || created.User != run.RootUser || created.Network != run.NetworkNone {
+		t.Fatalf("created: %+v", created)
+	}
+
+	// --- exec: stdout, stderr, exit code
+	start = time.Now()
+	result := vmRun(t, manager, id, `printf 'to stdout'; printf 'to stderr' >&2; exit 42`, "", nil, 30*time.Second)
+	timed("exec (trivial command, round trip)", start)
+	// The default tier is the absence of a network device, not a firewall
+	// in front of one.
+	if devices := vmRun(t, manager, id, `ls /sys/class/net | tr '\n' ' '`, "", nil, 30*time.Second); strings.TrimSpace(devices.stdout) != "lo" {
+		t.Fatalf("a run on network \"none\" has network devices: %q", devices.stdout)
+	}
+	if result.stdout != "to stdout" || result.stderr != "to stderr" || result.code != 42 || result.timedOut {
+		t.Fatalf("exec streams: %+v", result)
+	}
+	// --- exec: env — create env, exec env, exec overrides create, value intact
+	awkward := `a b'c "d" $HOME \ end`
+	result = vmRun(t, manager, id, `printf '%s|%s|%s' "$FROM_CREATE" "$SHADOWED" "$AWKWARD"`, "",
+		map[string]string{"SHADOWED": "exec", "AWKWARD": awkward}, 30*time.Second)
+	if want := "create value|exec|" + awkward; result.stdout != want || result.code != 0 {
+		t.Fatalf("exec env: got %q, want %q", result.stdout, want)
+	}
+	// --- exec: cwd — /work by default, the given directory otherwise, and
+	// state persists between execs
+	result = vmRun(t, manager, id, `pwd && id -un && mkdir -p sub/dir && echo marker > sub/dir/state`, "", nil, 30*time.Second)
+	if result.stdout != "/work\nroot\n" || result.code != 0 {
+		t.Fatalf("default cwd and user: %+v", result)
+	}
+	result = vmRun(t, manager, id, `pwd && cat state`, "/work/sub/dir", nil, 30*time.Second)
+	if result.stdout != "/work/sub/dir\nmarker\n" || result.code != 0 {
+		t.Fatalf("exec cwd: %+v", result)
+	}
+	// --- exec: timeout ends the command and says so
+	start = time.Now()
+	result = vmRun(t, manager, id, `echo before; sleep 60; echo after`, "", nil, 2*time.Second)
+	if !result.timedOut || result.code != 124 || result.stdout != "before\n" {
+		t.Fatalf("exec timeout: %+v", result)
+	}
+	if elapsed := time.Since(start); elapsed < 2*time.Second || elapsed > 15*time.Second {
+		t.Fatalf("a 2s timeout returned after %s", elapsed)
+	}
+	if result = vmRun(t, manager, id, `pgrep -x sleep | wc -l`, "", nil, 30*time.Second); strings.TrimSpace(result.stdout) != "0" {
+		t.Fatalf("the timed-out command's children survived: %q", result.stdout)
+	}
+	// --- no network: loopback is the only interface the guest has
+	result = vmRun(t, manager, id, `ls /sys/class/net | tr '\n' ' '`, "", nil, 30*time.Second)
+	if strings.TrimSpace(result.stdout) != "lo" {
+		t.Fatalf("the guest has network interfaces: %q", result.stdout)
+	}
+
+	// --- files: a binary blob, byte-exact both ways
+	blob := make([]byte, 1<<20+4321)
+	if _, err := rand.Read(blob); err != nil {
+		t.Fatal(err)
+	}
+	copy(blob, []byte{0x00, 0xff, '\n', '\r', 0x1b, 0x80, 0x00, 0x00})
+	sum := sha256.Sum256(blob)
+	blobSum := hex.EncodeToString(sum[:])
+	start = time.Now()
+	if err := manager.WriteFile(ctx, id, run.LeaseCredential{}, run.WorkDir+"/data/deep/blob.bin", bytes.NewReader(blob)); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	timed("write file (1 MiB)", start)
+	start = time.Now()
+	got, err := manager.ReadFile(ctx, id, run.WorkDir+"/data/deep/blob.bin")
+	timed("read file (1 MiB)", start)
+	if err != nil || !bytes.Equal(got, blob) {
+		t.Fatalf("read file: %d bytes, equal=%t, err=%v", len(got), bytes.Equal(got, blob), err)
+	}
+	guestSum := func(m *run.Manager, runID string) string {
+		out := vmRun(t, m, runID, `sha256sum data/deep/blob.bin | cut -d' ' -f1`, "", nil, 30*time.Second)
+		return strings.TrimSpace(out.stdout)
+	}
+	if got := guestSum(manager, id); got != blobSum {
+		t.Fatalf("the guest sees different bytes than were written: %s != %s", got, blobSum)
+	}
+	if _, err := manager.ReadFile(ctx, id, run.WorkDir+"/data/missing"); err == nil {
+		t.Fatal("reading a missing file succeeded")
+	}
+	// Written by a command and never synced by it: a stop must still keep it.
+	vmRun(t, manager, id, `printf 'not synced by the run' > unsynced.txt`, "", nil, 30*time.Second)
+
+	// A second run that is simply left running, to be found by the next
+	// daemon life's sweep.
+	start = time.Now()
+	orphan, err := manager.Create(ctx, run.CreateRequest{Image: vm.GoldenImage, Limits: &run.Limits{MemoryMB: 1024, CPUs: 1}})
+	if err != nil {
+		t.Fatalf("create second run: %v", err)
+	}
+	timed("create (second run)", start)
+
+	// --- stop
+	start = time.Now()
+	stopped, err := manager.Stop(ctx, id)
+	if err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	timed("stop (guest sync + pause + snapshot + kill + destroy volume)", start)
+	if stopped.State != run.StateStopped || stopped.RetainUntil == nil {
+		t.Fatalf("stopped: %+v", stopped)
+	}
+	if _, err := manager.BeginExec(id, run.LeaseCredential{}); !errors.Is(err, run.ErrStopped) {
+		t.Fatalf("exec on a stopped run: %v", err)
+	}
+	runVolume := config.Pool + "/teploy-sbx-" + strings.ToLower(id)
+	if slices.Contains(poolListing(t, config.Pool), runVolume) {
+		t.Fatalf("the run volume %s outlived the stop", runVolume)
+	}
+	if left := hypervisorProcesses(t, config.RunDir); len(left) != 1 {
+		t.Fatalf("after the stop exactly the second run's VM should be alive, found pids %v", left)
+	}
+
+	// --- a daemon restart: a new driver and a new manager, same pool,
+	// same state dir. The first manager is simply abandoned, as on a crash.
+	// A warm pool's VMs are the crashed daemon's leftovers too.
+	warm := settledWarmPool(t, driver)
+	start = time.Now()
+	manager2, _, sweptProcesses, sweptVolumes := newVMManager(t, config, stateDir)
+	timed("restart (sweep one orphan VM + load registry)", start)
+	if sweptProcesses != 1+warm || sweptVolumes != 1+warm {
+		t.Fatalf("the restart sweep removed %d processes and %d volumes; want the one orphan run and %d warm pool VMs", sweptProcesses, sweptVolumes, warm)
+	}
+	if left := hypervisorProcesses(t, config.RunDir); len(left) != 0 {
+		t.Fatalf("the sweep left hypervisor processes: %v", left)
+	}
+	if _, err := manager2.Get(orphan.ID); !errors.Is(err, run.ErrNotFound) {
+		t.Fatalf("a running run came back from the registry: %v", err)
+	}
+	loaded, err := manager2.Get(id)
+	if err != nil || loaded.State != run.StateStopped {
+		t.Fatalf("the stopped run did not survive the restart: %+v %v", loaded, err)
+	}
+	defer manager2.Destroy(context.Background(), id)
+
+	// --- resume under the same ID, bytes intact
+	start = time.Now()
+	resumed, err := manager2.Resume(ctx, id, 1800)
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	timed("resume (clone + cold boot to agent ready)", start)
+	noGuestPartitions("after resume")
+	if resumed.ID != id || resumed.State != run.StateRunning {
+		t.Fatalf("resumed: %+v", resumed)
+	}
+	got, err = manager2.ReadFile(ctx, id, run.WorkDir+"/data/deep/blob.bin")
+	if err != nil || !bytes.Equal(got, blob) {
+		t.Fatalf("blob after resume: %d bytes, equal=%t, err=%v", len(got), bytes.Equal(got, blob), err)
+	}
+	if got := guestSum(manager2, id); got != blobSum {
+		t.Fatalf("the guest's bytes changed across stop and resume: %s != %s", got, blobSum)
+	}
+	result = vmRun(t, manager2, id, `cat unsynced.txt; printf '|%s|' "$FROM_CREATE"; cat sub/dir/state`, "", nil, 30*time.Second)
+	if result.stdout != "not synced by the run|create value|marker\n" {
+		t.Fatalf("state after resume (unsynced file, create env from the registry, earlier exec's file): %q", result.stdout)
+	}
+	// The stop snapshot is deleted once the resume has used it: the pool
+	// holds the run's volume and nothing else of this suite's.
+	if got, want := poolListing(t, config.Pool), append(slices.Clone(baseline), runVolume); !sameSet(got, want) {
+		t.Fatalf("pool after resume:\n  %v\nwant\n  %v", got, want)
+	}
+
+	// --- fork while running
+	vmRun(t, manager2, id, `printf 'written just before the fork, not synced' > prefork.txt`, "", nil, 30*time.Second)
+	start = time.Now()
+	forked, err := manager2.Fork(ctx, id, run.ForkRequest{TTLSec: 1800})
+	if err != nil {
+		t.Fatalf("fork: %v", err)
+	}
+	timed("fork (sync + pause + snapshot + resume parent + clone + cold boot child)", start)
+	noGuestPartitions("after fork")
+	defer manager2.Destroy(context.Background(), forked.ID)
+	if forked.ForkedFrom != id || forked.ID == id || forked.State != run.StateRunning {
+		t.Fatalf("forked: %+v", forked)
+	}
+	// The parent kept working through it and still does.
+	start = time.Now()
+	result = vmRun(t, manager2, id, `printf 'parent only' > after-fork.txt && cat prefork.txt`, "", nil, 30*time.Second)
+	timed("exec on the parent right after the fork", start)
+	if result.stdout != "written just before the fork, not synced" || result.code != 0 {
+		t.Fatalf("parent after fork: %+v", result)
+	}
+	if got := guestSum(manager2, id); got != blobSum {
+		t.Fatalf("the parent's bytes changed in the fork: %s", got)
+	}
+	// The child has the same bytes, as of the fork.
+	got, err = manager2.ReadFile(ctx, forked.ID, run.WorkDir+"/data/deep/blob.bin")
+	if err != nil || !bytes.Equal(got, blob) {
+		t.Fatalf("blob in the child: %d bytes, equal=%t, err=%v", len(got), bytes.Equal(got, blob), err)
+	}
+	if got := guestSum(manager2, forked.ID); got != blobSum {
+		t.Fatalf("the child's bytes differ from the parent's: %s != %s", got, blobSum)
+	}
+	result = vmRun(t, manager2, forked.ID, `cat prefork.txt; printf '|%s|' "$FROM_CREATE"; ls after-fork.txt 2>/dev/null | wc -l`, "", nil, 30*time.Second)
+	if result.stdout != "written just before the fork, not synced|create value|0\n" {
+		t.Fatalf("child state (pre-fork file, inherited env, no post-fork parent file): %q", result.stdout)
+	}
+	// And the two are independent from here on.
+	vmRun(t, manager2, forked.ID, `printf 'child only' > child.txt && rm data/deep/blob.bin`, "", nil, 30*time.Second)
+	if got := guestSum(manager2, id); got != blobSum {
+		t.Fatalf("a delete in the child reached the parent: %s", got)
+	}
+	if result = vmRun(t, manager2, id, `ls child.txt 2>/dev/null | wc -l`, "", nil, 30*time.Second); strings.TrimSpace(result.stdout) != "0" {
+		t.Fatalf("a write in the child reached the parent: %q", result.stdout)
+	}
+
+	// --- a caller-owned snapshot, deleted while its source still runs
+	start = time.Now()
+	ref, err := manager2.Snapshot(ctx, id)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	timed("snapshot of a running run (sync + pause + snapshot + resume)", start)
+	noGuestPartitions("after snapshot")
+	if !slices.Contains(poolListing(t, config.Pool), ref) {
+		t.Fatalf("the snapshot ref %q is not a ZFS snapshot in the pool", ref)
+	}
+	if err := manager2.DeleteSnapshot(ctx, ref); err != nil {
+		t.Fatalf("delete snapshot: %v", err)
+	}
+	if result = vmRun(t, manager2, id, `cat after-fork.txt`, "", nil, 30*time.Second); result.stdout != "parent only" {
+		t.Fatalf("the parent after its snapshot was deleted: %+v", result)
+	}
+
+	// --- destroy: nothing left behind
+	start = time.Now()
+	if err := manager2.Destroy(ctx, id); err != nil {
+		t.Fatalf("destroy parent: %v", err)
+	}
+	timed("destroy (kill + destroy volume)", start)
+	// The child outlives its source.
+	if result = vmRun(t, manager2, forked.ID, `cat child.txt`, "", nil, 30*time.Second); result.stdout != "child only" {
+		t.Fatalf("the child after its source was destroyed: %+v", result)
+	}
+	if err := manager2.Destroy(ctx, forked.ID); err != nil {
+		t.Fatalf("destroy child: %v", err)
+	}
+	if got := poolListing(t, config.Pool); !slices.Equal(got, baseline) {
+		t.Fatalf("volumes or snapshots left behind:\n  %v\nwant exactly the baseline\n  %v", got, baseline)
+	}
+	if left := hypervisorProcesses(t, config.RunDir); len(left) != 0 {
+		t.Fatalf("hypervisor processes left behind: %v", left)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(config.RunDir, config.Owner[:16])); slices.ContainsFunc(entries, func(entry os.DirEntry) bool {
+		return !vm.WarmPoolHolds(strings.TrimSuffix(entry.Name(), ".jail"))
+	}) {
+		t.Fatalf("runtime dirs left behind: %v", entries)
+	}
+	if len(manager2.List()) != 0 {
+		t.Fatalf("runs left in the registry: %v", manager2.List())
+	}
+
+	names := make([]string, 0, len(timings))
+	for name := range timings {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		t.Logf("timing: %-75s %s", name, timings[name].Round(time.Millisecond))
+	}
+}
+
+func sameSet(a, b []string) bool {
+	a, b = slices.Clone(a), slices.Clone(b)
+	sort.Strings(a)
+	sort.Strings(b)
+	return slices.Equal(a, b)
+}
+
+// The daemon refuses to start on a host that is missing a piece, and names
+// the piece: here, a golden snapshot that does not exist on a host that
+// otherwise has everything.
+func TestVMPreflightNamesAMissingGoldenSnapshot(t *testing.T) {
+	config := vmTestConfig(t)
+	config.Golden = config.Pool + "/no-such-golden@v0"
+	_, err := vm.New(context.Background(), config, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil || !strings.Contains(err.Error(), config.Golden) || !strings.Contains(err.Error(), "the vm driver cannot start") {
+		t.Fatalf("got %v", err)
+	}
+	if strings.Contains(err.Error(), "/dev/kvm") || strings.Contains(err.Error(), "hypervisor binary") {
+		t.Fatalf("this host should only be missing the golden snapshot: %v", err)
+	}
+}
+
+// zvolPartitions lists the partition devices the host has made for ZFS
+// volumes (zd0p1, ...), sorted.
+func zvolPartitions(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir("/sys/class/block")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var partitions []string
+	for _, entry := range entries {
+		if disk, number, ok := strings.Cut(entry.Name(), "p"); ok && strings.HasPrefix(disk, "zd") && number != "" {
+			partitions = append(partitions, entry.Name())
+		}
+	}
+	sort.Strings(partitions)
+	return partitions
+}
+
+// dirBytes is the total size of the regular files under dir.
+func dirBytes(t *testing.T, dir string) int64 {
+	t.Helper()
+	var total int64
+	err := filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return total
+}
+
+// What a guest can do to the host and to its own run without the agent's
+// cooperation: write to its console without end, and power itself off.
+func TestVMGuestConsoleFloodAndPowerOff(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Fatal("the vm suite needs root (zfs, /dev/kvm)")
+	}
+	config := vmTestConfig(t)
+	ctx := context.Background()
+	manager, _, _, _ := newVMManager(t, config, t.TempDir())
+	baseline := poolListing(t, config.Pool)
+	created, err := manager.Create(ctx, run.CreateRequest{Image: vm.GoldenImage, Limits: &run.Limits{MemoryMB: 1024, CPUs: 1}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	id := created.ID
+	t.Cleanup(func() { _ = manager.Destroy(context.Background(), id) })
+
+	// --- the console is the guest's to write, and the host's memory is not
+	// (an emulated UART is slow, so the flood is small and the bound on
+	// what the host may keep of it on disk is smaller)
+	const flood = 64 << 10
+	result := vmRun(t, manager, id, `head -c 65536 /dev/zero | tr '\0' x > /dev/console; echo done`, "", nil, 5*time.Minute)
+	if result.code != 0 || !strings.Contains(result.stdout, "done") {
+		t.Fatalf("console flood: %+v", result)
+	}
+	runDir := filepath.Join(config.RunDir, config.Owner[:16])
+	if kept := dirBytes(t, runDir); kept > flood/16 {
+		t.Errorf("a guest that wrote %d bytes to its console left %d bytes in the host's runtime dir %s", flood, kept, runDir)
+	}
+
+	// --- a guest that powers itself off keeps its disk: stop, resume
+	if result = vmRun(t, manager, id, `echo kept > kept.txt && sync`, "", nil, 30*time.Second); result.code != 0 {
+		t.Fatalf("write before power off: %+v", result)
+	}
+	if session, err := manager.BeginExec(id, run.LeaseCredential{}); err == nil {
+		_, _, _ = session.Exec(ctx, `poweroff -f`, "", nil, 30*time.Second, io.Discard, io.Discard)
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for len(hypervisorProcesses(t, config.RunDir)) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the hypervisor outlived its guest's power off")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if _, err := manager.Stop(ctx, id); err != nil {
+		t.Fatalf("stop of a run whose guest powered off: %v", err)
+	}
+	if _, err := manager.Resume(ctx, id, 0); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if result = vmRun(t, manager, id, `cat kept.txt`, "", nil, 30*time.Second); strings.TrimSpace(result.stdout) != "kept" {
+		t.Fatalf("the disk of a powered-off guest after stop and resume: %+v", result)
+	}
+
+	if err := manager.Destroy(ctx, id); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+	if got := poolListing(t, config.Pool); !slices.Equal(got, baseline) {
+		t.Fatalf("volumes or snapshots left behind:\n  %v\nwant exactly the baseline\n  %v", got, baseline)
+	}
+	if left := hypervisorProcesses(t, config.RunDir); len(left) != 0 {
+		t.Fatalf("hypervisor processes left behind: %v", left)
+	}
+}

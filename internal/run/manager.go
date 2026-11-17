@@ -48,6 +48,10 @@ var (
 	// conflicts with the run's state, not missing runs.
 	ErrStopped = errors.New("run is stopped")
 	ErrRunning = errors.New("run is running")
+	// ErrAtCapacity: the daemon is running as many runs as it was told it
+	// may. Nothing is wrong with the request; another daemon, or a later
+	// attempt, can take it.
+	ErrAtCapacity = errors.New("at capacity")
 )
 
 // Network tiers. The wire accepts "egress" as an alias for
@@ -269,6 +273,13 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	if strings.TrimSpace(req.Image) == "" {
 		return nil, fmt.Errorf("%w: image is required", ErrBadRequest)
 	}
+	// A driver that cannot honour every create says so first, in its own
+	// words, rather than through whichever later check happens to trip.
+	if admitter, ok := m.runtime.(CreateAdmitter); ok {
+		if err := admitter.AdmitCreate(req); err != nil {
+			return nil, err
+		}
+	}
 	network, err := ParseNetwork(req.Network)
 	if err != nil {
 		return nil, err
@@ -407,7 +418,8 @@ type bootResult struct {
 	cachePath   string
 }
 
-func containerName(id string) string { return "teploy-sbx-" + strings.ToLower(id) }
+// ContainerName is the name a run's container (or VM) is created under.
+func ContainerName(id string) string { return "teploy-sbx-" + strings.ToLower(id) }
 
 // boot starts the container for b: warm volume, per-run proxy, container,
 // snapshot seed. On failure it gives back everything it took — except when
@@ -419,7 +431,7 @@ func (m *Manager) boot(ctx context.Context, b bootRequest) (res bootResult, left
 		return res, "", fmt.Errorf("%w: this daemon has no egress proxy, so egressAllow cannot be honoured", ErrBadRequest)
 	}
 	spec := CreateSpec{
-		Name:     containerName(b.id),
+		Name:     ContainerName(b.id),
 		Image:    b.image,
 		Env:      b.env,
 		MemoryMB: b.limits.MemoryMB,
@@ -477,7 +489,9 @@ func (m *Manager) boot(ctx context.Context, b bootRequest) (res bootResult, left
 		}
 	}
 
-	if len(b.extra) > 0 {
+	// A daemon with per-run proxies and no shared one (the VM driver's)
+	// gives every allowlist run a proxy of its own, extra entries or not.
+	if len(b.extra) > 0 || (b.network == NetworkAllowlist && m.ProxyURL == "" && m.Egress != nil) {
 		// A private proxy carrying default+extra, alive only as long as
 		// this run — the entries must not leak to any other container
 		// sharing the bridge. Opened last, so nothing between here and
@@ -652,6 +666,12 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 	}
 	m.mu.Unlock()
 	// Revoke egress immediately; keep the volume/registry until removal succeeds.
+	// The port a closed proxy had does not become another run's door for
+	// the run that is still being removed: under the Docker driver the
+	// host firewall admits a port only while its own proxy listens, and
+	// every private proxy asks for its own credential; under the VM
+	// driver a proxy's port exists only inside its run's own network
+	// namespace, and is not given out again while that namespace does.
 	m.closeEgress(id)
 	attempt, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -711,8 +731,26 @@ func (m *Manager) freeze(ctx context.Context, id string) (func() error, error) {
 	return func() error { return nil }, nil
 }
 
-// SnapshotRepo is the image repository all run snapshots live under.
+// SnapshotRepo is the image repository all of the Docker driver's run
+// snapshots live under. Other drivers name their own (SnapshotNamer).
 const SnapshotRepo = "teploy-sbx-snap"
+
+// newSnapshotRef asks the driver for the reference of a snapshot about to
+// be taken; ownsSnapshotRef asks it whether a reference is one of its own.
+// A runtime that is not a SnapshotNamer gets Docker's references.
+func (m *Manager) newSnapshotRef() string {
+	if namer, ok := m.runtime.(SnapshotNamer); ok {
+		return namer.NewSnapshotRef(m.now())
+	}
+	return dockerSnapshotRef(m.now())
+}
+
+func (m *Manager) ownsSnapshotRef(ref string) bool {
+	if namer, ok := m.runtime.(SnapshotNamer); ok {
+		return namer.OwnsSnapshotRef(ref)
+	}
+	return ownsDockerSnapshotRef(ref)
+}
 
 // Snapshot commits a run's filesystem to a fresh snapshot image and
 // returns its ref. Snapshots deliberately do NOT expire with the run —
@@ -735,7 +773,7 @@ func (m *Manager) Snapshot(ctx context.Context, id string) (string, error) {
 // capture commits current's filesystem to a fresh snapshot ref. The
 // caller holds the run's capture exclusivity (beginCapture).
 func (m *Manager) capture(ctx context.Context, current *Run) (string, error) {
-	ref := SnapshotRepo + ":" + strings.ToLower(NewULID(m.now()))
+	ref := m.newSnapshotRef()
 	// CachePath (not just CacheDir): a warm run's workspace lives ON the
 	// mounted volume, and the snapshot must bake those bytes in or the
 	// restore boots an empty workspace.
@@ -745,11 +783,11 @@ func (m *Manager) capture(ctx context.Context, current *Run) (string, error) {
 	return ref, nil
 }
 
-// DeleteSnapshot removes a snapshot image. Only refs under SnapshotRepo
-// are deletable through the API — the daemon must never be usable to rmi
-// arbitrary host images.
+// DeleteSnapshot removes a snapshot. Only refs in the driver's own
+// snapshot namespace are deletable through the API — the daemon must never
+// be usable to remove arbitrary host images or volumes.
 func (m *Manager) DeleteSnapshot(ctx context.Context, ref string) error {
-	if !strings.HasPrefix(ref, SnapshotRepo+":") {
+	if !m.ownsSnapshotRef(ref) {
 		return fmt.Errorf("%w: not a sandbox snapshot ref: %s", ErrBadRequest, ref)
 	}
 	// A snapshot the registry itself holds (a stopped run's filesystem, or

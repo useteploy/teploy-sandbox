@@ -83,6 +83,49 @@ type Runtime interface {
 	RemoveImage(ctx context.Context, imageRef string) error
 }
 
+// SnapshotNamer is the part of the boundary that makes snapshot references
+// the driver's own. A reference is an opaque string to the manager: it asks
+// the driver to mint one before each Snapshot, stores it, hands it back as
+// CreateSpec.Image to resume or fork, and passes it to RemoveImage when the
+// last run lets go. What the string is — an image ref for Docker, a ZFS
+// snapshot name for the VM driver — is the driver's business, and so is
+// recognising one: only a reference the driver owns is ever accepted from
+// a caller or from the registry file.
+//
+// It is optional so that the Runtime interface itself did not change: a
+// runtime without it gets Docker's references (SnapshotRepo + ":" + id).
+type SnapshotNamer interface {
+	// NewSnapshotRef mints the reference for a snapshot about to be taken.
+	NewSnapshotRef(now time.Time) string
+	// OwnsSnapshotRef reports whether ref is in this driver's snapshot
+	// namespace. It must be decidable from the string alone.
+	OwnsSnapshotRef(ref string) bool
+}
+
+// CreateAdmitter is implemented by a driver that cannot honour every
+// create: AdmitCreate is asked before anything is allocated and answers
+// with an ErrBadRequest for what the driver does not support.
+type CreateAdmitter interface {
+	AdmitCreate(req CreateRequest) error
+}
+
+// WarmPoolReporter is implemented by a driver that keeps machines booted
+// ahead of creates (the VM driver's warm pool). Optional, like the two
+// above. WarmPool is nil when the driver has no pool configured.
+type WarmPoolReporter interface {
+	WarmPool() []WarmPoolSize
+}
+
+// WarmPoolSize is one size a warm pool keeps: how many it is to keep, how
+// many are booted and waiting, and how many are booting.
+type WarmPoolSize struct {
+	CPUs     int `json:"cpus"`
+	MemoryMB int `json:"memoryMb"`
+	Target   int `json:"target"`
+	Ready    int `json:"ready"`
+	Booting  int `json:"booting"`
+}
+
 // EgressNetwork is the INTERNAL bridge egress-opt-in runs join — a
 // dedicated network (never the `teploy` app network) with no NAT and no
 // default route; the daemon's allowlist proxy on its gateway is the only
@@ -720,6 +763,18 @@ func (d *DockerRuntime) copySeed(ctx context.Context, containerID, imageRef, vol
 	}
 	return nil
 }
+
+// NewSnapshotRef and OwnsSnapshotRef make DockerRuntime a SnapshotNamer:
+// its references are image refs under SnapshotRepo.
+func (d *DockerRuntime) NewSnapshotRef(now time.Time) string { return dockerSnapshotRef(now) }
+
+func (d *DockerRuntime) OwnsSnapshotRef(ref string) bool { return ownsDockerSnapshotRef(ref) }
+
+func dockerSnapshotRef(now time.Time) string {
+	return SnapshotRepo + ":" + strings.ToLower(NewULID(now))
+}
+
+func ownsDockerSnapshotRef(ref string) bool { return strings.HasPrefix(ref, SnapshotRepo+":") }
 
 // ImageIsSnapshot recognises a snapshot by its REF: everything under
 // SnapshotRepo is this daemon's namespace (the same identity DeleteSnapshot

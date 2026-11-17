@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -20,6 +21,12 @@ import (
 	"github.com/useteploy/teploy-sandbox/internal/egress"
 	"github.com/useteploy/teploy-sandbox/internal/run"
 	"github.com/useteploy/teploy-sandbox/internal/server"
+	"github.com/useteploy/teploy-sandbox/internal/vm"
+)
+
+const (
+	driverDocker = "docker"
+	driverVM     = "vm"
 )
 
 // version is set by goreleaser at build time.
@@ -52,6 +59,14 @@ Usage:
                        [--egress-allow host,.suffix,host:port] [--egress-proxy-port 7443]
                        [--cache-root /var/lib/teploy-sandbox/cache] [--cache-max-gb 20]
                        [--state-dir /var/lib/teploy-sandbox/state] [--stopped-retention 336h]
+                       [--driver docker|vm]
+                       [--vm-hypervisor cloud-hypervisor] [--vm-kernel /var/lib/teploy-sandbox/vm/Image]
+                       [--vm-pool sbx] [--vm-golden sbx/golden-guestd@v1] [--vm-run-dir /run/teploy-sandbox/vm]
+                       [--vm-uid-base 1879048192] [--vm-cgroup /sys/fs/cgroup/teploy-sandbox-vm]
+                       [--vm-dev-dir /dev/teploy-sandbox]
+                       [--vm-subnet 10.209.0.0/16] [--vm-dns 192.0.2.53,...] [--vm-open-private]
+                       [--vm-disk-mbps 256] [--vm-disk-iops 16000] [--vm-net-mbit 200] [--vm-net-connections 4096]
+                       [--vm-max-runs 0] [--vm-warm 2x2048=3,...] [--vm-warm-boots 2] [--vm-warm-headroom-mb 1024]
   teploy-sandbox version`)
 }
 
@@ -73,8 +88,79 @@ func serve(args []string) error {
 		"host directory for the durable run registry: stopped runs survive a daemon restart (empty keeps the registry in memory only)")
 	stoppedRetention := flags.String("stopped-retention", envOr("SBX_STOPPED_RETENTION", run.DefaultStoppedRetention.String()),
 		"how long a stopped run is kept before it and its snapshot are deleted (Go duration, e.g. 336h)")
+	driverName := flags.String("driver", envOr("SBX_DRIVER", driverDocker),
+		"what a run is: \"docker\" (a container) or \"vm\" (experimental: a Cloud Hypervisor VM on a ZFS volume; needs KVM)")
+	vmHypervisor := flags.String("vm-hypervisor", envOr("SBX_VM_HYPERVISOR", vm.DefaultHypervisor),
+		"vm driver: the cloud-hypervisor binary (a path, or a name on PATH)")
+	vmKernel := flags.String("vm-kernel", envOr("SBX_VM_KERNEL", vm.DefaultKernel),
+		"vm driver: the uncompressed guest kernel image every run direct-boots")
+	vmCmdline := flags.String("vm-cmdline", envOr("SBX_VM_CMDLINE", vm.DefaultCmdline()),
+		"vm driver: the guest kernel command line")
+	vmPool := flags.String("vm-pool", envOr("SBX_VM_POOL", vm.DefaultPool),
+		"vm driver: the ZFS pool (or a dataset in one) run volumes and snapshots are created under; it must have volmode=dev")
+	vmGolden := flags.String("vm-golden", envOr("SBX_VM_GOLDEN", ""),
+		"vm driver: the golden snapshot runs are cloned from (default <vm-pool>/golden-guestd@v1; see scripts/build-golden.sh)")
+	vmRunDir := flags.String("vm-run-dir", envOr("SBX_VM_RUN_DIR", vm.DefaultRunDir),
+		"vm driver: directory for each VM's sockets")
+	vmUIDBase := flags.Uint("vm-uid-base", uint(envFloat("SBX_VM_UID_BASE", vm.DefaultUIDBase)),
+		fmt.Sprintf("vm driver: the first of the %d UIDs VM processes run under, one per VM; no account may have one of them", vm.UIDCount))
+	vmCgroup := flags.String("vm-cgroup", envOr("SBX_VM_CGROUP", vm.DefaultCgroup),
+		"vm driver: the cgroup v2 directory each VM gets a group in, with the cpu, memory and pids controllers")
+	vmDevDir := flags.String("vm-dev-dir", envOr("SBX_VM_DEV_DIR", vm.DefaultDevDir),
+		"vm driver: directory for each VM's private disk device node; must allow device nodes (not /run)")
+	vmSubnet := flags.String("vm-subnet", envOr("SBX_VM_SUBNET", vm.DefaultSubnet),
+		"vm driver: the IPv4 range guests are addressed from; nothing else on the host may use it")
+	vmDNS := flags.String("vm-dns", envOr("SBX_VM_DNS", ""),
+		"vm driver: up to three IPv4 resolvers for the guests of runs with network \"open\" (comma-separated; default: the host's own, where they are not on the host itself)")
+	vmOpenPrivate := flags.Bool("vm-open-private", envBool("SBX_VM_OPEN_PRIVATE"),
+		"vm driver: let runs with network \"open\" reach private address ranges (the host's LAN, an overlay network), as the docker driver's open tier does; off, they reach the public internet only")
+	vmDiskMBps := flags.Int("vm-disk-mbps", int(envFloat("SBX_VM_DISK_MBPS", vm.DefaultDiskMBPerSecond)),
+		"vm driver: what each run may read from its disk, and what it may write to it, in MiB per second (cgroup io.max on the run's volume); 0 is no limit")
+	vmDiskIOPS := flags.Int("vm-disk-iops", int(envFloat("SBX_VM_DISK_IOPS", vm.DefaultDiskIOPS)),
+		"vm driver: how many reads, and how many writes, each run may make on its disk per second; 0 is no limit")
+	vmNetMbit := flags.Int("vm-net-mbit", int(envFloat("SBX_VM_NET_MBIT", vm.DefaultNetMbit)),
+		"vm driver: what each run with a network may send, and what it may receive, in megabits per second; 0 is no limit")
+	vmNetConnections := flags.Int("vm-net-connections", int(envFloat("SBX_VM_NET_CONNECTIONS", vm.DefaultNetConnections)),
+		"vm driver: how many connections each run with a network may have tracked at once; 0 is no limit")
+	vmMaxRuns := flags.Int("vm-max-runs", int(envFloat("SBX_VM_MAX_RUNS", 0)),
+		"vm driver: how many VMs runs may have at once (a create beyond it is refused with 503); 0 is no limit. The host's connection table, open file limit and AIO limit are checked against it at start")
+	vmWarm := flags.String("vm-warm", envOr("SBX_VM_WARM", ""),
+		"vm driver: VMs to keep booted ahead of creates, as CPUSxMEMORY=COUNT[,...] (e.g. 2x2048=3,4x8192=1); a create on the golden image whose CPUs round up to CPUS and whose memory is MEMORY MiB takes one. Empty is no pool")
+	vmWarmBoots := flags.Int("vm-warm-boots", int(envFloat("SBX_VM_WARM_BOOTS", vm.DefaultWarmBoots)),
+		"vm driver: the most boots under way at once for which the warm pool starts another (creates that boot their own VM count)")
+	vmWarmHeadroom := flags.Int("vm-warm-headroom-mb", int(envFloat("SBX_VM_WARM_HEADROOM_MB", vm.DefaultWarmHeadroomMB)),
+		"vm driver: host memory (MemAvailable, MiB) the warm pool leaves free beyond a new VM's limit before it boots one; 0 is none")
+	vmBootTimeout := flags.Duration("vm-boot-timeout", envDuration("SBX_VM_BOOT_TIMEOUT", vm.DefaultBootTimeout),
+		"vm driver: how long a new VM may take to answer")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *driverName != driverDocker && *driverName != driverVM {
+		return fmt.Errorf("driver: must be %q or %q, got %q", driverDocker, driverVM, *driverName)
+	}
+	if *vmGolden == "" {
+		*vmGolden = *vmPool + "/golden-guestd@v1"
+	}
+	warmUnavailable := false
+	warmSizes, err := vm.ParseWarmSizes(*vmWarm)
+	if err != nil {
+		return fmt.Errorf("vm-warm: %w", err)
+	}
+	if *driverName != driverVM && len(warmSizes) > 0 {
+		return errors.New("vm-warm: the warm pool is the vm driver's (--driver vm)")
+	}
+	if *vmMaxRuns < 0 || *vmWarmBoots < 1 || *vmWarmHeadroom < 0 {
+		return errors.New("vm-max-runs and vm-warm-headroom-mb must not be negative, and vm-warm-boots must be at least 1")
+	}
+	if *vmUIDBase > 1<<31 {
+		return fmt.Errorf("vm-uid-base: %d is not a usable UID", *vmUIDBase)
+	}
+	if *driverName == driverVM && *cacheRoot != "" {
+		// The warm repo cache is bind-mounted host directories, which a VM
+		// has no way to mount yet: the store is not opened at all, so a
+		// `warm` create is refused instead of handed an empty volume.
+		*cacheRoot = ""
+		warmUnavailable = true
 	}
 
 	// Refuse a retention that is not the configured one: a typo here would
@@ -162,77 +248,167 @@ func serve(args []string) error {
 		return fmt.Errorf("token: %w", err)
 	}
 
-	// SBX_RUNTIME=runsc puts gVisor between every run and the host kernel;
-	// unset means Docker's default runtime. SBX_SHM_MB sizes /dev/shm for
-	// runs that launch a headless browser (Chromium needs 512 MB or more).
-	runtime := &run.DockerRuntime{Runtime: os.Getenv("SBX_RUNTIME"), ShmMB: int(envFloat("SBX_SHM_MB", 512))}
+	// The daemon's identity: a digest of its token file's path. Both
+	// drivers mark what they create with it, and their startup sweeps
+	// remove only what carries it.
 	ownerPath, err := filepath.Abs(*tokenFile)
 	if err != nil {
 		return err
 	}
 	owner := sha256.Sum256([]byte(ownerPath))
-	runtime.Owner = hex.EncodeToString(owner[:])
-	runtime.CleanupRoot = filepath.Join(filepath.Dir(*tokenFile), ".sandbox-cleanup")
-	if err := runtime.RecoverScratch(); err != nil {
-		return fmt.Errorf("recover scratch resources: %w", err)
-	}
+	ownerID := hex.EncodeToString(owner[:])
+
+	// backend is what a run is. The Docker branch below is the daemon as it
+	// always was; the VM branch replaces every Docker call with a VM.
+	var backend run.Runtime
+	var docker *run.DockerRuntime
+	runtimeName := ""
 	proxyURL := ""
 	var pool *egress.Pool
-	if err := runtime.EnsureEgressNetwork(context.Background()); err != nil {
-		// Egress is opt-in per run; a missing bridge only blocks those runs.
-		log.Warn("egress network unavailable", "error", err)
-	} else {
-		// Default-deny egress: the bridge is internal, so this allowlist
-		// proxy on its gateway is a run's only path off the box.
-		gateway, err := runtime.EgressGateway(context.Background())
+	if *driverName == driverVM {
+		driver, err := vm.New(context.Background(), vm.Config{
+			Hypervisor:  *vmHypervisor,
+			Kernel:      *vmKernel,
+			Cmdline:     *vmCmdline,
+			Pool:        *vmPool,
+			Golden:      *vmGolden,
+			RunDir:      *vmRunDir,
+			Owner:       ownerID,
+			UIDBase:     uint32(*vmUIDBase),
+			Cgroup:      *vmCgroup,
+			DevDir:      *vmDevDir,
+			BootTimeout: *vmBootTimeout,
+			Subnet:      *vmSubnet,
+			DNS:         egress.ParseAllowlist(*vmDNS),
+			OpenPrivate: *vmOpenPrivate,
+			// The driver reads zero as "the default".
+			DiskMBPerSecond: vmLimit(*vmDiskMBps),
+			DiskIOPS:        vmLimit(*vmDiskIOPS),
+			NetMbit:         vmLimit(*vmNetMbit),
+			NetConnections:  vmLimit(*vmNetConnections),
+			MaxRuns:         *vmMaxRuns,
+			Warm: vm.WarmConfig{
+				Sizes:      warmSizes,
+				Boots:      *vmWarmBoots,
+				HeadroomMB: vmLimit(*vmWarmHeadroom),
+			},
+		}, log)
 		if err != nil {
-			log.Warn("egress proxy disabled", "error", err)
-		} else {
+			return err
+		}
+		defer func() {
+			// After every run is gone: with no VM left, the host's
+			// firewall table goes too.
+			closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := driver.Close(closeCtx); err != nil {
+				log.Warn("vm network teardown", "error", err)
+			}
+		}()
+		// No VM outlives its daemon, exactly as no container does: every
+		// VM process and run volume carrying this daemon's mark belongs to
+		// a previous life and is unreachable. Stopped runs have neither —
+		// they are a registry record and a snapshot, which the sweep keeps.
+		processes, volumes, err := driver.Sweep(context.Background())
+		if err != nil {
+			return fmt.Errorf("orphan sweep: %w", err)
+		}
+		if processes > 0 || volumes > 0 {
+			log.Info("swept orphaned run VMs from a previous daemon life", "processes", processes, "volumes", volumes)
+		}
+		// Every allowlist run gets a proxy and a credential of its own.
+		// There is no shared listener: each proxy listens inside its
+		// run's own network namespace, where no other guest is.
+		if gateway, ok := driver.Gateway(); ok {
 			allow := append(egress.Allowlist{}, egress.DefaultAllowlist...)
 			allow = append(allow, deployAllow...)
-			// Bind synchronously: if the gateway isn't a host interface
-			// (VM-backed Docker on dev machines), runs must not be handed
-			// a dead proxy URL — they stay fully sealed instead.
-			firewall := &egress.HostFirewall{Bridge: run.EgressBridge, Gateway: gateway, Chain: "TEPLOY-SBX"}
-			if err := firewall.Start(); err != nil {
-				firewall.Close()
-				log.Warn("egress proxy disabled: host firewall unavailable", "error", err)
+			pool = &egress.Pool{Base: allow, Bind: gateway, Log: log, Private: true, Listen: driver.ProxyListener}
+			defer pool.Shutdown()
+		}
+		backend = driver
+		runtimeName = "cloud-hypervisor"
+		log.Warn("vm driver is experimental: runs run as root in the guest, and warm caches are unavailable",
+			"pool", *vmPool, "golden", *vmGolden, "kernel", *vmKernel, "subnet", *vmSubnet, "openPrivate", *vmOpenPrivate,
+			"diskMBps", *vmDiskMBps, "diskIOPS", *vmDiskIOPS, "netMbit", *vmNetMbit, "netConnections", *vmNetConnections,
+			"maxRuns", *vmMaxRuns, "warm", *vmWarm)
+		if warmUnavailable {
+			log.Info("warm repo cache is not available under the vm driver; --cache-root is ignored")
+		}
+	} else {
+		// SBX_RUNTIME=runsc puts gVisor between every run and the host kernel;
+		// unset means Docker's default runtime. SBX_SHM_MB sizes /dev/shm for
+		// runs that launch a headless browser (Chromium needs 512 MB or more).
+		docker = &run.DockerRuntime{Runtime: os.Getenv("SBX_RUNTIME"), ShmMB: int(envFloat("SBX_SHM_MB", 512))}
+		docker.Owner = ownerID
+		docker.CleanupRoot = filepath.Join(filepath.Dir(*tokenFile), ".sandbox-cleanup")
+		if err := docker.RecoverScratch(); err != nil {
+			return fmt.Errorf("recover scratch resources: %w", err)
+		}
+		if err := docker.EnsureEgressNetwork(context.Background()); err != nil {
+			// Egress is opt-in per run; a missing bridge only blocks those runs.
+			log.Warn("egress network unavailable", "error", err)
+		} else {
+			// Default-deny egress: the bridge is internal, so this allowlist
+			// proxy on its gateway is a run's only path off the box.
+			gateway, err := docker.EgressGateway(context.Background())
+			if err != nil {
+				log.Warn("egress proxy disabled", "error", err)
 			} else {
-				defer firewall.Close()
-				pool = &egress.Pool{Base: allow, Bind: gateway, Log: log, PermitPort: firewall.PermitPort, RevokePort: firewall.RevokePort}
-				url, err := pool.Start(*egressProxyPort)
-				if err != nil {
-					log.Warn("egress proxy disabled — allowlist runs are fully sealed (no allowlisted door)",
-						"addr", net.JoinHostPort(gateway, *egressProxyPort), "error", err)
-					pool = nil
+				allow := append(egress.Allowlist{}, egress.DefaultAllowlist...)
+				allow = append(allow, deployAllow...)
+				// Bind synchronously: if the gateway isn't a host interface
+				// (VM-backed Docker on dev machines), runs must not be handed
+				// a dead proxy URL — they stay fully sealed instead.
+				firewall := &egress.HostFirewall{Bridge: run.EgressBridge, Gateway: gateway, Chain: "TEPLOY-SBX"}
+				if err := firewall.Start(); err != nil {
+					firewall.Close()
+					log.Warn("egress proxy disabled: host firewall unavailable", "error", err)
 				} else {
-					proxyURL = url
-					defer pool.Shutdown()
-					log.Info("egress allowlist proxy up", "addr", url, "entries", len(allow))
+					defer firewall.Close()
+					pool = &egress.Pool{Base: allow, Bind: gateway, Log: log, PermitPort: firewall.PermitPort, RevokePort: firewall.RevokePort}
+					url, err := pool.Start(*egressProxyPort)
+					if err != nil {
+						log.Warn("egress proxy disabled — allowlist runs are fully sealed (no allowlisted door)",
+							"addr", net.JoinHostPort(gateway, *egressProxyPort), "error", err)
+						pool = nil
+					} else {
+						proxyURL = url
+						defer pool.Shutdown()
+						log.Info("egress allowlist proxy up", "addr", url, "entries", len(allow))
+					}
 				}
 			}
 		}
-	}
-	// No container outlives its daemon: any we labelled that survived a
-	// previous daemon life is an unreachable orphan (the registry file
-	// brings back stopped runs only, and those have none). Sweep before
-	// serving.
-	if swept, err := runtime.SweepOrphans(context.Background()); err != nil {
-		return fmt.Errorf("orphan sweep: %w", err)
-	} else if swept > 0 {
-		log.Info("swept orphaned run containers from a previous daemon life", "count", swept)
+		// No container outlives its daemon: any we labelled that survived a
+		// previous daemon life is an unreachable orphan (the registry file
+		// brings back stopped runs only, and those have none). Sweep before
+		// serving.
+		if swept, err := docker.SweepOrphans(context.Background()); err != nil {
+			return fmt.Errorf("orphan sweep: %w", err)
+		} else if swept > 0 {
+			log.Info("swept orphaned run containers from a previous daemon life", "count", swept)
+		}
+
+		backend = docker
+		runtimeName = docker.Runtime
 	}
 
-	manager := run.NewManager(runtime, log)
+	manager := run.NewManager(backend, log)
 	manager.ProxyURL = proxyURL
 	manager.SandboxUser = *sandboxUser
+	if *driverName == driverVM {
+		// Every command runs as root inside the guest in this slice; the
+		// run object says so (`user: "root"`) rather than naming an account
+		// the guest does not use.
+		manager.SandboxUser = ""
+	}
 	manager.StoppedRetention = retention
 	if pool != nil {
 		manager.Egress = pool
 	}
 	if *cacheRoot != "" {
 		manager.Cache = run.NewCacheStore(*cacheRoot, int64(*cacheMaxGB*(1<<30)))
-		live, err := runtime.LiveCacheDirs(context.Background())
+		live, err := docker.LiveCacheDirs(context.Background())
 		if err != nil {
 			return fmt.Errorf("inspect cache ownership: %w", err)
 		}
@@ -265,7 +441,12 @@ func serve(args []string) error {
 		Version:    version,
 		Log:        log,
 		ServerName: hostname,
-		Runtime:    runtime.Runtime,
+		Runtime:    runtimeName,
+		Driver:     *driverName,
+		// Not in this slice under either driver: a container gets no
+		// /dev/kvm, and nested virtualization in a run's VM is neither
+		// configured nor verified yet.
+		NestedVirt: false,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -286,6 +467,16 @@ func parseRetention(raw string) (time.Duration, error) {
 	return retention, nil
 }
 
+// vmLimit is a limit flag's value as the vm driver's config takes it: on
+// the command line 0 turns a limit off, and the config says that with a
+// negative value.
+func vmLimit(flag int) int {
+	if flag <= 0 {
+		return -1
+	}
+	return flag
+}
+
 func envOr(name, fallback string) string {
 	if v, ok := os.LookupEnv(name); ok {
 		return v
@@ -297,6 +488,22 @@ func envFloat(name string, fallback float64) float64 {
 	if v := os.Getenv(name); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			return f
+		}
+	}
+	return fallback
+}
+
+// envBool reads a boolean setting; anything strconv does not read as true
+// is false, so a typo never widens what a run can reach.
+func envBool(name string) bool {
+	value, err := strconv.ParseBool(os.Getenv(name))
+	return err == nil && value
+}
+
+func envDuration(name string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(name); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
 		}
 	}
 	return fallback

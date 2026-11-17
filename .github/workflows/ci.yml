@@ -49,14 +49,20 @@ jobs:
           go-version: "1.26.x"
       - name: Unit tests of the vm driver, as root
         run: |
+          # The tests' output goes through a pipe, and a step's shell is
+          # "bash -e" without pipefail unless a shell is named: without
+          # this line the step would end with tee's status, and a test
+          # that failed would only show in the log.
+          set -o pipefail
           # Statically linked, as the jail needs it, and somewhere a
           # process of any UID can start it.
           CGO_ENABLED=0 go test -c -o vm-unit.test ./internal/vm/
           sudo install -D -m 0755 vm-unit.test /opt/teploy-test/vm-unit.test
           sudo /opt/teploy-test/vm-unit.test -test.v 2>&1 | tee vm-unit.log
-          # A root-only test that skipped itself proved nothing.
-          if grep -E -- '--- SKIP: Test(Jail|SocketDir)' vm-unit.log; then
-            echo "a root-only test was skipped" >&2
+          # A test that skipped itself proved nothing: as root on this
+          # runner none of the package's tests has a reason to.
+          if grep -E -- '--- SKIP' vm-unit.log; then
+            echo "a test was skipped" >&2
             exit 1
           fi
           for name in TestJailHoldsNothingOfTheHost TestJailRefusesTheCallsTheFilterNames TestSocketDirIsBounded TestSeccompNumbersAreThisArchitectures; do

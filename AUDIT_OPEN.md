@@ -591,3 +591,264 @@ Open, and what closing each would take:
   the daemon; a service manager may set it otherwise, and a core of a
   hypervisor is its guest's memory handed to the host's dump handler).
 
+
+## 2026-11-16 — VM driver: the hypervisor's jail, and a network that does not need its firewall
+
+The review above left two structural gaps: a hypervisor shared the
+host's file tree, and the firewall was all that kept a guest from the
+host's services. Both are closed by taking the thing away rather than by
+forbidding it. Same host as above (Cloud Hypervisor v54.1, statically
+linked; Linux 6.8; arm64; nested KVM); the whole `vmintegration` suite
+passes on it (twelve tests, one run after the last change to the code;
+its figures are below).
+
+### What is enforced
+
+**A jail per hypervisor.** The daemon starts its own binary again as a
+helper (`/proc/self/exe` under the name `teploy-sandbox-vm-jail`; the
+code runs from an `init` in `internal/vm`, so the same binary serves and
+no jailer is installed) in new mount, PID, network, IPC, UTS and cgroup
+namespaces, directly in the VM's cgroup. As root, the helper makes the
+mount tree private, mounts a 64 KiB tmpfs, bind-mounts seven paths into
+it under the names they have on the host, `pivot_root`s into it,
+detaches the old root, remounts the new one read-only, sets the host
+name, the core limit and an empty capability bounding set, changes to
+the VM's GID, group and UID, sets `no_new_privs` and executes the
+hypervisor. The UID, cgroup, seccomp and Landlock layers are as before;
+the `SO_PEERCRED` check on the VM's sockets is unchanged (the socket
+directory is the host's own, bound in). The tap is still a descriptor.
+
+**A network namespace per run.** Not one namespace for all guests, which
+is what the review sketched: with one shared namespace a guest is kept
+from another guest, and from another run's proxy port, by rules again.
+With one namespace per run there is nothing to forbid. An allowlist
+run's namespace holds its tap, the gateway address and the run's proxy
+listener (a socket the daemon makes from a thread inside that namespace,
+through a new `Listen` hook on the proxy pool) and has no link to
+anywhere. An open run's namespace has one veth link to the host; in it,
+unreachable routes cover every range that is not the public internet,
+the guests' subnet and each of the host's addresses, and an unreachable
+routing rule covers TCP port 25. IPv6 is disabled in the namespace,
+reverse-path filtering is strict, and the namespace answers no ping.
+The nftables rules remain, as the second layer, in two places: a
+ruleset in every run's namespace (default drop, ingress filter at the
+tap) and the host's table for the open runs' links. The watch compares
+the kernel's listing of each with the listing taken when it was written
+and rewrites what differs.
+
+### How it was verified (live)
+
+The jail, from `TestVMConfinement` and every other test that inspects a
+VM (each runs `inspectJail`):
+
+- Namespaces: the hypervisor's `mnt`, `pid`, `net`, `ipc`, `uts` and
+  `cgroup` links all differ from the host's; `NSpid` is its host PID and
+  1; no other process on the host has its PID namespace.
+- Mounts, from `/proc/PID/mountinfo`, exactly these eight: `/`
+  `ro,nosuid,nodev,noexec`; the binary `ro,nosuid,nodev`; the kernel
+  image `ro,nosuid,nodev,noexec`; the disk node, `/dev/kvm` and
+  `/dev/urandom` `ro,nosuid,noexec`; the socket directory
+  `rw,nosuid,nodev,noexec`.
+- From inside, as the VM's UID: a thread of the test joins the
+  hypervisor's mount, network, IPC and UTS namespaces and takes its UID,
+  GID and group. Its listing of `/` is the whole jail (below). `connect`
+  to the system D-Bus, the four journald and systemd sockets, the
+  resolver's socket and both snapd sockets: `no such file or directory`
+  for each. `stat` of `/proc`, `/sys`, `/etc`, `/etc/passwd`,
+  `/run/dbus`, `/run/systemd`, `/var`, `/home`, `/root`, `/tmp`,
+  `/dev/net/tun`, `/dev/vhost-net`, `/dev/vhost-vsock`, `/dev/udmabuf`,
+  `/dev/zvol` and the other VM's disk node, socket directory and API
+  socket: the same. Its own disk node, `/dev/kvm` and `/dev/urandom`
+  open read-write. Creating a file in `/` fails with a read-only file
+  system.
+- Through the hypervisor itself (its API, `vm.add-disk`): a file outside
+  the jail that its UID owns, and the other VM's disk node, are `No such
+  file or directory` (before the jail both were `Permission denied`: they
+  existed and Landlock refused them). A file inside the jail, in its own
+  socket directory, owned by its UID and mode 0666, is still `Permission
+  denied`: Landlock holds separately.
+- Core limit: `Max core file size 1 1 bytes` in `/proc/PID/limits`.
+- A real jail entered by the unit test binary itself
+  (`TestJailHoldsNothingOfTheHost`, root only): PID 1, the given UID and
+  group, host name `vm`, only its own directory writable, nothing mounted
+  on the host afterwards. `TestJailRunsADynamicallyLinkedProgram` runs
+  `ls` in a jail with the host's library directories: `/` lists `dev etc
+  lib tmp usr`, `/etc` lists `ld.so.cache`, there is no `/run`.
+
+One jail, as the test printed it:
+
+```
+/dev
+/dev/kvm
+/dev/teploy-sandbox
+/dev/teploy-sandbox/f285481bdff2a71a
+/dev/teploy-sandbox/f285481bdff2a71a/teploy-sbx-01m7kcgh6p5yh2t7v6nt99x7sb
+/dev/urandom
+/opt
+/opt/sbx
+/opt/sbx/Image
+/opt/sbx/cloud-hypervisor
+/run
+/run/teploy-vmtest
+/run/teploy-vmtest/f285481bdff2a71a
+/run/teploy-vmtest/f285481bdff2a71a/teploy-sbx-01m7kcgh6p5yh2t7v6nt99x7sb
+/run/teploy-vmtest/f285481bdff2a71a/teploy-sbx-01m7kcgh6p5yh2t7v6nt99x7sb/api.sock
+/run/teploy-vmtest/f285481bdff2a71a/teploy-sbx-01m7kcgh6p5yh2t7v6nt99x7sb/api.sock.lock
+/run/teploy-vmtest/f285481bdff2a71a/teploy-sbx-01m7kcgh6p5yh2t7v6nt99x7sb/vsock.sock
+```
+
+The network without its firewall, from `TestVMNetworkFailsClosed`: two
+open guests and two allowlist guests running, private ranges opened so
+that every refusal has a control beside it. The driver's upkeep is
+stopped first (nothing puts a rule back; this is also the state of a
+dead daemon). Then every table the daemon wrote is flushed (the host's
+table and its set, and both tables in each of the four namespaces), the
+probes run; then every table is deleted, the probes run again; the test
+checks before and after each round that no rule exists. In both states:
+
+- open guest to open guest: ping, TCP and UDP to a listening port,
+  frames at the other guest's MAC, to broadcast and through the gateway's
+  MAC, the other guest's address taken as a second address and used as a
+  source, IPv6 all-nodes: nothing arrives at the other guest and nothing
+  with its source address leaves the host;
+- allowlist guest, with a default route it gives itself: the other
+  guests, the peer and the internet, by ping and TCP: nothing;
+- all four guests to the host itself, on the gateway address, the
+  host's own address and its address on another link: TCP to a listener
+  bound to every address, TCP 22, UDP, ping: nothing, and the listener
+  counts no connection;
+- another run's proxy port, from an open guest and from the other
+  allowlist guest, with that run's own credential: not there;
+- an open guest to the link-local metadata address, to port 25 on a
+  peer it otherwise reaches, and to ports 22, 80 and 443 of its
+  (private) resolver: nothing. These three are held by the routes and
+  the routing rules alone.
+
+Controls in the deleted state: the allowlist guest reaches its
+allowlisted peer through its own proxy, and the open guest reaches the
+peer on port 8080 (the peer routes back through the host, so this works
+without the masquerade rule). In the flushed state the namespaces'
+chains are still there with their default drop, and no guest has any
+network; the host's chains accept by default, which is why that state is
+checked separately.
+
+The watch, from `TestVMNetworkIsolation`: with three guests running, the
+host's table deleted and every namespace's ruleset flushed, and
+separately every table emptied in place (`flush table`, `flush set`),
+the listing of all four rulesets was byte for byte what it had been
+after 0.8 to 1.9 s (two runs of each); the log carries an error for
+each. The previous watch did not notice the second case at all.
+
+Everything the earlier entries checked still holds in the new structure
+and is still checked: no guest-to-guest path, only the run's own proxy
+port, the ranges and port 25, nine spoofed frames dropped at the tap's
+ingress hook (now in the run's namespace), the tier across stop, resume
+and fork, teardown (no namespace, link, route, set element or tracked
+connection left), and the crash case: a new daemon cuts a leftover open
+guest off before it sweeps, and the sweep removes this daemon's stray
+namespace and link, the taps, gateway device and netdev table that an
+earlier version of the driver kept on the host, and nothing of another
+daemon identity.
+
+The checks themselves, by building the driver weaker and running
+`TestVMNetworkFailsClosed` (it passed the flushed state each time, where
+the namespaces' default drop still holds, and failed in the deleted
+state):
+
+- without the unreachable routes for the host's own addresses and with
+  the namespace answering pings: `open guest b reached the host itself`,
+  with TCP to the listener and to port 22 on both of the host's
+  addresses and a ping of all three targets open;
+- without the unreachable route for link-local: `an open guest reached
+  the link-local metadata address`;
+- without the routing rule for port 25: `an open guest connected to port 25`.
+
+The jail's checks were not run against a weakened jail; they have
+controls instead (the sockets it finds missing accept a connection on
+the host; the devices it needs open inside).
+
+### Measured (nested arm64; not a statement about bare metal)
+
+- The jail: a process started and reaped, median of 40, as the driver
+  started hypervisors before and through the helper: 11.6 against
+  24.7 ms in one run and 7.4 against 16.6 ms in another, so 9 to 13 ms
+  more per create. A cold boot was 14 to 18 s in the same run.
+- Host-side network setup per create, over eleven creates. Allowlist:
+  23 to 51 ms for the namespace and the proxy's listener, made before
+  the VM, and 20 to 23 ms for the tap, ruleset and routes: 45 to 75 ms
+  together. Open: 70 to 155 ms (the link, the host's table, some thirty
+  routes and rules, written as one batch), with one of 510 ms that was
+  the first after a boot. Before, with everything on the host, both
+  were 40 to 50 ms. So a namespace per run costs an allowlist create
+  about 20 ms and an open create 30 to 100 ms.
+- Throughput, a 1 GiB download from the neighbour namespace: 179 and
+  184 MB/s on the open tier, 169 and 217 MB/s through the allowlist
+  proxy, against 353 and 547 MB/s from the host itself. The entry above
+  measured 260 to 290 and 250 to 300 against 570 to 840, on the same
+  machine on a quieter day. The open tier has one more hop than it had
+  (the veth link); how much of the difference that is cannot be told
+  from these four numbers.
+- The watch: one `nft list` per running networked VM every two seconds,
+  besides the host's table. Not timed under load.
+
+### Deviations from what was asked, and why
+
+- **One namespace per run, not one for all guests.** Above. It costs a
+  namespace and, for open runs, a veth pair per run, and makes
+  guest-to-guest and proxy-port isolation hold without rules.
+- **`destroyIf` still closes the proxy first.** Reordering it would
+  change the Docker driver, where revoking a run's egress the moment it
+  is destroyed (even if the container cannot be removed) was a
+  deliberate fix of an earlier audit. The finding itself is closed for
+  the VM driver by structure: a proxy's port exists only in its run's
+  namespace, another run's proxy is in another namespace, and the port
+  number (20000 plus the address slot) is not given out again until the
+  namespace that had it has been removed
+  (`TestAProxyListenerHoldsItsPlaceUntilAVMHasIt`). The guest of a run
+  being destroyed has nothing to reach on that port: no socket listens
+  in its namespace again.
+- **The core limit is 1 byte, not 0.** Tried on this host, whose
+  `core_pattern` pipes to a crash reporter: a process with a limit of 0
+  that died of SIGSEGV was handed to the reporter, which wrote a report;
+  with a limit of 1 the kernel logged `has RLIMIT_CORE set to 1` /
+  `Aborting core` and did not start the reporter. One byte is below any
+  dump's size, so no file is written either.
+- **Not made non-dumpable.** The flag does not survive `execve` (the
+  kernel resets it for a program the process may read), so only the
+  hypervisor could set it on itself, and it does not. What the flag
+  would have added to the limit above is protection from `ptrace` by the
+  same UID, and nothing else has a VM's UID.
+
+### What remains
+
+- **An open guest can be sent to, with both rulesets gone.** With the
+  host's table and the run's own ruleset both removed, the host forwards
+  to an open guest whatever is routed to it, and nothing drops what is
+  not an answer. Only someone who can make the host route to the guests'
+  subnet can use it: a neighbour on the host's own segment. Reverse-path
+  filtering in the namespace refuses sources in the blocked ranges, so
+  with private ranges closed (the default) that neighbour needs a public
+  address. Routes cannot express "answers only".
+- **A new address of the host** is unreachable from open guests at once
+  through the host's table (which drops everything a guest sends to the
+  host itself) and through the run's ruleset and routes after the next
+  watch, at most two seconds later. With the host's table gone and the
+  daemon dead, an address the host gains afterwards has no unreachable
+  route in namespaces that already exist.
+- **The listing a ruleset is compared with is taken just after it is
+  written,** in a second command. A change made between the two would be
+  taken for the daemon's own.
+- **A VM's socket directory is on the host's `/run`.** It is the one
+  writable place in the jail. A hypervisor that a guest took over can
+  make entries there as far as its Landlock rules let it (they allow at
+  least links), against the inode and size limits of the host's `/run`
+  rather than a limit of its own. A small tmpfs per VM, mounted on the
+  host and bound into the jail, would bound it; not done.
+- **The jail of a dynamically linked hypervisor** holds the host's
+  library directories read-only. The path is unit-tested and was run
+  with `ls`, not with a hypervisor.
+- `/dev/kvm` and `/dev/urandom` are in the jail because the hypervisor
+  needs them; the KVM ioctl surface is as exposed as before.
+- Still open from the entry above: a udev rule file that honours neither
+  flag; the per-identity directories that are never swept.
+- Not built for this driver: x86-64 was not run, nor bare metal.

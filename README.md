@@ -142,11 +142,14 @@ boot), nested virtualisation inside a run, and memory reclaim policy.
 Host setup: `sudo scripts/install-host.sh [POOL]` prepares a host and can
 be run again at any time; a second run changes nothing. It installs the
 udev rule described below, makes sure `/dev/kvm` is openable by a group
-rather than by root alone, checks the VM UID range and the cgroup
-controllers, sets `volmode=dev` on the pool, checks what guest networking
-needs (the `ip`, `nft` and `conntrack` commands, `/dev/net/tun`, dummy
-interfaces, nftables ingress hooks), turns on IPv4 forwarding and makes
-that permanent, and reports whether the kernel has Landlock. The pool, the kernel image and the golden snapshot
+rather than by root alone, checks the VM UID range (against accounts and
+against `/etc/subuid` and `/etc/subgid`) and the cgroup controllers, sets
+`volmode=dev` on the pool, checks what guest networking needs (the `ip`,
+`nft` and `conntrack` commands, `/dev/net/tun`, and a trial network
+namespace with a veth link, a routing rule that matches a port and an
+nftables ruleset in it), turns on IPv4 forwarding and makes that
+permanent, says whether the hypervisor binary is statically linked, and
+reports whether the kernel has Landlock. The pool, the kernel image and the golden snapshot
 are yours to provide: build the golden with `scripts/build-golden.sh`
 from a volume holding a bootable systemd root filesystem.
 
@@ -159,19 +162,26 @@ there is one:
   Landlock: a host that lacks it is refused, not warned.
 - `/dev/kvm`, with a group (or everyone) allowed to open it;
 - the `cloud-hypervisor` binary (`--vm-hypervisor`) and an uncompressed
-  guest kernel (`--vm-kernel`), both readable by any user;
+  guest kernel (`--vm-kernel`), both readable by any user. Use the
+  statically linked build (the upstream release has one): a dynamically
+  linked binary works, but its jail then also holds the host's library
+  directories, read-only, and the daemon says so at start;
 - a ZFS pool (`--vm-pool`) with `volmode=dev` set on it, and a golden
   snapshot in it (`--vm-golden`);
 - udev not probing ZFS volumes for filesystems (below);
-- 4096 UIDs no account has, from `--vm-uid-base` (default 1879048192);
+- 4096 UIDs no account has and no range in `/etc/subuid` or
+  `/etc/subgid` hands out, from `--vm-uid-base` (default 1879048192);
 - a cgroup the daemon may create groups in, with the `cpu`, `memory`
   and `pids` controllers (`--vm-cgroup`, default
   `/sys/fs/cgroup/teploy-sandbox-vm`);
 - a directory for device nodes on a filesystem that allows them
   (`--vm-dev-dir`, default `/dev/teploy-sandbox`; `/run` is `nodev`);
 - for guest networking: the `ip` (iproute2), `nft` (nftables) and
-  `conntrack` (conntrack-tools) commands, `/dev/net/tun`,
-  `net.ipv4.ip_forward=1`, an IPv4 subnet nothing else on the host uses
+  `conntrack` (conntrack-tools) commands, `/dev/net/tun`, network
+  namespaces with veth links, routing rules that match a port (Linux
+  4.17 or newer) and nftables inside a namespace (the daemon makes and
+  removes a trial namespace at start and refuses a host where any of it
+  fails), `net.ipv4.ip_forward=1`, an IPv4 subnet nothing else on the host uses
   (`--vm-subnet`, default `10.209.0.0/16`), and an IPv4 DNS resolver
   that is not on the host itself (`--vm-dns`, default: the host's own
   resolvers). These are required whatever tiers you use.
@@ -182,12 +192,36 @@ Confinement of the hypervisor. The hypervisor process is what a guest
 talks to, so each one is run as if a guest had already taken it over.
 The layers are independent; each is checked by the live suite.
 
+- **Its own file tree and process table (the jail).** A hypervisor
+  does not run in the host's file tree. The daemon starts its own
+  binary again as a small helper, in new mount, PID, network, IPC, UTS
+  and cgroup namespaces and already inside the VM's cgroup. The helper
+  mounts an empty tmpfs, binds into it exactly seven things (the
+  hypervisor binary, the kernel image, the VM's disk node, `/dev/kvm`,
+  `/dev/urandom`, and the directory the VM's two sockets are made in),
+  makes that the root with `pivot_root`, detaches the old root so that
+  no path, descriptor or working directory leads back to the host's
+  tree, drops to the VM's UID and executes the hypervisor in its place.
+  The root is read-only; everything is `nosuid`, everything but the
+  binary `noexec`, everything but the three devices `nodev`, and only
+  the socket directory is writable. There is no `/proc`, no `/sys`, no
+  `/etc`, no `/run/dbus` and no other run's disk or sockets: the host's
+  unix sockets that anyone may connect to (the system D-Bus, journald,
+  the resolver, snapd) have no name the hypervisor could connect to.
+  In its PID namespace the hypervisor is process 1 and alone, so no
+  process of the host has a number it could signal or inspect. The
+  helper is root for the few milliseconds this takes, runs nothing but
+  the daemon's own code, and adds about 10 ms to a create. No separate
+  jailer binary is installed.
 - **Its own user.** Every VM's hypervisor runs under a UID and GID of
   its own from the reserved range, for as long as it runs, with one
-  supplementary group (the one that opens `/dev/kvm`), no capabilities
-  and `no_new_privs`, in network and IPC namespaces of its own that
-  hold nothing (not even a working loopback). Nothing in its process
-  tree is root. Per-VM UIDs
+  supplementary group (the one that opens `/dev/kvm`), no capabilities,
+  an empty capability bounding set and `no_new_privs`, in network and
+  IPC namespaces of its own that hold nothing (not even a working
+  loopback). Its core dump limit is 1 byte, soft and hard: a
+  hypervisor's memory is its guest's, and that limit, unlike 0, also
+  keeps the kernel from handing a dump to a crash reporter that
+  `core_pattern` pipes to. Per-VM UIDs
   rather than one shared account, because with a shared account one
   hypervisor could open another run's disk, connect to another run's
   control socket and signal another run's process; with its own UID,
@@ -202,12 +236,10 @@ The layers are independent; each is checked by the live suite.
 - **The hypervisor's own sandbox.** `--seccomp true` (a system call
   outside the hypervisor's list kills it) and `--landlock`, which limits
   the process to the paths on its command line: the kernel image, its
-  disk node, its two sockets and `/dev/kvm`. A file its UID owns
-  elsewhere is refused. What Landlock does not judge is a connect to a
-  unix socket by path: the hypervisor is in the host's mount namespace,
-  and the host's sockets that anyone may connect to (the system D-Bus,
-  journald, a local resolver) are kept from it by its seccomp filter
-  alone. See AUDIT_OPEN.md.
+  disk node, its two sockets, `/dev/kvm` and `/dev/urandom`. A file its
+  UID owns elsewhere in its jail is refused. Landlock does not judge a
+  connect to a unix socket by its path; the jail is what keeps the
+  host's sockets from the hypervisor, by not containing them.
 - **Its sockets are not trusted by path.** The runtime dir is the VM's
   own, so the daemon checks, on every connection, that the VM's UID is
   what listens there before it sends anything.
@@ -231,6 +263,10 @@ A guest controls its own kernel, so nothing here depends on what a guest
 does with its network device: it can send any frame, claim any address
 and speak any protocol, and the host decides what leaves the tap.
 
+Nor does it depend on a firewall being in place. A firewall fails open:
+flush it, and everything passes. So the first layer is what exists at
+all, and the rules only say it a second time.
+
 | `network` | What a VM run gets |
 |---|---|
 | `none` (default) | No network device at all. |
@@ -239,45 +275,86 @@ and speak any protocol, and the host decides what leaves the tap.
 
 How it is built:
 
-- **One tap per VM, no bridge.** The daemon creates the tap in the host's
-  network namespace and hands the hypervisor the open descriptor
-  (`--net fd=3`). The hypervisor stays unprivileged and in its empty
-  network namespace: it has a file descriptor, not an interface. The tap
-  is not persistent, so it exists exactly as long as its hypervisor does.
-  With no bridge there is no layer-2 path from one guest to another.
-- **At the tap's ingress hook** (nftables, `netdev` family, before the
-  host's ARP and IP code runs): only frames from the VM's MAC, only IPv4
-  from the VM's address, and only ARP requests for the gateway from that
-  MAC and address. Everything else is dropped there: spoofed MACs and
-  addresses, IPv6 of every kind, DHCP, multicast, broadcast, other
-  ethertypes. IPv6 is also turned off on the host's side of the tap. The
-  host's neighbour entry for a guest is permanent, so no ARP a guest
-  sends can change who the host thinks has an address.
-- **Addresses.** Each VM has one address, a /32 routed to its tap; the
-  gateway address is the same for every VM and lives on a dummy
-  interface. The guest is told its address, route and resolvers through
-  its agent (it needs `ip` from iproute2; with systemd-resolved it is
-  configured through `resolvectl`, otherwise `/etc/resolv.conf` is
-  written). Nothing is offered by DHCP. An address is not handed to
-  another VM until every other address has been used, and the connection
+- **A network namespace per run.** Every run with a network has a
+  namespace of its own, made by the daemon, and its tap exists in that
+  namespace and nowhere else. The host's services are not in it (a
+  socket bound to every address of the host is bound in the host's
+  namespace), and neither is any other run's tap. There is no bridge
+  and no shared segment, so there is no path of any kind from one guest
+  to another.
+- **An allowlist run's namespace leads nowhere.** It holds the tap, the
+  gateway address and one listening socket: the run's proxy, which the
+  daemon listens for from inside that namespace (the proxy's own
+  connections leave from the host, as before). It has no link to the
+  host and no route but the guest's own address. Its proxy port cannot
+  be reached from another run, with or without the credential, because
+  it does not exist in another run's namespace.
+- **An open run's namespace has one link to the host,** which routes
+  and masquerades what arrives on it. Inside the namespace the ranges
+  that are not the public internet, the guests' subnet and each of the
+  host's own addresses are unreachable routes, port 25 is an
+  unreachable routing rule, and DNS to the configured resolvers is
+  looked up in a table of its own. These are routes, not firewall
+  rules: they hold with no nftables table anywhere. The daemon follows
+  the host's addresses and updates the routes when they change.
+- **The tap is handed over as a descriptor.** The daemon creates it in
+  the run's namespace and gives the hypervisor the open file
+  (`--net fd=3`). The hypervisor stays unprivileged, in its jail and in
+  its own empty network namespace: it has a file descriptor, not an
+  interface. The tap is not persistent, so it exists exactly as long as
+  its hypervisor does.
+- **In the namespace, no IPv6 at all** (disabled, not filtered), strict
+  reverse-path filtering (a packet is only accepted from the interface
+  its source address is routed to, which for the tap is the VM's one
+  address), no answer to a ping, no redirects, and no forwarding unless
+  the run is open.
+- **The rules, in two places.** Each run's namespace has its own
+  nftables ruleset whose chains drop by default. At the tap's ingress
+  hook (before the namespace's ARP and IP code runs): only frames from
+  the VM's MAC, only IPv4 from the VM's address, and only ARP requests
+  for the gateway from that MAC and address; spoofed MACs and
+  addresses, IPv6, DHCP, multicast, broadcast and other ethertypes are
+  dropped there. Then: to the namespace itself, only an allowlist run's
+  own proxy port; through it, only an open run's traffic, never to the
+  guests' subnet or the host's addresses, DNS to the resolvers, then
+  everything except the ranges that are not the public internet and TCP
+  port 25; back to the guest, only answers. A `flush ruleset` on the
+  host does not touch these: nftables is per namespace. The host has
+  one table per daemon identity for the open runs' links, which says
+  the same again (and masquerades); a link the table does not name is
+  dropped at every hook.
+- **Addresses.** Each VM has one address, a /32 routed to its tap. The
+  gateway address is the same in every run's namespace and means that
+  namespace. Neighbour entries are permanent on both sides of every
+  link, so no ARP a guest sends can change who has an address. The
+  guest is told its address, route and resolvers through its agent (it
+  needs `ip` from iproute2; with systemd-resolved it is configured
+  through `resolvectl`, otherwise `/etc/resolv.conf` is written).
+  Nothing is offered by DHCP. An address is not handed to another VM
+  until every other address has been used, and the host's connection
   tracker's entries for it are deleted when it is given up and again
-  before it is used.
-- **To the host itself** (any of its addresses, any protocol): dropped,
-  except TCP from an allowlist run's tap and address to that run's proxy
-  port on the gateway. Not the daemon's API, not SSH, not another run's
-  proxy.
-- **Through the host:** nothing from an allowlist run (the kernel's
-  per-interface forwarding is off on its tap as well). From an open run:
-  never to another guest or the guest subnet; DNS to the configured
-  resolvers; then everything except the ranges that are not the public
-  internet, and except TCP port 25. To a guest: only answers.
-- **One nftables table per daemon identity**, rewritten as a whole, in
-  one transaction, from the list of running VMs; a tap whose name starts
-  with the daemon's prefix and that the table does not name is dropped at
-  every hook. The daemon checks every two seconds that its tables are
-  still there and puts them back (a host firewall reload that begins
-  with `flush ruleset` removes them; until they are back, at most those
-  two seconds, guests are not filtered).
+  before it is used. An allowlist run's proxy port is fixed by its
+  address slot (20000 plus the slot), so it is likewise not used again
+  while the namespace that had it exists.
+- **The daemon watches the contents of its rules, not only that they
+  exist.** Every two seconds it lists each ruleset it wrote (the host's
+  table and every run's namespace), compares it with what the kernel
+  listed when it was written, and writes back whatever differs: a table
+  that was deleted, a table that was flushed and left empty, a single
+  changed rule. Each restore is logged as an error.
+
+What happens with no rules at all, which the live suite does to four
+running guests (every table of the daemon flushed, then deleted, on the
+host and inside every namespace, with the daemon's upkeep stopped so
+that nothing comes back): no guest reaches a host service on any of the
+host's addresses, another guest, or another run's proxy; an allowlist
+guest still reaches only its own proxy; an open guest still reaches
+nothing link-local, no port 25 and nothing of its resolver beyond DNS.
+What an open run loses then is its way out (nothing masquerades), not
+its limits. What remains open in that state is in AUDIT_OPEN.md: a
+neighbour on the host's own network segment that routes the guests'
+subnet through the host could send unsolicited packets to an open
+guest.
 
 Where the `open` tier differs from the Docker driver's, on purpose. The
 Docker `open` tier is "everything the host can route", including the
@@ -305,16 +382,23 @@ What to know before relying on it:
 - `net.ipv4.ip_forward=1` makes the host route between all of its
   interfaces, not only for guests. If that is new on your host, filter
   forwarding for the rest in your own firewall.
-- Another firewall on the host that drops by default (a `policy drop`
-  input or forward chain: ufw, firewalld, Docker's `FORWARD` chain)
-  still applies: an accept in this daemon's table does not overrule a
-  drop in another. Allow traffic arriving on the daemon's taps there
-  (the daemon logs the chains it finds at start, and the tap prefix).
-- While the daemon is dead (a crash), its rules stay as they were, so a
-  leftover guest has exactly its tier, but its proxy is gone and nothing
-  watches the tables. The next start rewrites the table before anything
-  else, which cuts every leftover guest off, and the sweep then kills
-  them and removes their taps.
+- Another firewall on the host that drops forwarded traffic by default
+  (a `policy drop` forward chain: ufw, firewalld, Docker's `FORWARD`
+  chain) still applies to open runs: an accept in this daemon's table
+  does not overrule a drop in another. Allow traffic arriving on the
+  daemon's links there (the daemon logs the chains it finds at start,
+  and the link prefix, `tvh…`). An allowlist run does not pass the
+  host's firewall at all.
+- While the daemon is dead (a crash), the namespaces and their rules
+  stay as they were, so a leftover guest has at most its tier: an
+  allowlist guest has nothing (its proxy was the daemon), an open guest
+  has the internet. Nothing watches the rules then, and nothing needs
+  to for the host's services and other guests to stay out of reach.
+  The next start rewrites the host's table before anything else, which
+  cuts every leftover open guest off, and the sweep then kills the VMs
+  and removes their namespaces and links.
+- The watch costs one `nft list` per running networked VM every two
+  seconds.
 
 The guest's disk is opened with direct I/O, so it is not cached a second
 time in the host's page cache at the VM's expense.

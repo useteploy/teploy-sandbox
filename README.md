@@ -22,6 +22,7 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 | `POST /v1/runs/{id}/resume` | `{ttlSec?, takeover?}` → the same run, same `id`, `state: "running"`, new deadline (`takeover`: see Off-host storage) |
 | `POST /v1/runs/{id}/fork` | `{ttlSec?, labels?, onExpire?}` → 201, a new run started from this one's filesystem and settings, with `forkedFrom` |
 | `GET /v1/capacity` | `{server, driver, runtime, cpus, memoryMb, runs: {running, stopped}, allocated: {cpus, memoryMb}, warmPool?}` — the host's size and the sum of running runs' limits (and of the VM driver's warm pool, when it has one) |
+| `GET /v1/remote/snapshots` | Only with remote storage: the caller snapshots in the bucket → `{snapshots: [{id, run?, createdAt, storedBytes}]}` — membership is the durability probe for a snapshot whose upload failed and is retried |
 | `POST /v1/remote/sync`, `POST /v1/remote/collect`, `POST /v1/remote/rotate` | Only with remote storage (400 without): look for runs stopped on other daemons now → `{remote, changed}`; garbage-collect the bucket now → 204; re-wrap the bucket's keys under the current master → `{manifestsRewrapped, recordsRewrapped, …}` |
 | `GET /v1/runs`, `GET /health` | List; `{status, version}` |
 
@@ -655,6 +656,7 @@ serve --driver vm --state-dir /var/lib/teploy-sandbox/state \
 | `--remote-secret-key-file` (or `SBX_REMOTE_SECRET_KEY`, `AWS_SECRET_ACCESS_KEY`) | | The secret is never a flag value |
 | `--remote-key-file` (or `SBX_REMOTE_KEY`) | required | The 32-byte master key: raw, base64 or hex. The same on every daemon |
 | `--remote-previous-key-file` | none | Comma-separated files of master keys this daemon still opens but no longer wraps with (the state while a rotation runs) |
+| `--remote-snapshot-retry` | 24h | How long a caller snapshot whose upload failed is retried before it stays on that host only (0: not retried) |
 | `--remote-chunk-mb`, `--remote-parallel` | 16, 4 | Object size and objects in flight; a transfer holds about (parallel + 1) chunks in memory, whatever the disk's size |
 | `--remote-max-chain` | 8 | Incremental uploads in a row before one is sent against the base image again |
 | `--remote-local` | `keep` | `keep` a durable snapshot's local copy for a fast resume here, or `drop` it at once |
@@ -775,9 +777,18 @@ Losing the current master with no backup still loses every stopped run
 that is only in the bucket; there is no recovery from that.
 
 **Caller snapshots.** `POST /snapshot` uploads too and adds
-`"remote": {"state", "id", ...}` to its answer; `image: "snapshot:<id>"`
-on create boots it on any daemon. A failed upload is reported there and
-not retried: the snapshot is then on that host only.
+`"remote": {"state", "id", "error?", ...}` to its answer — the ID names
+the snapshot in remote storage whichever way the upload went, so a
+snapshot that failed is still nameable. `failed` means failed so far:
+the upload is retried by the upkeep (`--remote-snapshot-retry`, 24h by
+default) and `GET /v1/remote/snapshots` says when it landed; membership
+is the probe. `image: "snapshot:<id>"` on create boots it on any
+daemon, and a delete may name that ID too. What a delete by ID removes
+is the bucket copy and anything local to the host asked; a local copy on
+another host goes by the ref that host minted, which is the caller's to
+keep. Until its upload has landed, a snapshot is deletable only on the
+host that took it — nowhere else can name what is not in the bucket
+yet.
 
 Requirements of the service: SigV4, PUT/GET/HEAD/DELETE, ListObjectsV2,
 and read-after-write consistency of objects and listings. Run live

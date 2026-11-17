@@ -550,3 +550,31 @@ func TestRotationRewrapsWithoutMovingAnything(t *testing.T) {
 		t.Fatalf("the moved record under the new master only: %v", err)
 	}
 }
+
+// The listing answers only the caller's snapshots: a stop snapshot's
+// membership is a run's business, and a caller who could name one could
+// boot a filesystem that a run's destruction silently collects.
+func TestListSnapshotsAnswersOnlyCallerSnapshots(t *testing.T) {
+	store, _ := testStore(t)
+	key, err := store.Keys().NewKey("run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Upload(bg, Manifest{ID: "snap-1", Purpose: PurposeSnapshot, Run: "run-1", GUID: "1"}, key, bytes.NewReader(randomBytes(t, 1500))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Upload(bg, Manifest{ID: "snap-2", Purpose: PurposeStop, Run: "run-1", GUID: "2"}, key, bytes.NewReader(randomBytes(t, 1500))); err != nil {
+		t.Fatal(err)
+	}
+	baseKey, _ := store.Keys().NewKey("base-7")
+	if _, err := store.Upload(bg, Manifest{ID: "base-7", Purpose: PurposeBase, GUID: "7"}, baseKey, bytes.NewReader(randomBytes(t, 1500))); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := store.ListSnapshots(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != "snap-1" || listed[0].Run != "run-1" || listed[0].StoredBytes == 0 || listed[0].CreatedAt.IsZero() {
+		t.Fatalf("the caller snapshot is the listing: %+v", listed)
+	}
+}

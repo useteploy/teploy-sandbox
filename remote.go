@@ -38,6 +38,7 @@ type remoteFlags struct {
 	gcInterval    *time.Duration
 	gcGrace       *time.Duration
 	syncInterval  *time.Duration
+	snapshotRetry *time.Duration
 	unfenced      *bool
 }
 
@@ -74,6 +75,8 @@ func addRemoteFlags(flags *flag.FlagSet) *remoteFlags {
 			"remote storage: how long an object must have been garbage before it is deleted; longer than any upload takes"),
 		syncInterval: flags.Duration("remote-sync-interval", envDuration("SBX_REMOTE_SYNC_INTERVAL", run.DefaultRemoteSyncInterval),
 			"remote storage: how often runs stopped, resumed or destroyed on other daemons are looked for"),
+		snapshotRetry: flags.Duration("remote-snapshot-retry", envDuration("SBX_REMOTE_SNAPSHOT_RETRY", run.DefaultSnapshotRetry),
+			"remote storage: how long a caller snapshot whose upload failed is retried before it stays on that host only (0: not retried, the old behaviour)"),
 		unfenced: flags.Bool("remote-unfenced", envBool("SBX_REMOTE_UNFENCED"),
 			"remote storage: on a service without conditional writes, still let this daemon resume and delete runs another daemon wrote last. Only when something else guarantees that one daemon at a time acts on a run"),
 	}
@@ -149,6 +152,9 @@ func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, sta
 	}
 	if *f.local != run.LocalKeep && *f.local != run.LocalDrop {
 		return nil, fmt.Errorf("remote-local must be %q or %q, got %q", run.LocalKeep, run.LocalDrop, *f.local)
+	}
+	if *f.snapshotRetry < 0 {
+		return nil, errors.New("remote-snapshot-retry must not be negative")
 	}
 	if *f.gcGrace <= 0 || *f.gcInterval <= 0 || *f.syncInterval <= 0 {
 		return nil, errors.New("remote-gc-grace, remote-gc-interval and remote-sync-interval must be positive: a grace of zero would delete in the very round a snapshot is first seen unreferenced, while a fork may still be naming it")

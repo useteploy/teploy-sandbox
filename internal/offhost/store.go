@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/useteploy/teploy-sandbox/internal/run"
 	"github.com/useteploy/teploy-sandbox/internal/s3"
 )
 
@@ -533,4 +535,38 @@ func (s *Store) deleteKeys(ctx context.Context, objects []s3.Object) error {
 	}
 	wg.Wait()
 	return first
+}
+
+// ListSnapshots lists the caller snapshots in the bucket: every
+// manifest is opened, because a snapshot's purpose, its run and its
+// size are inside the seal — a listing by object names alone would
+// answer with every stopped run's snapshot in the fleet, and stop
+// snapshots are not a caller's to boot or delete (they go with the run
+// whose record names them). The walk is the one a collection or a
+// rotation pass already pays.
+func (s *Store) ListSnapshots(ctx context.Context) ([]run.RemoteSnapshot, error) {
+	objects, err := s.objects.ListAll(ctx, s.prefix+"snap/")
+	if err != nil {
+		return nil, err
+	}
+	var out []run.RemoteSnapshot
+	for _, object := range objects {
+		id, name, ok := strings.Cut(strings.TrimPrefix(object.Key, s.prefix+"snap/"), "/")
+		if !ok || name != "manifest" || IsBaseID(id) {
+			continue
+		}
+		manifest, _, err := s.Manifest(ctx, id)
+		if err != nil {
+			if errors.Is(err, ErrNoSnapshot) {
+				continue // deleted between the listing and the read
+			}
+			return nil, fmt.Errorf("list snapshots: %w", err)
+		}
+		if manifest.Purpose != PurposeSnapshot {
+			continue
+		}
+		out = append(out, run.RemoteSnapshot{ID: id, Run: manifest.Run, CreatedAt: manifest.CreatedAt, StoredBytes: manifest.StoredBytes})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
 }

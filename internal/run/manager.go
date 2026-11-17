@@ -269,9 +269,18 @@ type Manager struct {
 	// RemoteSyncInterval and RemoteGCInterval pace remote upkeep.
 	RemoteSyncInterval time.Duration
 	RemoteGCInterval   time.Duration
+	// SnapshotRetry is how long a caller snapshot whose upload failed is
+	// retried before it stays on this host only; zero is no retry, the
+	// permanent semantics a failed upload has always had.
+	SnapshotRetry time.Duration
 
 	mu   sync.Mutex
 	runs map[string]*Run
+
+	// snapshotNotes are caller snapshots' standing with remote storage:
+	// an upload owed and being retried, in flight, or a delete owed
+	// (remote_snapshots.go). Keyed by the local ref.
+	snapshotNotes map[string]*snapshotNote
 
 	// statePath is the durable registry file ("" = memory only). persistMu
 	// orders writers so an older registry can never replace a newer one;
@@ -301,11 +310,13 @@ func NewManager(runtime Runtime, log *slog.Logger) *Manager {
 		now:     time.Now,
 		runs:    make(map[string]*Run),
 
-		tombstones: make(map[string]uint64),
-		remoteSeen: make(map[string]uint64),
+		tombstones:    make(map[string]uint64),
+		snapshotNotes: make(map[string]*snapshotNote),
+		remoteSeen:    make(map[string]uint64),
 
 		SandboxUser:      DefaultSandboxUser,
 		StoppedRetention: DefaultStoppedRetention,
+		SnapshotRetry:    DefaultSnapshotRetry,
 	}
 }
 
@@ -843,15 +854,41 @@ func (m *Manager) Snapshot(ctx context.Context, id string) (string, error) {
 // SnapshotRemote is Snapshot, and with remote storage it also uploads
 // the snapshot before it answers. The upload's outcome is the second
 // result (nil without remote storage); a snapshot whose upload failed
-// still exists, on this host only.
+// still exists, on this host only, and is retried by the upkeep until it
+// lands or SnapshotRetry passes — the answer's ID names it in remote
+// storage either way, and the listing says whether it ever arrived.
 func (m *Manager) SnapshotRemote(ctx context.Context, id string) (string, *SnapshotRemote, error) {
 	current, release, err := m.beginCapture(id)
 	if err != nil {
 		return "", nil, err
 	}
 	defer release()
-	ref, err := m.capture(ctx, current)
-	if err != nil {
+	ref := m.newSnapshotRef()
+	if m.OffHost != nil {
+		// The note is written ahead of the capture, and the write is
+		// confirmed: a snapshot taken on a note that never landed would
+		// be retried by nothing.
+		m.mu.Lock()
+		m.snapshotNotes[ref] = &snapshotNote{Ref: ref, Run: id, Key: current.remoteKey, Base: current.base, AddedAt: m.now(), State: noteUploading}
+		m.mu.Unlock()
+		if err := m.persistNow(); err != nil {
+			m.mu.Lock()
+			delete(m.snapshotNotes, ref)
+			m.mu.Unlock()
+			m.persist()
+			return "", nil, fmt.Errorf("registry not persisted, so the snapshot could not be retried if its upload failed: %w", err)
+		}
+	}
+	// CachePath (not just CacheDir): a warm run's workspace lives ON the
+	// mounted volume, and the snapshot must bake those bytes in or the
+	// restore boots an empty workspace.
+	if err := m.runtime.Snapshot(ctx, current.ContainerID, current.CachePath, ref); err != nil {
+		if m.OffHost != nil {
+			m.mu.Lock()
+			delete(m.snapshotNotes, ref)
+			m.mu.Unlock()
+			m.persist()
+		}
 		return "", nil, err
 	}
 	m.log.Info("run snapshotted", "id", id, "image", ref, "warm", current.CachePath != "")
@@ -876,8 +913,14 @@ func (m *Manager) capture(ctx context.Context, current *Run) (string, error) {
 
 // DeleteSnapshot removes a snapshot. Only refs in the driver's own
 // snapshot namespace are deletable through the API — the daemon must never
-// be usable to remove arbitrary host images or volumes.
+// be usable to remove arbitrary host images or volumes. A snapshot in
+// remote storage may also be named by its universal ID
+// ("snapshot:<id>", the spelling the listing answers), so a snapshot can
+// be deleted on a host other than the one that took it.
 func (m *Manager) DeleteSnapshot(ctx context.Context, ref string) error {
+	if image, err := m.resolveImage(ref); err == nil {
+		ref = image
+	}
 	if !m.ownsSnapshotRef(ref) {
 		return fmt.Errorf("%w: not a sandbox snapshot ref: %s", ErrBadRequest, ref)
 	}
@@ -894,29 +937,43 @@ func (m *Manager) DeleteSnapshot(ctx context.Context, ref string) error {
 		m.log.Info("snapshot deleted", "image", ref)
 		return nil
 	}
+	// The delete is written ahead like the upload: a note in the
+	// deleting state, completed by the upkeep if a crash interrupts it,
+	// so no window of the delete leaks a snapshot permanently. A retry
+	// in flight owns the ref for now — racing it could resurrect what
+	// this call removes, so the delete is refused instead.
+	m.mu.Lock()
+	if note, ok := m.snapshotNotes[ref]; ok {
+		switch note.State {
+		case noteUploading:
+			m.mu.Unlock()
+			return fmt.Errorf("%w: snapshot %s is uploading to remote storage; delete it again once that has finished", ErrBusy, ref)
+		case noteDeleting:
+			// A delete already owed: this call finishes it.
+		default:
+			note.State = noteDeleting
+		}
+	} else {
+		m.snapshotNotes[ref] = &snapshotNote{Ref: ref, State: noteDeleting, AddedAt: m.now()}
+	}
+	m.mu.Unlock()
+	if err := m.persistNow(); err != nil {
+		m.log.Error("registry not persisted; the snapshot delete is not begun, so nothing can be left half deleted", "image", ref, "error", err)
+		return fmt.Errorf("registry not persisted: %w", err)
+	}
 	// With remote storage a snapshot may be here, there, or both. The
 	// remote copy goes first: a failure then leaves the local one, and
-	// the delete can be asked for again.
-	remote, err := m.OffHost.HasRemote(ctx, ref)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrRemoteUnavailable, err)
-	}
-	if remote {
-		if err := m.OffHost.DeleteSnapshot(ctx, ref); err != nil {
-			return err
-		}
-	}
-	local, err := m.OffHost.HasLocal(ctx, ref)
-	if err != nil {
+	// the delete can be asked for again — or the upkeep finishes it.
+	if err := m.deleteSnapshotHeld(ctx, ref, false); err != nil {
+		m.persist()
 		return err
 	}
-	if local || !remote {
-		// Neither here nor there: the driver's own "no such snapshot".
-		if err := m.runtime.RemoveImage(ctx, ref); err != nil {
-			return err
-		}
+	m.mu.Lock()
+	if note, ok := m.snapshotNotes[ref]; ok && note.State == noteDeleting {
+		delete(m.snapshotNotes, ref)
 	}
-	m.log.Info("snapshot deleted", "image", ref, "local", local, "remote", remote)
+	m.mu.Unlock()
+	m.persist()
 	return nil
 }
 

@@ -815,6 +815,14 @@ func (m *Manager) RotateRemote(ctx context.Context) (RotateStats, error) {
 	return m.OffHost.Rotate(ctx)
 }
 
+// RemoteSnapshots lists the caller snapshots in the bucket.
+func (m *Manager) RemoteSnapshots(ctx context.Context) ([]RemoteSnapshot, error) {
+	if m.OffHost == nil {
+		return nil, fmt.Errorf("%w: this daemon has no remote storage", ErrBadRequest)
+	}
+	return m.OffHost.ListSnapshots(ctx)
+}
+
 // DefaultRemoteSyncInterval and DefaultRemoteGCInterval pace the upkeep
 // of remote storage.
 const (
@@ -862,6 +870,12 @@ func (m *Manager) Maintain(ctx context.Context) {
 	} else {
 		m.flushTombstones(ctx)
 	}
+	// Snapshot notes first: an upload they owe pins nothing in the
+	// bucket yet, and the sooner it lands the less a base that is about
+	// to be released makes it a full send; a delete they owe is the
+	// removal of garbage.
+	m.finishSnapshotDeletes(ctx)
+	m.retrySnapshotNotes(ctx)
 	m.publishPending(ctx)
 	m.evictUnderPressure(ctx)
 	if gcDue {
@@ -887,24 +901,56 @@ type SnapshotRemote struct {
 }
 
 // publishSnapshot uploads a caller's snapshot of a running run. A failure
-// is reported, not retried: the snapshot is then on this host only, as
-// every snapshot was before remote storage.
+// is not the end of it: the note (written ahead of the capture) stays
+// and the upkeep retries it, so the answer says failed the way a stop
+// does — failed so far, with the error — and the ID names the snapshot
+// in remote storage whichever way it goes. The listing is how a caller
+// learns that a failed one eventually landed.
 func (m *Manager) publishSnapshot(ctx context.Context, current *Run, ref string) *SnapshotRemote {
+	answer := &SnapshotRemote{}
+	if id, ok := m.OffHost.RemoteID(ref); ok {
+		answer.ID = id
+	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.publishTimeout())
 	defer cancel()
 	uploaded, err := m.OffHost.Upload(ctx, UploadRequest{Run: current.ID, Ref: ref, Base: current.base, Key: current.remoteKey, Purpose: PurposeSnapshot})
-	if err != nil {
-		m.log.Error("snapshot is not durable off the host; it exists on this host only", "id", current.ID, "image", ref, "error", err)
-		return &SnapshotRemote{State: RemoteFailed, Error: err.Error()}
-	}
 	m.mu.Lock()
-	if live, ok := m.runs[current.ID]; ok && live.remoteKey == "" {
-		live.remoteKey = uploaded.Key
+	if err != nil {
+		m.log.Error("snapshot is not durable off the host yet; it exists on this host only and the upload is retried", "id", current.ID, "image", ref, "error", err)
+		if note, ok := m.snapshotNotes[ref]; ok && note.State == noteUploading {
+			if m.SnapshotRetry <= 0 {
+				delete(m.snapshotNotes, ref)
+			} else {
+				note.State = noteWaiting
+			}
+		}
+		m.mu.Unlock()
+		m.persist()
+		answer.State = RemoteFailed
+		answer.Error = err.Error()
+		return answer
 	}
+	delete(m.snapshotNotes, ref)
+	m.keepSnapshotKeyLocked(current.ID, uploaded.Key)
 	m.mu.Unlock()
 	m.persist()
 	m.log.Info("snapshot is durable off the host", "id", current.ID, "image", ref, "storedBytes", uploaded.StoredBytes, "incremental", uploaded.Incremental, "took", uploaded.Took.String())
-	return &SnapshotRemote{State: RemoteDurable, ID: uploaded.ID, StoredBytes: uploaded.StoredBytes, Incremental: uploaded.Incremental}
+	answer.State = RemoteDurable
+	answer.StoredBytes = uploaded.StoredBytes
+	answer.Incremental = uploaded.Incremental
+	return answer
+}
+
+// keepSnapshotKeyLocked stores a run's wrapped data key on the run when
+// it is new or has changed — a rotation re-wraps on write, and the run's
+// next upload should carry the new spelling, not the retired one.
+func (m *Manager) keepSnapshotKeyLocked(id, key string) {
+	if key == "" {
+		return
+	}
+	if live, ok := m.runs[id]; ok && live.remoteKey != key {
+		live.remoteKey = key
+	}
 }
 
 // portableImage is the prefix of a create's image that names a snapshot

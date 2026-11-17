@@ -1981,3 +1981,74 @@ Not done: an unfenced store rotates only the records its own daemon
 wrote last (the same rule as its resumes); no recovery — a master key
 lost with no copy loses what only it opens; the rotation is one pass
 on demand, not a fleet-coordinated procedure with a checklist.
+
+## 2026-11-17 — off-host storage: caller snapshots retried, listed, and deletable by ID
+
+The register's open item was "a failed upload is reported and not
+retried, and nothing lists the snapshots in the bucket." Both halves,
+designed on paper first (two independent reviewers; their findings
+shaped every rule below) and then built:
+
+- **A note per snapshot, in the registry file** (additive; a malformed
+  one refuses the start, the file's own discipline). It is written
+  ahead of the capture and the write is confirmed: a snapshot is not
+  taken on a note that did not land, because nothing would retry it.
+  States: uploading (owned by the request or upkeep round that is
+  uploading now), waiting (retried at the next upkeep), deleting (a
+  delete owed). A note read back at startup is never left uploading.
+- **Retry**: the upkeep retries waiting notes, oldest first, under a
+  15-minute deadline of its own (a caller's own snapshot waits as long
+  as publishTimeout; the upkeep must not hold its single flight for
+  hours on one wedged retry). A note older than --remote-snapshot-retry
+  (24h, 0 disables retry — the old semantics) is dropped loudly: its
+  snapshot stays on that host only. The note's base may have been
+  released meanwhile; the retry then sends in full against the base
+  image — a cost, stated, not a failure.
+- **The answer** keeps {durable|failed} — no third state — but always
+  carries the snapshot's universal ID, and failed means failed-so-far
+  with the error. The listing is how a caller learns a failed one
+  landed: membership is the probe.
+- **Delete**: a snapshot in the bucket may be named by its ID
+  ("snapshot:<id>"), so a snapshot is deletable on a host that never
+  held it. A delete while the note is uploading answers 409: the
+  manifest is the last request of a multi-request upload, and a delete
+  that stepped through that gap would resurrect, permanently and
+  bootably, what it removed (nothing collects a caller snapshot).
+  Otherwise the note moves to a persisted deleting phase — the delete's
+  own write-ahead, like the tombstones — and the upkeep completes it
+  after a crash: bucket first, then the local copy, both idempotent.
+  What a delete by ID removes is the bucket copy and anything local to
+  the host asked; another host's local copy goes by that host's ref.
+- **The listing** (GET /v1/remote/snapshots) decrypts every manifest,
+  because a snapshot's purpose, run and size are inside the seal and a
+  listing by object names would answer with every stopped run's
+  snapshot in the fleet — IDs whose bootability dies with the run that
+  owned them. The walk is the one a collection or rotation pass already
+  pays. No pagination, like GET /v1/runs; caller snapshots are the one
+  unbounded set in the bucket, and the listing grows with them.
+
+Crash rows added to the table above's model, all recovered by the note
+plus the startup rules: a crash between the note and the capture (the
+upkeep drops a note whose snapshot never materialised); between the
+capture and the upload (retried); after the upload but before the note
+is erased (the retry hits the manifest-exists path — Already, cheap);
+anywhere inside a delete (the deleting phase completes); a restart
+while a note is uploading (reset to waiting). The startup sweep was
+re-checked to leave a live caller snapshot alone — load-bearing for
+every one of these, and now asserted by a regression test.
+
+Known limits, deliberate: a snapshot whose host dies before its first
+successful upload is lost to the retry (only earlier success fixes
+that); the listing is anonymous (nothing in the bucket records whose
+snapshot it is; callers keep their IDs); a delete by ID before the
+upload lands exists nowhere but the birth host, by rule; and a daemon
+writing the registry with an older binary silently reverts to no retry
+(the file is not a wire).
+
+What the design reviews found and the build owes them: the
+delete-vs-manifest-window (closed by the 409; the heavier parked-deleter
+design it replaced is unnecessary exactly because a delete can no longer
+proceed during an upload), the delete's missing write-ahead, the
+unconfirmed persist, the note born retryable, the cross-daemon
+delete-before-upload rule, the rotation-drains-notes runbook line, the
+give-up age, and the listing that must decrypt to tell the truth.

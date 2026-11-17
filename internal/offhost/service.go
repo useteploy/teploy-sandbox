@@ -507,6 +507,21 @@ func (s *Service) Advance(ctx context.Context, record run.RemoteRecord) (string,
 	return key.Wrapped, err
 }
 
+// RemoteID is a snapshot ref's universal ID.
+func (s *Service) RemoteID(ref string) (string, bool) {
+	id, err := s.id(ref)
+	return id, err == nil
+}
+
+// ListSnapshots lists the caller snapshots in the bucket. Every
+// manifest is read and opened — the same walk a collection or a
+// rotation pass pays — because a snapshot's purpose, owner and size
+// live inside the seal, and a listing by object names alone would
+// answer with every stopped run's snapshot in the fleet.
+func (s *Service) ListSnapshots(ctx context.Context) ([]run.RemoteSnapshot, error) {
+	return s.store.ListSnapshots(ctx)
+}
+
 // Collect runs a garbage collection.
 func (s *Service) Collect(ctx context.Context) error {
 	start := time.Now()

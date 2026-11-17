@@ -427,6 +427,7 @@ func serve(args []string) error {
 		manager.LocalCache = *remote.local
 		manager.RemoteSyncInterval = *remote.syncInterval
 		manager.RemoteGCInterval = *remote.gcInterval
+		manager.SnapshotRetry = *remote.snapshotRetry
 	}
 	if *cacheRoot != "" {
 		manager.Cache = run.NewCacheStore(*cacheRoot, int64(*cacheMaxGB*(1<<30)))

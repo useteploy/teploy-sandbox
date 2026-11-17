@@ -175,7 +175,29 @@ type OffHost interface {
 	// manifest, and every stopped run's record as a new generation with
 	// the state and the owner unchanged. Chunks do not move.
 	Rotate(ctx context.Context) (RotateStats, error)
+	// RemoteID is the universal ID of a snapshot ref, the name it has
+	// on every daemon sharing the storage; false for a ref that is not
+	// one of this daemon's snapshot refs.
+	RemoteID(ref string) (string, bool)
+	// ListSnapshots lists the caller snapshots in the bucket: what a
+	// create with image "snapshot:<id>" can boot, and what a delete by
+	// that ID can remove.
+	ListSnapshots(ctx context.Context) ([]RemoteSnapshot, error)
 	// Pressure is whether local storage is short enough that copies
 	// which are safe in remote storage should go.
 	Pressure(ctx context.Context) (bool, error)
+}
+
+// RemoteSnapshot is one caller snapshot in the bucket. Membership is
+// the durability probe: a snapshot the upload of which failed is here
+// exactly when its retry has landed.
+type RemoteSnapshot struct {
+	ID string `json:"id"`
+	// Run is the run the snapshot was taken of, if it said so.
+	Run string `json:"run,omitempty"`
+	// CreatedAt is when the snapshot was uploaded (a rotation re-wraps
+	// the manifest but keeps this).
+	CreatedAt time.Time `json:"createdAt"`
+	// StoredBytes is what the snapshot occupies in the bucket.
+	StoredBytes int64 `json:"storedBytes"`
 }

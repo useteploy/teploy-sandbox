@@ -93,6 +93,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/remote/sync", s.auth(s.handleRemoteSync))
 	mux.Handle("POST /v1/remote/collect", s.auth(s.handleRemoteCollect))
 	mux.Handle("POST /v1/remote/rotate", s.auth(s.handleRemoteRotate))
+	mux.Handle("GET /v1/remote/snapshots", s.auth(s.handleRemoteSnapshots))
 	mux.Handle("PUT /v1/runs/{id}/files/{path...}", s.auth(s.handlePutFile))
 	mux.Handle("GET /v1/runs/{id}/files/{path...}", s.auth(s.handleGetFile))
 	return mux
@@ -318,6 +319,22 @@ func (s *Server) handleRemoteRotate(w http.ResponseWriter, r *http.Request) {
 		"recordsRunning": stats.RecordsRunning, "recordsConflicted": stats.RecordsConflicted,
 		"recordsUnfenced": stats.RecordsUnfenced, "recordsDestroyed": stats.RecordsDestroyed,
 	})
+}
+
+// handleRemoteSnapshots lists the caller snapshots in the bucket: the
+// durability probe for a snapshot whose upload failed and is retried
+// (membership means durable), and the roster of what a create with
+// image "snapshot:<id>" can boot anywhere.
+func (s *Server) handleRemoteSnapshots(w http.ResponseWriter, r *http.Request) {
+	snapshots, err := s.Manager.RemoteSnapshots(r.Context())
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if snapshots == nil {
+		snapshots = []run.RemoteSnapshot{}
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"snapshots": snapshots})
 }
 
 func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {

@@ -14,6 +14,7 @@ import (
 	"github.com/useteploy/teploy-sandbox/internal/offhost"
 	"github.com/useteploy/teploy-sandbox/internal/offhost/offhosttest"
 	"github.com/useteploy/teploy-sandbox/internal/run"
+	"github.com/useteploy/teploy-sandbox/internal/s3"
 )
 
 // These tests run the whole off-host path on fakes: two or more daemons,
@@ -43,8 +44,15 @@ func newHost(t *testing.T, bucket *offhosttest.Memory, name string, previous *re
 // newHostKeys is newHost with the daemon's keyring chosen by the test:
 // a rotation's half-done state, or a fleet that has moved on.
 func newHostKeys(t *testing.T, bucket *offhosttest.Memory, name string, previous *remoteHost, keyring *offhost.Keyring, options ...hostOption) *remoteHost {
+	return newHostObjs(t, bucket, bucket, name, previous, keyring, options...)
+}
+
+// newHostObjs is newHostKeys with the store's object storage chosen
+// separately from the bucket the test inspects: a wrapper that delays
+// one operation, to order a race by hand.
+func newHostObjs(t *testing.T, mem *offhosttest.Memory, objects offhost.Objects, name string, previous *remoteHost, keyring *offhost.Keyring, options ...hostOption) *remoteHost {
 	t.Helper()
-	h := &remoteHost{name: name, bucket: bucket, stateDir: t.TempDir()}
+	h := &remoteHost{name: name, bucket: mem, stateDir: t.TempDir()}
 	var rig *testRig
 	if previous != nil {
 		rig = newRig(t, previous.testRig)
@@ -65,7 +73,7 @@ func newHostKeys(t *testing.T, bucket *offhosttest.Memory, name string, previous
 			t.Fatal(err)
 		}
 	}
-	h.store = offhost.NewStore(bucket, "fleet", keys, quietLog())
+	h.store = offhost.NewStore(objects, "fleet", keys, quietLog())
 	h.store.ChunkBytes = 96
 	h.store.Parallel = 3
 	if err := h.store.Probe(bg); err != nil {
@@ -1148,5 +1156,166 @@ func TestMasterKeysRotateWithoutTheOldOne(t *testing.T) {
 	}
 	if stats.Records != 0 || stats.Manifests != 0 || stats.ManifestsCurrent == 0 || stats.RecordsRunning != 1 {
 		t.Fatalf("everything is already under the new master: %+v", stats)
+	}
+}
+
+// blockingBucket holds every manifest write at a gate: an upload caught
+// mid-flight, chunks in the bucket and its manifest not yet there.
+type blockingBucket struct {
+	*offhosttest.Memory
+	gate chan struct{}
+}
+
+func (b *blockingBucket) Put(ctx context.Context, key string, body []byte, opts s3.PutOptions) error {
+	if strings.HasSuffix(key, "/manifest") {
+		select {
+		case <-b.gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return b.Memory.Put(ctx, key, body, opts)
+}
+
+// A caller snapshot whose upload failed is retried by the upkeep, the
+// answer names its universal ID even on failure, the listing is how a
+// caller learns it landed — and a snapshot durable in the bucket is
+// deletable from a host that never held it, by that ID.
+func TestACallerSnapshotThatFailedToUploadIsRetried(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	a, b := newHost(t, bucket, "host-a", nil), newHost(t, bucket, "host-b", nil)
+	created := a.startRun(t, payload(t, 400))
+	bucket.SetFail(func(op, key string) error {
+		if op == "put" {
+			return errors.New("storage is down")
+		}
+		return nil
+	})
+	ref, remote, err := a.manager.SnapshotRemote(bg, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote == nil || remote.State != run.RemoteFailed || remote.ID == "" || remote.Error == "" {
+		t.Fatalf("a failed upload still names the snapshot and its error: %+v", remote)
+	}
+	bucket.SetFail(nil)
+	a.manager.Maintain(bg)
+	listed, err := a.manager.RemoteSnapshots(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != remote.ID || listed[0].Run != created.ID || listed[0].StoredBytes == 0 || listed[0].CreatedAt.IsZero() {
+		t.Fatalf("the retried snapshot is the listing: %+v", listed)
+	}
+	// Durable, so deletable from a host that never held it, by ID. What
+	// that removes is the bucket copy and anything local to the host
+	// asked; the birth host's copy stays until it is deleted there, by
+	// the ref the caller was given (refs are a host's own spelling).
+	if err := b.manager.DeleteSnapshot(bg, "snapshot:"+remote.ID); err != nil {
+		t.Fatalf("delete by universal id: %v", err)
+	}
+	if has, _ := a.store.HasSnapshot(bg, remote.ID); has {
+		t.Fatal("the snapshot is still in remote storage")
+	}
+	if has, _ := a.service.HasLocal(bg, ref); !has {
+		t.Fatal("the delete reached into a host it was not asked of")
+	}
+	if err := a.manager.DeleteSnapshot(bg, ref); err != nil {
+		t.Fatalf("delete by the birth host's ref: %v", err)
+	}
+	if has, _ := a.service.HasLocal(bg, ref); has {
+		t.Fatal("the snapshot is still on the host that took it")
+	}
+}
+
+// A delete interrupted by a crash (and by a storage outage) is
+// completed by the restart's upkeep; nothing about the restart — the
+// startup sweep included — touches a live caller snapshot while it
+// waits.
+func TestASnapshotDeleteSurvivesACrashInsideIt(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	a := newHost(t, bucket, "host-a", nil)
+	created := a.startRun(t, payload(t, 300))
+	ref, remote, err := a.manager.SnapshotRemote(bg, created.ID)
+	if err != nil || remote == nil || remote.State != run.RemoteDurable {
+		t.Fatalf("snapshot: %+v %v", remote, err)
+	}
+	bucket.SetFail(func(op, key string) error {
+		if op == "delete" {
+			return errors.New("storage is down")
+		}
+		return nil
+	})
+	if err := a.manager.DeleteSnapshot(bg, ref); err == nil {
+		t.Fatal("a delete against a down bucket must fail")
+	}
+	bucket.SetFail(nil)
+	restarted := newHost(t, bucket, "host-a", a)
+	// The load-bearing precondition: a restart's sweep leaves a live
+	// caller snapshot alone while its delete is still owed.
+	if has, _ := restarted.service.HasLocal(bg, ref); !has {
+		t.Fatal("the restart's sweep removed a live caller snapshot")
+	}
+	restarted.manager.Maintain(bg)
+	if has, _ := restarted.store.HasSnapshot(bg, remote.ID); has {
+		t.Fatal("the delete the crash interrupted was not completed")
+	}
+	if has, _ := restarted.service.HasLocal(bg, ref); has {
+		t.Fatal("the local copy outlived the delete")
+	}
+	if listed, err := restarted.manager.RemoteSnapshots(bg); err != nil || len(listed) != 0 {
+		t.Fatalf("the listing after the delete: %v %v", listed, err)
+	}
+}
+
+// A delete must not race an upload that is landing: the retry's
+// manifest is the last request of a multi-request upload, and a delete
+// that stepped through the gap would resurrect what it removed. The
+// delete is refused while the upload is in flight, and works after.
+func TestADeleteDoesNotRaceAnUploadLanding(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	block := &blockingBucket{Memory: bucket, gate: make(chan struct{})}
+	a := newHostObjs(t, bucket, block, "host-a", nil, nil)
+	created := a.startRun(t, payload(t, 300))
+	bucket.SetFail(func(op, key string) error {
+		if op == "put" {
+			return errors.New("storage is down")
+		}
+		return nil
+	})
+	ref, remote, err := a.manager.SnapshotRemote(bg, created.ID)
+	if err != nil || remote == nil || remote.State != run.RemoteFailed {
+		t.Fatalf("a failed upload: %+v %v", remote, err)
+	}
+	// Storage returns, but every manifest write is held at the gate: the
+	// upkeep's retry reaches the door and waits there.
+	bucket.SetFail(nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.manager.Maintain(bg)
+	}()
+	for i := 0; ; i++ {
+		if len(bucket.Keys("fleet/v1/snap/")) > 0 {
+			break
+		}
+		if i > 1000 {
+			t.Fatal("the retry never started uploading")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := a.manager.DeleteSnapshot(bg, ref); !errors.Is(err, run.ErrBusy) {
+		t.Fatalf("a delete during an in-flight upload = %v, want busy", err)
+	}
+	close(block.gate)
+	<-done
+	if has, _ := a.store.HasSnapshot(bg, remote.ID); !has {
+		t.Fatal("the retry did not land")
+	}
+	if err := a.manager.DeleteSnapshot(bg, ref); err != nil {
+		t.Fatalf("delete after the upload: %v", err)
+	}
+	if has, _ := a.store.HasSnapshot(bg, remote.ID); has {
+		t.Fatal("the snapshot outlived its delete")
 	}
 }

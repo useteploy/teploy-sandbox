@@ -469,3 +469,24 @@ func TestShutdownStopsRunsThatAskedForIt(t *testing.T) {
 		t.Fatalf("a failed shutdown stop must leave the run as it was: %+v %v", got, err)
 	}
 }
+
+func TestSnapshotNotesDecode(t *testing.T) {
+	owns := func(ref string) bool { return ref == "tank/sbx/teploy-snap-1" }
+	good := `{"version":1,"snapshotNotes":[` +
+		`{"ref":"tank/sbx/teploy-snap-1","run":"01M7NQSS0N4DNYHNF635Y203BP","key":"k","state":"waiting","addedAt":"2026-11-17T00:00:00Z"}]}`
+	_, _, _, notes, err := decodeState([]byte(good), owns)
+	if err != nil || len(notes) != 1 || notes["tank/sbx/teploy-snap-1"].State != noteWaiting {
+		t.Fatalf("a written note reads back: %v %v", notes, err)
+	}
+	for name, bad := range map[string]string{
+		"not this daemon's": `{"version":1,"snapshotNotes":[{"ref":"elsewhere","state":"waiting"}]}`,
+		"unknown state":     `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","state":"gone"}]}`,
+		"duplicate":        `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","state":"waiting"},{"ref":"tank/sbx/teploy-snap-1","state":"deleting"}]}`,
+		"not a run id":     `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","run":"nope","state":"waiting"}]}`,
+		"foreign base":     `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","base":"elsewhere","state":"waiting"}]}`,
+	} {
+		if _, _, _, _, err := decodeState([]byte(bad), owns); err == nil {
+			t.Fatalf("a malformed note (%s) must refuse the registry file", name)
+		}
+	}
+}

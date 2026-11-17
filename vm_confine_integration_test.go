@@ -335,6 +335,10 @@ func holdStrayDescriptor(t *testing.T) {
 // jailControls logs the control for the jail's missing sockets once.
 var jailControls sync.Once
 
+// sysSetns is setns(2), which the syscall package does not name on
+// every architecture (not on amd64).
+var sysSetns = map[string]uintptr{"amd64": 308, "arm64": 268}[runtime.GOARCH]
+
 // jailView is what a process with the VM's identity finds in the VM's
 // namespaces.
 type jailView struct {
@@ -382,7 +386,7 @@ func viewJail(t *testing.T, pid int, uid, gid, group uint32, stats, devices []st
 				return fmt.Errorf("unshare the thread's root: %w", err)
 			}
 			for i, kind := range kinds {
-				if _, _, errno := syscall.RawSyscall(syscall.SYS_SETNS, handles[i].Fd(), kind.flag, 0); errno != 0 {
+				if _, _, errno := syscall.RawSyscall(sysSetns, handles[i].Fd(), kind.flag, 0); errno != 0 {
 					return fmt.Errorf("join the hypervisor's %s namespace: %w", kind.name, errno)
 				}
 			}

@@ -10,6 +10,19 @@ import (
 	"unsafe"
 )
 
+// sysSetns is the number of setns(2) on this architecture, or 0 where
+// this driver does not know it. Not syscall.SYS_SETNS: the syscall
+// package's tables were frozen before the call existed on some
+// architectures, amd64 among them, and a daemon that names the constant
+// does not compile there at all (the Docker driver included).
+var sysSetns = setnsNumbers[runtime.GOARCH]
+
+var setnsNumbers = map[string]uintptr{
+	"amd64": 308,
+	// The table every newer architecture shares.
+	"arm64": 268, "riscv64": 268, "loong64": 268,
+}
+
 // inNamespace runs fn on a thread that is in the named network
 // namespace: a socket or a device made there, and a process started
 // there, belong to that namespace. The empty name is the namespace the
@@ -24,6 +37,9 @@ func inNamespace(name string, fn func() error) error {
 	if name != filepath.Base(name) {
 		return fmt.Errorf("%q is not the name of a network namespace", name)
 	}
+	if sysSetns == 0 {
+		return fmt.Errorf("entering a network namespace is not supported on %s", runtime.GOARCH)
+	}
 	target, err := os.Open(filepath.Join(netnsDir, name))
 	if err != nil {
 		return err
@@ -32,7 +48,7 @@ func inNamespace(name string, fn func() error) error {
 	done := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
-		if _, _, errno := syscall.RawSyscall(syscall.SYS_SETNS, target.Fd(), syscall.CLONE_NEWNET, 0); errno != 0 {
+		if _, _, errno := syscall.RawSyscall(sysSetns, target.Fd(), syscall.CLONE_NEWNET, 0); errno != 0 {
 			done <- fmt.Errorf("enter the network namespace %s: %w", name, errno)
 			return
 		}

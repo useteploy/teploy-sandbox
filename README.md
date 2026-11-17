@@ -700,6 +700,10 @@ decode this mode. Images used for timed execs must provide coreutils timeout.
 
 Before deployment, run `go build ./...`, `go vet ./...`, `go test ./...`,
 `go test -race ./...`, and `CGO_ENABLED=0 go test -tags integration ./...`.
+Build for both architectures whichever one you are on
+(`GOOS=linux GOARCH=amd64 go build ./...` and the same with `arm64`, and
+`go vet -tags vmintegration ./...` for each): the VM driver makes system
+calls by number, and CI compiles both for that reason.
 Native Linux firewall fixtures need root: build a static integration test
 binary with `CGO_ENABLED=0 go test -c -tags integration -o /tmp/sandbox-tests .`
 and run `sudo /tmp/sandbox-tests -test.v`. Native Linux

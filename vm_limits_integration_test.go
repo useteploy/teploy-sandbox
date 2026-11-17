@@ -151,10 +151,12 @@ func TestVMLimits(t *testing.T) {
 	// --- the disk. Direct I/O in the guest, so that what is measured is
 	// what reaches the volume and not the guest's page cache.
 	const (
-		capMB    = 20
-		capIOPS  = 500
-		writeMB  = 100
-		smallIOs = 4000
+		capMB = 10
+		// Low, because the control varies on a busy host: the same guest
+		// has made between 550 and 5400 small writes per second here.
+		capIOPS  = 200
+		writeMB  = 60
+		smallIOs = 1600
 	)
 	write := fmt.Sprintf("if=/dev/zero of=/work/load bs=1M count=%d oflag=direct", writeMB)
 	read := "if=/work/load of=/dev/null bs=1M iflag=direct"
@@ -188,7 +190,7 @@ func TestVMLimits(t *testing.T) {
 			capMB, cgroupValue(t, machine.cgroup, "io.max"), writeMB, written.mibPerSecond(), readBack.mibPerSecond(), boot.Round(100*time.Millisecond), cgroupValue(t, machine.cgroup, "io.stat"))
 		for what, result := range map[string]ddResult{"write": written, "read": readBack} {
 			// The kernel lets a little through at once before it starts
-			// to count; over 100 MiB that is a few per cent.
+			// to count; over 60 MiB that is a few per cent.
 			if rate := result.mibPerSecond(); rate > capMB*1.15 {
 				t.Errorf("the guest's %s ran at %.1f MiB/s under a limit of %d", what, rate, capMB)
 			}
@@ -225,7 +227,7 @@ func TestVMLimits(t *testing.T) {
 
 	// --- the network: a rate each way, and a number of connections
 	const (
-		capMbit     = 40
+		capMbit     = 20
 		capConns    = 200
 		sinkPort    = 9200
 		holdPort    = 9300

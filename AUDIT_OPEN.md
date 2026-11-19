@@ -1640,11 +1640,16 @@ two minutes; it is six creates now.
 - **A create whose pool VM dies under it fails.** It is not retried
   with a VM booted for it; the caller gets a 500 and may ask again. The
   window is the claim itself.
-- **One caller can keep the pool empty.** Every create that takes a
-  pool VM costs the host a boot, whether the run is kept, destroyed at
-  once or abandoned mid-claim (a claim whose caller gives up destroys
-  the VM). There is no fairness between callers: the others then wait
-  for a cold boot, as with no pool.
+- **One caller can keep the pool empty.** Deferred to Cloud, by
+  design, not fixable in the daemon: the daemon's one bearer token
+  cannot tell callers apart, so there is nothing to be fair between —
+  any limit it invented would throttle every caller together. What the
+  churner costs the others is bounded at exactly the no-pool baseline
+  (a cold boot), and the boot backoffs already keep the host from
+  being spent on endless refills. Per-caller fairness is a start-rate
+  limit, which needs caller identity, which Cloud has (limits per
+  organization: concurrent runs, starts per minute — the platform
+  plan's Phase 5).
 - **A closing daemon removes its pool one VM at a time** under the 15 s
   it has for the driver (about 0.1 s each here). What is not removed in
   time keeps running until the next start's sweep, like a run's VM

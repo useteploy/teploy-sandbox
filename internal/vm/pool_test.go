@@ -599,3 +599,78 @@ func TestAFullDaemonRefusesBeforeItMakesAnything(t *testing.T) {
 		t.Fatalf("a refused create was given %d proxies and %d places in the network; %d VMs booted", opened, len(network.attached), len(rig.hypervisor.started))
 	}
 }
+
+// The register's open item, closed: a pool VM that dies under its claim
+// no longer fails the create — the run is given a VM booted for it. The
+// dead VM itself goes, and the pool carries on.
+func TestACreateWhosePoolVMDiedUnderItBootsItsOwn(t *testing.T) {
+	sizes, err := ParseWarmSizes("1x512=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rig := newWarmRig(t, WarmConfig{Sizes: sizes})
+	waitPool(t, rig.driver, "full", full)
+	names := rig.hypervisor.running()
+	if len(names) != 1 {
+		t.Fatalf("the pool holds %d VMs, want one: %v", len(names), names)
+	}
+	dead := names[0]
+	machine := rig.hypervisor.machine(dead)
+	// Hold the VM inside its guest setup — the claim's last step, the
+	// register's exact window — and kill it there.
+	setupArrived := make(chan struct{})
+	release := make(chan struct{})
+	machine.mu.Lock()
+	machine.setupFunc = func(string, io.Writer) (int, bool, error) {
+		close(setupArrived)
+		<-release
+		return -1, false, errors.New("connection refused: vm is gone")
+	}
+	machine.mu.Unlock()
+
+	created := make(chan *run.Run, 1)
+	createErr := make(chan error, 1)
+	go func() {
+		runCreated, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Limits: &run.Limits{MemoryMB: 512, CPUs: 1}})
+		if err != nil {
+			createErr <- err
+			return
+		}
+		created <- runCreated
+	}()
+	select {
+	case <-setupArrived:
+	case err := <-createErr:
+		t.Fatalf("the create failed before its pool VM's guest setup: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the create never reached its pool VM's guest setup")
+	}
+	if err := machine.Kill(bg); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+
+	select {
+	case err := <-createErr:
+		t.Fatalf("a create whose pool VM died under it failed: %v", err)
+	case got := <-created:
+		session, err := rig.manager.BeginExec(got.ID, run.LeaseCredential{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out strings.Builder
+		if _, _, err := session.Exec(bg, "echo up", "", nil, time.Minute, &out, &out); err != nil || out.String() != "/work$ echo up" {
+			// The fake agent echoes rather than executes; that it answers
+			// at all is the point.
+			t.Fatalf("the run booted for the create answers %q (%v)", out.String(), err)
+		}
+		if err := rig.manager.Destroy(bg, got.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The dead VM is gone — its volume too — and the pool refills.
+	waitPool(t, rig.driver, "full again", full)
+	if current := rig.hypervisor.running(); len(current) != 1 || current[0] == dead {
+		t.Fatalf("the pool after the death: %v", current)
+	}
+}

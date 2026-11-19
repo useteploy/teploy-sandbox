@@ -1655,3 +1655,28 @@ two minutes; it is six creates now.
   the 4096 UIDs, not together, and not against the guest addresses.
 - **Not run:** x86-64, bare metal, and a hostile hypervisor against
   `AddNet` on a live VM (the bound is unit-tested on a real socket).
+
+## 2026-11-18 — VM driver: a create whose pool VM dies under it boots its own
+
+The warm-pool review's open item, closed: a create that claimed a pool VM
+and had it die mid-claim no longer fails — the driver discards the dead
+VM (everything of the run's with it) and answers ErrWarmVMDead, and the
+manager serves the create again at once with a VM booted for it, once.
+The create is not made to wait for the pool to have another, and the
+caller sees nothing but a slightly slower create.
+
+The line is drawn at death, not at any claim failure: a guest whose
+setup fails while its VM still lives (an image without iproute2, say)
+still fails the create as before — a cold boot of the same golden image
+would fail the same way, and pretending otherwise would only add the
+boot's cost to the error. The check runs before the discard, because a
+discard kills the machine and a machine the discard killed is not one
+that died under its claim.
+
+Verified on the fakes: a pool VM killed inside its guest setup — the
+register's exact window, staged deterministically through the fake
+agent's setup hook — yields a working run from a VM booted for it, the
+dead VM's volume gone, the pool refilled; a claim that fails with the
+VM alive still fails the create and destroys the pool VM (unchanged,
+existing test). Race-clean. Not yet re-run live: it goes with the
+validation box's first suite run.

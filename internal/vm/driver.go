@@ -275,7 +275,17 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 	// claimed is never handed to another run, nor put back in the pool.
 	env, err := d.claim(ctx, name, machine, spec, proxyPort)
 	if err != nil {
+		// Before the discard: a discard kills the machine, and a VM the
+		// discard killed is not one that died under its claim.
+		diedUnderClaim := source == "warm pool" && machineExited(machine)
 		cleanupErr := d.discard(cleanupCtx, name, machine, spec.Name)
+		if diedUnderClaim && cleanupErr == nil {
+			// The pool's VM died under its claim — the register's open
+			// item. Everything of the run's was given back with the
+			// discard, so the caller may simply be served again, by a
+			// VM booted for it; the manager does that at once.
+			return "", fmt.Errorf("%w (vm %s): %v", run.ErrWarmVMDead, name, err)
+		}
 		if cleanupErr != nil {
 			d.track(name, &instance{machine: machine, network: spec.Name})
 			return name, errors.Join(err, cleanupErr)
@@ -347,6 +357,17 @@ func (d *Driver) boot(ctx context.Context, name, ref string, cpus, memoryMB int)
 		return machine, true, errors.Join(err, cleanupErr)
 	}
 	return nil, false, err
+}
+
+// machineExited says whether a VM's process is already gone, without
+// waiting for it.
+func machineExited(machine Machine) bool {
+	select {
+	case <-machine.Exited():
+		return true
+	default:
+		return false
+	}
 }
 
 // claim makes a booted VM the run's: its network device on the run's tier

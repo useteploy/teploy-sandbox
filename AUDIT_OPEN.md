@@ -2052,3 +2052,61 @@ proceed during an upload), the delete's missing write-ahead, the
 unconfirmed persist, the note born retryable, the cross-daemon
 delete-before-upload rule, the rotation-drains-notes runbook line, the
 give-up age, and the listing that must decrypt to tell the truth.
+
+## 2026-11-17/18 — off-host storage: the live suite on the branch, and what the host taught
+
+The whole vmintegration suite was run on this branch (nested arm64,
+Cloud Hypervisor 54.1, ZFS 2.2, versitygw 1.11 on loopback), pool off
+and pool on, over 2026-11-17/18.
+
+**Found by the live suite and fixed, each with a fake-level regression
+test added:**
+
+- **Deleting a durable snapshot by its ID was refused while any run on
+  that host had booted from it** ("belongs to run; delete the run
+  instead"). The fakes never hit it because they never booted a
+  snapshot before deleting it. The rule is now: the bucket copy is the
+  caller's to delete whatever a host booted from it — a run's fetched
+  local copy is that run's to release when it ends (the create path's
+  own ownership rule); a holder blocks a delete only when the local
+  copy is all there is. The upkeep's completion of a crashed delete
+  takes a held copy the same way.
+- **A FAILED earlier run of the suite left orphan snapshot and base
+  volumes on the standing pool that nothing collects** — the sweep
+  takes only what a registry names, and a failed run's registries are
+  gone; the orphans pin their base images forever and the suite's
+  next run fails its own reclaim check. The suite now sweeps
+  `teploy-snap-*` and `teploy-base-*` off the standing pool before it
+  starts (a fresh host has none), and its base-image check names this
+  run's base by its golden's guid instead of any base at all.
+- **The new tests' daemons kept warm pools when the suite ran with
+  SBX_VM_WARM**, overcommitting the suite's small host; the off-host
+  daemons are pinned warm-off (the pool tests are the pool coverage).
+
+**Live-verified on this branch (pool off): the full suite, including
+the new TestVMKeyRotation (a fleet's master key rotated: manifests
+re-wrapped in place, no chunk moved, the record's owner preserved, a
+daemon given only the new master resumes the run by restoring from the
+bucket) and TestVMCallerSnapshots (durable before the answer, listed,
+booted by universal ID on a pool that never held it, deleted by that
+ID from there, the birth host's copy kept until its own ref deletes
+it). TestVMWarmPoolRaces failed twice on time alone under a loaded
+host and passed quiet, the known flake class recorded on 2026-11-16.**
+
+**Pool on:** the full suite passed everything except the three
+S3-dependent tests, which a dead test server (an operator miss, not
+the code) kept from starting; re-running just those three on this host
+was not completed: the 8 GiB nested guest failed environmentally,
+in a chain worth recording because every link is a way to lose a
+night — warm pools plus concurrent restores leave little memory
+margin; a journald storm (every zfs receive/clone/destroy of hundreds
+of restore operations is a uevent) ate a core; a wedged run never ran
+its bucket-cleanup defers, so the throwaway S3 server's directory
+filled the 15 GB root disk; full disk suspended the standing pool
+(zpool clear recovered it, no data errors), then a txg_sync wedge and,
+after another reboot, guest boots at several times their healthy
+time. None of it implicates the branch — the same binary passed the
+whole suite pool-off — but the pool-on trio on THIS branch is
+**unverified**: re-run it on a host with headroom (the production
+validation box) before the merge decision. The trio now streams its
+output (-test.v) so a wedge cannot eat the record again.

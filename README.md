@@ -628,6 +628,51 @@ pool, and the network and lifecycle tests then get pool VMs; the
 `TestVMWarmPool` and `TestVMWarmPoolRaces` tests bring their own pool
 either way)
 
+### Validating on a fresh x86-64 host
+
+Everything above has also been developed and verified on nested arm64;
+what that cannot give is x86-64 itself (the amd64 seccomp filter, ACPI
+hot-plug instead of a device tree) or bare-metal figures. A fresh host
+closes both. Every step refuses what it cannot do, so a host that gets
+to the end is a host the suite will run on.
+
+1. **Provision** Debian 12 or 13 on x86-64 with root: 4+ CPUs, 8 GB RAM
+   minimum (16 GB to run the pool-on suite comfortably), a disk for the
+   ZFS pool. Record the CPU model, kernel and hypervisor versions with
+   the results.
+2. **ZFS**: install OpenZFS (Debian: `zfs-dkms zfsutils-linux`) and
+   create the pool —
+   `zpool create -O compression=lz4 -O volmode=dev sbx DISK`
+   (a file works too: `truncate -s 20G /pool.img` and create on it).
+3. **Host setup**: `sudo scripts/install-host.sh sbx`. Idempotent; it
+   writes the udev rule, opens `/dev/kvm` to the kvm group, and checks
+   the cgroup controllers. The daemon refuses a host it has not prepared.
+4. **Golden image**: a bootable x86-64 Linux root filesystem with
+   systemd on a zvol (a cloud image written to the volume, cloud-init
+   off) — it needs `iproute2` and the virtio drivers, and nothing that
+   configures network devices on its own (there is no DHCP; the agent is
+   told the address). Build the guest agent
+   (`CGO_ENABLED=0 go build -o teploy-guestd ./cmd/teploy-guestd`) and
+   `sudo scripts/build-golden.sh --from POOL/base@snap --to
+   POOL/golden-guestd@v1 --guestd ./teploy-guestd`.
+5. **Cloud Hypervisor**: the amd64 static build of the pinned version,
+   on PATH or named by `SBX_VM_HYPERVISOR`.
+6. **Object storage** for the off-host tests: any S3-compatible service
+   on loopback (versitygw is what development used), with the four
+   `SBX_S3_TEST_*` variables the suite reads.
+7. **The suite**: from a checkout,
+   `CGO_ENABLED=0 go test -c -tags vmintegration -o vm.test .` (cross
+   compile from anywhere with `GOOS=linux GOARCH=amd64`), then as root
+   run the whole suite pool-off and pool-on, and the root-only unit
+   tests with it (`-test.run "TestVM|TestJail|TestSocketDir|TestAKilled|
+   TestAProxy|TestTheWatch"`). `TestVMWarmPoolRaces` is timing-sensitive:
+   on a loaded host it may fail on time alone — re-run it alone before
+   believing a failure.
+8. **Record** the run in `AUDIT_OPEN.md`: what passed, on what hardware,
+   and the figures nesting could not give — cold boot time, warm claim,
+   create-to-first-exec, and the memory overhead per VM at a few sizes
+   (the cgroup figures the arm64 entries carry).
+
 ## Writable leases
 
 A human takes exclusive writable ownership of a run while its agent is

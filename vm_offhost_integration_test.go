@@ -73,7 +73,7 @@ func zfsCommand(t *testing.T, name string, args ...string) string {
 
 // startOffHostDaemon is a manager on the VM driver with remote storage,
 // wired as serve wires it.
-func startOffHostDaemon(t *testing.T, name string, config vm.Config, objects *s3.Client, prefix string, master []byte, mutate func(*run.Manager)) *offHostDaemon {
+func startOffHostDaemon(t *testing.T, name string, config vm.Config, objects *s3.Client, prefix string, master []byte, previous [][]byte, mutate func(*run.Manager)) *offHostDaemon {
 	t.Helper()
 	d := &offHostDaemon{name: name, config: config, logs: &bytes.Buffer{}}
 	log := slog.New(slog.NewTextHandler(&lockedWriter{w: d.logs}, nil))
@@ -88,6 +88,11 @@ func startOffHostDaemon(t *testing.T, name string, config vm.Config, objects *s3
 	keys, err := offhost.NewKeyring(master)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, old := range previous {
+		if err := keys.AddPrevious(old); err != nil {
+			t.Fatal(err)
+		}
 	}
 	d.store = offhost.NewStore(objects, prefix, keys, log)
 	if err := d.store.Probe(context.Background()); err != nil {
@@ -157,6 +162,40 @@ func rate(bytes int64, took time.Duration) string {
 	return fmt.Sprintf("%.0f MiB/s", float64(bytes)/(1<<20)/took.Seconds())
 }
 
+// offHostPoolA gives the first daemon a pool of its own, with a golden
+// image of its own: the same bytes as the standing one, and another
+// snapshot, so nothing of it is on the standing pool's host to begin
+// with. The pool is destroyed and its file removed at cleanup.
+func offHostPoolA(t *testing.T, configB vm.Config) vm.Config {
+	t.Helper()
+	poolFile := envOr("SBX_OFFHOST_POOL_FILE", "/var/tmp/sbx-offhost-pool.img")
+	destroyPool := func() {
+		_ = exec.Command("zpool", "destroy", "-f", offHostPool).Run()
+		_ = os.Remove(poolFile)
+	}
+	destroyPool()
+	t.Cleanup(destroyPool)
+	zfsCommand(t, "truncate", "-s", "8G", poolFile)
+	zfsCommand(t, "zpool", "create", "-O", "compression=lz4", "-O", "volmode=dev", offHostPool, poolFile)
+	zfsCommand(t, "sh", "-c", fmt.Sprintf("zfs send %s | zfs receive %s/golden-src", configB.Golden, offHostPool))
+	sourceSnapshot := offHostPool + "/golden-src@" + strings.SplitN(configB.Golden, "@", 2)[1]
+	zfsCommand(t, "zfs", "clone", sourceSnapshot, offHostPool+"/golden")
+	zfsCommand(t, "zfs", "snapshot", offHostPool+"/golden@v1")
+	ownerA := sha256.Sum256([]byte("teploy-sandbox vmintegration suite, off-host daemon A"))
+	configA := configB
+	configA.Pool = offHostPool
+	configA.Golden = offHostPool + "/golden@v1"
+	configA.Owner = hex.EncodeToString(ownerA[:])
+	configA.Cgroup = vm.DefaultCgroup + "-offhost"
+	configA.UIDBase = vm.DefaultUIDBase + 2*vm.UIDCount
+	configA.Subnet = "10.213.0.0/16"
+	configA.Warm = vm.WarmConfig{}
+	if a, b := zfsCommand(t, "zfs", "get", "-Hp", "-o", "value", "guid", configA.Golden), zfsCommand(t, "zfs", "get", "-Hp", "-o", "value", "guid", configB.Golden); a == b {
+		t.Fatalf("the two golden images are the same snapshot (%s)", a)
+	}
+	return configA
+}
+
 func TestVMOffHost(t *testing.T) {
 	endpoint := os.Getenv("SBX_S3_TEST_ENDPOINT")
 	if endpoint == "" {
@@ -208,38 +247,24 @@ func TestVMOffHost(t *testing.T) {
 	configB := vmTestConfig(t)
 	// Clear what an aborted attempt left, then take the baseline.
 	newVMManager(t, configB, t.TempDir())
+	// The sweep removes what a registry names, and snapshot and base
+	// volumes are named by registries that no longer exist anywhere: a
+	// FAILED earlier run of this suite leaves orphans nothing collects
+	// (the driver's documented stance: those volumes are the caller's).
+	// A fresh host has none; make this one match.
+	for _, kind := range []string{"teploy-snap-", "teploy-base-"} {
+		for _, name := range strings.Fields(zfsCommand(t, "zfs", "list", "-H", "-r", "-o", "name", configB.Pool)) {
+			if idx := strings.Index(name, "/"+kind); idx >= 0 {
+				zfsCommand(t, "zfs", "destroy", "-R", name)
+			}
+		}
+	}
 	baselineB := poolListing(t, configB.Pool)
 
-	// The first daemon gets a pool of its own, with a golden image of its
-	// own: the same bytes as the standing one, and another snapshot, so
-	// nothing of it is on the second daemon's host to begin with.
-	poolFile := envOr("SBX_OFFHOST_POOL_FILE", "/var/tmp/sbx-offhost-pool.img")
-	destroyPool := func() {
-		_ = exec.Command("zpool", "destroy", "-f", offHostPool).Run()
-		_ = os.Remove(poolFile)
-	}
-	destroyPool()
-	defer destroyPool()
-	zfsCommand(t, "truncate", "-s", "8G", poolFile)
-	zfsCommand(t, "zpool", "create", "-O", "compression=lz4", "-O", "volmode=dev", offHostPool, poolFile)
-	zfsCommand(t, "sh", "-c", fmt.Sprintf("zfs send %s | zfs receive %s/golden-src", configB.Golden, offHostPool))
-	sourceSnapshot := offHostPool + "/golden-src@" + strings.SplitN(configB.Golden, "@", 2)[1]
-	zfsCommand(t, "zfs", "clone", sourceSnapshot, offHostPool+"/golden")
-	zfsCommand(t, "zfs", "snapshot", offHostPool+"/golden@v1")
-	ownerA := sha256.Sum256([]byte("teploy-sandbox vmintegration suite, off-host daemon A"))
-	configA := configB
-	configA.Pool = offHostPool
-	configA.Golden = offHostPool + "/golden@v1"
-	configA.Owner = hex.EncodeToString(ownerA[:])
-	configA.Cgroup = vm.DefaultCgroup + "-offhost"
-	configA.UIDBase = vm.DefaultUIDBase + 2*vm.UIDCount
-	configA.Subnet = "10.213.0.0/16"
-	configA.Warm = vm.WarmConfig{}
-	if a, b := zfsCommand(t, "zfs", "get", "-Hp", "-o", "value", "guid", configA.Golden), zfsCommand(t, "zfs", "get", "-Hp", "-o", "value", "guid", configB.Golden); a == b {
-		t.Fatalf("the two golden images are the same snapshot (%s)", a)
-	}
+	configA := offHostPoolA(t, configB)
+	thisBase := configB.Pool + "/teploy-base-" + zfsCommand(t, "zfs", "get", "-Hp", "-o", "value", "guid", configA.Golden)
 
-	a := startOffHostDaemon(t, "daemon-a", configA, objects, prefix, master, nil)
+	a := startOffHostDaemon(t, "daemon-a", configA, objects, prefix, master, nil, nil)
 	aClosed := false
 	defer func() {
 		if !aClosed {
@@ -251,7 +276,7 @@ func TestVMOffHost(t *testing.T) {
 	}()
 	// The second daemon keeps no local copies: every resume on it after a
 	// stop is a restore from the bucket.
-	b := startOffHostDaemon(t, "daemon-b", configB, objects, prefix, master, func(m *run.Manager) { m.LocalCache = run.LocalDrop })
+	b := startOffHostDaemon(t, "daemon-b", configB, objects, prefix, master, nil, func(m *run.Manager) { m.LocalCache = run.LocalDrop })
 	defer func() {
 		for _, current := range b.manager.List() {
 			_ = b.manager.Destroy(ctx, current.ID)
@@ -424,9 +449,6 @@ func TestVMOffHost(t *testing.T) {
 	}
 	aClosed = true
 	zfsCommand(t, "zpool", "destroy", "-f", offHostPool)
-	if err := os.Remove(poolFile); err != nil {
-		t.Fatal(err)
-	}
 	if out, _ := exec.Command("zpool", "list", "-H", "-o", "name").Output(); slices.Contains(strings.Fields(string(out)), offHostPool) {
 		t.Fatal("the first daemon's pool still exists")
 	}
@@ -449,8 +471,11 @@ func TestVMOffHost(t *testing.T) {
 	// Whether the base image is fetched too depends on who won the race:
 	// the winner restored the raced run, base image and all, and a base
 	// image that was received stays.
+	// This test's base image is named by its own golden image's guid
+	// (asked before the first daemon's pool is destroyed below); older
+	// runs' bases, held or not, are not this test's business.
 	hasBase := func() bool {
-		return strings.Contains(strings.Join(poolListing(t, configB.Pool), "\n"), configB.Pool+"/teploy-base-")
+		return slices.Contains(poolListing(t, configB.Pool), thisBase)
 	}
 	withBase := !hasBase()
 	restored := fullStored + incrementalStored
@@ -637,4 +662,244 @@ func sizeOf(objects []s3.Object) int64 {
 		total += object.Size
 	}
 	return total
+}
+
+// The fleet changes its master key: what the old one still protects is
+// re-wrapped, no chunk moves, and a daemon given only the new key then
+// restores and resumes a run stopped under the old one.
+func TestVMKeyRotation(t *testing.T) {
+	endpoint := os.Getenv("SBX_S3_TEST_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("SBX_S3_TEST_ENDPOINT is not set")
+	}
+	if os.Getuid() != 0 {
+		t.Fatal("the vm suite needs root (zfs, /dev/kvm)")
+	}
+	ctx := context.Background()
+	objects, err := s3.New(s3.Config{
+		Endpoint: endpoint, Bucket: os.Getenv("SBX_S3_TEST_BUCKET"), PathStyle: true,
+		Credentials: s3.Credentials{AccessKey: os.Getenv("SBX_S3_TEST_ACCESS_KEY"), SecretKey: os.Getenv("SBX_S3_TEST_SECRET_KEY")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := objects.CreateBucket(ctx); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	prefix := fmt.Sprintf("rot-%d", time.Now().Unix())
+	keysUnder := func(under string) []s3.Object {
+		t.Helper()
+		listed, err := objects.ListAll(ctx, prefix+"/"+under)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return listed
+	}
+	defer func() {
+		for _, object := range keysUnder("") {
+			_ = objects.Delete(ctx, object.Key)
+		}
+	}()
+	oldMaster, newMaster := make([]byte, offhost.KeySize), make([]byte, offhost.KeySize)
+	if _, err := rand.Read(oldMaster); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(newMaster); err != nil {
+		t.Fatal(err)
+	}
+
+	configB := vmTestConfig(t)
+	// This test's daemons keep no warm pool of their own (SBX_VM_WARM
+	// reaches every config otherwise): the pool tests are the pool
+	// coverage, and this suite's host is small.
+	configB.Warm = vm.WarmConfig{}
+	newVMManager(t, configB, t.TempDir())
+	configA := offHostPoolA(t, configB)
+
+	a := startOffHostDaemon(t, "rot-a", configA, objects, prefix, oldMaster, nil, nil)
+	limits := &run.Limits{MemoryMB: 1024, CPUs: 1}
+	created, err := a.manager.Create(ctx, run.CreateRequest{Image: vm.GoldenImage, Limits: limits})
+	if err != nil {
+		t.Fatalf("create: %v\n%s", err, a.logs.String())
+	}
+	a.exec(t, created.ID, `dd if=/dev/urandom of=/work/big.bin bs=1M count=64 status=none && sync`, 5*time.Minute)
+	want := a.digest(t, created.ID)
+	stopped := a.stopDurable(t, created.ID)
+	snapshot := stopped.Remote.Snapshot
+	before := keysUnder("v1/snap/" + snapshot + "/")
+	if len(before) < 3 {
+		t.Fatalf("the snapshot is %d objects", len(before))
+	}
+	// The run stays stopped and durable: closing the daemon leaves its
+	// record exactly as rotation must find it.
+	if err := a.driver.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The fleet's new master, with the old one along to read; one pass.
+	b := startOffHostDaemon(t, "rot-b", configB, objects, prefix, newMaster, [][]byte{oldMaster}, nil)
+	defer func() {
+		for _, current := range b.manager.List() {
+			_ = b.manager.Destroy(ctx, current.ID)
+		}
+		_ = b.driver.Close(context.Background())
+	}()
+	start := time.Now()
+	stats, err := b.manager.RotateRemote(ctx)
+	if err != nil {
+		t.Fatalf("rotate: %v\n%s", err, b.logs.String())
+	}
+	if stats.Manifests < 2 || stats.Records < 1 {
+		t.Fatalf("one pass rewrapped the stop snapshot, the base image and the record: %+v", stats)
+	}
+	t.Logf("rotation pass: %+v in %s", stats, time.Since(start).Round(time.Millisecond))
+	after := keysUnder("v1/snap/" + snapshot + "/")
+	if len(after) != len(before) {
+		t.Fatalf("the rotation moved objects: %d before, %d after", len(before), len(after))
+	}
+	for i := range before {
+		if before[i].Key != after[i].Key || (before[i].Size != after[i].Size && !strings.HasSuffix(before[i].Key, "manifest")) {
+			t.Fatalf("the rotation changed %s", before[i].Key)
+		}
+	}
+
+	// The old master is gone for good: a daemon given only the new one
+	// adopts the run and resumes it, restoring the snapshot from the
+	// bucket (its own golden image is a different snapshot).
+	if err := b.driver.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c := startOffHostDaemon(t, "rot-c", configB, objects, prefix, newMaster, nil, nil)
+	defer c.driver.Close(context.Background())
+	if _, err := c.manager.SyncRemote(ctx); err != nil {
+		t.Fatalf("sync: %v\n%s", err, c.logs.String())
+	}
+	start = time.Now()
+	resumed, err := c.manager.Resume(ctx, created.ID, 0)
+	if err != nil {
+		t.Fatalf("resume under the new master only: %v\n%s", err, c.logs.String())
+	}
+	took := time.Since(start)
+	if got := c.digest(t, resumed.ID); got != want {
+		t.Fatalf("the resumed run's bytes differ: %s != %s", got, want)
+	}
+	t.Logf("resume from the bucket under the new master only: %s", took.Round(time.Millisecond))
+	_ = c.manager.Destroy(ctx, resumed.ID)
+}
+
+// A caller snapshot is durable, listed, bootable from its universal ID on
+// a host that never held it, and deletable by that ID from there.
+func TestVMCallerSnapshots(t *testing.T) {
+	endpoint := os.Getenv("SBX_S3_TEST_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("SBX_S3_TEST_ENDPOINT is not set")
+	}
+	if os.Getuid() != 0 {
+		t.Fatal("the vm suite needs root (zfs, /dev/kvm)")
+	}
+	ctx := context.Background()
+	objects, err := s3.New(s3.Config{
+		Endpoint: endpoint, Bucket: os.Getenv("SBX_S3_TEST_BUCKET"), PathStyle: true,
+		Credentials: s3.Credentials{AccessKey: os.Getenv("SBX_S3_TEST_ACCESS_KEY"), SecretKey: os.Getenv("SBX_S3_TEST_SECRET_KEY")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := objects.CreateBucket(ctx); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	prefix := fmt.Sprintf("snap-%d", time.Now().Unix())
+	keysUnder := func(under string) []s3.Object {
+		t.Helper()
+		listed, err := objects.ListAll(ctx, prefix+"/"+under)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return listed
+	}
+	defer func() {
+		for _, object := range keysUnder("") {
+			_ = objects.Delete(ctx, object.Key)
+		}
+	}()
+	master := make([]byte, offhost.KeySize)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+
+	configB := vmTestConfig(t)
+	// This test's daemons keep no warm pool of their own (SBX_VM_WARM
+	// reaches every config otherwise): the pool tests are the pool
+	// coverage, and this suite's host is small.
+	configB.Warm = vm.WarmConfig{}
+	newVMManager(t, configB, t.TempDir())
+	configA := offHostPoolA(t, configB)
+
+	a := startOffHostDaemon(t, "snap-a", configA, objects, prefix, master, nil, nil)
+	defer func() {
+		for _, current := range a.manager.List() {
+			_ = a.manager.Destroy(context.Background(), current.ID)
+		}
+		_ = a.driver.Close(context.Background())
+	}()
+	created, err := a.manager.Create(ctx, run.CreateRequest{Image: vm.GoldenImage, Limits: &run.Limits{MemoryMB: 1024, CPUs: 1}})
+	if err != nil {
+		t.Fatalf("create: %v\n%s", err, a.logs.String())
+	}
+	a.exec(t, created.ID, `dd if=/dev/urandom of=/work/big.bin bs=1M count=64 status=none && sync`, 5*time.Minute)
+	want := a.digest(t, created.ID)
+
+	// The snapshot, durable before the call answers.
+	ref, remote, err := a.manager.SnapshotRemote(ctx, created.ID)
+	if err != nil || remote == nil {
+		t.Fatalf("snapshot: %+v %v\n%s", remote, err, a.logs.String())
+	}
+	if remote.State != run.RemoteDurable || remote.ID == "" {
+		t.Fatalf("the snapshot is not durable: %+v", remote)
+	}
+	listed, err := a.manager.RemoteSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != remote.ID || listed[0].Run != created.ID || listed[0].StoredBytes == 0 || listed[0].CreatedAt.IsZero() {
+		t.Fatalf("the listing is the snapshot: %+v", listed)
+	}
+	t.Logf("caller snapshot %s: %s stored, listed with %d others", remote.ID, mib(remote.StoredBytes), len(listed)-1)
+
+	// Another pool entirely boots it by ID.
+	b := startOffHostDaemon(t, "snap-b", configB, objects, prefix, master, nil, nil)
+	defer func() {
+		for _, current := range b.manager.List() {
+			_ = b.manager.Destroy(context.Background(), current.ID)
+		}
+		_ = b.driver.Close(context.Background())
+	}()
+	booted, err := b.manager.Create(ctx, run.CreateRequest{Image: "snapshot:" + remote.ID, Limits: &run.Limits{MemoryMB: 1024, CPUs: 1}})
+	if err != nil {
+		t.Fatalf("create from the snapshot's universal ID: %v\n%s", err, b.logs.String())
+	}
+	if got := b.digest(t, booted.ID); got != want {
+		t.Fatalf("the booted copy's bytes differ: %s != %s", got, want)
+	}
+
+	// And deletes it by ID, from the host that never took it. The birth
+	// host keeps its local copy until it is deleted there, by its ref.
+	if err := b.manager.DeleteSnapshot(ctx, "snapshot:"+remote.ID); err != nil {
+		t.Fatalf("delete by universal ID: %v", err)
+	}
+	if keys := keysUnder("v1/snap/" + remote.ID + "/"); len(keys) != 0 {
+		t.Fatalf("the snapshot is still in the bucket: %v", keys)
+	}
+	if listed, _ := a.manager.RemoteSnapshots(ctx); len(listed) != 0 {
+		t.Fatalf("the listing after the delete: %v", listed)
+	}
+	if has, _ := a.service.HasLocal(ctx, ref); !has {
+		t.Fatal("the delete reached into the host that took the snapshot")
+	}
+	if err := a.manager.DeleteSnapshot(ctx, ref); err != nil {
+		t.Fatalf("delete by the birth host's ref: %v", err)
+	}
+	if has, _ := a.service.HasLocal(ctx, ref); has {
+		t.Fatal("the snapshot is still on the host that took it")
+	}
 }

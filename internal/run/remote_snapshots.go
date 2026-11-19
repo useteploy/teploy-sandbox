@@ -145,7 +145,7 @@ func (m *Manager) finishSnapshotDeletes(ctx context.Context) {
 	}
 	m.mu.Unlock()
 	for _, note := range due {
-		if err := m.deleteSnapshotHeld(ctx, note.Ref, true); err != nil {
+		if err := m.deleteSnapshotHeld(ctx, note.Ref, m.imageHolder(note.Ref) != "", true); err != nil {
 			m.log.Error("a snapshot delete is owed to remote storage; retrying", "image", note.Ref, "error", err)
 			continue
 		}
@@ -159,10 +159,12 @@ func (m *Manager) finishSnapshotDeletes(ctx context.Context) {
 }
 
 // deleteSnapshotHeld removes a snapshot from remote storage and then
-// from this host. tolerateGone (the upkeep's completion) treats a
-// snapshot that is nowhere at all as deleted; a caller's own delete
-// still hears the driver's no-such-snapshot error.
-func (m *Manager) deleteSnapshotHeld(ctx context.Context, ref string, tolerateGone bool) error {
+// from this host. keepLocal leaves the local copy alone: a run here
+// booted from it and holds it, and it goes when that run does.
+// tolerateGone (the upkeep's completion) treats a snapshot that is
+// nowhere at all as deleted; a caller's own delete still hears the
+// driver's no-such-snapshot error.
+func (m *Manager) deleteSnapshotHeld(ctx context.Context, ref string, keepLocal, tolerateGone bool) error {
 	remote, err := m.OffHost.HasRemote(ctx, ref)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrRemoteUnavailable, err)
@@ -176,11 +178,11 @@ func (m *Manager) deleteSnapshotHeld(ctx context.Context, ref string, tolerateGo
 	if err != nil {
 		return err
 	}
-	if local {
+	if local && !keepLocal {
 		if err := m.runtime.RemoveImage(ctx, ref); err != nil {
 			return err
 		}
-	} else if !remote && !tolerateGone {
+	} else if !remote && !local && !tolerateGone {
 		// A caller's own delete of something that is nowhere at all
 		// still hears the driver's no-such-snapshot answer.
 		return m.runtime.RemoveImage(ctx, ref)

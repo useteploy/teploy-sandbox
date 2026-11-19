@@ -926,9 +926,23 @@ func (m *Manager) DeleteSnapshot(ctx context.Context, ref string) error {
 	}
 	// A snapshot the registry itself holds (a stopped run's filesystem, or
 	// the image a resumed or forked run booted from) is not the caller's
-	// to delete: it goes with the run that owns it.
+	// to delete: it goes with the run that owns it. One exception, the
+	// same model the create path uses: a run that booted from a CALLER's
+	// snapshot holds only a local copy of something that is durable in
+	// remote storage. The bucket copy is the caller's to delete now; the
+	// local copy is the run's to release when it ends.
 	if holder := m.imageHolder(ref); holder != "" {
-		return fmt.Errorf("%w: snapshot %s belongs to run %s; delete the run instead", ErrBusy, ref, holder)
+		if m.OffHost == nil {
+			return fmt.Errorf("%w: snapshot %s belongs to run %s; delete the run instead", ErrBusy, ref, holder)
+		}
+		remote, err := m.OffHost.HasRemote(ctx, ref)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrRemoteUnavailable, err)
+		}
+		if !remote {
+			// Its only copy is the one the run holds.
+			return fmt.Errorf("%w: snapshot %s belongs to run %s; delete the run instead", ErrBusy, ref, holder)
+		}
 	}
 	if m.OffHost == nil {
 		if err := m.runtime.RemoveImage(ctx, ref); err != nil {
@@ -964,7 +978,8 @@ func (m *Manager) DeleteSnapshot(ctx context.Context, ref string) error {
 	// With remote storage a snapshot may be here, there, or both. The
 	// remote copy goes first: a failure then leaves the local one, and
 	// the delete can be asked for again — or the upkeep finishes it.
-	if err := m.deleteSnapshotHeld(ctx, ref, false); err != nil {
+	// A local copy a run here booted from stays with that run.
+	if err := m.deleteSnapshotHeld(ctx, ref, m.imageHolder(ref) != "", false); err != nil {
 		m.persist()
 		return err
 	}

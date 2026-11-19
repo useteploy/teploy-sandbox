@@ -1220,6 +1220,24 @@ func TestACallerSnapshotThatFailedToUploadIsRetried(t *testing.T) {
 	if has, _ := a.service.HasLocal(bg, ref); !has {
 		t.Fatal("the delete reached into a host it was not asked of")
 	}
+	// A run here booted from the snapshot: the bucket copy was still the
+	// caller's to delete, and the local copy is the run's to release.
+	booter, err := a.manager.Create(bg, run.CreateRequest{Image: "snapshot:" + remote.ID})
+	if err != nil {
+		t.Fatalf("boot the snapshot on its birth host: %v", err)
+	}
+	if has, _ := a.service.HasLocal(bg, ref); !has {
+		t.Fatal("the booted run's copy is missing")
+	}
+	if has, _ := a.store.HasSnapshot(bg, remote.ID); has {
+		t.Fatal("the snapshot came back to remote storage")
+	}
+	if err := a.manager.Destroy(bg, booter.ID); err != nil {
+		t.Fatal(err)
+	}
+	if has, _ := a.service.HasLocal(bg, ref); !has {
+		t.Fatal("the birth host's own copy went with a run that merely booted it")
+	}
 	if err := a.manager.DeleteSnapshot(bg, ref); err != nil {
 		t.Fatalf("delete by the birth host's ref: %v", err)
 	}

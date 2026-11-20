@@ -61,9 +61,55 @@ type Machine interface {
 	AddNet(ctx context.Context, tap *os.File, mac string) error
 	// Exited is closed once the VM process is gone.
 	Exited() <-chan struct{}
+	// Exit is how the VM process ended. It is only meaningful once
+	// Exited is closed.
+	Exit() MachineExit
 	// Diagnostics is what the VM left behind for a human: the end of its
 	// serial console and of the hypervisor's own output.
 	Diagnostics() string
+}
+
+// MachineExit is how a VM process ended: killed by Signal, or, when
+// Signal is zero, exited by itself with Code.
+type MachineExit struct {
+	Signal syscall.Signal
+	Code   int
+}
+
+// KilledFromOutside reports whether the process was ended by SIGKILL:
+// the kernel's OOM killer (the host's or the VM's cgroup's), an operator's
+// kill -9, or the daemon's own Kill. It is never how the process ends
+// itself: a guest that powers off or panics, or a hypervisor that gives
+// up, exits with a code, and a system call outside a seccomp filter is
+// SIGSYS.
+func (e MachineExit) KilledFromOutside() bool { return e.Signal == syscall.SIGKILL }
+
+func (e MachineExit) String() string {
+	if e.Signal != 0 {
+		return "killed by " + e.Signal.String()
+	}
+	return "exit code " + strconv.Itoa(e.Code)
+}
+
+// exitOf reads how a waited-for process ended.
+func exitOf(state *os.ProcessState) MachineExit {
+	if state == nil {
+		return MachineExit{Code: -1}
+	}
+	if status, ok := state.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return MachineExit{Signal: status.Signal()}
+	}
+	return MachineExit{Code: state.ExitCode()}
+}
+
+// hypervisorRefusal is an answer from a hypervisor that is alive and said
+// no, as opposed to one that could not be reached at all.
+type hypervisorRefusal struct {
+	action, status, body string
+}
+
+func (e *hypervisorRefusal) Error() string {
+	return fmt.Sprintf("hypervisor %s: %s: %s", e.action, e.status, e.body)
 }
 
 // Hypervisor starts VMs and finds the ones a previous daemon life left.
@@ -253,6 +299,8 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 	}}
 	go func() {
 		_ = cmd.Wait()
+		// Before the close, which is what makes it visible.
+		machine.exit = exitOf(cmd.ProcessState)
 		close(machine.exited)
 	}()
 	return machine, nil
@@ -264,8 +312,10 @@ type chMachine struct {
 	cell    *cell
 	process *os.Process
 	exited  chan struct{}
-	agent   *guest.Client
-	api     *http.Client
+	// exit is set once, before exited is closed.
+	exit  MachineExit
+	agent *guest.Client
+	api   *http.Client
 	// serial is the end of the guest's console, output the end of what
 	// the hypervisor itself printed.
 	serial, output *tailBuffer
@@ -275,6 +325,7 @@ type chMachine struct {
 
 func (m *chMachine) Agent() Agent                     { return m.agent }
 func (m *chMachine) Exited() <-chan struct{}          { return m.exited }
+func (m *chMachine) Exit() MachineExit                { return m.exit }
 func (m *chMachine) Pause(ctx context.Context) error  { return m.call(ctx, "vm.pause") }
 func (m *chMachine) Resume(ctx context.Context) error { return m.call(ctx, "vm.resume") }
 
@@ -291,7 +342,7 @@ func (m *chMachine) call(ctx context.Context, action string) error {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return fmt.Errorf("hypervisor %s: %s: %s", action, resp.Status, strings.TrimSpace(string(body)))
+		return &hypervisorRefusal{action: action, status: resp.Status, body: strings.TrimSpace(string(body))}
 	}
 	return nil
 }
@@ -352,7 +403,7 @@ func (m *chMachine) AddNet(ctx context.Context, tap *os.File, mac string) error 
 	defer resp.Body.Close()
 	answer, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("hypervisor vm.add-net: %s: %s", resp.Status, strings.TrimSpace(string(answer)))
+		return &hypervisorRefusal{action: "vm.add-net", status: resp.Status, body: strings.TrimSpace(string(answer))}
 	}
 	return nil
 }

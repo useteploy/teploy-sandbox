@@ -54,12 +54,6 @@ const RootUser = "root"
 // project's own image. The manager falls back to root on it.
 var ErrNoSuchUser = errors.New("image has no such user")
 
-// ErrWarmVMDead is Create's answer when the pre-booted VM a warm pool
-// handed the create died under its claim: nothing of the run was
-// consumed, and the create is tried again at once with a VM booted for
-// it (which the manager does, once).
-var ErrWarmVMDead = errors.New("the pre-booted VM died as its run claimed it")
-
 // Runtime is the container boundary. DockerRuntime shells out to the
 // docker CLI (the family's approach — no SDK dep, CGO_ENABLED=0 stays
 // trivial); tests use a fake.

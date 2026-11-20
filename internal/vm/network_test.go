@@ -136,6 +136,11 @@ func (f *fakeNet) sys() netSys {
 					return nil, gone("ip netns del")
 				}
 				delete(f.spaces, args[2])
+			case space != nil && name == "ip" && has(args, "link", "del"):
+				if !space.links[args[2]] {
+					return nil, &CommandError{Command: "ip link", Stderr: `Cannot find device "` + args[2] + `"`, Err: errors.New("exit status 1")}
+				}
+				delete(space.links, args[2])
 			case name == "ip" && has(args, "link", "del"):
 				if !f.links[args[2]] {
 					return nil, &CommandError{Command: "ip link", Stderr: `Cannot find device "` + args[2] + `"`, Err: errors.New("exit status 1")}
@@ -831,6 +836,57 @@ func TestDetachRevokesFirstAndCanBeRepeated(t *testing.T) {
 	fake.index(t, "conntrack -D -s 10.209.0.2")
 }
 
+// A VM that died under its claim is replaced under the same name: its
+// device goes, and an allowlist run's place stays, sealed, with its
+// proxy's listener in it, for the replacement's device on the same port.
+// An open run's place goes entirely, as with Detach.
+func TestUnplugKeepsAnAllowlistRunsPlaceForTheNextVM(t *testing.T) {
+	network, fake := startedNetwork(t, nil)
+	_, listener, port := attachAllowlist(t, network, "run-a")
+	ns, tap := network.attached["run-a"].ns, network.attached["run-a"].tap
+	// The hypervisor is gone, and its tap with it.
+	fake.mu.Lock()
+	delete(fake.spaces[ns].links, tap)
+	fake.mu.Unlock()
+	must(t, network.Unplug(bg, "run-a"))
+	space := fake.space(ns)
+	if space == nil {
+		t.Fatal("unplug removed the run's namespace, and its proxy's listener with it")
+	}
+	if strings.Contains(space.rules, " accept") || strings.Contains(space.rules, "hook ingress") {
+		t.Fatalf("an unplugged place is not sealed:\n%s", space.rules)
+	}
+	if a := network.attached["run-a"]; a == nil || a.attached || a.listener == nil {
+		t.Fatalf("the place after unplug: %+v", a)
+	}
+	// The replacement's device, on the same proxy.
+	_, err := network.Attach(bg, "run-a", run.NetworkAllowlist, port)
+	must(t, err)
+	// A tap still there is removed; a second unplug has nothing to do.
+	must(t, network.Unplug(bg, "run-a"))
+	if fake.space(ns).links[tap] {
+		t.Fatal("unplug left the tap")
+	}
+	must(t, network.Unplug(bg, "run-a"))
+	// The run never got its replacement: closing the proxy gives the
+	// place back, as for a run that never started.
+	must(t, listener.Close())
+	if network.attached["run-a"] != nil || fake.space(ns) != nil {
+		t.Fatal("the place outlived its proxy")
+	}
+
+	_, err = network.Attach(bg, "run-b", run.NetworkOpen, 0)
+	must(t, err)
+	nsB := network.attached["run-b"].ns
+	must(t, network.Unplug(bg, "run-b"))
+	if network.attached["run-b"] != nil || fake.space(nsB) != nil {
+		t.Fatal("an open run's place survived unplug")
+	}
+	_, err = network.Attach(bg, "run-b", run.NetworkOpen, 0)
+	must(t, err)
+	must(t, network.Unplug(bg, "nobody"))
+}
+
 func TestAnAddressIsNotReusedAtOnce(t *testing.T) {
 	network, _ := startedNetwork(t, func(c *Config) { c.Subnet = "198.18.4.0/28" }) // thirteen addresses
 	first, err := network.Attach(bg, "run-a", run.NetworkOpen, 0)
@@ -1388,6 +1444,12 @@ type fakeNetwork struct {
 	detachErr error
 	swept     int
 	dir       string
+	// strict has the fake keep places as the real network does: an
+	// allowlist device only where a proxy listens (places, made by the
+	// fakeEgress that has this network), a place Detach removes is gone
+	// with its listener, and a name has one device at a time.
+	strict bool
+	places map[string]bool
 }
 
 func newFakeNetwork(t *testing.T) *fakeNetwork {
@@ -1408,6 +1470,14 @@ func (n *fakeNetwork) Attach(_ context.Context, name, tier string, proxyPort int
 	defer n.mu.Unlock()
 	if n.attachErr != nil {
 		return nil, n.attachErr
+	}
+	if n.strict {
+		if _, ok := n.attached[name]; ok {
+			return nil, fmt.Errorf("%s already has a network device", name)
+		}
+		if tier == run.NetworkAllowlist && !n.places[name] {
+			return nil, fmt.Errorf("the proxy of %s does not listen in the run's own network namespace", name)
+		}
 	}
 	file, err := os.CreateTemp(n.dir, "tap")
 	if err != nil {
@@ -1431,7 +1501,34 @@ func (n *fakeNetwork) Detach(_ context.Context, name string) error {
 		delete(n.attached, name)
 		n.history = append(n.history, "detach "+name)
 	}
+	delete(n.places, name)
 	return nil
+}
+
+func (n *fakeNetwork) Unplug(ctx context.Context, name string) error {
+	n.mu.Lock()
+	guest, ok := n.attached[name]
+	if ok && guest.Tier == run.NetworkAllowlist {
+		delete(n.attached, name)
+		n.history = append(n.history, "unplug "+name)
+	}
+	n.mu.Unlock()
+	if ok && guest.Tier != run.NetworkAllowlist {
+		return n.Detach(ctx, name)
+	}
+	return nil
+}
+
+// place is what the proxy's Listen does to the network: the run's place,
+// with a listener in it.
+func (n *fakeNetwork) place(name string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.places == nil {
+		n.places = map[string]bool{}
+	}
+	n.places[name] = true
+	n.history = append(n.history, "listen "+name)
 }
 
 func (n *fakeNetwork) Sweep(context.Context) (int, error) { n.swept++; return 0, nil }
@@ -1443,6 +1540,9 @@ type fakeEgress struct {
 	opened map[string][]string
 	closed []string
 	next   int
+	// network, when set, is given the run's place as the real proxy's
+	// listener makes it.
+	network *fakeNetwork
 }
 
 func (e *fakeEgress) OpenFor(runID string, extra []string) (string, error) {
@@ -1453,6 +1553,9 @@ func (e *fakeEgress) OpenFor(runID string, extra []string) (string, error) {
 	}
 	e.opened[runID] = extra
 	e.next++
+	if e.network != nil {
+		e.network.place(run.ContainerName(runID))
+	}
 	return fmt.Sprintf("http://run:secret%d@10.209.0.1:%d", e.next, 40000+e.next), nil
 }
 

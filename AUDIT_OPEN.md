@@ -1639,14 +1639,23 @@ two minutes; it is six creates now.
 
 - **A create whose pool VM dies under it fails.** It is not retried
   with a VM booted for it; the caller gets a 500 and may ask again. The
-  window is the claim itself.
+  window is the claim itself. (Closed for a VM killed from outside by
+  the 2026-11-18 entry below; a VM that dies of its claim still fails
+  its create, by design.)
 - **One caller can keep the pool empty.** Deferred to Cloud, by
   design, not fixable in the daemon: the daemon's one bearer token
   cannot tell callers apart, so there is nothing to be fair between —
   any limit it invented would throttle every caller together. What the
-  churner costs the others is bounded at exactly the no-pool baseline
-  (a cold boot), and the boot backoffs already keep the host from
-  being spent on endless refills. Per-caller fairness is a start-rate
+  churner costs the other callers is bounded at exactly the no-pool
+  baseline (a cold boot). What it costs the host is not bounded in
+  rate: the pool's boots are bounded in number at once
+  (`--vm-warm-boots`, counting creates' own boots) and by the memory
+  headroom, and paused with a doubling backoff after failed boots and
+  after VMs that die (waiting in the pool or, since the 2026-11-18 entry
+  below, as a create claims them), but a claim that succeeds is
+  followed by a refill boot at once, so a caller that keeps creating
+  and destroying runs has the host boot one VM per create, as fast as
+  that many boots at once can go. Per-caller fairness is a start-rate
   limit, which needs caller identity, which Cloud has (limits per
   organization: concurrent runs, starts per minute — the platform
   plan's Phase 5).
@@ -1661,27 +1670,78 @@ two minutes; it is six creates now.
 - **Not run:** x86-64, bare metal, and a hostile hypervisor against
   `AddNet` on a live VM (the bound is unit-tested on a real socket).
 
-## 2026-11-18 — VM driver: a create whose pool VM dies under it boots its own
+## 2026-11-18 — VM driver: a create whose pool VM is killed under it boots its own
 
-The warm-pool review's open item, closed: a create that claimed a pool VM
-and had it die mid-claim no longer fails — the driver discards the dead
-VM (everything of the run's with it) and answers ErrWarmVMDead, and the
-manager serves the create again at once with a VM booted for it, once.
-The create is not made to wait for the pool to have another, and the
-caller sees nothing but a slightly slower create.
+The warm-pool review's open item, closed for the case it was about: a
+create that claimed a pool VM whose hypervisor was then killed from
+outside (SIGKILL: the host's or the VM cgroup's OOM killer, an
+operator's `kill -9`) no longer fails. The fallback is inside
+`Driver.Create`, under the admission the create already holds, so no
+other create can take its slot in between and it never returns to the
+pool: the dead VM is given back (`unclaim`: its process is killed and
+reaped, which releases its cgroup, UID and device node; its network
+device is unplugged; its volume is destroyed), and the create continues
+on the cold-boot path with a VM booted for it under the run's own name.
+Once: the VM booted for it is not from the pool, and if that one dies
+too the create fails like any other. The manager-level retry the first
+version of this change had is gone: it went back through `Create`, which
+took the pool's next VM (two dying pool VMs made a 500), and it gave its
+admission up and took it again (a concurrent create could take the slot
+in between and make a 503).
 
-The line is drawn at death, not at any claim failure: a guest whose
-setup fails while its VM still lives (an image without iproute2, say)
-still fails the create as before — a cold boot of the same golden image
-would fail the same way, and pretending otherwise would only add the
-boot's cost to the error. The check runs before the discard, because a
-discard kills the machine and a machine the discard killed is not one
-that died under its claim.
+The line is drawn at how the VM died, not at any claim failure:
 
-Verified on the fakes: a pool VM killed inside its guest setup — the
-register's exact window, staged deterministically through the fake
-agent's setup hook — yields a working run from a VM booted for it, the
-dead VM's volume gone, the pool refilled; a claim that fails with the
-VM alive still fails the create and destroys the pool VM (unchanged,
-existing test). Race-clean. Not yet re-run live: it goes with the
-validation box's first suite run.
+- **Killed from outside: replaced.** Only `SIGKILL`, read from the
+  hypervisor's wait status (`MachineExit.KilledFromOutside`). It is no
+  fault of the run's and would not happen to a VM booted for it.
+- **Died of its claim: not replaced.** A hypervisor killed by a seccomp
+  filter (`SIGSYS`: on the hot-plug path of an architecture whose list
+  lacks a call, say), a guest that panics bringing up the hot-plugged
+  device or powers off (the hypervisor exits with a code): a VM booted
+  for the run would die the same way, and replacing it would turn one
+  fast failure into two slow ones. The create fails, with the exit and
+  the hypervisor's diagnostics in the log.
+- **Alive: not replaced**, as before (an image without iproute2, say).
+- **The caller has given up: not replaced.** Nothing is booted for a
+  create whose context is done.
+
+Every death at a claim now counts in the pool's backoff, as a death in
+the pool does, and the count is reset when a claim succeeds, not when a
+VM is taken. Before, `take` reset the count and the pool's watcher
+ignores a claimed VM, so a pool whose every VM died of its claim never
+paused: five creates made eleven boots and all failed.
+
+A dead hypervisor's sockets fail at once, but its exit is only seen once
+its process has been reaped and its output pipes drained (the daemon
+waits up to 5 s for those). A pool VM whose claim failed because its
+process did not answer at all (`vmUnreachable`: the vsock or API socket
+failed, as opposed to an exit code from the guest or an HTTP answer from
+the hypervisor) is given up to 1.5 s, under the cleanup deadline, to be
+seen gone before it is judged alive.
+
+An allowlist run keeps its place in the network across the replacement:
+its namespace holds the listener of its proxy, which the manager opened
+for the run and still holds, so the dead VM's device is unplugged
+(`Network.Unplug`: the namespace is sealed again and the tap removed if
+anything still holds it) and the replacement's device is attached on
+the same proxy. An open run's place has no listener and goes entirely,
+as with `Detach`; the replacement gets a new one. The first failure is
+logged with its exit, the hypervisor's diagnostics and the claim's
+error before the replacement boots.
+
+Verified on the fakes only, race-clean: on none, allowlist and open, a
+pool VM killed inside its guest setup gives a working run on a VM booted
+for it, the dead VM killed (its confinement released) and its volume
+gone, an allowlist run's one proxy kept and its device moved to the new
+VM, an open run's place replaced; two pool VMs killed under claims, and
+the create still succeeds without taking the second; a VM whose exit is
+seen 300 ms after its sockets fail is still replaced; a `SIGSYS` or a
+guest's own exit fails the create without a boot, and two of them in a
+row leave the pool with two deaths and a paused refill; a given-up
+create boots nothing. The wait status is read from real processes in a
+unit test, and `Unplug` against the fake host network. **It has not run
+against a real hypervisor**: no live host was available for this
+change, and `TestVMWarmPoolRaces` (which kills pool hypervisors with
+`SIGKILL` as creates take them, and accepts a create that succeeds or
+fails) is the live check that goes with the validation host's next
+suite run.

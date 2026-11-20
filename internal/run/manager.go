@@ -352,14 +352,6 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		OnExpire:  onExpire,
 	}
 	created, err := m.launch(ctx, boot, run)
-	if errors.Is(err, ErrWarmVMDead) {
-		// The pre-booted VM this create was given died under its claim;
-		// nothing of it survives, and nothing of the run was consumed.
-		// One VM booted for the run, once — the create is not made to
-		// wait for the pool to have another.
-		m.log.Info("the pool's VM died under its create; booting one for the run", "id", boot.id, "image", req.Image)
-		created, err = m.launch(ctx, boot, run)
-	}
 	if err != nil {
 		return nil, err
 	}

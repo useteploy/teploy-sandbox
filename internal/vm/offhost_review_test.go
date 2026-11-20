@@ -840,12 +840,16 @@ func TestAFastClockDoesNotReapEarly(t *testing.T) {
 	created := a.startRun(t, payload(t, 200))
 	stopped := a.stop(t, created.ID)
 	kept := stopped.RetainUntil.Sub(*stopped.StoppedAt)
-	// host-b's clock is five days ahead.
+	// host-b's clock is five days ahead. (One clock function, moved
+	// through an atomic: the reaper starts the upkeep in the background,
+	// which reads the clock too.)
 	skew := 5 * 24 * time.Hour
-	b.manager.SetClock(func() time.Time { return time.Now().Add(skew) })
+	var ahead atomic.Int64
+	ahead.Store(int64(skew))
+	b.manager.SetClock(func() time.Time { return time.Now().Add(time.Duration(ahead.Load())) })
 	b.sync(t)
 	// One real day later: nowhere near the run's retention.
-	b.manager.SetClock(func() time.Time { return time.Now().Add(skew + 24*time.Hour) })
+	ahead.Store(int64(skew + 24*time.Hour))
 	if reaped := b.manager.Reap(bg); reaped != 0 {
 		t.Fatalf("a daemon whose clock is %s ahead reaped a run stopped a day ago (kept for %s)", skew, kept)
 	}
@@ -853,7 +857,7 @@ func TestAFastClockDoesNotReapEarly(t *testing.T) {
 		t.Fatalf("the run's record: %+v, %v", record, err)
 	}
 	// And it does reap, once it has itself seen the run for that long.
-	b.manager.SetClock(func() time.Time { return time.Now().Add(skew + kept + time.Minute) })
+	ahead.Store(int64(skew + kept + time.Minute))
 	if reaped := b.manager.Reap(bg); reaped != 1 {
 		t.Fatalf("reaped %d runs after the retention passed on its own clock", reaped)
 	}
@@ -1018,5 +1022,60 @@ func TestHostCommandsAreStartedWithoutTheDaemonsSecrets(t *testing.T) {
 	}
 	if strings.Contains(streamed.String(), "the master key") || strings.Contains(streamed.String(), "the secret") {
 		t.Fatal("a streaming host command inherited the daemon's secrets")
+	}
+}
+
+// Review R4. A registry written by a binary that does not know the
+// remote fields comes back without them: a stopped run with no record
+// of the generation this daemon wrote. Publishing it then met the
+// daemon's own newest record, called that a takeover, and the run could
+// never be resumed again.
+func TestARegistryThatLostItsRemoteFieldsRecovers(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	a, b := newHost(t, bucket, "host-a", nil), newHost(t, bucket, "host-b", nil)
+	created := a.startRun(t, payload(t, 200))
+	a.stop(t, created.ID)
+	if _, err := a.manager.Resume(bg, created.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	a.write(t, created.ID, []byte("written under the older binary"))
+	// The older binary stops the run: no upload, no record.
+	bucket.SetFail(func(op, key string) error { return errors.New("not this binary's business") })
+	if _, err := a.manager.Stop(bg, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	bucket.SetFail(nil)
+	var file struct {
+		Version int                      `json:"version"`
+		Runs    []map[string]interface{} `json:"runs"`
+	}
+	raw, err := os.ReadFile(filepath.Join(a.stateDir, "runs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range file.Runs {
+		for _, field := range []string{"remote", "base", "remoteGen", "remoteHeld", "remoteKey"} {
+			delete(entry, field)
+		}
+	}
+	raw, _ = json.Marshal(file)
+	if err := os.WriteFile(filepath.Join(a.stateDir, "runs.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The daemon is upgraded again.
+	again := a.restart(t)
+	again.manager.Maintain(bg)
+	if got := again.get(t, created.ID); got.Remote == nil || got.Remote.State != run.RemoteDurable {
+		t.Fatalf("after the upgrade the run is %+v", got.Remote)
+	}
+	b.sync(t)
+	if _, err := b.manager.Resume(bg, created.ID, 0); err != nil {
+		t.Fatalf("resume elsewhere: %v", err)
+	}
+	if got := b.read(t, created.ID); string(got) != "written under the older binary" {
+		t.Fatalf("the resumed run has %q", got)
 	}
 }

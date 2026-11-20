@@ -1745,3 +1745,62 @@ change, and `TestVMWarmPoolRaces` (which kills pool hypervisors with
 `SIGKILL` as creates take them, and accepts a create that succeeds or
 fails) is the live check that goes with the validation host's next
 suite run.
+
+## 2026-11-20 — VM driver: independent review of the claim's fallback
+
+A sixth review, of the change above, by reading and on the fakes; again
+with no live hypervisor.
+
+Fixed:
+
+- **A rollback ran under a deadline that began with the create.**
+  `Create` made its 30 s cleanup context before it booted or claimed
+  anything, so a rollback had whatever the boot and the claim had left
+  of it. With a boot longer than that (the default `BootTimeout` is
+  120 s), or with the second boot the fallback adds, a VM whose claim
+  failed was killed under a deadline already passed: nothing of it was
+  released there, and it came back as a leftover for the reaper, which
+  did converge. Older than the fallback (a slow cold boot had it too),
+  made more likely by it. The deadline now starts where the claim
+  failed.
+- **The fake machine's exit could be read before it was reaped**, which
+  a real wait status cannot; and the branch "not seen gone after the
+  grace" had no test. Both closed in the tests.
+
+Read and found sound, not proved on a host:
+
+- **Nothing of the dead VM is left when the replacement boots.**
+  `unclaim` runs only once the process has been waited for, and `Kill`
+  then removes the cgroup (which must be empty to go) before the UID,
+  device node and socket directory are given up. The hypervisor is the
+  first process of its own PID namespace, so nothing of its tree
+  outlives it holding the tap, and the daemon closed its own copy at
+  the hand-over. The replacement has another name, so another volume,
+  cgroup, device node and socket directory; a UID given out again is
+  checked against one cell's sockets only.
+- **A re-attached allowlist place is a fresh one.** After `Unplug` the
+  namespace has the sealed ruleset (which the watch's baseline is then
+  of), its loopback address and its listener, exactly as after
+  `Listen`; the tap's filter, queueing discipline, route and neighbour
+  entry went with the tap, and `Attach` makes all of them again before
+  the new tap is up. The namespace's connection tracker is not flushed:
+  nothing reads its state (the proxy's port is admitted by address and
+  device, and the connection cap counts from the new ruleset).
+- **A VM cannot have itself replaced.** No run's code is in a pool VM
+  before its claim succeeds, and a process cannot `SIGKILL` the first
+  process of its own PID namespace, itself included. What can is the
+  kernel: a pool VM that reaches its cgroup's memory limit at the
+  hot-plug would be replaced once and counted.
+- **A caller cannot drive the backoff.** A death is counted only when
+  the process is seen gone before the daemon kills it; a create that is
+  cancelled, or fails for a reason of the run's, leaves a live VM, which
+  is discarded uncounted.
+
+Left as they are:
+
+- A VM whose process takes longer than the grace to end (queued disk I/O
+  under its limit is what delays a killed hypervisor) fails its create
+  as before the change, and that death is not counted.
+- A pool VM that was killed and whose claim failed at `Attach` is
+  replaced although an allowlist run's place went with the failed
+  `Attach`: one boot is spent before the second claim is refused.

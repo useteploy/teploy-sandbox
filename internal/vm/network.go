@@ -252,6 +252,13 @@ type Network interface {
 	// Detach removes a VM's device and everything that admitted it.
 	// Detaching what is not attached succeeds.
 	Detach(ctx context.Context, name string) error
+	// Unplug takes back the device of a VM that is gone and keeps the
+	// place for the VM that replaces it under the same name: an
+	// allowlist run's namespace stays sealed, with its proxy's listener
+	// in it, for the next Attach. A place without a listener (an open
+	// run's) is removed as Detach removes it, and Attach makes a new one.
+	// Unplugging what is not attached succeeds.
+	Unplug(ctx context.Context, name string) error
 	// Sweep removes what a previous daemon life left; it returns the
 	// number of devices removed.
 	Sweep(ctx context.Context) (int, error)
@@ -1243,6 +1250,33 @@ func (n *hostNetwork) Detach(ctx context.Context, name string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.detachLocked(ctx, name)
+}
+
+func (n *hostNetwork) Unplug(ctx context.Context, name string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	a, ok := n.attached[name]
+	switch {
+	case !ok:
+		return nil
+	case a.listener == nil || a.closing:
+		return n.detachLocked(ctx, name)
+	case !a.attached:
+		return nil
+	}
+	// Sealed first, as a place that is waiting for its VM is: from here
+	// nothing passes in the namespace, whatever is still in it.
+	if err := n.writeRun(ctx, a, true); err != nil {
+		return fmt.Errorf("seal %s: %w", a.ns, err)
+	}
+	// The tap went with the hypervisor that held it (the caller killed
+	// it); one that is somehow still there is removed, with the rate
+	// limits and routes that were on it.
+	if _, err := n.sys.run(ctx, a.ns, "ip", "link", "del", a.tap); err != nil && !isGone(err) {
+		return fmt.Errorf("remove the tap %s: %w", a.tap, err)
+	}
+	a.attached, a.gone = false, false
+	return nil
 }
 
 // removeLocked removes a place's link and namespace, and with the

@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -448,9 +449,13 @@ type fakeMachine struct {
 	gate chan struct{}
 	up   bool
 
-	mu       sync.Mutex
-	dead     bool
-	paused   bool
+	mu     sync.Mutex
+	dead   bool
+	paused bool
+	// gone: the process is dead and its sockets fail, while exited may
+	// not be closed yet (die).
+	gone     bool
+	exit     MachineExit
 	exited   chan struct{}
 	pingErr  error
 	killErr  error
@@ -467,6 +472,8 @@ type fakeMachine struct {
 	addNetErr error
 	// events is the order of sync, pause, resume and kill calls.
 	events []string
+	// killDeadline is the deadline the last Kill was given.
+	killDeadline time.Time
 	// execs records each exec's merged environment; setups is the guest
 	// setup scripts the driver ran, which are not a run's execs.
 	execs  []map[string]string
@@ -480,6 +487,44 @@ type fakeMachine struct {
 func (m *fakeMachine) Agent() Agent            { return (*fakeAgent)(m) }
 func (m *fakeMachine) Exited() <-chan struct{} { return m.exited }
 func (m *fakeMachine) Diagnostics() string     { return "fake serial log" }
+
+// Exit is how the process ended, and nothing before it has been reaped:
+// a real machine's wait status is not there to be read until Exited is
+// closed, and a driver that read it early would see no kill at all.
+func (m *fakeMachine) Exit() MachineExit {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.dead {
+		return MachineExit{}
+	}
+	return m.exit
+}
+
+// die ends the machine as something other than the daemon would, and as
+// a real hypervisor's end looks to the daemon: its sockets fail at once,
+// and exited is closed lag later, once the process has been reaped.
+func (m *fakeMachine) die(exit MachineExit, lag time.Duration) {
+	m.mu.Lock()
+	if m.gone || m.dead {
+		m.mu.Unlock()
+		return
+	}
+	m.gone, m.exit = true, exit
+	m.mu.Unlock()
+	reaped := func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if !m.dead {
+			m.dead = true
+			close(m.exited)
+		}
+	}
+	if lag <= 0 {
+		reaped()
+		return
+	}
+	time.AfterFunc(lag, reaped)
+}
 
 func (m *fakeMachine) isDead() bool {
 	m.mu.Lock()
@@ -521,7 +566,7 @@ func (m *fakeMachine) AddNet(_ context.Context, tap *os.File, mac string) error 
 	if m.addNetErr != nil {
 		return m.addNetErr
 	}
-	if m.dead {
+	if m.dead || m.gone {
 		return errors.New("connection refused: vm is gone")
 	}
 	if m.netMAC != "" {
@@ -533,15 +578,19 @@ func (m *fakeMachine) AddNet(_ context.Context, tap *os.File, mac string) error 
 	return nil
 }
 
-func (m *fakeMachine) Kill(context.Context) error {
+func (m *fakeMachine) Kill(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.killDeadline, _ = ctx.Deadline()
 	if m.killErr != nil {
 		return m.killErr
 	}
 	m.events = append(m.events, "kill")
 	if !m.dead {
-		m.dead = true
+		if !m.gone {
+			m.exit = MachineExit{Signal: syscall.SIGKILL}
+		}
+		m.dead, m.gone = true, true
 		close(m.exited)
 		if !m.up && m.hypervisor != nil {
 			m.up = true
@@ -562,7 +611,7 @@ func (a *fakeAgent) alive() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	switch {
-	case m.dead:
+	case m.dead || m.gone:
 		return errors.New("connection refused: vm is gone")
 	case m.paused:
 		return errors.New("vm is paused")

@@ -451,12 +451,14 @@ func (p *warmPool) pauseLocked(n int) {
 	}
 }
 
-// diedLocked counts a VM that exited while it waited in the pool, and
-// pauses the pool's boots as a failed boot does. A boot that succeeds
-// says nothing about these: a guest that powers off, or a host that
-// kills what it has no memory for, gives VMs that boot and then die, and
+// diedLocked counts a VM that exited while it waited in the pool, or as
+// a create claimed it, and pauses the pool's boots as a failed boot does.
+// A boot that succeeds says nothing about these: a guest that powers off,
+// a host that kills what it has no memory for, or a guest or hypervisor
+// that dies of what a claim does to it (a hot-plugged device, a system
+// call its filter refuses) gives VMs that boot and then die, and
 // replacing each at once is a boot loop at the host's full speed. The
-// count starts again when a create takes a VM (take). Zero when the pool
+// count starts again when a claim succeeds (claimed). Zero when the pool
 // is closed.
 func (p *warmPool) diedLocked() int {
 	if p.closed {
@@ -528,11 +530,33 @@ func (p *warmPool) take(cpus, memoryMB int) *warmVM {
 		default:
 		}
 		delete(p.owned, vm.name)
-		// A VM lived until it was wanted: the pool's VMs are not dying.
-		p.deaths = 0
 		return vm
 	}
 	return nil
+}
+
+// claimed says that a VM from the pool lived through its claim: the
+// pool's VMs are not dying. Not at take: a VM that is taken and then dies
+// of its claim is as much a death as one that dies waiting, and a pool
+// whose every VM dies so must back off too.
+func (p *warmPool) claimed() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.deaths = 0
+	p.mu.Unlock()
+}
+
+// diedAtClaim counts a VM from the pool that died as a create claimed it,
+// and returns the deaths in a row.
+func (p *warmPool) diedAtClaim() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.diedLocked()
 }
 
 // coldBoot counts a create's own boot against the pool's bound on boots

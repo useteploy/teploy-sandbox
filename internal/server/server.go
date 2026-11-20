@@ -93,6 +93,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/remote/sync", s.auth(s.handleRemoteSync))
 	mux.Handle("POST /v1/remote/collect", s.auth(s.handleRemoteCollect))
 	mux.Handle("POST /v1/remote/rotate", s.auth(s.handleRemoteRotate))
+	mux.Handle("POST /v1/remote/scrub", s.auth(s.handleRemoteScrub))
 	mux.Handle("GET /v1/remote/snapshots", s.auth(s.handleRemoteSnapshots))
 	mux.Handle("PUT /v1/runs/{id}/files/{path...}", s.auth(s.handlePutFile))
 	mux.Handle("GET /v1/runs/{id}/files/{path...}", s.auth(s.handleGetFile))
@@ -306,7 +307,7 @@ func (s *Server) handleRemoteCollect(w http.ResponseWriter, r *http.Request) {
 
 // handleRemoteRotate re-wraps remote storage's keys under the current
 // master now: the half of key rotation that is not a daemon's own
-// writes.
+// writes. The answer says whether the previous master is still needed.
 func (s *Server) handleRemoteRotate(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.Manager.RotateRemote(r.Context())
 	if err != nil {
@@ -314,11 +315,28 @@ func (s *Server) handleRemoteRotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"manifestsRewrapped": stats.Manifests, "manifestsCurrent": stats.ManifestsCurrent,
+		"manifestsRewrapped": stats.Manifests, "manifestsCurrent": stats.ManifestsCurrent, "manifestsSkipped": stats.ManifestsSkipped,
 		"recordsRewrapped": stats.Records, "recordsCurrent": stats.RecordsCurrent,
 		"recordsRunning": stats.RecordsRunning, "recordsConflicted": stats.RecordsConflicted,
 		"recordsUnfenced": stats.RecordsUnfenced, "recordsDestroyed": stats.RecordsDestroyed,
+		"recordsRunningPrevious": stats.RecordsRunningPrevious, "recordsDestroyedPrevious": stats.RecordsDestroyedPrevious,
+		"localKeysRewrapped": stats.LocalKeys, "localKeysFailed": stats.LocalKeysFailed,
+		// Whether the previous master key must stay configured, and in
+		// words why.
+		"previousKeyNeeded": stats.PreviousKeyNeeded, "previousKeyNeededFor": stats.PreviousKeyNeededFor,
 	})
+}
+
+// handleRemoteScrub checks now, instead of at the next scheduled round,
+// that every stopped run this daemon reports durable is whole in remote
+// storage.
+func (s *Server) handleRemoteScrub(w http.ResponseWriter, r *http.Request) {
+	if s.Manager.OffHost == nil {
+		s.writeError(w, fmt.Errorf("%w: this daemon has no remote storage", run.ErrBadRequest))
+		return
+	}
+	stats := s.Manager.ScrubRemote(r.Context())
+	s.writeJSON(w, http.StatusOK, map[string]any{"checked": stats.Checked, "notWhole": stats.NotWhole, "unreachable": stats.Unreachable})
 }
 
 // handleRemoteSnapshots lists the caller snapshots in the bucket: the

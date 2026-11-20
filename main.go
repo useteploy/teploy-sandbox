@@ -71,9 +71,11 @@ Usage:
                        [--remote-endpoint https://s3.example.com --remote-bucket NAME --remote-key-file PATH
                         [--remote-prefix P] [--remote-region us-east-1] [--remote-path-style]
                         [--remote-access-key ID] [--remote-secret-key-file PATH]
-                        [--remote-chunk-mb 16] [--remote-parallel 4] [--remote-max-chain 8]
-                        [--remote-local keep|drop] [--remote-pool-reserve 15]
-                        [--remote-sync-interval 1m] [--remote-gc-interval 1h] [--remote-gc-grace 24h] [--remote-unfenced]]
+                        [--remote-previous-key-file PATH,...] [--remote-insecure-http]
+                        [--remote-chunk-mb 16] [--remote-parallel 4] [--remote-transfers 4] [--remote-max-chain 8]
+                        [--remote-local keep|drop] [--remote-pool-reserve 15] [--remote-snapshot-retry 12h]
+                        [--remote-sync-interval 1m] [--remote-gc-interval 1h] [--remote-gc-grace 24h]
+                        [--remote-scrub-interval 6h] [--remote-unfenced]]
   teploy-sandbox version`)
 }
 
@@ -428,6 +430,11 @@ func serve(args []string) error {
 		manager.RemoteSyncInterval = *remote.syncInterval
 		manager.RemoteGCInterval = *remote.gcInterval
 		manager.SnapshotRetry = *remote.snapshotRetry
+		manager.Transfers = *remote.transfers
+		manager.RemoteScrubInterval = *remote.scrubInterval
+		if *remote.scrubInterval == 0 {
+			manager.RemoteScrubInterval = -1
+		}
 	}
 	if *cacheRoot != "" {
 		manager.Cache = run.NewCacheStore(*cacheRoot, int64(*cacheMaxGB*(1<<30)))

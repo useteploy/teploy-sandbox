@@ -534,6 +534,15 @@ func TestDestroyedRunsAreCollected(t *testing.T) {
 	if err := b.manager.Destroy(bg, gone.ID); err != nil {
 		t.Fatalf("destroy on host-b: %v", err)
 	}
+	// host-a drops its copy when it looks: the record says "destroyed".
+	// (With no grace, as here, that record is collected at once; a
+	// daemon that only looked afterwards would find no record at all,
+	// which is not a statement that the run was destroyed. See
+	// TestAMissingRecordIsNotADestroyedRun.)
+	a.sync(t)
+	if _, err := a.manager.Get(gone.ID); !errors.Is(err, run.ErrNotFound) {
+		t.Fatalf("host-a still lists a run destroyed on host-b: %v", err)
+	}
 	if err := b.manager.CollectRemote(bg); err != nil {
 		t.Fatal(err)
 	}
@@ -543,11 +552,6 @@ func TestDestroyedRunsAreCollected(t *testing.T) {
 	}
 	if left := bucket.Keys("fleet/v1/run/" + gone.ID); len(left) != 0 {
 		t.Fatalf("the destroyed run's records were left: %v", left)
-	}
-	// host-a drops its copy when it looks, and the other run is whole.
-	a.sync(t)
-	if _, err := a.manager.Get(gone.ID); !errors.Is(err, run.ErrNotFound) {
-		t.Fatalf("host-a still lists a run destroyed on host-b: %v", err)
 	}
 	if _, err := b.manager.Resume(bg, keep.ID, 0); err != nil {
 		t.Fatalf("the other run does not resume after a collection: %v", err)
@@ -802,6 +806,13 @@ func TestLocalCopiesAreDroppedWhenAskedOrUnderPressure(t *testing.T) {
 			t.Fatal("local copies were kept with the pool short of space")
 		}
 		assertPool(t, a.zfs, pristine...)
+		// A restore that cannot fit is not started.
+		if _, err := a.manager.Resume(bg, first.ID, 0); err == nil || !strings.Contains(err.Error(), "free") {
+			t.Fatalf("resume into a pool with no room: %v", err)
+		}
+		a.zfs.mu.Lock()
+		a.zfs.available, a.zfs.used = 5000, 5000
+		a.zfs.mu.Unlock()
 		if _, err := a.manager.Resume(bg, first.ID, 0); err != nil {
 			t.Fatalf("resume after eviction: %v", err)
 		}

@@ -467,6 +467,20 @@ func (m *Manager) Fork(ctx context.Context, id string, req ForkRequest) (*Run, e
 		child.OnExpire = onExpire
 	}
 	childID := NewULID(now)
+	if m.OffHost != nil {
+		// From its record until it is in the registry (or given up) the
+		// child is a run remote storage lists and this daemon does not:
+		// exactly what a run lost to a crash looks like. A sync in that
+		// window is told otherwise.
+		m.mu.Lock()
+		m.forking[childID] = struct{}{}
+		m.mu.Unlock()
+		defer func() {
+			m.mu.Lock()
+			delete(m.forking, childID)
+			m.mu.Unlock()
+		}()
+	}
 	if m.OffHost != nil && base != "" {
 		// The child's first upload will build on a snapshot that is in
 		// remote storage for some other run's sake. A record of the
@@ -620,7 +634,19 @@ func (m *Manager) imageHolder(ref string) string {
 // that no longer needs it.
 func (m *Manager) releaseImages(refs []string) {
 	for _, ref := range refs {
-		if ref == "" || m.imageHolder(ref) != "" {
+		if ref == "" {
+			continue
+		}
+		m.mu.Lock()
+		held := m.imageHolderLocked(ref, "") != ""
+		pinned := !held && m.pins[ref] > 0
+		if pinned {
+			// An upload that holds no run still reads it: released when
+			// that ends (pin).
+			m.releaseOwed[ref] = true
+		}
+		m.mu.Unlock()
+		if held || pinned {
 			continue
 		}
 		m.removeImage(ref)

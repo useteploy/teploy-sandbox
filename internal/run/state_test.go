@@ -474,19 +474,67 @@ func TestSnapshotNotesDecode(t *testing.T) {
 	owns := func(ref string) bool { return ref == "tank/sbx/teploy-snap-1" }
 	good := `{"version":1,"snapshotNotes":[` +
 		`{"ref":"tank/sbx/teploy-snap-1","run":"01M7NQSS0N4DNYHNF635Y203BP","key":"k","state":"waiting","addedAt":"2026-11-17T00:00:00Z"}]}`
-	_, _, _, notes, err := decodeState([]byte(good), owns)
-	if err != nil || len(notes) != 1 || notes["tank/sbx/teploy-snap-1"].State != noteWaiting {
-		t.Fatalf("a written note reads back: %v %v", notes, err)
+	_, _, _, notes, dropped, err := decodeState([]byte(good), owns)
+	if err != nil || len(dropped) != 0 || len(notes) != 1 || notes["tank/sbx/teploy-snap-1"].State != noteWaiting {
+		t.Fatalf("a written note reads back: %v %v %v", notes, dropped, err)
 	}
 	for name, bad := range map[string]string{
 		"not this daemon's": `{"version":1,"snapshotNotes":[{"ref":"elsewhere","state":"waiting"}]}`,
-		"unknown state":     `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","state":"gone"}]}`,
 		"duplicate":         `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","state":"waiting"},{"ref":"tank/sbx/teploy-snap-1","state":"deleting"}]}`,
 		"not a run id":      `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","run":"nope","state":"waiting"}]}`,
 		"foreign base":      `{"version":1,"snapshotNotes":[{"ref":"tank/sbx/teploy-snap-1","base":"elsewhere","state":"waiting"}]}`,
+		"a foreign fetch":   `{"version":1,"fetching":["elsewhere"]}`,
 	} {
-		if _, _, _, _, err := decodeState([]byte(bad), owns); err == nil {
+		if _, _, _, _, _, err := decodeState([]byte(bad), owns); err == nil {
 			t.Fatalf("a malformed note (%s) must refuse the registry file", name)
 		}
+	}
+}
+
+// Review B1. A note in a state this binary does not know — the daemon
+// itself wrote "" for a note it had given up on — refused the start as a
+// corrupt registry, and the way out it named (remove the file) would
+// have dropped every stopped run. Such a note is dropped, and said.
+func TestANoteInAnUnknownStateDoesNotRefuseTheRegistry(t *testing.T) {
+	owns := func(ref string) bool { return strings.HasPrefix(ref, "tank/sbx/teploy-snap-") }
+	for _, state := range []string{"", "gone", "archived"} {
+		file := `{"version":1,"snapshotNotes":[` +
+			`{"ref":"tank/sbx/teploy-snap-1","state":"` + state + `","addedAt":"2026-11-17T00:00:00Z"},` +
+			`{"ref":"tank/sbx/teploy-snap-2","state":"waiting","addedAt":"2026-11-17T00:00:00Z"}],` +
+			`"fetching":["tank/sbx/teploy-snap-3"]}`
+		_, orphaned, _, notes, dropped, err := decodeState([]byte(file), owns)
+		if err != nil {
+			t.Fatalf("a note in state %q refused the registry: %v", state, err)
+		}
+		if len(dropped) != 1 || !strings.Contains(dropped[0], "teploy-snap-1") {
+			t.Fatalf("the dropped note must be reported: %v", dropped)
+		}
+		if len(notes) != 1 || notes["tank/sbx/teploy-snap-2"] == nil {
+			t.Fatalf("the other note must load: %v", notes)
+		}
+		// Review R3: a fetch a crash interrupted is released like the
+		// images of a run the restart lost.
+		if len(orphaned) != 1 || orphaned[0] != "tank/sbx/teploy-snap-3" {
+			t.Fatalf("an interrupted fetch must be released: %v", orphaned)
+		}
+	}
+}
+
+// Review B9. Without remote storage "snapshot:<tag>" is an image name
+// like any other, as it was before remote storage existed: the Docker
+// driver's images may be called that.
+func TestSnapshotColonIsAnImageNameWithoutRemoteStorage(t *testing.T) {
+	m, rt, _ := newTestManager(t)
+	created, err := m.Create(context.Background(), CreateRequest{Image: "snapshot:v1"})
+	if err != nil {
+		t.Fatalf("create with image snapshot:v1 and no remote storage: %v", err)
+	}
+	if created.Image != "snapshot:v1" || rt.created[0].Image != "snapshot:v1" {
+		t.Fatalf("the image reached the driver as %q", rt.created[0].Image)
+	}
+	// And a delete of one is the driver's to refuse or do, not ours to
+	// reinterpret.
+	if err := m.DeleteSnapshot(context.Background(), "snapshot:v1"); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("delete of an image that is not a snapshot ref: %v", err)
 	}
 }

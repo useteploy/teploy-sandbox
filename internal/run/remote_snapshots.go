@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -33,8 +34,12 @@ const (
 
 // DefaultSnapshotRetry is how long a caller snapshot whose upload failed
 // keeps being retried before it stays on this host only, which has been
-// the permanent semantics of a failed upload since the beginning.
-const DefaultSnapshotRetry = 24 * time.Hour
+// the permanent semantics of a failed upload since the beginning. It is
+// shorter than the default collection grace on purpose: the previous
+// upload a retry is sent against is something collection may delete once
+// its run is gone, and a retry inside the grace still finds it. (One
+// that does not sends against the base image instead, and checks.)
+const DefaultSnapshotRetry = 12 * time.Hour
 
 // retrySnapshotDeadline bounds an upkeep-driven upload attempt. A
 // caller's own snapshot waits as long as publishTimeout; the upkeep must
@@ -56,62 +61,66 @@ type snapshotNote struct {
 }
 
 // retrySnapshotNotes retries every waiting note, oldest first. A note
-// past the give-up age is dropped: its snapshot stays on this host only,
+// past the give-up age is deleted: its snapshot stays on this host only,
 // which is what a failed upload has always meant.
+//
+// Notes are only ever changed under Manager.mu and never handed out: a
+// note is moved to uploading immediately before its own upload, one at a
+// time, so that every other waiting snapshot stays deletable while the
+// round works through them.
 func (m *Manager) retrySnapshotNotes(ctx context.Context) {
-	if m.SnapshotRetry <= 0 {
-		// No retry configured: a failed upload means this host only,
-		// the permanent semantics a failed upload always had.
-		m.mu.Lock()
-		for ref, note := range m.snapshotNotes {
-			if note.State == noteWaiting {
-				delete(m.snapshotNotes, ref)
-			}
-		}
-		m.mu.Unlock()
-		return
-	}
-	var due []*snapshotNote
 	now := m.now()
+	var due, expired []snapshotNote
 	m.mu.Lock()
-	for _, note := range m.snapshotNotes {
+	for ref, note := range m.snapshotNotes {
 		if note.State != noteWaiting {
 			continue
 		}
-		if m.SnapshotRetry > 0 && now.Sub(note.AddedAt) > m.SnapshotRetry {
-			note.State = "" // dropped below, outside the lock
-			due = append(due, note)
+		if m.SnapshotRetry <= 0 || now.Sub(note.AddedAt) > m.SnapshotRetry {
+			// No retry configured, or retried for long enough.
+			expired = append(expired, *note)
+			delete(m.snapshotNotes, ref)
 			continue
 		}
-		note.State = noteUploading
-		due = append(due, note)
+		due = append(due, *note)
 	}
 	m.mu.Unlock()
-	if len(due) == 0 {
-		return
+	if len(expired) > 0 {
+		m.persist()
+		for _, note := range expired {
+			if m.SnapshotRetry > 0 {
+				m.log.Error("a caller snapshot's upload was retried for too long; it stays on this host only", "image", note.Ref, "run", note.Run, "retried", m.SnapshotRetry.String())
+			}
+		}
 	}
 	sort.Slice(due, func(i, j int) bool { return due[i].AddedAt.Before(due[j].AddedAt) })
 	for _, note := range due {
-		if note.State == "" {
-			m.mu.Lock()
-			if current, ok := m.snapshotNotes[note.Ref]; ok && current.State == noteWaiting {
-				delete(m.snapshotNotes, note.Ref)
-			}
-			m.mu.Unlock()
-			m.log.Error("a caller snapshot's upload was retried for too long; it stays on this host only", "image", note.Ref, "run", note.Run, "retried", m.SnapshotRetry.String())
-			m.persist()
+		m.mu.Lock()
+		current, ok := m.snapshotNotes[note.Ref]
+		claimed := ok && current.State == noteWaiting
+		if claimed {
+			current.State = noteUploading
+			note = *current
+		}
+		m.mu.Unlock()
+		if !claimed {
+			// Deleted, or being deleted, since the round began.
 			continue
 		}
 		m.retrySnapshotNote(ctx, note)
 	}
 }
 
-// retrySnapshotNote uploads one waiting note under the upkeep's own
-// deadline. The caller has already moved it to uploading.
-func (m *Manager) retrySnapshotNote(ctx context.Context, note *snapshotNote) {
+// retrySnapshotNote uploads one note under the upkeep's own deadline.
+// The caller has already moved it to uploading.
+func (m *Manager) retrySnapshotNote(ctx context.Context, note snapshotNote) {
 	attempt, cancel := context.WithTimeout(context.WithoutCancel(ctx), min(m.publishTimeout(), retrySnapshotDeadline))
 	defer cancel()
-	uploaded, err := m.OffHost.Upload(attempt, UploadRequest{Run: note.Run, Ref: note.Ref, Base: note.Base, Key: note.Key, Purpose: PurposeSnapshot})
+	// The previous upload the stream would be sent against may be let
+	// go by its run while this one reads it.
+	unpin := m.pin(note.Base)
+	defer unpin()
+	uploaded, err := m.upload(attempt, UploadRequest{Run: note.Run, Ref: note.Ref, Base: note.Base, Key: note.Key, Purpose: PurposeSnapshot})
 	if err != nil {
 		m.log.Error("a caller snapshot is still not durable off the host; retrying", "image", note.Ref, "run", note.Run, "error", err)
 		m.mu.Lock()
@@ -137,17 +146,21 @@ func (m *Manager) retrySnapshotNote(ctx context.Context, note *snapshotNote) {
 // halves are idempotent, so an interrupted completion simply runs again.
 func (m *Manager) finishSnapshotDeletes(ctx context.Context) {
 	m.mu.Lock()
-	var due []*snapshotNote
+	var due []snapshotNote
 	for _, note := range m.snapshotNotes {
 		if note.State == noteDeleting {
-			due = append(due, note)
+			due = append(due, *note)
 		}
 	}
 	m.mu.Unlock()
 	for _, note := range due {
-		if err := m.deleteSnapshotHeld(ctx, note.Ref, m.imageHolder(note.Ref) != "", true); err != nil {
+		if err := m.deleteSnapshotHeld(ctx, note.Ref, m.imageHolder(note.Ref) != "", true); err != nil && !errors.Is(err, ErrNotCallerSnapshot) {
 			m.log.Error("a snapshot delete is owed to remote storage; retrying", "image", note.Ref, "error", err)
 			continue
+		} else if err != nil {
+			// A run's stop snapshot: never a caller's to delete, so
+			// nothing is owed (the request that noted it was refused).
+			m.log.Warn("a snapshot delete was noted for a run's stop snapshot; the note is dropped", "image", note.Ref)
 		}
 		m.mu.Lock()
 		if current, ok := m.snapshotNotes[note.Ref]; ok && current.State == noteDeleting {

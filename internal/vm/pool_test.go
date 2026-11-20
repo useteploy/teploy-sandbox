@@ -826,3 +826,54 @@ func TestAGivenUpCreateIsNotReplaced(t *testing.T) {
 		t.Fatalf("%d VMs booted (want the pool's one), deaths %d", started, deaths)
 	}
 }
+
+// A rollback's deadline starts when the rollback does. One that started
+// with the create would be spent by the boot before it (a boot may take
+// four times as long), and the VM whose claim failed would be given back
+// with a deadline that had already passed: killed, and nothing of it
+// released. Both VMs a create can claim: one booted for it, and the one
+// booted in place of a pool VM that was killed.
+func TestARollbackHasItsWholeDeadlineHoweverLongTheBootTook(t *testing.T) {
+	for what, pooled := range map[string]bool{"booted for the run": false, "booted for a killed pool VM": true} {
+		t.Run(what, func(t *testing.T) {
+			config := WarmConfig{}
+			if pooled {
+				config.Sizes = []WarmSize{{1, 512, 1}}
+			}
+			rig := newWarmRig(t, config)
+			if pooled {
+				waitPool(t, rig.driver, "full", full)
+				dieAtClaim(rig.hypervisor.machine(rig.warmVMs(1, 512)[0]), killedFromOutside, 0, nil)
+			}
+			var mu sync.Mutex
+			var failed *fakeMachine
+			var failedAt time.Time
+			rig.hypervisor.mu.Lock()
+			rig.hypervisor.onStart = func(machine *fakeMachine) {
+				machine.setupFunc = func(string, io.Writer) (int, bool, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					if failed == nil {
+						failed, failedAt = machine, time.Now()
+					}
+					return 1, false, nil
+				}
+			}
+			rig.hypervisor.mu.Unlock()
+			if _, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Limits: &run.Limits{MemoryMB: 512, CPUs: 1}}); err == nil {
+				t.Fatal("a create whose guest setup failed succeeded")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if failed == nil || !failed.killed() {
+				t.Fatalf("the VM booted for the run was not removed: %+v", failed)
+			}
+			failed.mu.Lock()
+			deadline := failed.killDeadline
+			failed.mu.Unlock()
+			if left := deadline.Sub(failedAt); left < rollbackTimeout {
+				t.Fatalf("the rollback was given %s of its %s: its deadline began before the claim failed", left, rollbackTimeout)
+			}
+		})
+	}
+}

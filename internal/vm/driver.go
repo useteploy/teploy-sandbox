@@ -237,10 +237,6 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 	}
 	defer admitted()
 
-	// Rollbacks run under a fresh deadline: the request's may be what
-	// just expired.
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
 	cpus := vcpus(spec.CPUs)
 	start := time.Now()
 	name, source := spec.Name, sourceBoot
@@ -289,6 +285,14 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 				"vm", booted.String(), "total", time.Since(start).String())
 			return name, nil
 		}
+		// Rollbacks run under a deadline of their own: the request's may be
+		// what just expired. It starts here, where the rollback does, and
+		// not where the create did: a boot may take longer than the whole
+		// of it (BootTimeout), and a rollback whose deadline had passed
+		// before it began would give nothing back.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+		// At most twice: a create claims at most two VMs.
+		defer cancel()
 		if source == sourcePool {
 			// Before anything is removed: a discard kills the machine, and
 			// a VM the discard killed is not one that died under its claim.
@@ -311,6 +315,9 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 		return "", err
 	}
 }
+
+// rollbackTimeout bounds giving back a VM whose claim failed.
+const rollbackTimeout = 30 * time.Second
 
 // Where a run's VM came from, as the log says it.
 const (

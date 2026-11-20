@@ -472,6 +472,8 @@ type fakeMachine struct {
 	addNetErr error
 	// events is the order of sync, pause, resume and kill calls.
 	events []string
+	// killDeadline is the deadline the last Kill was given.
+	killDeadline time.Time
 	// execs records each exec's merged environment; setups is the guest
 	// setup scripts the driver ran, which are not a run's execs.
 	execs  []map[string]string
@@ -570,9 +572,10 @@ func (m *fakeMachine) AddNet(_ context.Context, tap *os.File, mac string) error 
 	return nil
 }
 
-func (m *fakeMachine) Kill(context.Context) error {
+func (m *fakeMachine) Kill(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.killDeadline, _ = ctx.Deadline()
 	if m.killErr != nil {
 		return m.killErr
 	}

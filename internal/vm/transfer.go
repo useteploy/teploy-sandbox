@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/useteploy/teploy-sandbox/internal/offhost"
 )
 
 // Transfer is the driver's snapshots as streams, for off-host storage
@@ -220,8 +222,10 @@ func (t *Transfer) Send(ctx context.Context, id, from string, w io.Writer) error
 
 // Receive creates id from a stream, as a clone of from when the stream is
 // incremental. The volume is marked as a restore in progress, which
-// nothing else in the driver takes for a snapshot.
-func (t *Transfer) Receive(ctx context.Context, id, from string, r io.Reader) error {
+// nothing else in the driver takes for a snapshot. expect is what the
+// manifest says the stream is; the stream is held to it before the pool
+// sees a byte (ZFS.Receive).
+func (t *Transfer) Receive(ctx context.Context, id, from string, expect offhost.Stream, r io.Reader) error {
 	v := t.volumes
 	v.mu.Lock()
 	target, err := v.target(id)
@@ -235,7 +239,7 @@ func (t *Transfer) Receive(ctx context.Context, id, from string, r io.Reader) er
 	}
 	if err == nil {
 		// What an interrupted restore left under this name.
-		err = v.discardStaged(ctx, datasetOf(target))
+		err = v.discardLeftover(ctx, target)
 	}
 	base := ""
 	if err == nil && origin != "" {
@@ -256,7 +260,7 @@ func (t *Transfer) Receive(ctx context.Context, id, from string, r io.Reader) er
 			v.mu.Unlock()
 		}()
 	}
-	return v.zfs.Receive(ctx, target, origin, v.props(kindRestore), r)
+	return v.zfs.Receive(ctx, target, origin, v.props(kindRestore), StreamIdentity{GUID: expect.GUID, FromGUID: expect.ParentGUID}, r)
 }
 
 // Commit ends a restore: final becomes a live reference, a base image a
@@ -265,10 +269,30 @@ func (t *Transfer) Receive(ctx context.Context, id, from string, r io.Reader) er
 // marked last: a restore cut short here leaves volumes still marked as a
 // restore, removed at the next start, and never a reference whose origin
 // is.
+//
+// Nothing is committed that is not a volume: the stream's first record
+// was checked before it was received, and this is the pool's own word
+// on what came of it.
+//
+// A commit that fails part-way has already marked some of the chain as
+// snapshots that are let go; Discard takes those too.
 func (t *Transfer) Commit(ctx context.Context, final string, staged []string) error {
 	v := t.volumes
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	for _, id := range staged {
+		target, err := v.target(id)
+		if err != nil {
+			return err
+		}
+		kind, err := v.zfs.Property(ctx, datasetOf(target), "type")
+		if err != nil {
+			return err
+		}
+		if kind != "volume" {
+			return fmt.Errorf("what was received as %s is a %q, not a volume; it is not made usable", id, kind)
+		}
+	}
 	var passed []string
 	for _, id := range staged {
 		target, err := v.target(id)
@@ -303,9 +327,13 @@ func (t *Transfer) Commit(ctx context.Context, final string, staged []string) er
 	return nil
 }
 
-// Discard removes what a failed restore received, newest first. Only
-// volumes still marked as a restore go: anything that was on the host
-// before is not the restore's to remove.
+// Discard removes what a failed restore received, newest first: the
+// volumes still marked as a restore, and those a commit that failed
+// part-way had already turned into snapshots that are let go. A usable
+// reference that was on the host before is not the restore's to remove,
+// and neither is a base image a commit got as far as marking: it is kept
+// like any other received base, for the next restore or until the pool
+// is short.
 func (t *Transfer) Discard(ctx context.Context, staged []string) error {
 	v := t.volumes
 	v.mu.Lock()
@@ -314,7 +342,7 @@ func (t *Transfer) Discard(ctx context.Context, staged []string) error {
 	for index := len(staged) - 1; index >= 0; index-- {
 		target, err := v.target(staged[index])
 		if err == nil {
-			err = v.discardStaged(ctx, datasetOf(target))
+			err = v.discardLeftover(ctx, target)
 		}
 		if err != nil && first == nil {
 			first = err
@@ -323,9 +351,12 @@ func (t *Transfer) Discard(ctx context.Context, staged []string) error {
 	return first
 }
 
-// discardStaged destroys one volume a restore was receiving, with its
-// snapshots. A volume that is not there, or is not a restore, is left.
-func (v *Volumes) discardStaged(ctx context.Context, volume string) error {
+// discardLeftover removes what an unfinished restore left under a
+// snapshot's name: a volume still marked as a restore, or a holder whose
+// own snapshot is no longer a usable reference (a commit marked it as
+// let go and did not get to collect it). Anything else is left.
+func (v *Volumes) discardLeftover(ctx context.Context, target string) error {
+	volume := datasetOf(target)
 	dataset, err := v.zfs.Dataset(ctx, volume)
 	if errors.Is(err, ErrNoDataset) {
 		return nil
@@ -333,10 +364,20 @@ func (v *Volumes) discardStaged(ctx context.Context, volume string) error {
 	if err != nil {
 		return err
 	}
-	if !v.mine(dataset) || dataset.Kind != kindRestore {
+	if !v.mine(dataset) {
 		return nil
 	}
-	return v.destroyWhole(ctx, volume)
+	switch dataset.Kind {
+	case kindRestore:
+		return v.destroyWhole(ctx, volume)
+	case kindSnapshot:
+		live, err := v.liveRef(ctx, target)
+		if err != nil || live {
+			return err
+		}
+		return v.collect(ctx, volume, false)
+	}
+	return nil
 }
 
 // destroyWhole destroys a volume and its snapshots. It fails while
@@ -372,17 +413,23 @@ func (v *Volumes) collectBase(ctx context.Context, volume string) error {
 // sweepTransfers is the startup half of a restore's cleanup: volumes
 // still marked as a restore belong to one a previous daemon life did not
 // finish. A restore's volumes are clones of one another, so they go in
-// as many passes as it takes.
+// as many passes as it takes. A filesystem carrying this daemon's mark
+// is nothing the driver makes — it came out of a stream — and goes the
+// same way, whatever it is marked as.
 func (v *Volumes) sweepTransfers(ctx context.Context) error {
 	for {
 		volumes, err := v.zfs.Volumes(ctx, v.root)
 		if err != nil {
 			return err
 		}
+		filesystems, err := v.zfs.Filesystems(ctx, v.root)
+		if err != nil {
+			return err
+		}
 		left, removed := 0, 0
 		var last error
-		for _, dataset := range volumes {
-			if !v.mine(dataset) || dataset.Kind != kindRestore {
+		for index, dataset := range append(filesystems, volumes...) {
+			if !v.mine(dataset) || (index >= len(filesystems) && dataset.Kind != kindRestore) {
 				continue
 			}
 			if err := v.destroyWhole(ctx, dataset.Name); err != nil {

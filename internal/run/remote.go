@@ -78,6 +78,14 @@ var (
 	// ErrRemoteUnavailable: remote storage could not be asked, so the
 	// daemon cannot tell whether the run is its to change.
 	ErrRemoteUnavailable = errors.New("remote storage unavailable")
+	// ErrRemoteIncomplete: remote storage was asked, and a snapshot it
+	// is supposed to hold is not whole there (its manifest, a chunk, or
+	// something its stream builds on is missing). Not a failure to ask:
+	// a verdict.
+	ErrRemoteIncomplete = errors.New("snapshot is not whole in remote storage")
+	// ErrNotCallerSnapshot: the snapshot is a run's stop, which goes
+	// with its run and is not a caller's to delete or boot by ID.
+	ErrNotCallerSnapshot = errors.New("snapshot belongs to a run")
 )
 
 // RemoteRecord is one generation of a run's remote record.
@@ -128,18 +136,33 @@ type UploadResult struct {
 
 // RotateStats is what one master-key rotation pass did. Nothing was
 // re-uploaded: the data keys themselves did not change, only the master
-// each is wrapped by. A pass that ends with RecordsRunning or
-// RecordsConflicted is not the whole fleet, but is not unsafe either:
-// every previous master the daemons were given still opens everything.
+// each is wrapped by — which is also why a rotation is not a recovery
+// from a master key that leaked. PreviousKeyNeeded says whether the pass
+// saw anything a previous master still opens, and PreviousKeyNeededFor
+// why, in words; a pass that ends without it is necessary for retiring
+// the previous master, and every daemon's own pass must end so.
 type RotateStats struct {
 	Manifests         int `json:"manifestsRewrapped"`
 	ManifestsCurrent  int `json:"manifestsCurrent"`
+	ManifestsSkipped  int `json:"manifestsSkipped"`
 	Records           int `json:"recordsRewrapped"`
 	RecordsCurrent    int `json:"recordsCurrent"`
 	RecordsRunning    int `json:"recordsRunning"`
 	RecordsConflicted int `json:"recordsConflicted"`
 	RecordsUnfenced   int `json:"recordsUnfenced"`
 	RecordsDestroyed  int `json:"recordsDestroyed"`
+	// RecordsRunningPrevious and RecordsDestroyedPrevious are the
+	// running and destroyed records a previous master still wraps.
+	RecordsRunningPrevious   int `json:"recordsRunningPrevious"`
+	RecordsDestroyedPrevious int `json:"recordsDestroyedPrevious"`
+	// LocalKeys is how many data keys in this daemon's own registry
+	// (running runs, snapshot uploads owed) were re-wrapped by the pass;
+	// LocalKeysFailed how many could not be.
+	LocalKeys       int `json:"localKeysRewrapped"`
+	LocalKeysFailed int `json:"localKeysFailed"`
+	// PreviousKeyNeeded: the previous master key must stay configured.
+	PreviousKeyNeeded    bool     `json:"previousKeyNeeded"`
+	PreviousKeyNeededFor []string `json:"previousKeyNeededFor"`
 }
 
 // OffHost is remote storage as the manager uses it.
@@ -159,15 +182,30 @@ type OffHost interface {
 	// Runs is every run with a record, and its newest generation.
 	Runs(ctx context.Context) (map[string]uint64, error)
 	// Ensure makes sure this host has the snapshot, restoring it from
-	// remote storage when it does not.
+	// remote storage when it does not. ErrNotFound when it is in
+	// neither place.
 	Ensure(ctx context.Context, ref string) error
+	// Verify checks that the snapshot is whole in remote storage, with
+	// everything its stream builds on: ErrRemoteIncomplete when it is
+	// not, another error when storage could not be asked. Upload has
+	// done this for what it reports; a caller verifies again whenever
+	// time has passed and something depends on the answer — before the
+	// only other copy is deleted, and on the scrub's schedule.
+	Verify(ctx context.Context, ref string) error
+	// SnapshotPurpose is what remote storage says a snapshot is
+	// (PurposeStop or PurposeSnapshot) and which run it was taken of;
+	// found is false when remote storage has no such snapshot.
+	SnapshotPurpose(ctx context.Context, ref string) (purpose, owner string, found bool, err error)
+	// Rewrap returns a wrapped data key under the current master key.
+	Rewrap(owner, key string) (string, error)
 	HasLocal(ctx context.Context, ref string) (bool, error)
 	HasRemote(ctx context.Context, ref string) (bool, error)
 	// Ref is the local reference of a snapshot ID; false for a string
 	// that is not an ID.
 	Ref(id string) (string, bool)
 	// DeleteSnapshot removes a caller's snapshot from remote storage.
-	// One that is not there is not an error.
+	// One that is not there is not an error; a run's stop snapshot is
+	// ErrNotCallerSnapshot.
 	DeleteSnapshot(ctx context.Context, ref string) error
 	// Collect deletes what nothing refers to any more.
 	Collect(ctx context.Context) error

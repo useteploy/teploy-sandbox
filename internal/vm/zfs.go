@@ -3,10 +3,12 @@ package vm
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"os"
 	"os/exec"
 	"slices"
 	"strconv"
@@ -40,9 +42,32 @@ func (e *CommandError) Unwrap() error { return e.Err }
 
 type execCommander struct{}
 
+// secretEnv are the daemon's environment variables that hold secrets
+// (remote storage's master key and credentials). No host command the
+// driver runs has any use for them, and a child's environment is
+// readable by whoever can read /proc/<pid>/environ of it.
+var secretEnv = []string{
+	"SBX_REMOTE_KEY", "SBX_REMOTE_SECRET_KEY", "SBX_REMOTE_SESSION_TOKEN", "SBX_REMOTE_ACCESS_KEY",
+	"AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_ACCESS_KEY_ID",
+}
+
+// childEnv is the daemon's environment without its secrets: what a host
+// command is started with.
+func childEnv(environ []string) []string {
+	kept := make([]string, 0, len(environ))
+	for _, entry := range environ {
+		name, _, _ := strings.Cut(entry, "=")
+		if !slices.Contains(secretEnv, name) {
+			kept = append(kept, entry)
+		}
+	}
+	return kept
+}
+
 func (execCommander) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	var stdout, stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = childEnv(os.Environ())
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
 		command := name
@@ -70,6 +95,7 @@ func (execCommander) Stream(ctx context.Context, stdin io.Reader, stdout io.Writ
 	defer cancel()
 	stderr := tailBuffer{limit: streamStderr}
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = childEnv(os.Environ())
 	cmd.Stdout, cmd.Stderr = stdout, &stderr
 	// A command that has exited is not waited on for a pipe someone
 	// else still holds open.
@@ -173,6 +199,10 @@ type ZFS interface {
 	Dataset(ctx context.Context, name string) (Dataset, error)
 	// Volumes lists every volume under root (root itself excluded).
 	Volumes(ctx context.Context, root string) ([]Dataset, error)
+	// Filesystems lists every filesystem under root (root itself
+	// excluded). The driver creates none: one that carries its mark came
+	// out of a stream that was not a volume's, and only goes.
+	Filesystems(ctx context.Context, root string) ([]Dataset, error)
 	// Snapshots lists a dataset's own snapshots, oldest first.
 	Snapshots(ctx context.Context, dataset string) ([]SnapshotInfo, error)
 	// Exists reports whether a dataset or snapshot exists.
@@ -199,9 +229,12 @@ type ZFS interface {
 	Send(ctx context.Context, snapshot, from string, w io.Writer) error
 	// Receive creates snapshot (dataset@name, the dataset new) from a
 	// stream, as a clone of origin when the stream is incremental, with
-	// the given properties. A stream that ends early or is not one
-	// creates nothing.
-	Receive(ctx context.Context, snapshot, origin string, props map[string]string, r io.Reader) error
+	// the given properties. The stream must be the plain stream of one
+	// volume's snapshot with the identities expect names: anything else
+	// (a filesystem, a replication package, another snapshot) is refused
+	// before the pool sees it. A stream that ends early or is not one
+	// creates nothing, and nothing received is ever mounted.
+	Receive(ctx context.Context, snapshot, origin string, props map[string]string, expect StreamIdentity, r io.Reader) error
 	// Space is the bytes available to, and the bytes used by, a dataset
 	// and everything under it.
 	Space(ctx context.Context, root string) (available, used int64, err error)
@@ -263,8 +296,11 @@ func parseDatasets(out []byte) ([]Dataset, error) {
 	return datasets, nil
 }
 
+// Dataset describes name whether it is a volume or a filesystem: what a
+// cleanup looks at must not be blind to a kind of dataset the driver
+// never makes.
 func (z *zfsCLI) Dataset(ctx context.Context, name string) (Dataset, error) {
-	out, err := z.run(ctx, "list", "-H", "-p", "-t", "volume", "-o", datasetColumns, name)
+	out, err := z.run(ctx, "list", "-H", "-p", "-t", "filesystem,volume", "-o", datasetColumns, name)
 	if isMissing(err) {
 		return Dataset{}, ErrNoDataset
 	}
@@ -282,7 +318,15 @@ func (z *zfsCLI) Dataset(ctx context.Context, name string) (Dataset, error) {
 }
 
 func (z *zfsCLI) Volumes(ctx context.Context, root string) ([]Dataset, error) {
-	out, err := z.run(ctx, "list", "-H", "-p", "-r", "-t", "volume", "-o", datasetColumns, root)
+	return z.list(ctx, "volume", root)
+}
+
+func (z *zfsCLI) Filesystems(ctx context.Context, root string) ([]Dataset, error) {
+	return z.list(ctx, "filesystem", root)
+}
+
+func (z *zfsCLI) list(ctx context.Context, kind, root string) ([]Dataset, error) {
+	out, err := z.run(ctx, "list", "-H", "-p", "-r", "-t", kind, "-o", datasetColumns, root)
 	if err != nil {
 		return nil, err
 	}
@@ -290,7 +334,7 @@ func (z *zfsCLI) Volumes(ctx context.Context, root string) ([]Dataset, error) {
 	if err != nil {
 		return nil, err
 	}
-	// A root that is itself a volume lists itself; it is not "under" root.
+	// The root lists itself; it is not "under" root.
 	kept := datasets[:0]
 	for _, dataset := range datasets {
 		if dataset.Name != root {
@@ -405,15 +449,102 @@ func (z *zfsCLI) Send(ctx context.Context, snapshot, from string, w io.Writer) e
 	return z.stream(ctx, nil, w, append(args, snapshot)...)
 }
 
-func (z *zfsCLI) Receive(ctx context.Context, snapshot, origin string, props map[string]string, r io.Reader) error {
-	args := []string{"receive"}
+// StreamIdentity is what a stream must say it is: the guid of the
+// snapshot it creates, and of the snapshot it is incremental against
+// ("" for a full stream).
+type StreamIdentity struct {
+	GUID, FromGUID string
+}
+
+// A send stream begins with one DRR_BEGIN record (OpenZFS
+// include/sys/zfs_ioctl.h, struct dmu_replay_record; the layout has not
+// changed since the format's first version, and was read from the 2.2
+// sources): a 32-bit record type and payload length, then struct
+// drr_begin — magic, version and features, creation time, the object
+// set's type, flags, the guid of the snapshot, the guid of the snapshot
+// it is incremental against, and its name — in the sender's byte order,
+// which the magic number tells.
+const (
+	beginRecordBytes = 312
+	streamMagic      = 0x2F5bacbac
+	// drr_versioninfo's low two bits: a plain stream of one dataset, as
+	// opposed to a package of several (zfs send -R, -p).
+	streamSubstream = 1
+	// dmu_objset_type_t: a volume.
+	objsetZvol = 3
+)
+
+// checkStreamBegin reads the first record of a stream and refuses
+// anything but the plain stream of one volume snapshot with the
+// identities expected. What is uploaded is authenticated, so only a
+// holder of the fleet's master key can present another stream at all;
+// this is what that holder still cannot do with it: have a host receive
+// (and mount) a filesystem, a tree of datasets with properties of its
+// choosing, or a snapshot other than the one the manifest names.
+func checkStreamBegin(header []byte, expect StreamIdentity) error {
+	if len(header) < beginRecordBytes {
+		return errors.New("the stream is shorter than its first record")
+	}
+	var order binary.ByteOrder = binary.LittleEndian
+	switch {
+	case binary.LittleEndian.Uint64(header[8:]) == streamMagic:
+	case binary.BigEndian.Uint64(header[8:]) == streamMagic:
+		order = binary.BigEndian
+	default:
+		return errors.New("not a ZFS send stream (no stream magic in its first record)")
+	}
+	if record := order.Uint32(header[0:]); record != 0 {
+		return fmt.Errorf("the stream does not begin with a begin record (record type %d)", record)
+	}
+	if kind := order.Uint64(header[16:]) & 3; kind != streamSubstream {
+		return fmt.Errorf("the stream is a package of datasets (header type %d), not one snapshot's stream", kind)
+	}
+	if objset := order.Uint32(header[32:]); objset != objsetZvol {
+		return fmt.Errorf("the stream is not a volume's (object set type %d)", objset)
+	}
+	check := func(what, want string, got uint64) error {
+		if want == "" {
+			if got != 0 {
+				return fmt.Errorf("the stream is incremental (against guid %d) where a full one is expected", got)
+			}
+			return nil
+		}
+		parsed, err := strconv.ParseUint(want, 10, 64)
+		if err != nil {
+			return fmt.Errorf("the %s guid %q in the manifest is not a guid", what, want)
+		}
+		if parsed != got {
+			return fmt.Errorf("the stream's %s is guid %d, and the manifest says %s", what, got, want)
+		}
+		return nil
+	}
+	if expect.GUID == "" {
+		return errors.New("no guid to check the stream against")
+	}
+	if err := check("snapshot", expect.GUID, order.Uint64(header[40:])); err != nil {
+		return err
+	}
+	return check("incremental source", expect.FromGUID, order.Uint64(header[48:]))
+}
+
+func (z *zfsCLI) Receive(ctx context.Context, snapshot, origin string, props map[string]string, expect StreamIdentity, r io.Reader) error {
+	header := make([]byte, beginRecordBytes)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return fmt.Errorf("zfs receive %s: the stream ended inside its first record: %w", snapshot, err)
+	}
+	if err := checkStreamBegin(header, expect); err != nil {
+		return fmt.Errorf("zfs receive %s refused: %w", snapshot, err)
+	}
+	// -u: whatever is received is not mounted. A volume never is; this
+	// is for the stream the check above should have refused.
+	args := []string{"receive", "-u"}
 	if origin != "" {
 		args = append(args, "-o", "origin="+origin)
 	}
 	for _, key := range slices.Sorted(maps.Keys(props)) {
 		args = append(args, "-o", key+"="+props[key])
 	}
-	return z.stream(ctx, r, nil, append(args, snapshot)...)
+	return z.stream(ctx, io.MultiReader(bytes.NewReader(header), r), nil, append(args, snapshot)...)
 }
 
 func (z *zfsCLI) Space(ctx context.Context, root string) (available, used int64, err error) {

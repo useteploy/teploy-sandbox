@@ -111,6 +111,7 @@ func (m *Memory) Delete(_ context.Context, key string) error {
 	return nil
 }
 
+// ListAll lists every object under prefix, in key order.
 func (m *Memory) ListAll(_ context.Context, prefix string) ([]s3.Object, error) {
 	if err := m.fail("list", prefix); err != nil {
 		return nil, err
@@ -125,6 +126,21 @@ func (m *Memory) ListAll(_ context.Context, prefix string) ([]s3.Object, error) 
 	}
 	sort.Slice(listed, func(i, j int) bool { return listed[i].Key < listed[j].Key })
 	return listed, nil
+}
+
+// Walk hands every object under prefix to each, in key order: the
+// listing as it was when the walk began.
+func (m *Memory) Walk(ctx context.Context, prefix string, each func(s3.Object) error) error {
+	listed, err := m.ListAll(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	for _, object := range listed {
+		if err := each(object); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Keys lists the keys under prefix, sorted.
@@ -172,4 +188,87 @@ func (m *Memory) Size(prefix string) int64 {
 		total += object.Size
 	}
 	return total
+}
+
+// Faulty is a bucket that misbehaves on request: a test sets the hook it
+// needs and the rest pass through to the Memory underneath. It is how
+// the answers a real service can give wrongly, late or not at all are
+// provoked at one exact call.
+type Faulty struct {
+	*Memory
+	mu sync.Mutex
+	// BeforePut runs before a write reaches the bucket.
+	BeforePut func(key string)
+	// AfterPut runs after a write has landed; its error is the answer
+	// the caller gets (a write whose answer was lost).
+	AfterPut func(key string) error
+	// GetErr, when it returns an error, is the answer to a read (a 404
+	// for an object that is there).
+	GetErr func(key string) error
+	// AfterGet runs after a read that succeeded.
+	AfterGet func(key string)
+	// Listed rewrites a listing before the caller sees it: stale, cut
+	// short, without times, or ignoring the prefix.
+	Listed func(prefix string, listed []s3.Object) []s3.Object
+}
+
+// NewFaulty wraps a bucket.
+func NewFaulty(memory *Memory) *Faulty { return &Faulty{Memory: memory} }
+
+// Set changes hooks under the wrapper's lock.
+func (f *Faulty) Set(change func(*Faulty)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	change(f)
+}
+
+func (f *Faulty) Put(ctx context.Context, key string, body []byte, opts s3.PutOptions) error {
+	f.mu.Lock()
+	before, after := f.BeforePut, f.AfterPut
+	f.mu.Unlock()
+	if before != nil {
+		before(key)
+	}
+	if err := f.Memory.Put(ctx, key, body, opts); err != nil {
+		return err
+	}
+	if after != nil {
+		return after(key)
+	}
+	return nil
+}
+
+func (f *Faulty) Get(ctx context.Context, key string, limit int64) ([]byte, error) {
+	f.mu.Lock()
+	getErr, after := f.GetErr, f.AfterGet
+	f.mu.Unlock()
+	if getErr != nil {
+		if err := getErr(key); err != nil {
+			return nil, err
+		}
+	}
+	data, err := f.Memory.Get(ctx, key, limit)
+	if err == nil && after != nil {
+		after(key)
+	}
+	return data, err
+}
+
+func (f *Faulty) Walk(ctx context.Context, prefix string, each func(s3.Object) error) error {
+	listed, err := f.Memory.ListAll(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	rewrite := f.Listed
+	f.mu.Unlock()
+	if rewrite != nil {
+		listed = rewrite(prefix, listed)
+	}
+	for _, object := range listed {
+		if err := each(object); err != nil {
+			return err
+		}
+	}
+	return nil
 }

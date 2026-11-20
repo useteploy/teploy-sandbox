@@ -503,6 +503,11 @@ func (v *Volumes) collectLogged(ctx context.Context, volume string) {
 // to a run whose VM did not survive the previous daemon life. Snapshot
 // references are left alone — the registry and callers own those. Returns
 // the number of run volumes removed.
+//
+// What an unfinished restore left goes before the dead snapshots are
+// reclaimed, not after: a commit that a crash cut short leaves holders
+// that are let go and still cloned by a volume marked as a restore, and
+// they can only go once that volume has.
 func (v *Volumes) Sweep(ctx context.Context) (int, error) {
 	if v.owner == "" {
 		return 0, errors.New("volume sweep requires daemon ownership identity")
@@ -522,6 +527,9 @@ func (v *Volumes) Sweep(ctx context.Context) (int, error) {
 			removed++
 		}
 	}
+	if err := v.sweepTransfers(ctx); err != nil {
+		return removed, err
+	}
 	for _, dataset := range volumes {
 		if v.mine(dataset) && dataset.Kind == kindSnapshot {
 			if err := v.collect(ctx, dataset.Name, false); err != nil {
@@ -529,7 +537,7 @@ func (v *Volumes) Sweep(ctx context.Context) (int, error) {
 			}
 		}
 	}
-	return removed, v.sweepTransfers(ctx)
+	return removed, nil
 }
 
 func waitForPath(ctx context.Context, path string) error {

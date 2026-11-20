@@ -107,18 +107,25 @@ func TestALostAnswerIsNotAConflict(t *testing.T) {
 	}
 }
 
+// lostAnswer writes the first object whose key holds match (a record,
+// unless told otherwise) twice: the write is in, and what the client
+// then saw was its own retry.
 type lostAnswer struct {
 	*offhosttest.Memory
-	used bool
+	match string
+	used  bool
 }
 
 func (l *lostAnswer) Put(ctx contextType, key string, body []byte, opts putOptions) error {
 	if err := l.Memory.Put(ctx, key, body, opts); err != nil {
 		return err
 	}
-	if strings.Contains(key, "/run/") && !l.used {
+	match := l.match
+	if match == "" {
+		match = "/run/"
+	}
+	if strings.Contains(key, match) && !l.used {
 		l.used = true
-		// The write is in; what the client then saw was its retry.
 		return l.Memory.Put(ctx, key, body, opts)
 	}
 	return nil
@@ -167,13 +174,12 @@ type staleListing struct {
 	hide int
 }
 
-func (s *staleListing) ListAll(ctx contextType, prefix string) ([]objectType, error) {
-	listed, err := s.Memory.ListAll(ctx, prefix)
+func (s *staleListing) Walk(ctx contextType, prefix string, each func(objectType) error) error {
 	if s.hide > 0 && strings.Contains(prefix, "/run/") {
 		s.hide--
-		return nil, err
+		return nil
 	}
-	return listed, err
+	return s.Memory.Walk(ctx, prefix, each)
 }
 
 func TestWithoutConditionalWritesAnotherDaemonsRunIsLeftAlone(t *testing.T) {
@@ -230,6 +236,10 @@ func TestCollect(t *testing.T) {
 	key, _ := store.Keys().NewKey(runA)
 	put := func(id, purpose, parentID string) *Manifest {
 		t.Helper()
+		key := key
+		if IsBaseID(id) {
+			key, _ = store.Keys().NewKey(id)
+		}
 		manifest, err := store.Upload(bg, Manifest{ID: id, Purpose: purpose, Parent: parentID, GUID: id}, key, strings.NewReader(strings.Repeat("x", 2500)))
 		if err != nil {
 			t.Fatal(err)
@@ -242,11 +252,11 @@ func TestCollect(t *testing.T) {
 	put(orphan, PurposeStop, base)
 	put(callers, PurposeSnapshot, "")
 	// An upload that never finished: chunks and no manifest.
-	if err := bucket.Put(bg, store.chunkKey(partial, "abc", 0), []byte("chunk"), putOptions{}); err != nil {
+	if err := bucket.Put(bg, store.chunkKey(partial, "00000000000000ab", 0), []byte("chunk"), putOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	// And one whose manifest stands, with a second attempt's leftovers.
-	if err := bucket.Put(bg, store.chunkKey(child, "loser", 0), []byte("chunk"), putOptions{}); err != nil {
+	if err := bucket.Put(bg, store.chunkKey(child, "00000000000000cd", 0), []byte("chunk"), putOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	// The run's record names the child; the parent and the base are
@@ -270,8 +280,9 @@ func TestCollect(t *testing.T) {
 		return stats
 	}
 
-	// Nothing is old enough yet.
-	if stats := collect(); stats.Objects != 0 || stats.Kept != 4 {
+	// Nothing is old enough yet, and nothing has been watched: garbage
+	// is what this daemon has SEEN as garbage for the grace.
+	if stats := collect(); stats.Objects != 0 || stats.Kept != 4 || len(stats.Broken) != 0 || stats.Foreign != 0 {
 		t.Fatalf("first pass: %+v", stats)
 	}
 	now = now.Add(2 * grace)
@@ -290,7 +301,7 @@ func TestCollect(t *testing.T) {
 	if left := bucket.Keys(store.snapshotPrefix(orphan)); len(left) != 0 {
 		t.Fatalf("a collected snapshot's chunks were left: %v", left)
 	}
-	if raw := bucket.Raw(store.chunkKey(child, "loser", 0)); raw != nil {
+	if raw := bucket.Raw(store.chunkKey(child, "00000000000000cd", 0)); raw != nil {
 		t.Fatal("a losing attempt's chunk was left under a snapshot that stands")
 	}
 	if got, err := download(store, child); err != nil || len(got) != 2500 {
@@ -313,6 +324,14 @@ func TestCollect(t *testing.T) {
 	if !has(callers) {
 		t.Fatal("a caller's snapshot was collected")
 	}
+	// The record that says "destroyed" outlives the run's snapshots by a
+	// long way: it is what tells a daemon still holding a copy that the
+	// copy is to go.
+	if left := bucket.Keys(store.runPrefix(runA)); len(left) == 0 {
+		t.Fatal("a destroyed run's record went with its snapshots")
+	}
+	now = now.Add(tombstoneGraces * grace)
+	collect()
 	if left := bucket.Keys(store.runPrefix(runA)); len(left) != 0 {
 		t.Fatalf("a destroyed run's records were left: %v", left)
 	}

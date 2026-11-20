@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
@@ -48,7 +50,13 @@ func testStore(t *testing.T) (*Store, *offhosttest.Memory) {
 	return store, bucket
 }
 
-const snapA = "00000000000000000000000001"
+const (
+	snapA = "00000000000000000000000001"
+	snapB = "00000000000000000000000002"
+	snapC = "00000000000000000000000003"
+	runB  = "01HZZZZZZZZZZZZZZZZZZZZZZB"
+	runC  = "01HZZZZZZZZZZZZZZZZZZZZZZC"
+)
 
 func randomBytes(t *testing.T, n int) []byte {
 	t.Helper()
@@ -259,8 +267,24 @@ func TestAFailedUploadLeavesNoSnapshot(t *testing.T) {
 		if has, _ := store.HasSnapshot(bg, snapA); has {
 			t.Fatal("a snapshot exists without its manifest having been written")
 		}
+		// The chunks stay: a write that was attempted may have landed, or
+		// may yet (see TestAManifestWhoseAnswerWasLost). They are chunks
+		// no manifest names, which is collection's to remove.
+		if left := bucket.Keys(""); len(left) != 3 {
+			t.Fatalf("after a manifest write that failed: %v, want the three chunks", left)
+		}
+		bucket.SetFail(nil)
+		clock := time.Now()
+		store.now = func() time.Time { return clock }
+		if _, err := store.Collect(bg, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		clock = clock.Add(2 * time.Hour)
+		if _, err := store.Collect(bg, time.Hour); err != nil {
+			t.Fatal(err)
+		}
 		if left := bucket.Keys(""); len(left) != 0 {
-			t.Fatalf("a failed upload left %v", left)
+			t.Fatalf("collection left %v", left)
 		}
 	})
 	t.Run("an empty stream", func(t *testing.T) {
@@ -382,11 +406,12 @@ func TestProbeFindsAServiceWithoutConditionalWrites(t *testing.T) {
 }
 
 func TestMasterKeyForms(t *testing.T) {
-	raw := bytes.Repeat([]byte{0xAB}, KeySize)
+	raw, _ := hex.DecodeString("3b1f8e02c4d5a6977081929fa0b1c2d3e4f5061728394a5b6c7d8e9fa0b1c2d3")
 	forms := map[string][]byte{
-		"raw":    raw,
-		"hex":    []byte(strings.Repeat("ab", KeySize) + "\n"),
-		"base64": []byte("q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=\n"),
+		"raw":            raw,
+		"hex":            []byte(hex.EncodeToString(raw) + "\n"),
+		"base64":         []byte(base64.StdEncoding.EncodeToString(raw) + "\n"),
+		"base64, no pad": []byte(base64.RawURLEncoding.EncodeToString(raw)),
 	}
 	for name, form := range forms {
 		got, err := ParseMasterKey(form)
@@ -394,9 +419,23 @@ func TestMasterKeyForms(t *testing.T) {
 			t.Errorf("%s: %x, %v", name, got, err)
 		}
 	}
-	for _, bad := range []string{"", "short", strings.Repeat("ab", 31), strings.Repeat("zz", 32)} {
-		if _, err := ParseMasterKey([]byte(bad)); err == nil {
-			t.Errorf("%q was accepted as a master key", bad)
+	// Review A10: what is plainly not a random key is refused, whatever
+	// its length.
+	weak := map[string][]byte{
+		"empty":                 nil,
+		"short":                 []byte("short"),
+		"62 hex digits":         []byte(strings.Repeat("ab", 31)),
+		"not hex":               []byte(strings.Repeat("zz", 32)),
+		"32 zero bytes":         make([]byte, KeySize),
+		"one byte, repeated":    bytes.Repeat([]byte{0xAB}, KeySize),
+		"a passphrase":          []byte("correct horse battery staple 123"),
+		"hex of zeros":          []byte(strings.Repeat("00", KeySize)),
+		"a short pattern":       bytes.Repeat([]byte{1, 2, 3, 4}, KeySize/4),
+		"32 characters of text": []byte(strings.Repeat("ab", 16)),
+	}
+	for name, bad := range weak {
+		if _, err := ParseMasterKey(bad); err == nil {
+			t.Errorf("%s was accepted as a master key", name)
 		}
 	}
 }
@@ -423,7 +462,7 @@ func TestAKeyOpensOnlyForItsOwner(t *testing.T) {
 
 func TestMarkChainsRefusesAnEndlessChain(t *testing.T) {
 	needed := map[string]bool{"tail": true}
-	manifests := map[string]*Manifest{"tail": {Parent: "head"}, "head": {Parent: "tail"}}
+	manifests := map[string]*summary{"tail": {parent: "head"}, "head": {parent: "tail"}}
 	if err := markChains(needed, manifests); err == nil {
 		t.Fatal("a chain that circles must be an error, not a hang")
 	}
@@ -433,15 +472,15 @@ func TestMarkChainsRefusesAnEndlessChain(t *testing.T) {
 // its read is not this round's failure: nothing of it is left to keep.
 func TestCollectToleratesAManifestThatVanishesMidRound(t *testing.T) {
 	store, bucket := testStore(t)
-	parentKey, _ := store.Keys().NewKey("parent")
-	if _, err := store.Upload(bg, Manifest{ID: "parent", Purpose: PurposeSnapshot, GUID: "1"}, parentKey, bytes.NewReader(randomBytes(t, 1500))); err != nil {
+	parentKey, _ := store.Keys().NewKey(snapB)
+	if _, err := store.Upload(bg, Manifest{ID: snapB, Purpose: PurposeSnapshot, GUID: "1"}, parentKey, bytes.NewReader(randomBytes(t, 1500))); err != nil {
 		t.Fatal(err)
 	}
-	childKey, _ := store.Keys().NewKey("child")
-	if _, err := store.Upload(bg, Manifest{ID: "child", Purpose: PurposeSnapshot, GUID: "2", Parent: "parent"}, childKey, bytes.NewReader(randomBytes(t, 1500))); err != nil {
+	childKey, _ := store.Keys().NewKey(snapC)
+	if _, err := store.Upload(bg, Manifest{ID: snapC, Purpose: PurposeSnapshot, GUID: "2", Parent: snapB}, childKey, bytes.NewReader(randomBytes(t, 1500))); err != nil {
 		t.Fatal(err)
 	}
-	bucket.Remove("fleet/v1/snap/parent/manifest")
+	bucket.Remove("fleet/v1/snap/" + snapB + "/manifest")
 	stats, err := store.Collect(bg, time.Hour)
 	if err != nil {
 		t.Fatalf("a manifest that vanished mid-round must not fail the round: %v", err)
@@ -449,27 +488,27 @@ func TestCollectToleratesAManifestThatVanishesMidRound(t *testing.T) {
 	if stats.Snapshots != 0 {
 		t.Fatalf("nothing is old enough to delete: %+v", stats)
 	}
-	if has, _ := store.HasSnapshot(bg, "child"); !has {
+	if has, _ := store.HasSnapshot(bg, snapC); !has {
 		t.Fatal("the surviving snapshot was deleted")
 	}
 }
 
 func TestRotationRewrapsWithoutMovingAnything(t *testing.T) {
 	store, bucket := testStore(t)
-	key, err := store.Keys().NewKey("run-1")
+	key, err := store.Keys().NewKey(runB)
 	if err != nil {
 		t.Fatal(err)
 	}
 	stream := randomBytes(t, 2500)
-	if _, err := store.Upload(bg, Manifest{ID: "snap-1", Purpose: PurposeSnapshot, GUID: "1", Run: "run-1"}, key, bytes.NewReader(stream)); err != nil {
+	if _, err := store.Upload(bg, Manifest{ID: snapB, Purpose: PurposeSnapshot, GUID: "1", Run: runB}, key, bytes.NewReader(stream)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Advance(bg, Record{Run: "run-1", Generation: 1, State: RecordStopped, Snapshot: "snap-1"}, key, "daemon-a", false); err != nil {
+	if err := store.Advance(bg, Record{Run: runB, Generation: 1, State: RecordStopped, Snapshot: snapB}, key, "daemon-a", false); err != nil {
 		t.Fatal(err)
 	}
 	chunk := func() []string {
 		var out []string
-		for _, key := range bucket.Keys("fleet/v1/snap/snap-1/") {
+		for _, key := range bucket.Keys("fleet/v1/snap/" + snapB + "/") {
 			if !strings.HasSuffix(key, "/manifest") {
 				out = append(out, key)
 			}
@@ -504,8 +543,8 @@ func TestRotationRewrapsWithoutMovingAnything(t *testing.T) {
 		t.Fatal("a chunk moved or changed")
 	}
 	// The rewritten record keeps its state and its owner.
-	latest, _, err := rotated.Latest(bg, "run-1")
-	if err != nil || latest.Owner != "daemon-a" || latest.State != RecordStopped || latest.Generation != 2 || latest.Snapshot != "snap-1" {
+	latest, _, err := rotated.Latest(bg, runB)
+	if err != nil || latest.Owner != "daemon-a" || latest.State != RecordStopped || latest.Generation != 2 || latest.Snapshot != snapB {
 		t.Fatalf("the rotated record: %+v %v", latest, err)
 	}
 
@@ -518,10 +557,10 @@ func TestRotationRewrapsWithoutMovingAnything(t *testing.T) {
 	if err := moved.Probe(bg); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := moved.Manifest(bg, "snap-1"); err != nil {
+	if _, _, err := moved.Manifest(bg, snapB); err != nil {
 		t.Fatalf("the manifest under the new master only: %v", err)
 	}
-	if _, _, err := moved.Latest(bg, "run-1"); err != nil {
+	if _, _, err := moved.Latest(bg, runB); err != nil {
 		t.Fatalf("the record under the new master only: %v", err)
 	}
 
@@ -529,14 +568,14 @@ func TestRotationRewrapsWithoutMovingAnything(t *testing.T) {
 	// written with the old wrapped spelling stays old until a pass moves
 	// it. (The service above the store re-wraps its own writes; that is
 	// asserted in the vm suite.)
-	oldKey, err := store.Keys().NewKey("run-2")
+	oldKey, err := store.Keys().NewKey(runC)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := rotated.Advance(bg, Record{Run: "run-2", Generation: 1, State: RecordStopped}, oldKey, "daemon-b", false); err != nil {
+	if err := rotated.Advance(bg, Record{Run: runC, Generation: 1, State: RecordStopped}, oldKey, "daemon-b", false); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := moved.Latest(bg, "run-2"); err == nil {
+	if _, _, err := moved.Latest(bg, runC); err == nil {
 		t.Fatal("a store-level write rewrapped, which is not the store's to do")
 	}
 	stats, err = rotated.Rotate(bg, "daemon-b", false)
@@ -546,7 +585,7 @@ func TestRotationRewrapsWithoutMovingAnything(t *testing.T) {
 	if stats.Records != 1 || stats.RecordsCurrent != 1 {
 		t.Fatalf("one record left to move, one already moved: %+v", stats)
 	}
-	if _, _, err := moved.Latest(bg, "run-2"); err != nil {
+	if _, _, err := moved.Latest(bg, runC); err != nil {
 		t.Fatalf("the moved record under the new master only: %v", err)
 	}
 }
@@ -556,14 +595,14 @@ func TestRotationRewrapsWithoutMovingAnything(t *testing.T) {
 // boot a filesystem that a run's destruction silently collects.
 func TestListSnapshotsAnswersOnlyCallerSnapshots(t *testing.T) {
 	store, _ := testStore(t)
-	key, err := store.Keys().NewKey("run-1")
+	key, err := store.Keys().NewKey(runB)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Upload(bg, Manifest{ID: "snap-1", Purpose: PurposeSnapshot, Run: "run-1", GUID: "1"}, key, bytes.NewReader(randomBytes(t, 1500))); err != nil {
+	if _, err := store.Upload(bg, Manifest{ID: snapB, Purpose: PurposeSnapshot, Run: runB, GUID: "1"}, key, bytes.NewReader(randomBytes(t, 1500))); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Upload(bg, Manifest{ID: "snap-2", Purpose: PurposeStop, Run: "run-1", GUID: "2"}, key, bytes.NewReader(randomBytes(t, 1500))); err != nil {
+	if _, err := store.Upload(bg, Manifest{ID: snapC, Purpose: PurposeStop, Run: runB, GUID: "2"}, key, bytes.NewReader(randomBytes(t, 1500))); err != nil {
 		t.Fatal(err)
 	}
 	baseKey, _ := store.Keys().NewKey("base-7")
@@ -574,7 +613,7 @@ func TestListSnapshotsAnswersOnlyCallerSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(listed) != 1 || listed[0].ID != "snap-1" || listed[0].Run != "run-1" || listed[0].StoredBytes == 0 || listed[0].CreatedAt.IsZero() {
+	if len(listed) != 1 || listed[0].ID != snapB || listed[0].Run != runB || listed[0].StoredBytes == 0 || listed[0].CreatedAt.IsZero() {
 		t.Fatalf("the caller snapshot is the listing: %+v", listed)
 	}
 }

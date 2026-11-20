@@ -77,48 +77,51 @@ func recordName(id string, generation uint64) string {
 	return id + "/" + strconv.FormatUint(generation, 10)
 }
 
-// parseRecordKey splits "…/run/<id>/<generation>".
+// parseRecordKey splits "…/run/<id>/<generation>". Only a key of exactly
+// that shape is a record: whatever else a listing hands over is not
+// this store's, and nothing is done to it.
 func (s *Store) parseRecordKey(key string) (id string, generation uint64, ok bool) {
 	rest, found := strings.CutPrefix(key, s.prefix+"run/")
 	if !found {
 		return "", 0, false
 	}
 	id, digits, found := strings.Cut(rest, "/")
-	if !found || len(digits) != 20 {
+	if !found || len(digits) != 20 || strings.Trim(digits, "0123456789") != "" || !validRunID(id) {
 		return "", 0, false
 	}
 	generation, err := strconv.ParseUint(digits, 10, 64)
-	return id, generation, err == nil && id != ""
+	return id, generation, err == nil && generation > 0
 }
 
 // Runs lists every run that has a record, with its newest generation.
 func (s *Store) Runs(ctx context.Context) (map[string]uint64, error) {
-	objects, err := s.objects.ListAll(ctx, s.prefix+"run/")
-	if err != nil {
-		return nil, err
-	}
 	runs := make(map[string]uint64)
-	for _, object := range objects {
+	err := s.objects.Walk(ctx, s.prefix+"run/", func(object s3.Object) error {
 		if id, generation, ok := s.parseRecordKey(object.Key); ok && generation >= runs[id] {
 			runs[id] = generation
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return runs, nil
 }
 
 // newest is the highest generation a run has, 0 for none.
 func (s *Store) newest(ctx context.Context, id string) (uint64, error) {
-	objects, err := s.objects.ListAll(ctx, s.runPrefix(id))
-	if err != nil {
-		return 0, err
-	}
 	var newest uint64
-	for _, object := range objects {
+	prefix := s.runPrefix(id)
+	err := s.objects.Walk(ctx, prefix, func(object s3.Object) error {
+		if !strings.HasPrefix(object.Key, prefix) {
+			return fmt.Errorf("the listing of %q holds %q, which is not under it", prefix, object.Key)
+		}
 		if _, generation, ok := s.parseRecordKey(object.Key); ok && generation > newest {
 			newest = generation
 		}
-	}
-	return newest, nil
+		return nil
+	})
+	return newest, err
 }
 
 func (s *Store) readRecord(ctx context.Context, id string, generation uint64) (*Record, Key, error) {
@@ -139,6 +142,11 @@ func (s *Store) readRecord(ctx context.Context, id string, generation uint64) (*
 	}
 	if record.Run != id || record.Generation != generation {
 		return nil, Key{}, fmt.Errorf("%w: generation %d of %s is not what its name says", ErrCorrupt, generation, id)
+	}
+	// A run's record is under the run's own key. The seal binds the
+	// document to its name and to the key; this binds the key to the run.
+	if key.Owner != id {
+		return nil, Key{}, fmt.Errorf("%w: generation %d of %s is under the key of %s", ErrCorrupt, generation, id, key.Owner)
 	}
 	return &record, key, nil
 }

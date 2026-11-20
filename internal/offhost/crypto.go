@@ -52,22 +52,53 @@ type Keyring struct {
 	previous map[string]cipher.AEAD
 }
 
-// ParseMasterKey reads a master key: 32 raw bytes, or their base64 or hex
-// spelling (surrounding whitespace ignored).
+// ParseMasterKey reads a master key: 32 random bytes, as 64 hex digits,
+// as base64 (standard or URL alphabet, with or without padding), or raw
+// (a file of exactly 32 bytes). Surrounding whitespace is ignored for
+// the two text forms.
+//
+//	head -c 32 /dev/urandom | xxd -p -c 64 > remote.key
+//
+// A key that is plainly not random is refused: 32 bytes of text (a
+// passphrase typed into the file is not a key, and neither is the text
+// of a hex or base64 key cut short), or bytes that hardly vary.
 func ParseMasterKey(raw []byte) ([]byte, error) {
-	if len(raw) == KeySize {
-		return bytes.Clone(raw), nil
-	}
+	var key []byte
 	text := strings.TrimSpace(string(raw))
 	if decoded, err := hex.DecodeString(text); err == nil && len(decoded) == KeySize {
-		return decoded, nil
+		key = decoded
 	}
 	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		if key != nil {
+			break
+		}
 		if decoded, err := encoding.DecodeString(text); err == nil && len(decoded) == KeySize {
-			return decoded, nil
+			key = decoded
 		}
 	}
-	return nil, fmt.Errorf("a master key is %d bytes, raw, base64 or hex", KeySize)
+	if key == nil && len(raw) == KeySize {
+		printable := true
+		for _, b := range raw {
+			printable = printable && b >= 0x20 && b < 0x7f
+		}
+		if printable {
+			return nil, errors.New("the master key file holds 32 characters of text, which is not a key: give 32 random bytes as 64 hex digits or as base64")
+		}
+		key = bytes.Clone(raw)
+	}
+	if key == nil {
+		return nil, fmt.Errorf("a master key is %d random bytes: 64 hex digits, base64, or the raw bytes", KeySize)
+	}
+	distinct := map[byte]struct{}{}
+	for _, b := range key {
+		distinct[b] = struct{}{}
+	}
+	// 32 random bytes essentially never have fewer than 16 distinct
+	// values; zeros, a repeated byte or a short pattern always do.
+	if len(distinct) < 16 {
+		return nil, errors.New("the master key is not random (its bytes hardly vary); generate one, for example with: head -c 32 /dev/urandom | xxd -p -c 64")
+	}
+	return key, nil
 }
 
 func newAEAD(key []byte) (cipher.AEAD, error) {

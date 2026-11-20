@@ -45,12 +45,17 @@ type fakeZFS struct {
 	guidBase  int
 	// available and used are what Space reports.
 	available, used int64
+	// receiveAnything turns off Receive's check of a stream's first
+	// record: for tests of what holds when that check is not there.
+	receiveAnything bool
 }
 
 type fakeDataset struct {
 	origin string
 	props  map[string]string
 	files  map[string][]byte
+	// filesystem: not a volume. The driver makes none; a stream can.
+	filesystem bool
 }
 
 type fakeSnapshot struct {
@@ -115,16 +120,24 @@ func (z *fakeZFS) Dataset(_ context.Context, name string) (Dataset, error) {
 }
 
 func (z *fakeZFS) Volumes(_ context.Context, root string) ([]Dataset, error) {
+	return z.list(root, false), nil
+}
+
+func (z *fakeZFS) Filesystems(_ context.Context, root string) ([]Dataset, error) {
+	return z.list(root, true), nil
+}
+
+func (z *fakeZFS) list(root string, filesystems bool) []Dataset {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	var volumes []Dataset
-	for name := range z.datasets {
-		if strings.HasPrefix(name, root+"/") {
-			volumes = append(volumes, z.describe(name))
+	var listed []Dataset
+	for name, dataset := range z.datasets {
+		if strings.HasPrefix(name, root+"/") && dataset.filesystem == filesystems {
+			listed = append(listed, z.describe(name))
 		}
 	}
-	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
-	return volumes, nil
+	sort.Slice(listed, func(i, j int) bool { return listed[i].Name < listed[j].Name })
+	return listed
 }
 
 func (z *fakeZFS) clonesOf(snapshot string) []string {
@@ -300,6 +313,12 @@ func (z *fakeZFS) Property(_ context.Context, name, key string) (string, error) 
 		return snapshot.guid, nil
 	}
 	if dataset, ok := z.datasets[name]; ok {
+		if key == "type" {
+			if dataset.filesystem {
+				return "filesystem", nil
+			}
+			return "volume", nil
+		}
 		if value, ok := dataset.props[key]; ok {
 			return value, nil
 		}
@@ -331,6 +350,9 @@ type fakeStream struct {
 	GUID     string
 	FromGUID string
 	Files    map[string][]byte
+	// Filesystem: the stream of a filesystem, which a volume's pool
+	// must never be made to hold.
+	Filesystem bool `json:",omitempty"`
 }
 
 func (z *fakeZFS) Send(_ context.Context, snapshot, from string, w io.Writer) error {
@@ -366,7 +388,7 @@ func (z *fakeZFS) Send(_ context.Context, snapshot, from string, w io.Writer) er
 	return err
 }
 
-func (z *fakeZFS) Receive(_ context.Context, snapshot, origin string, props map[string]string, r io.Reader) error {
+func (z *fakeZFS) Receive(_ context.Context, snapshot, origin string, props map[string]string, expect StreamIdentity, r io.Reader) error {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -387,6 +409,10 @@ func (z *fakeZFS) Receive(_ context.Context, snapshot, origin string, props map[
 	if err := json.Unmarshal(data[16:], &stream); err != nil {
 		return errors.New("cannot receive: invalid stream")
 	}
+	// As the real Receive holds a stream to its first record.
+	if !z.receiveAnything && (stream.Filesystem || stream.GUID != expect.GUID || stream.FromGUID != expect.FromGUID) {
+		return fmt.Errorf("zfs receive %s refused: the stream is not the one the manifest names", snapshot)
+	}
 	dataset := datasetOf(snapshot)
 	if _, exists := z.datasets[dataset]; exists {
 		return fmt.Errorf("cannot receive new filesystem stream: destination '%s' exists", dataset)
@@ -405,7 +431,7 @@ func (z *fakeZFS) Receive(_ context.Context, snapshot, origin string, props map[
 	case origin != "":
 		return errors.New("cannot receive: a full stream has no origin")
 	}
-	z.datasets[dataset] = &fakeDataset{origin: origin, props: maps.Clone(props), files: cloneFiles(stream.Files)}
+	z.datasets[dataset] = &fakeDataset{origin: origin, props: maps.Clone(props), files: cloneFiles(stream.Files), filesystem: stream.Filesystem}
 	z.snapshots[snapshot] = &fakeSnapshot{txg: z.tick(), guid: stream.GUID, props: map[string]string{}, files: cloneFiles(stream.Files)}
 	return nil
 }

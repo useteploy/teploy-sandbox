@@ -630,48 +630,217 @@ either way)
 
 ### Validating on a fresh x86-64 host
 
-Everything above has also been developed and verified on nested arm64;
-what that cannot give is x86-64 itself (the amd64 seccomp filter, ACPI
-hot-plug instead of a device tree) or bare-metal figures. A fresh host
-closes both. Every step refuses what it cannot do, so a host that gets
-to the end is a host the suite will run on.
+Everything above was developed and run live on arm64 only (nested KVM);
+x86-64 has been compiled and unit-tested by CI, never run with a
+hypervisor. The steps below take a fresh host to a run of the whole live
+suite and to the figures that close the x86-64 and bare-metal items in
+`AUDIT_OPEN.md`. Follow them in order; each command is meant to be run
+as written, from the checkout unless it says otherwise. Not every
+mistake is caught for you: the daemon and `scripts/install-host.sh`
+check the host, but nothing checks that the guest kernel or the base
+image is the one described here.
 
-1. **Provision** Debian 12 or 13 on x86-64 with root: 4+ CPUs, 8 GB RAM
-   minimum (16 GB to run the pool-on suite comfortably), a disk for the
-   ZFS pool. Record the CPU model, kernel and hypervisor versions with
-   the results.
-2. **ZFS**: install OpenZFS (Debian: `zfs-dkms zfsutils-linux`) and
-   create the pool —
-   `zpool create -O compression=lz4 -O volmode=dev sbx DISK`
-   (a file works too: `truncate -s 20G /pool.img` and create on it).
-3. **Host setup**: `sudo scripts/install-host.sh sbx`. Idempotent; it
-   writes the udev rule, opens `/dev/kvm` to the kvm group, and checks
-   the cgroup controllers. The daemon refuses a host it has not prepared.
-4. **Golden image**: a bootable x86-64 Linux root filesystem with
-   systemd on a zvol (a cloud image written to the volume, cloud-init
-   off) — it needs `iproute2` and the virtio drivers, and nothing that
-   configures network devices on its own (there is no DHCP; the agent is
-   told the address). Build the guest agent
-   (`CGO_ENABLED=0 go build -o teploy-guestd ./cmd/teploy-guestd`) and
-   `sudo scripts/build-golden.sh --from POOL/base@snap --to
-   POOL/golden-guestd@v1 --guestd ./teploy-guestd`.
-5. **Cloud Hypervisor**: the amd64 static build of the pinned version,
-   on PATH or named by `SBX_VM_HYPERVISOR`.
-6. **Object storage** for the off-host tests: any S3-compatible service
-   on loopback (versitygw is what development used), with the four
-   `SBX_S3_TEST_*` variables the suite reads.
-7. **The suite**: from a checkout,
-   `CGO_ENABLED=0 go test -c -tags vmintegration -o vm.test .` (cross
-   compile from anywhere with `GOOS=linux GOARCH=amd64`), then as root
-   run the whole suite pool-off and pool-on, and the root-only unit
-   tests with it (`-test.run "TestVM|TestJail|TestSocketDir|TestAKilled|
-   TestAProxy|TestTheWatch"`). `TestVMWarmPoolRaces` is timing-sensitive:
-   on a loaded host it may fail on time alone — re-run it alone before
-   believing a failure.
-8. **Record** the run in `AUDIT_OPEN.md`: what passed, on what hardware,
-   and the figures nesting could not give — cold boot time, warm claim,
-   create-to-first-exec, and the memory overhead per VM at a few sizes
-   (the cgroup figures the arm64 entries carry).
+1. **The host.** A bare-metal x86-64 machine with VT-x on in its
+   firmware, 4 or more CPUs, 16 GB of memory, a spare disk for the ZFS
+   pool and outbound internet. A cloud VM with nested KVM can run every
+   step and closes the x86-64 items, but not the audit's bare-metal
+   item: its figures are nested ones, like the arm64 runs. Install
+   **Ubuntu 24.04 LTS** with its 6.8 kernel (the server install's
+   default): Linux 6.8 and ZFS 2.2 are the versions of the arm64 runs,
+   so the CPU architecture is the only variable. Keep the
+   host free of other firewalls (no Docker; leave `ufw` inactive): a
+   `policy drop` forward chain blocks open runs (see Guest networking
+   above).
+   `ls -l /dev/kvm` must show the device.
+2. **Packages.**
+   `sudo apt-get update && sudo apt-get install -y zfsutils-linux nftables conntrack iproute2 qemu-utils cloud-guest-utils e2fsprogs git curl python3`
+   (`curl` and `python3` are also used on the host by the network tests,
+   for their peer). Go comes from go.dev, not from Ubuntu, whose
+   `golang-go` is older than `go.mod` allows; CI builds with 1.26:
+   `curl -fsSL https://go.dev/dl/go1.26.11.linux-amd64.tar.gz | sudo tar -C /usr/local -xz`
+   and `export PATH=/usr/local/go/bin:$PATH` (any later 1.26.x works).
+   Then `git clone https://github.com/useteploy/teploy-sandbox.git && cd teploy-sandbox`.
+3. **The ZFS pool**, named `sbx` throughout:
+   `sudo zpool create -O compression=lz4 -O volmode=dev sbx /dev/disk/by-id/YOUR-DISK`.
+   A file works for a trial (`sudo truncate -s 60G /var/lib/sbx.img`,
+   then the same command with `/var/lib/sbx.img` for the disk), but its
+   disk figures are not a bare-metal host's.
+4. **Cloud Hypervisor v54.1**, the version every live run so far used,
+   as its statically linked release asset, before the host script so
+   that it checks the binary:
+   `sudo curl -fsSL -o /usr/local/bin/cloud-hypervisor https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.1/cloud-hypervisor-static`,
+   `sudo chmod 0755 /usr/local/bin/cloud-hypervisor`, and
+   `cloud-hypervisor --version` to see it run.
+5. **The guest kernel.** The guest runs the host's choice of kernel,
+   not the image's: Cloud Hypervisor on x86-64 boots an uncompressed ELF
+   `vmlinux` directly (PVH), with no initramfs, so everything the guest
+   needs must be built in: virtio block, PCI and net, the virtio vsock
+   transport (the agent's only way in), the balloon, the RNG, ACPI PCI
+   hot-plug (how a run's network device arrives), ext4 and vfat (the
+   image mounts its EFI partition). A distro's `/boot/vmlinuz` is a
+   compressed bzImage that loads those as modules, and does not boot
+   here. Use the kernel Cloud Hypervisor publishes for this: the
+   `vmlinux-x86_64` asset of a `ch-release-*` release of
+   [cloud-hypervisor/linux](https://github.com/cloud-hypervisor/linux/releases),
+   built from that tag's `arch/x86/configs/ch_defconfig`, which has all
+   of the above built in and no module support (`make ch_defconfig && make vmlinux`
+   in that tree builds the same). For example, the newest release when
+   this was written:
+   `sudo install -d -m 0755 /var/lib/teploy-sandbox/vm` and
+   `sudo curl -fsSL -o /var/lib/teploy-sandbox/vm/vmlinux-x86_64 https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v7.2.8-20261009/vmlinux-x86_64`,
+   then `sudo chmod 0644 /var/lib/teploy-sandbox/vm/vmlinux-x86_64`
+   (an unprivileged VM process must read it). The daemon and the suite
+   look for `/var/lib/teploy-sandbox/vm/Image` (the arm64 name) unless
+   told otherwise, and refuse to start without a kernel: set
+   `SBX_VM_KERNEL=/var/lib/teploy-sandbox/vm/vmlinux-x86_64` (the
+   daemon's `--vm-kernel`). Leave `SBX_VM_CMDLINE` unset: the default
+   command line already names the x86-64 console (`ttyS0`) and the root
+   partition (`/dev/vda1`).
+6. **Host setup**: `sudo env SBX_VM_WARM=1x512=2,1x1024=1 scripts/install-host.sh sbx`.
+   It writes the udev rule, opens `/dev/kvm` to the `kvm` group, checks
+   the cgroup controllers, the network tools and kernel features, the
+   hypervisor's linkage, seccomp and Landlock, and sizes the host for
+   the pool the suite will use. It must end with "host is ready". If it
+   reports no `tbf` queue,
+   `sudo apt-get install -y linux-modules-extra-$(uname -r)` and run it
+   again.
+7. **The base image**: Ubuntu 24.04's cloud image, which has what the
+   suite runs in a guest (systemd, `iproute2`, `curl`, `python3`,
+   `netcat-openbsd`) and puts its root filesystem in partition 1, where
+   the kernel command line looks for it. Write it to a volume, grow its
+   root filesystem, and turn cloud-init off (with it on, a guest looks
+   for a datasource on every boot and configures network devices
+   itself). The pool hides every volume's partitions (`volmode=dev`), so
+   this one volume shows them while it is prepared, as
+   `scripts/build-golden.sh` does:
+
+   ```sh
+   curl -fsSLO https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+   sudo zfs create -V 20G sbx/base
+   sudo qemu-img convert -f qcow2 -O raw noble-server-cloudimg-amd64.img /dev/zvol/sbx/base
+   sudo zfs set volmode=full sbx/base
+   sudo udevadm settle
+   disk=$(readlink -f /dev/zvol/sbx/base)
+   ls -l "${disk}p1"                 # the root partition; if it is not there yet, wait a moment and repeat from the readlink
+   sudo growpart "$disk" 1
+   sudo e2fsck -f -y "${disk}p1"
+   sudo resize2fs "${disk}p1"
+   mnt=$(mktemp -d)
+   sudo mount "${disk}p1" "$mnt"
+   sudo touch "$mnt/etc/cloud/cloud-init.disabled"
+   sudo umount "$mnt"
+   sudo zfs set volmode=dev sbx/base
+   sudo zfs snapshot sbx/base@v1
+   ```
+
+8. **The golden image**: the guest agent for x86-64, installed into a
+   clone of the base:
+   `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o teploy-guestd ./cmd/teploy-guestd`,
+   then
+   `sudo scripts/build-golden.sh --from sbx/base@v1 --to sbx/golden-guestd@v1 --guestd ./teploy-guestd`.
+   `sbx/golden-guestd@v1` is the name the suite and the daemon use by
+   default.
+9. **The root-only unit tests**, exactly as CI's `vm-root` job runs
+   them. They are in `./internal/vm`, and they re-execute their own test
+   binary inside a jail as an unprivileged UID, which is why the binary
+   is installed where any UID can start it:
+
+   ```sh
+   set -o pipefail
+   CGO_ENABLED=0 go test -c -o vm-unit.test ./internal/vm/
+   sudo install -D -m 0755 vm-unit.test /opt/teploy-test/vm-unit.test
+   sudo /opt/teploy-test/vm-unit.test -test.v 2>&1 | tee vm-unit.log
+   grep -E -- '--- SKIP' vm-unit.log && echo "a test was skipped: that is a failure"
+   for name in TestJailHoldsNothingOfTheHost TestJailRefusesTheCallsTheFilterNames TestSocketDirIsBounded TestSeccompNumbersAreThisArchitectures; do
+     grep -q -- "--- PASS: $name" vm-unit.log || echo "$name did not run"
+   done
+   ```
+
+   The run must pass, with no `--- SKIP` (as root on this host none of
+   them has a reason to skip) and with all four named tests passing.
+   `TestJailRefusesTheCallsTheFilterNames` makes the refused calls on
+   purpose and can leave seccomp kill lines in the kernel log; the check
+   in step 11 only reads what came after.
+10. **The live suite**, twice: without a warm pool and with one. Each
+    run takes about 30 minutes, and the network tests need outbound
+    internet (the open tier is tested against public hosts). Build once,
+    then note the time, so that step 11 reads only these runs' kernel
+    log:
+
+    ```sh
+    CGO_ENABLED=0 go test -c -tags vmintegration -o vm.test .
+    start="$(date '+%F %T')"
+    sudo env SBX_VM_KERNEL=/var/lib/teploy-sandbox/vm/vmlinux-x86_64 SBX_VM_HYPERVISOR=/usr/local/bin/cloud-hypervisor \
+      SBX_VM_POOL=sbx SBX_VM_GOLDEN=sbx/golden-guestd@v1 \
+      ./vm.test -test.run TestVM -test.v -test.timeout 2h 2>&1 | tee vm-pool-off.log
+    sudo env SBX_VM_KERNEL=/var/lib/teploy-sandbox/vm/vmlinux-x86_64 SBX_VM_HYPERVISOR=/usr/local/bin/cloud-hypervisor \
+      SBX_VM_POOL=sbx SBX_VM_GOLDEN=sbx/golden-guestd@v1 SBX_VM_WARM=1x512=2,1x1024=1 \
+      ./vm.test -test.run TestVM -test.v -test.timeout 2h 2>&1 | tee vm-pool-on.log
+    ```
+
+    Both must end in `PASS`, again with no `--- SKIP`.
+    `TestVMWarmPoolRaces` is sensitive to timing: if it alone fails,
+    re-run it alone (`-test.run TestVMWarmPoolRaces`) before believing
+    the failure, and record both runs.
+11. **What to record**, in a new dated entry in `AUDIT_OPEN.md`, to
+    close its open x86-64 and bare-metal items:
+    - the host: CPU model, bare metal or not, memory, disk, Ubuntu and
+      kernel version (`uname -r`), ZFS (`zfs version`), the hypervisor
+      (`cloud-hypervisor --version`) and the guest kernel's release tag;
+    - that both runs passed (or what failed, and the re-runs);
+    - **no seccomp kills** with the real x86-64 hypervisor under the
+      daemon's own filter: `sudo journalctl -k --since "$start" | grep -E 'type=1326|seccomp'`
+      prints nothing after both runs (a kill of the daemon's filter is
+      logged as `type=1326` with `sig=31`);
+    - **warm and cold create timings**: the `WARM` and `COLD` lines
+      `TestVMWarmPool` logs (create to first exec, per tier);
+    - **memory overhead**: the lines `TestVMMemoryStaysInsideItsCgroup`
+      logs per guest size (cgroup limit, idle, peak, the hypervisor's
+      `VmHWM`); with 16 GB all three sizes run, and a "skipping the
+      ... guest" line means the host was too small;
+    - **the network device's hot-plug**: the network tests passing says
+      it works; whether x86-64 needs the PCI rescan the guest setup does
+      for arm64 (on x86-64 the hypervisor announces the device through
+      ACPI, and the rescan is believed to find nothing new) needs one
+      look inside a guest, below;
+    - **how many VMs of the default size (1 CPU, 1024 MiB) fit**, below,
+      both as measured and as the cgroup limits allow
+      (`(MemTotal − 2 GiB) / 1096 MiB`, 1096 MiB being the cgroup limit of
+      a 1024 MiB guest).
+
+    For the last two, run the daemon by hand. In one terminal:
+
+    ```sh
+    go build -o teploy-sandbox .
+    sudo ./teploy-sandbox serve --driver vm --token-file /var/lib/teploy-sandbox/check/token \
+      --vm-kernel /var/lib/teploy-sandbox/vm/vmlinux-x86_64 --vm-pool sbx --vm-golden sbx/golden-guestd@v1
+    ```
+
+    and in another (the daemon mints the token file on its first start):
+
+    ```sh
+    T=$(sudo cat /var/lib/teploy-sandbox/check/token)
+    api() { curl -s -H "Authorization: Bearer $T" "$@"; }
+    id=$(api -d '{"image":"golden","network":"open"}' http://127.0.0.1:7439/v1/runs | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+    api -N -d '{"cmd":"dmesg | grep -iE \"acpiphp|hotplug|virtio_net|pci 0000:00\""}' http://127.0.0.1:7439/v1/runs/$id/exec
+    api -X DELETE http://127.0.0.1:7439/v1/runs/$id
+    : > ids
+    while [ "$(awk '/MemAvailable/ { print int($2 / 1024) }' /proc/meminfo)" -gt 2048 ]; do
+      api -f -d '{"image":"golden"}' http://127.0.0.1:7439/v1/runs | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' >> ids || break
+    done
+    wc -l < ids
+    for id in $(cat ids); do api -X DELETE http://127.0.0.1:7439/v1/runs/$id; done
+    ```
+
+    Record the guest's kernel lines for the device, and the daemon's
+    `vm network device ready` log line for that run (`guestSetup` is the
+    guest's part; on arm64 the rescan was 157 to 168 ms of it). The loop
+    boots default-size VMs, idle, until the host has 2 GiB available:
+    record the count, which is the measured figure. Stop the daemon with
+    Ctrl-C when done.
+
+The off-host storage tests have their own section once that work is
+merged.
 
 ## Writable leases
 

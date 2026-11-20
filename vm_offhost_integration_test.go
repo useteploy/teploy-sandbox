@@ -207,7 +207,7 @@ func TestVMOffHost(t *testing.T) {
 	ctx := context.Background()
 	dataMB := int(envFloat("SBX_OFFHOST_MB", 300))
 	objects, err := s3.New(s3.Config{
-		Endpoint: endpoint, Bucket: os.Getenv("SBX_S3_TEST_BUCKET"), PathStyle: true,
+		Endpoint: endpoint, Bucket: os.Getenv("SBX_S3_TEST_BUCKET"), PathStyle: true, AllowInsecure: true,
 		Credentials: s3.Credentials{AccessKey: os.Getenv("SBX_S3_TEST_ACCESS_KEY"), SecretKey: os.Getenv("SBX_S3_TEST_SECRET_KEY")},
 	})
 	if err != nil {
@@ -677,7 +677,7 @@ func TestVMKeyRotation(t *testing.T) {
 	}
 	ctx := context.Background()
 	objects, err := s3.New(s3.Config{
-		Endpoint: endpoint, Bucket: os.Getenv("SBX_S3_TEST_BUCKET"), PathStyle: true,
+		Endpoint: endpoint, Bucket: os.Getenv("SBX_S3_TEST_BUCKET"), PathStyle: true, AllowInsecure: true,
 		Credentials: s3.Credentials{AccessKey: os.Getenv("SBX_S3_TEST_ACCESS_KEY"), SecretKey: os.Getenv("SBX_S3_TEST_SECRET_KEY")},
 	})
 	if err != nil {
@@ -799,7 +799,7 @@ func TestVMCallerSnapshots(t *testing.T) {
 	}
 	ctx := context.Background()
 	objects, err := s3.New(s3.Config{
-		Endpoint: endpoint, Bucket: os.Getenv("SBX_S3_TEST_BUCKET"), PathStyle: true,
+		Endpoint: endpoint, Bucket: os.Getenv("SBX_S3_TEST_BUCKET"), PathStyle: true, AllowInsecure: true,
 		Credentials: s3.Credentials{AccessKey: os.Getenv("SBX_S3_TEST_ACCESS_KEY"), SecretKey: os.Getenv("SBX_S3_TEST_SECRET_KEY")},
 	})
 	if err != nil {

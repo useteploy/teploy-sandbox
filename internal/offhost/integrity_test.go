@@ -1047,3 +1047,41 @@ func TestAParentDeletedUnderAnUploadMeansAFullSend(t *testing.T) {
 	}
 	restores(t, store, snapT, host.data[snapT])
 }
+
+// Review A2: a modification time that cannot be read used to read as
+// the year 1, which every age check took for ancient. It ages nothing:
+// such chunks are kept, and the round says so.
+func TestGarbageWithoutATimeIsNotCollected(t *testing.T) {
+	memory := offhosttest.NewMemory()
+	bucket := offhosttest.NewFaulty(memory)
+	store := integrityStore(t, bucket, testKeyring(t, 1))
+	clock := time.Now()
+	store.now = func() time.Time { return clock }
+	leftover := store.chunkKey(snapA, "00000000000000ab", 0)
+	if err := memory.Put(bg, leftover, []byte("chunk"), putOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	bucket.Set(func(f *offhosttest.Faulty) {
+		f.Listed = func(_ string, listed []s3.Object) []s3.Object {
+			for i := range listed {
+				listed[i].LastModified = time.Time{}
+			}
+			return listed
+		}
+	})
+	for range 3 {
+		stats, err := store.Collect(bg, time.Hour)
+		if err != nil || stats.Objects != 0 || stats.Undated != 1 {
+			t.Fatalf("a round over chunks without a readable time: %+v, %v", stats, err)
+		}
+		clock = clock.Add(48 * time.Hour)
+	}
+	if memory.Raw(leftover) == nil {
+		t.Fatal("a chunk whose age could not be told was deleted")
+	}
+	// With times it goes, once it has been watched for the grace.
+	bucket.Set(func(f *offhosttest.Faulty) { f.Listed = nil })
+	if stats, err := store.Collect(bg, time.Hour); err != nil || stats.Objects != 1 {
+		t.Fatalf("with times: %+v, %v", stats, err)
+	}
+}

@@ -28,11 +28,13 @@ func liveClient(t *testing.T) *Client {
 		t.Skip("SBX_S3_TEST_ENDPOINT is not set")
 	}
 	client, err := New(Config{
-		Endpoint:    endpoint,
-		Region:      os.Getenv("SBX_S3_TEST_REGION"),
-		Bucket:      os.Getenv("SBX_S3_TEST_BUCKET"),
-		PathStyle:   os.Getenv("SBX_S3_TEST_VIRTUAL_HOST") == "",
-		Credentials: Credentials{AccessKey: os.Getenv("SBX_S3_TEST_ACCESS_KEY"), SecretKey: os.Getenv("SBX_S3_TEST_SECRET_KEY")},
+		Endpoint: endpoint,
+		// The suite's service is wherever the operator put it.
+		AllowInsecure: true,
+		Region:        os.Getenv("SBX_S3_TEST_REGION"),
+		Bucket:        os.Getenv("SBX_S3_TEST_BUCKET"),
+		PathStyle:     os.Getenv("SBX_S3_TEST_VIRTUAL_HOST") == "",
+		Credentials:   Credentials{AccessKey: os.Getenv("SBX_S3_TEST_ACCESS_KEY"), SecretKey: os.Getenv("SBX_S3_TEST_SECRET_KEY")},
 	})
 	if err != nil {
 		t.Fatal(err)

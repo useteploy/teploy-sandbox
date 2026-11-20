@@ -992,3 +992,31 @@ func TestARotationSaysWhetherTheOldKeyIsStillNeeded(t *testing.T) {
 		}
 	}
 }
+
+// Review A10: the daemon's secrets were inherited by every zfs and
+// zpool it started. No host command is started with them.
+func TestHostCommandsAreStartedWithoutTheDaemonsSecrets(t *testing.T) {
+	environ := []string{"PATH=/usr/bin", "SBX_REMOTE_KEY=k", "SBX_REMOTE_SECRET_KEY=s", "AWS_SECRET_ACCESS_KEY=s",
+		"AWS_SESSION_TOKEN=t", "SBX_REMOTE_SESSION_TOKEN=t", "LANG=C", "SBX_REMOTE_KEY_FILE=/etc/teploy/remote.key"}
+	got := strings.Join(childEnv(environ), " ")
+	if got != "PATH=/usr/bin LANG=C SBX_REMOTE_KEY_FILE=/etc/teploy/remote.key" {
+		t.Fatalf("a host command's environment: %s", got)
+	}
+	// And through the command runner itself.
+	t.Setenv("SBX_REMOTE_KEY", "the master key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "the secret")
+	out, err := execCommander{}.Run(bg, "env")
+	if err != nil {
+		t.Skipf("no env command here: %v", err)
+	}
+	if strings.Contains(string(out), "the master key") || strings.Contains(string(out), "the secret") {
+		t.Fatal("a host command inherited the daemon's secrets")
+	}
+	var streamed bytes.Buffer
+	if err := (execCommander{}).Stream(bg, nil, &streamed, "env"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(streamed.String(), "the master key") || strings.Contains(streamed.String(), "the secret") {
+		t.Fatal("a streaming host command inherited the daemon's secrets")
+	}
+}

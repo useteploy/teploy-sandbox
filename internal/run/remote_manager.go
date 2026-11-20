@@ -672,7 +672,15 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		republish(latest.Generation, fmt.Sprintf("remote storage has generation %d of the run's record, and this daemon knows %d", latest.Generation, view.remoteGen))
 		return nil
 	case latest.Mine && latest.State == RecordStopped && latest.Snapshot == view.snapshot:
-		// A stop of ours that was written and never acknowledged.
+		// A stop of ours that was written and never acknowledged. The
+		// record is there; whether the snapshot is, is asked like
+		// anywhere else before the word "durable" is used.
+		if err := m.OffHost.Verify(ctx, view.snapshot); errors.Is(err, ErrRemoteIncomplete) {
+			republish(latest.Generation, err.Error())
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("%w: %v", ErrRemoteUnavailable, err)
+		}
 		at := latest.WrittenAt
 		m.mu.Lock()
 		live := m.runs[id]

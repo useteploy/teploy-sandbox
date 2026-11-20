@@ -98,29 +98,6 @@ func TestLiveObjects(t *testing.T) {
 	}
 }
 
-func TestLiveMultipart(t *testing.T) {
-	client := liveClient(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	key := fmt.Sprintf("live-%d/multipart.bin", time.Now().UnixNano())
-	body := make([]byte, 2*MinPartSize+777)
-	_, _ = rand.Read(body)
-	size, err := client.PutStream(ctx, key, bytes.NewReader(body), MinPartSize, PutOptions{})
-	if err != nil || size != int64(len(body)) {
-		t.Fatalf("PutStream = %d, %v", size, err)
-	}
-	got, err := client.Get(ctx, key, int64(len(body)))
-	if err != nil || !bytes.Equal(got, body) {
-		t.Fatalf("multipart object: %d bytes, %v", len(got), err)
-	}
-	if err := client.Delete(ctx, key); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// TestLiveConditionalPut reports what the service does with
-// `If-None-Match: *`, and, where it honours it, that of many writers
-// racing for one key exactly one wins.
 func TestLiveConditionalPut(t *testing.T) {
 	client := liveClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)

@@ -38,6 +38,11 @@ type Config struct {
 	MaxAttempts int
 	// UserAgent is sent when set.
 	UserAgent string
+	// AllowInsecure admits an http:// endpoint that is not this host.
+	// Without TLS anything on the path reads every object name and can
+	// replay, drop or answer for the service; the signature only covers
+	// what the request says, never what the answer does.
+	AllowInsecure bool
 }
 
 // Client talks to one bucket.
@@ -51,8 +56,12 @@ type Client struct {
 }
 
 var (
-	// ErrNotFound: the object (or bucket) does not exist.
+	// ErrNotFound: the object does not exist. A bucket that does not
+	// exist is ErrNoBucket, never this: "the object is not there" is an
+	// answer daemons act on, and a mistyped bucket must not give it.
 	ErrNotFound = errors.New("s3: not found")
+	// ErrNoBucket: the service says the bucket itself does not exist.
+	ErrNoBucket = errors.New("s3: no such bucket")
 	// ErrPreconditionFailed: a conditional write found the object already
 	// there.
 	ErrPreconditionFailed = errors.New("s3: precondition failed")
@@ -76,7 +85,9 @@ func (e *Error) Error() string {
 func (e *Error) Is(target error) bool {
 	switch target {
 	case ErrNotFound:
-		return e.Status == http.StatusNotFound
+		return e.Status == http.StatusNotFound && e.Code != "NoSuchBucket"
+	case ErrNoBucket:
+		return e.Code == "NoSuchBucket"
 	case ErrPreconditionFailed:
 		return e.Status == http.StatusPreconditionFailed
 	}
@@ -88,6 +99,9 @@ func New(cfg Config) (*Client, error) {
 	endpoint, err := url.Parse(cfg.Endpoint)
 	if err != nil || (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.Host == "" {
 		return nil, fmt.Errorf("s3: endpoint %q must be an http or https URL", cfg.Endpoint)
+	}
+	if endpoint.Scheme == "http" && !cfg.AllowInsecure && !loopbackHost(endpoint.Hostname()) {
+		return nil, fmt.Errorf("s3: endpoint %q is plain http to another host; use https, or say explicitly that the path to the service is trusted", cfg.Endpoint)
 	}
 	if strings.Trim(endpoint.Path, "/") != "" || endpoint.RawQuery != "" {
 		return nil, fmt.Errorf("s3: endpoint %q must not have a path or query", cfg.Endpoint)
@@ -121,6 +135,16 @@ func New(cfg Config) (*Client, error) {
 	// response of its own and fails as an error.
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Client{cfg: cfg, endpoint: endpoint, http: client, now: time.Now, sleep: sleepContext}, nil
+}
+
+// loopbackHost reports whether host is this machine: a loopback address
+// or the name every resolver gives one.
+func loopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func sleepContext(ctx context.Context, d time.Duration) error {
@@ -188,6 +212,13 @@ func (c *Client) attempt(ctx context.Context, r request) (*response, error) {
 	if c.cfg.Credentials.SessionToken != "" {
 		signed["x-amz-security-token"] = c.cfg.Credentials.SessionToken
 	}
+	// Every header that changes what the request means is signed: a
+	// condition (If-None-Match, If-Match) that something on the path
+	// could strip would turn "create only" into "overwrite" with a
+	// signature that still verifies.
+	for name, value := range r.headers {
+		signed[strings.ToLower(name)] = value
+	}
 	sign := signRequest{method: r.method, path: path, query: r.query, headers: signed, payloadHash: payloadHash}
 
 	target := url.URL{Scheme: c.endpoint.Scheme, Host: host, Path: path, RawPath: uriEncode(path, true), RawQuery: canonicalQuery(r.query)}
@@ -200,9 +231,6 @@ func (c *Client) attempt(ctx context.Context, r request) (*response, error) {
 		if name != "host" {
 			req.Header.Set(name, value)
 		}
-	}
-	for name, value := range r.headers {
-		req.Header.Set(name, value)
 	}
 	if c.cfg.UserAgent != "" {
 		req.Header.Set("User-Agent", c.cfg.UserAgent)
@@ -335,6 +363,8 @@ type PutOptions struct {
 	// succeeds only when no object has the key, and is
 	// ErrPreconditionFailed otherwise. Not every service honours it; see
 	// Store.Conditional in internal/offhost for how that is found out.
+	// The header is signed, so nothing between the daemon and the
+	// service can remove the condition without breaking the request.
 	IfAbsent    bool
 	ContentType string
 }
@@ -410,6 +440,12 @@ const maxListBody = 16 << 20
 
 // List returns one page of the keys under prefix (ListObjectsV2), in key
 // order. token is "" for the first page.
+//
+// A key that does not begin with prefix is an error, not a result: every
+// caller deletes by what a listing says, and a service (or something in
+// front of one) that ignores the prefix would otherwise have a daemon
+// delete what was never its own. A modification time that cannot be read
+// is the zero time; callers that age objects must not take it for old.
 func (c *Client) List(ctx context.Context, prefix, delimiter, token string) (Page, error) {
 	query := url.Values{"list-type": {"2"}}
 	if prefix != "" {
@@ -443,11 +479,17 @@ func (c *Client) List(ctx context.Context, prefix, delimiter, token string) (Pag
 	}
 	page := Page{}
 	for _, entry := range result.Contents {
+		if !strings.HasPrefix(entry.Key, prefix) {
+			return Page{}, fmt.Errorf("s3: the listing of %q holds %q, which is not under it; the service does not honour the prefix", prefix, entry.Key)
+		}
 		object := Object{Key: entry.Key, Size: entry.Size, ETag: entry.ETag}
 		object.LastModified, _ = time.Parse(time.RFC3339Nano, entry.LastModified)
 		page.Objects = append(page.Objects, object)
 	}
 	for _, entry := range result.CommonPrefixes {
+		if !strings.HasPrefix(entry.Prefix, prefix) {
+			return Page{}, fmt.Errorf("s3: the listing of %q holds the prefix %q, which is not under it", prefix, entry.Prefix)
+		}
 		page.Prefixes = append(page.Prefixes, entry.Prefix)
 	}
 	if result.IsTruncated {
@@ -459,36 +501,54 @@ func (c *Client) List(ctx context.Context, prefix, delimiter, token string) (Pag
 	return page, nil
 }
 
-// maxListPages bounds a listing the service never ends. S3 itself caps
-// a listing at 1000 pages of 1000 keys.
-const maxListPages = 1000
-
-// ListAll lists every key under prefix. A service that repeats a
-// continuation token, or never stops paginating, is an error, not a
-// listing: without a bound one broken answer would grow this without
-// end while the maintenance round that asked waits behind it.
-func (c *Client) ListAll(ctx context.Context, prefix string) ([]Object, error) {
-	var objects []Object
+// Walk calls each for every object under prefix, a page at a time: what
+// is held at once is one page, however large the bucket. An error from
+// each ends the walk and is returned.
+//
+// There is no bound on the number of pages (S3 has none, and a bound
+// makes every pass over a large bucket fail for good). What is refused
+// is a listing that cannot end: a continuation token the service has
+// already given.
+func (c *Client) Walk(ctx context.Context, prefix string, each func(Object) error) error {
 	token := ""
-	seen := map[string]bool{}
-	for page := 0; ; page++ {
-		if page >= maxListPages {
-			return nil, fmt.Errorf("s3: the listing of %q did not end within %d pages", prefix, maxListPages)
-		}
+	// One digest per page: a million pages (a billion keys) is 8 MB.
+	seen := map[[8]byte]struct{}{}
+	for {
 		page, err := c.List(ctx, prefix, "", token)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		objects = append(objects, page.Objects...)
+		for _, object := range page.Objects {
+			if err := each(object); err != nil {
+				return err
+			}
+		}
 		if page.Next == "" {
-			return objects, nil
+			return nil
 		}
-		if seen[page.Next] {
-			return nil, fmt.Errorf("s3: the service repeats the continuation token of %q", prefix)
+		digest := sha256.Sum256([]byte(page.Next))
+		mark := [8]byte(digest[:8])
+		if _, repeated := seen[mark]; repeated {
+			return fmt.Errorf("s3: the service repeats the continuation token of %q", prefix)
 		}
-		seen[page.Next] = true
+		seen[mark] = struct{}{}
 		token = page.Next
 	}
+}
+
+// ListAll lists every key under prefix into memory: for a prefix known
+// to be small (one run's records, a test's objects). Passes over a whole
+// bucket use Walk.
+func (c *Client) ListAll(ctx context.Context, prefix string) ([]Object, error) {
+	var objects []Object
+	err := c.Walk(ctx, prefix, func(object Object) error {
+		objects = append(objects, object)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return objects, nil
 }
 
 // CreateBucket creates the client's bucket. A bucket this account already

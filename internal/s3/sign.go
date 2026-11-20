@@ -1,6 +1,6 @@
 // Package s3 is a small client for S3-compatible object storage, written
 // against the standard library only: Signature Version 4, the handful of
-// object calls the daemon needs, multipart upload, and retries.
+// object calls the daemon needs, and retries.
 //
 // It deliberately speaks plain S3 and nothing a single provider adds. The
 // one feature beyond the 2006 API is the conditional write
@@ -68,16 +68,29 @@ func uriEncode(value string, keepSlash bool) string {
 	return out.String()
 }
 
-// canonicalQuery is the query string sorted by encoded name, then value.
+// canonicalQuery is the query string sorted by encoded name, and by
+// encoded value among equal names. Sorting the joined "name=value"
+// strings is not that: a name that is a prefix of another ("a", "a-b")
+// would follow it whenever the next byte sorts below '='.
 func canonicalQuery(query url.Values) string {
-	var pairs []string
+	type pair struct{ name, value string }
+	var pairs []pair
 	for name, values := range query {
 		for _, value := range values {
-			pairs = append(pairs, uriEncode(name, false)+"="+uriEncode(value, false))
+			pairs = append(pairs, pair{uriEncode(name, false), uriEncode(value, false)})
 		}
 	}
-	sort.Strings(pairs)
-	return strings.Join(pairs, "&")
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].name != pairs[j].name {
+			return pairs[i].name < pairs[j].name
+		}
+		return pairs[i].value < pairs[j].value
+	})
+	joined := make([]string, len(pairs))
+	for i, p := range pairs {
+		joined[i] = p.name + "=" + p.value
+	}
+	return strings.Join(joined, "&")
 }
 
 // canonicalHeaderValue trims a value and folds runs of spaces to one.

@@ -3,15 +3,14 @@ package s3
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,13 +30,14 @@ type fakeService struct {
 
 	mu       sync.Mutex
 	objects  map[string][]byte
-	uploads  map[string]map[int][]byte
-	nextID   int
 	requests []string
 	// fail answers the next requests with these statuses, one each.
 	fail []int
 	// pageSize is the listing page size.
 	pageSize int
+	// quiet keeps a signature mismatch out of the test's own failures:
+	// for a test that provokes one.
+	quiet bool
 }
 
 func newFakeService(t *testing.T) (*fakeService, *httptest.Server) {
@@ -46,7 +46,6 @@ func newFakeService(t *testing.T) (*fakeService, *httptest.Server) {
 		credentials: Credentials{AccessKey: "AKIDEXAMPLE", SecretKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"},
 		bucket:      "bucket",
 		objects:     map[string][]byte{},
-		uploads:     map[string]map[int][]byte{},
 		pageSize:    1000,
 	}
 	server := httptest.NewServer(service)
@@ -118,7 +117,9 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := f.verify(r, body); err != nil {
-		f.t.Errorf("%s %s: %v", r.Method, r.URL, err)
+		if !f.quiet {
+			f.t.Errorf("%s %s: %v", r.Method, r.URL, err)
+		}
 		fail(w, http.StatusForbidden, "SignatureDoesNotMatch")
 		return
 	}
@@ -140,50 +141,6 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && key == "":
 		f.list(w, query.Get("prefix"), query.Get("continuation-token"))
-	case r.Method == http.MethodPost && query.Has("uploads"):
-		f.nextID++
-		id := "upload-" + strconv.Itoa(f.nextID)
-		f.uploads[id] = map[int][]byte{}
-		fmt.Fprintf(w, "<InitiateMultipartUploadResult><UploadId>%s</UploadId></InitiateMultipartUploadResult>", id)
-	case r.Method == http.MethodPut && query.Has("uploadId"):
-		parts, ok := f.uploads[query.Get("uploadId")]
-		if !ok {
-			fail(w, http.StatusNotFound, "NoSuchUpload")
-			return
-		}
-		number, _ := strconv.Atoi(query.Get("partNumber"))
-		parts[number] = body
-		w.Header().Set("ETag", fmt.Sprintf("\"part-%d\"", number))
-	case r.Method == http.MethodPost && query.Has("uploadId"):
-		parts, ok := f.uploads[query.Get("uploadId")]
-		if !ok {
-			fail(w, http.StatusNotFound, "NoSuchUpload")
-			return
-		}
-		var document struct {
-			Parts []struct {
-				PartNumber int
-				ETag       string
-			} `xml:"Part"`
-		}
-		if err := xml.Unmarshal(body, &document); err != nil {
-			fail(w, http.StatusBadRequest, "MalformedXML")
-			return
-		}
-		var object []byte
-		for _, part := range document.Parts {
-			if part.ETag != fmt.Sprintf("\"part-%d\"", part.PartNumber) {
-				fail(w, http.StatusBadRequest, "InvalidPart")
-				return
-			}
-			object = append(object, parts[part.PartNumber]...)
-		}
-		delete(f.uploads, query.Get("uploadId"))
-		f.objects[key] = object
-		fmt.Fprint(w, "<CompleteMultipartUploadResult></CompleteMultipartUploadResult>")
-	case r.Method == http.MethodDelete && query.Has("uploadId"):
-		delete(f.uploads, query.Get("uploadId"))
-		w.WriteHeader(http.StatusNoContent)
 	case r.Method == http.MethodPut:
 		if _, exists := f.objects[key]; exists && r.Header.Get("If-None-Match") == "*" {
 			fail(w, http.StatusPreconditionFailed, "PreconditionFailed")
@@ -357,7 +314,7 @@ func TestClientVirtualHostAddressing(t *testing.T) {
 	service, server := newFakeService(t)
 	service.virtualHost = true
 	// The bucket is a host label: resolve every name to the test server.
-	client, err := New(Config{Endpoint: "http://s3.test", Bucket: service.bucket, Credentials: service.credentials,
+	client, err := New(Config{Endpoint: "http://s3.test", AllowInsecure: true, Bucket: service.bucket, Credentials: service.credentials,
 		HTTPClient: &http.Client{Transport: &http.Transport{Proxy: nil, DialContext: dialTo(server.Listener.Addr().String())}}})
 	if err != nil {
 		t.Fatal(err)
@@ -376,87 +333,6 @@ func TestClientVirtualHostAddressing(t *testing.T) {
 	}
 }
 
-func TestClientPutStream(t *testing.T) {
-	service, server := newFakeService(t)
-	client := service.client(t, server.URL)
-	ctx := context.Background()
-
-	data := make([]byte, 2*MinPartSize+12345)
-	_, _ = rand.Read(data)
-	size, err := client.PutStream(ctx, "big", iotestOneByteAtATimeAfter(data), MinPartSize, PutOptions{})
-	if err != nil || size != int64(len(data)) {
-		t.Fatalf("PutStream = %d, %v", size, err)
-	}
-	got, err := client.Get(ctx, "big", int64(len(data)))
-	if err != nil || !bytes.Equal(got, data) {
-		t.Fatalf("multipart object differs (%d bytes, %v)", len(got), err)
-	}
-
-	// Exactly two full parts: no empty third part.
-	exact := data[:2*MinPartSize]
-	if _, err := client.PutStream(ctx, "exact", bytes.NewReader(exact), MinPartSize, PutOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := client.Get(ctx, "exact", int64(len(exact))); !bytes.Equal(got, exact) {
-		t.Fatal("exact-multiple object differs")
-	}
-
-	// A small stream is one plain put.
-	service.mu.Lock()
-	service.requests = nil
-	service.mu.Unlock()
-	if _, err := client.PutStream(ctx, "small", strings.NewReader("tiny"), MinPartSize, PutOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	service.mu.Lock()
-	if len(service.requests) != 1 || service.requests[0] != "PUT /bucket/small" {
-		t.Fatalf("small stream requests = %v", service.requests)
-	}
-	service.mu.Unlock()
-
-	// A failing reader aborts the upload: nothing is left behind.
-	broken := io.MultiReader(bytes.NewReader(data[:MinPartSize+10]), failingReader{})
-	if _, err := client.PutStream(ctx, "broken", broken, MinPartSize, PutOptions{}); err == nil {
-		t.Fatal("PutStream of a failing reader succeeded")
-	}
-	service.mu.Lock()
-	defer service.mu.Unlock()
-	if len(service.uploads) != 0 {
-		t.Fatalf("%d multipart uploads left open", len(service.uploads))
-	}
-	if _, exists := service.objects["broken"]; exists {
-		t.Fatal("a failed upload left an object")
-	}
-}
-
-type failingReader struct{}
-
-func (failingReader) Read([]byte) (int, error) { return 0, errors.New("the source failed") }
-
-// iotestOneByteAtATimeAfter returns short reads, which a stream from a
-// pipe gives too.
-func iotestOneByteAtATimeAfter(data []byte) io.Reader {
-	return &shortReader{data: data}
-}
-
-type shortReader struct{ data []byte }
-
-func (s *shortReader) Read(p []byte) (int, error) {
-	if len(s.data) == 0 {
-		return 0, io.EOF
-	}
-	n := 70000
-	if n > len(p) {
-		n = len(p)
-	}
-	if n > len(s.data) {
-		n = len(s.data)
-	}
-	copy(p, s.data[:n])
-	s.data = s.data[n:]
-	return n, nil
-}
-
 func TestNewRejectsBadConfig(t *testing.T) {
 	good := Config{Endpoint: "https://s3.example.com", Bucket: "b", Credentials: Credentials{AccessKey: "a", SecretKey: "s"}}
 	if _, err := New(good); err != nil {
@@ -468,6 +344,9 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		"no bucket":      func(c *Config) { c.Bucket = "" },
 		"slash bucket":   func(c *Config) { c.Bucket = "a/b" },
 		"no credentials": func(c *Config) { c.Credentials = Credentials{} },
+		// Plain http to another host: object names in the clear, and
+		// answers anyone on the path can forge.
+		"http elsewhere": func(c *Config) { c.Endpoint = "http://s3.example.com" },
 	} {
 		cfg := good
 		mutate(&cfg)
@@ -532,5 +411,161 @@ func TestAListingThatRepeatsItsTokenEnds(t *testing.T) {
 	}
 	if pages != 2 {
 		t.Fatalf("two pages are enough to see the repeat, got %d", pages)
+	}
+}
+
+// Review A8: the condition of a conditional write is part of what is
+// signed. Unsigned, anything between the daemon and the service could
+// remove it and the request would still verify: "create only" would
+// become "overwrite".
+func TestConditionalHeadersAreSigned(t *testing.T) {
+	var authorization, condition string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization, condition = r.Header.Get("Authorization"), r.Header.Get("If-None-Match")
+		_, _ = io.Copy(io.Discard, r.Body)
+	}))
+	t.Cleanup(server.Close)
+	client, err := New(Config{Endpoint: server.URL, Bucket: "b", PathStyle: true, Credentials: Credentials{AccessKey: "a", SecretKey: "s"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Put(context.Background(), "v1/run/x/00000000000000000002", []byte("record"), PutOptions{IfAbsent: true, ContentType: "application/json"}); err != nil {
+		t.Fatal(err)
+	}
+	if condition != "*" {
+		t.Fatalf("If-None-Match = %q", condition)
+	}
+	_, list, _ := strings.Cut(authorization, "SignedHeaders=")
+	list, _, _ = strings.Cut(list, ",")
+	for _, want := range []string{"if-none-match", "content-type", "host", "x-amz-content-sha256", "x-amz-date"} {
+		if !strings.Contains(";"+list+";", ";"+want+";") {
+			t.Errorf("%s is not among the signed headers: %s", want, list)
+		}
+	}
+}
+
+// And the fake service, which recomputes every signature from the
+// request as received, refuses a conditional write whose condition was
+// removed on the way.
+func TestAStrippedConditionBreaksTheSignature(t *testing.T) {
+	service, server := newFakeService(t)
+	stripped := 0
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		forward, _ := http.NewRequest(r.Method, server.URL+r.URL.RequestURI(), bytes.NewReader(body))
+		forward.Header = r.Header.Clone()
+		forward.Host = r.Host
+		if forward.Header.Get("If-None-Match") != "" {
+			forward.Header.Del("If-None-Match")
+			stripped++
+		}
+		recorder := httptest.NewRecorder()
+		service.quiet = true
+		service.ServeHTTP(recorder, forward)
+		w.WriteHeader(recorder.Code)
+		_, _ = w.Write(recorder.Body.Bytes())
+	}))
+	t.Cleanup(proxy.Close)
+	client := service.client(t, proxy.URL)
+	err := client.Put(context.Background(), "k", []byte("x"), PutOptions{IfAbsent: true})
+	if err == nil || stripped == 0 {
+		t.Fatalf("a write whose condition was stripped on the way was accepted (stripped %d): %v", stripped, err)
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if _, written := service.objects["k"]; written {
+		t.Fatal("the unconditional form of a conditional write reached the bucket")
+	}
+}
+
+// Review A10: SigV4 sorts the query by name, then value — not the
+// joined "name=value" strings.
+func TestCanonicalQuerySortsByName(t *testing.T) {
+	if got := canonicalQuery(url.Values{"a": {"1"}, "a-b": {"2"}}); got != "a=1&a-b=2" {
+		t.Fatalf("canonical query = %s, want a=1&a-b=2", got)
+	}
+	if got := canonicalQuery(url.Values{"k": {"b", "a"}, "j": {"z"}}); got != "j=z&k=a&k=b" {
+		t.Fatalf("canonical query = %s", got)
+	}
+}
+
+// Review A6: a listing is what a collector deletes by. A service that
+// ignores the prefix must be an error, not a list of someone else's
+// objects.
+func TestAListingOutsideItsPrefixIsRefused(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<ListBucketResult><IsTruncated>false</IsTruncated>
+<Contents><Key>fleet/v1/snap/a/manifest</Key><Size>1</Size><LastModified>2026-01-02T03:04:05.000Z</LastModified></Contents>
+<Contents><Key>backups/database.dump</Key><Size>1</Size><LastModified>2026-01-02T03:04:05.000Z</LastModified></Contents>
+</ListBucketResult>`)
+	}))
+	t.Cleanup(server.Close)
+	client, err := New(Config{Endpoint: server.URL, Bucket: "bucket", PathStyle: true, Credentials: Credentials{AccessKey: "a", SecretKey: "s"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ListAll(context.Background(), "fleet/v1/"); err == nil || !strings.Contains(err.Error(), "backups/database.dump") {
+		t.Fatalf("a listing with a key outside its prefix: %v", err)
+	}
+}
+
+// Review A10: a listing has as many pages as it has; S3 sets no bound,
+// and a fixed one fails every pass over a large bucket for good.
+func TestAListingOfManyPagesIsWalked(t *testing.T) {
+	service, server := newFakeService(t)
+	service.pageSize = 1
+	client := service.client(t, server.URL)
+	service.mu.Lock()
+	for i := 0; i < 1500; i++ {
+		service.objects[fmt.Sprintf("p/%05d", i)] = []byte{1}
+	}
+	service.mu.Unlock()
+	count := 0
+	if err := client.Walk(context.Background(), "p/", func(Object) error { count++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1500 {
+		t.Fatalf("walked %d of 1500 objects", count)
+	}
+	// And a walk stops where its caller says.
+	stop := errors.New("enough")
+	if err := client.Walk(context.Background(), "p/", func(Object) error { return stop }); !errors.Is(err, stop) {
+		t.Fatalf("Walk = %v", err)
+	}
+}
+
+// Review A10: "no such bucket" is not "no such object". Daemons act on
+// the second (a run with no record, a snapshot with no manifest).
+func TestNoSuchBucketIsNotNotFound(t *testing.T) {
+	service, server := newFakeService(t)
+	client, err := New(Config{Endpoint: server.URL, Bucket: "another", PathStyle: true, Credentials: service.credentials})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.sleep = func(context.Context, time.Duration) error { return nil }
+	_, err = client.Get(context.Background(), "k", 8)
+	if errors.Is(err, ErrNotFound) || !errors.Is(err, ErrNoBucket) {
+		t.Fatalf("Get from a bucket that does not exist = %v", err)
+	}
+	if _, err := service.client(t, server.URL).Get(context.Background(), "k", 8); !errors.Is(err, ErrNotFound) || errors.Is(err, ErrNoBucket) {
+		t.Fatalf("Get of a missing object = %v", err)
+	}
+}
+
+// Review A2: a modification time that cannot be read stays the zero
+// time; it is the caller's to treat as unknown.
+func TestAnUnreadableListingTimeIsZero(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<ListBucketResult><IsTruncated>false</IsTruncated>
+<Contents><Key>a</Key><Size>1</Size><LastModified>yesterday</LastModified></Contents></ListBucketResult>`)
+	}))
+	t.Cleanup(server.Close)
+	client, err := New(Config{Endpoint: server.URL, Bucket: "bucket", PathStyle: true, Credentials: Credentials{AccessKey: "a", SecretKey: "s"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := client.ListAll(context.Background(), "")
+	if err != nil || len(listed) != 1 || !listed[0].LastModified.IsZero() {
+		t.Fatalf("ListAll = %+v, %v", listed, err)
 	}
 }

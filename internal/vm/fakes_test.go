@@ -488,9 +488,15 @@ func (m *fakeMachine) Agent() Agent            { return (*fakeAgent)(m) }
 func (m *fakeMachine) Exited() <-chan struct{} { return m.exited }
 func (m *fakeMachine) Diagnostics() string     { return "fake serial log" }
 
+// Exit is how the process ended, and nothing before it has been reaped:
+// a real machine's wait status is not there to be read until Exited is
+// closed, and a driver that read it early would see no kill at all.
 func (m *fakeMachine) Exit() MachineExit {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.dead {
+		return MachineExit{}
+	}
 	return m.exit
 }
 

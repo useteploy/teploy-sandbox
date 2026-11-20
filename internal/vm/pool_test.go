@@ -877,3 +877,44 @@ func TestARollbackHasItsWholeDeadlineHoweverLongTheBootTook(t *testing.T) {
 		})
 	}
 }
+
+// A pool VM whose sockets failed and whose process is still not seen gone
+// when the grace is over is not known to be dead, and nothing is booted
+// beside a VM that may live: the create fails, and the VM is killed and
+// given back as any VM whose claim failed.
+func TestAPoolVMNotSeenGoneInTimeIsNotReplaced(t *testing.T) {
+	rig, network, _ := newWarmNetworkedRig(t, WarmConfig{Sizes: []WarmSize{{1, 512, 1}}})
+	waitPool(t, rig.driver, "full", full)
+	pool := rig.driver.warmPool()
+	pool.mu.Lock()
+	pool.retryBase = time.Minute
+	pool.mu.Unlock()
+	dead := rig.warmVMs(1, 512)[0]
+	machine := rig.hypervisor.machine(dead)
+	dieAtClaim(machine, killedFromOutside, 10*claimDeathGrace, nil)
+	start := time.Now()
+	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Network: run.NetworkAllowlist, Limits: &run.Limits{MemoryMB: 512, CPUs: 1}}); err == nil {
+		t.Fatal("a create succeeded beside a pool VM that was not seen gone")
+	}
+	if waited := time.Since(start); waited < claimDeathGrace {
+		t.Fatalf("the create gave up after %s, before the grace of %s", waited, claimDeathGrace)
+	}
+	rig.hypervisor.mu.Lock()
+	started := len(rig.hypervisor.started)
+	rig.hypervisor.mu.Unlock()
+	if started != 1 {
+		t.Fatalf("%d VMs booted, want only the pool's one", started)
+	}
+	if !machine.killed() {
+		t.Fatal("the VM was not killed")
+	}
+	if ok, _ := rig.zfs.Exists(bg, testPool+"/"+dead); ok {
+		t.Fatal("the VM's volume is still there")
+	}
+	network.mu.Lock()
+	left, places := len(network.attached), len(network.places)
+	network.mu.Unlock()
+	if left != 0 || places != 0 {
+		t.Fatalf("left in the network: %d devices, %d places", left, places)
+	}
+}

@@ -83,7 +83,7 @@ func addRemoteFlags(flags *flag.FlagSet) *remoteFlags {
 		scrubInterval: flags.Duration("remote-scrub-interval", envDuration("SBX_REMOTE_SCRUB_INTERVAL", run.DefaultRemoteScrubInterval),
 			"remote storage: how often every stopped run this daemon reports durable is checked again in the bucket (manifest, every chunk, and everything its stream builds on); 0 never"),
 		transfers: flags.Int("remote-transfers", int(envFloat("SBX_REMOTE_TRANSFERS", run.DefaultTransfers)),
-			"remote storage: uploads and restores at once across all runs; each holds about (remote-parallel + 1) chunks in memory"),
+			"remote storage: uploads and restores at once across all runs; each holds about (remote-parallel + 1) chunks in memory. With more than one, uploads take at most all but one, which is left for restores"),
 		insecureHTTP: flags.Bool("remote-insecure-http", envBool("SBX_REMOTE_INSECURE_HTTP"),
 			"remote storage: allow a plain http:// endpoint on another host. Object names and sizes then cross the network in the clear and whatever is on the path can answer for the service; only for a network that is itself trusted"),
 		unfenced: flags.Bool("remote-unfenced", envBool("SBX_REMOTE_UNFENCED"),

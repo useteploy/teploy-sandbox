@@ -277,7 +277,8 @@ type Manager struct {
 	// durable still is (ScrubRemote); negative turns it off.
 	RemoteScrubInterval time.Duration
 	// Transfers is how many uploads and restores run at once
-	// (DefaultTransfers when zero). Set before the first one.
+	// (DefaultTransfers when zero); with more than one, uploads take at
+	// most all but one of them. Set before the first one.
 	Transfers int
 
 	mu   sync.Mutex
@@ -324,8 +325,12 @@ type Manager struct {
 	pins        map[string]int
 	releaseOwed map[string]bool
 
+	// transfers bounds uploads and restores together; uploads bounds the
+	// uploads among them to one fewer, so that a restore always has a
+	// transfer no upload can hold (transferSlot).
 	transferOnce sync.Once
 	transfers    chan struct{}
+	uploads      chan struct{}
 }
 
 func NewManager(runtime Runtime, log *slog.Logger) *Manager {

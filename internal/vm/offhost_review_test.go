@@ -393,7 +393,8 @@ func TestADestroyedRecordStillDropsTheCopy(t *testing.T) {
 func TestTransfersAreBoundedAcrossRuns(t *testing.T) {
 	bucket := offhosttest.NewMemory()
 	counting := &countingBucket{Memory: bucket, gate: make(chan struct{})}
-	const transfers = 2
+	// Three transfers: two for uploads, and one that only a restore takes.
+	const transfers, uploads = 3, 2
 	a := newHostObjs(t, bucket, counting, "host-a", nil, nil, func(_ *offhost.Config, m *run.Manager) { m.Transfers = transfers })
 	const runs = 12
 	var ids []string
@@ -407,7 +408,7 @@ func TestTransfersAreBoundedAcrossRuns(t *testing.T) {
 			done <- stopped
 		}()
 	}
-	bound := int64(transfers * a.store.Parallel)
+	bound := int64(uploads * a.store.Parallel)
 	deadline := time.Now().Add(2 * time.Second)
 	for counting.peak.Load() < bound && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
@@ -420,7 +421,7 @@ func TestTransfersAreBoundedAcrossRuns(t *testing.T) {
 		}
 	}
 	if peak := counting.peak.Load(); peak != bound {
-		t.Fatalf("%d stops at once had %d chunk writes in flight together; want %d (%d transfers of %d)", runs, peak, bound, transfers, a.store.Parallel)
+		t.Fatalf("%d stops at once had %d chunk writes in flight together; want %d (%d uploads of %d)", runs, peak, bound, uploads, a.store.Parallel)
 	}
 }
 

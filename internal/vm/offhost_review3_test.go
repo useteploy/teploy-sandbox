@@ -5,9 +5,12 @@ package vm
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/useteploy/teploy-sandbox/internal/offhost"
 	"github.com/useteploy/teploy-sandbox/internal/offhost/offhosttest"
 	"github.com/useteploy/teploy-sandbox/internal/run"
 )
@@ -212,5 +215,52 @@ func TestAStopIsNotDurableWhenItsBaseWentBeforeTheRecord(t *testing.T) {
 	}
 	if !bytes.Equal(b.read(t, created.ID), data) {
 		t.Fatal("bytes differ")
+	}
+}
+
+// The bound on transfers (review B7) was one pool for uploads and
+// restores alike. A stop uploads before it answers, so as many stops as
+// there are transfers held all of them for as long as their uploads
+// took, and a resume of a run that had to be fetched first — a caller
+// waiting, the run already claimed for this daemon — waited with them.
+func TestARestoreDoesNotWaitBehindEveryUpload(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	counting := &countingBucket{Memory: bucket, gate: make(chan struct{})}
+	const transfers = 2
+	a := newHostObjs(t, bucket, counting, "host-a", nil, nil, func(_ *offhost.Config, m *run.Manager) { m.Transfers = transfers })
+	b := newHost(t, bucket, "host-b", nil)
+	data := payload(t, 400)
+	elsewhere := b.startRun(t, data)
+	b.stop(t, elsewhere.ID)
+	a.sync(t)
+
+	const stops = 3
+	done := make(chan *run.Run, stops)
+	for range stops {
+		id := a.startRun(t, payload(t, 2000)).ID
+		go func() {
+			stopped, _ := a.manager.Stop(bg, id)
+			done <- stopped
+		}()
+	}
+	// The uploads are in flight, and stay there.
+	deadline := time.Now().Add(2 * time.Second)
+	for counting.inFlight.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+	defer cancel()
+	if _, err := a.manager.Resume(ctx, elsewhere.ID, 0); err != nil {
+		t.Fatalf("a resume that has to fetch, with %d stops uploading on a daemon of %d transfers: %v", stops, transfers, err)
+	}
+	if !bytes.Equal(a.read(t, elsewhere.ID), data) {
+		t.Fatal("bytes differ")
+	}
+	close(counting.gate)
+	for range stops {
+		if stopped := <-done; stopped == nil || stopped.Remote.State != run.RemoteDurable {
+			t.Fatalf("a stop that waited for a transfer: %+v", stopped)
+		}
 	}
 }

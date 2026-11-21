@@ -661,7 +661,7 @@ serve --driver vm --state-dir /var/lib/teploy-sandbox/state \
 | `--remote-insecure-http` | off | Allow a plain `http://` endpoint on another host. Only on a network that is itself trusted |
 | `--remote-snapshot-retry` | 12h | How long a caller snapshot whose upload failed is retried before it stays on that host only (0: not retried). Shorter than `--remote-gc-grace` |
 | `--remote-chunk-mb`, `--remote-parallel` | 16, 4 | Object size and objects in flight; one transfer holds about (parallel + 1) chunks in memory, whatever the disk's size |
-| `--remote-transfers` | 4 | Uploads and restores at once, across all runs. The rest wait |
+| `--remote-transfers` | 4 | Uploads and restores at once, across all runs. The rest wait. With more than one, one is never taken by an upload, so a resume that has to fetch is not behind every upload in flight |
 | `--remote-max-chain` | 8 | Incremental uploads in a row before one is sent against the base image again (1 to 64: no daemon restores through a longer chain) |
 | `--remote-local` | `keep` | `keep` a durable snapshot's local copy for a fast resume here, or `drop` it at once |
 | `--remote-pool-reserve` | 15 | Percent of the pool to keep free; below it, local copies of durable snapshots go, oldest stop first |
@@ -788,9 +788,12 @@ restore or until the pool is short; and if the removal itself fails
 (the error says so) the leftovers are marked as an unfinished restore,
 which the next start removes.
 
-At most `--remote-transfers` uploads and restores run at once; restores
-run one at a time, and so do uploads of base images. A request that
-waits for one gives up when its caller does.
+At most `--remote-transfers` uploads and restores run at once, and at
+most one fewer uploads than that (when it is more than one): restores
+run one at a time, and the transfer kept back is theirs, so a resume or
+a create that has to fetch a snapshot does not wait for as many uploads
+as there are transfers. Uploads of base images run one at a time too. A
+request that waits for a transfer gives up when its caller does.
 
 **One running copy.** A run's record is a series of numbered
 generations, each an object written once with `If-None-Match: *` (the

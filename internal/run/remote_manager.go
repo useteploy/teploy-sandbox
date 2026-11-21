@@ -30,26 +30,46 @@ const (
 // times that.
 const DefaultTransfers = 4
 
-// transferSlot waits for one of the daemon's transfers.
-func (m *Manager) transferSlot(ctx context.Context) (release func(), err error) {
+// transferSlot waits for one of the daemon's transfers. One of them is
+// never taken by an upload (when there is more than one): a resume that
+// has to fetch its snapshot is a caller waiting, with the run already
+// claimed for this daemon, and must not stand behind as many uploads as
+// there are transfers, each of which may take hours.
+func (m *Manager) transferSlot(ctx context.Context, upload bool) (release func(), err error) {
 	m.transferOnce.Do(func() {
 		slots := m.Transfers
 		if slots <= 0 {
 			slots = DefaultTransfers
 		}
 		m.transfers = make(chan struct{}, slots)
+		m.uploads = make(chan struct{}, max(slots-1, 1))
 	})
+	if upload {
+		select {
+		case m.uploads <- struct{}{}:
+		case <-ctx.Done():
+			return nil, fmt.Errorf("waiting for one of this daemon's %d uploads to remote storage: %w", cap(m.uploads), ctx.Err())
+		}
+	}
 	select {
 	case m.transfers <- struct{}{}:
-		return func() { <-m.transfers }, nil
 	case <-ctx.Done():
+		if upload {
+			<-m.uploads
+		}
 		return nil, fmt.Errorf("waiting for one of this daemon's %d transfers with remote storage: %w", cap(m.transfers), ctx.Err())
 	}
+	return func() {
+		<-m.transfers
+		if upload {
+			<-m.uploads
+		}
+	}, nil
 }
 
 // upload is OffHost.Upload as one of the daemon's transfers.
 func (m *Manager) upload(ctx context.Context, req UploadRequest) (UploadResult, error) {
-	release, err := m.transferSlot(ctx)
+	release, err := m.transferSlot(ctx, true)
 	if err != nil {
 		return UploadResult{}, err
 	}
@@ -59,7 +79,7 @@ func (m *Manager) upload(ctx context.Context, req UploadRequest) (UploadResult, 
 
 // restore is OffHost.Ensure as one of the daemon's transfers.
 func (m *Manager) restore(ctx context.Context, ref string) error {
-	release, err := m.transferSlot(ctx)
+	release, err := m.transferSlot(ctx, false)
 	if err != nil {
 		return err
 	}

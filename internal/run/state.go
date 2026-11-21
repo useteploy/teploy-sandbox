@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -36,6 +37,19 @@ const (
 type stateFile struct {
 	Version int        `json:"version"`
 	Runs    []stateRun `json:"runs"`
+	// Tombstones are runs destroyed here whose remote record does not
+	// say so yet, with the generation that will (see remote.go).
+	Tombstones map[string]uint64 `json:"tombstones,omitempty"`
+	// SnapshotNotes are caller snapshots whose upload to remote storage
+	// is owed (waiting), in flight (uploading) or whose delete is owed
+	// (deleting). Additive: a daemon that does not know the field
+	// ignores it, and one that does reads its absence as none.
+	SnapshotNotes []snapshotNote `json:"snapshotNotes,omitempty"`
+	// Fetching are snapshots a create was restoring from remote storage
+	// when the file was written: on this host for a run that does not
+	// exist yet. Read back, they are released like the images of a run
+	// the restart lost. Additive.
+	Fetching []string `json:"fetching,omitempty"`
 }
 
 // stateRun is one persisted record. A running run carries only ID, State
@@ -65,6 +79,13 @@ type stateRun struct {
 	Images      []string          `json:"images,omitempty"`
 	RunningMs   int64             `json:"runningMs,omitempty"`
 	LeaseGen    uint64            `json:"leaseGen,omitempty"`
+	// The off-host side (remote.go). Base is a snapshot ref like
+	// Snapshot; a running record carries it too, with the three below.
+	Remote     *RemoteState `json:"remote,omitempty"`
+	Base       string       `json:"base,omitempty"`
+	RemoteGen  uint64       `json:"remoteGen,omitempty"`
+	RemoteHeld bool         `json:"remoteHeld,omitempty"`
+	RemoteKey  string       `json:"remoteKey,omitempty"`
 }
 
 // LoadState points the manager at its durable registry in dir and loads
@@ -90,6 +111,9 @@ func (m *Manager) LoadState(ctx context.Context, dir string) (int, error) {
 	}
 	var stopped []*Run
 	var orphaned []string
+	var tombstones map[string]uint64
+	var notes map[string]*snapshotNote
+	var dropped []string
 	data, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -98,15 +122,41 @@ func (m *Manager) LoadState(ctx context.Context, dir string) (int, error) {
 	case err != nil:
 		return 0, fmt.Errorf("state file %s: %w; refusing to start with an empty registry", path, err)
 	default:
-		stopped, orphaned, err = decodeState(data, m.ownsSnapshotRef)
+		stopped, orphaned, tombstones, notes, dropped, err = decodeState(data, m.ownsSnapshotRef)
+	}
+	for _, complaint := range dropped {
+		// Loud, and not a reason to refuse the start: the registry's
+		// stopped runs are worth more than one note about a snapshot.
+		m.log.Error("registry: a snapshot note was not understood and is dropped; its snapshot, if it exists, stays on this host only", "path", path, "note", complaint)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("state file %s is corrupt (%w); refusing to start with an empty registry — repair or remove it by hand, then delete any snapshots it referenced (a registry written under another --driver is refused the same way: give each driver its own --state-dir)", path, err)
+	}
+	if m.OffHost == nil {
+		notes = nil
 	}
 
 	m.mu.Lock()
 	for _, run := range stopped {
 		m.runs[run.ID] = run
+	}
+	for id, generation := range tombstones {
+		m.tombstones[id] = generation
+	}
+	for _, note := range notes {
+		if note.State == noteUploading {
+			// Whatever owned this upload died with the daemon; nothing
+			// else will resolve it. Retried, not resumed.
+			note.State = noteWaiting
+		}
+		m.snapshotNotes[note.Ref] = note
+	}
+	if m.OffHost != nil {
+		// A run the restart lost may come back as it was at its last
+		// stop (SyncRemote), and the snapshot it needs for that may be
+		// among these: they are kept until the first sync has decided.
+		m.orphans = append(m.orphans, orphaned...)
+		orphaned = nil
 	}
 	m.mu.Unlock()
 	m.statePath = path
@@ -133,39 +183,90 @@ func (m *Manager) LoadState(ctx context.Context, dir string) (int, error) {
 // like a file this daemon wrote is an error — including a snapshot ref the
 // driver does not own (owns), which is what a registry written under
 // another driver looks like.
-func decodeState(data []byte, owns func(ref string) bool) (stopped []*Run, orphaned []string, err error) {
+//
+// One thing is forgiven: a snapshot note in a state this binary does not
+// know (an earlier version wrote "" for a note it had given up on; a
+// later one may have states of its own). A note is about one caller
+// snapshot's standing with remote storage; refusing the start over it
+// would hold every stopped run hostage to it, and the operator's way out
+// (removing the file) would lose them all. It is dropped and reported
+// in dropped.
+func decodeState(data []byte, owns func(ref string) bool) (stopped []*Run, orphaned []string, tombstones map[string]uint64, notes map[string]*snapshotNote, dropped []string, err error) {
+	fail := func(err error) ([]*Run, []string, map[string]uint64, map[string]*snapshotNote, []string, error) {
+		return nil, nil, nil, nil, nil, err
+	}
 	var file stateFile
-	if err := json.Unmarshal(data, &file); err != nil {
-		return nil, nil, err
+	if err = json.Unmarshal(data, &file); err != nil {
+		return fail(err)
 	}
 	if file.Version != stateVersion {
-		return nil, nil, fmt.Errorf("unsupported version %d", file.Version)
+		return fail(fmt.Errorf("unsupported version %d", file.Version))
+	}
+	for id := range file.Tombstones {
+		if !validULID(id) {
+			return fail(fmt.Errorf("bad run id %q among the destroyed", id))
+		}
+	}
+	for _, ref := range file.Fetching {
+		if !owns(ref) {
+			return fail(fmt.Errorf("a fetch of %q is recorded, which is not a sandbox snapshot ref of this daemon's driver", ref))
+		}
+		orphaned = append(orphaned, ref)
+	}
+	notes = map[string]*snapshotNote{}
+	for i := range file.SnapshotNotes {
+		note := file.SnapshotNotes[i]
+		if !owns(note.Ref) {
+			return fail(fmt.Errorf("snapshot note holds %q, which is not a sandbox snapshot ref of this daemon's driver", note.Ref))
+		}
+		if _, duplicate := notes[note.Ref]; duplicate {
+			return fail(fmt.Errorf("two notes for snapshot %q", note.Ref))
+		}
+		if note.Run != "" && !validULID(note.Run) {
+			return fail(fmt.Errorf("note for %q names run %q, which is not a run id", note.Ref, note.Run))
+		}
+		if note.Base != "" && !owns(note.Base) {
+			return fail(fmt.Errorf("note for %q builds on %q, which is not a sandbox snapshot ref of this daemon's driver", note.Ref, note.Base))
+		}
+		switch note.State {
+		case noteUploading, noteWaiting, noteDeleting:
+		default:
+			dropped = append(dropped, fmt.Sprintf("%s (state %q)", note.Ref, note.State))
+			continue
+		}
+		notes[note.Ref] = &note
 	}
 	seen := make(map[string]bool)
 	for _, rec := range file.Runs {
 		if !validULID(rec.ID) || seen[rec.ID] {
-			return nil, nil, fmt.Errorf("bad or duplicate run id %q", rec.ID)
+			return fail(fmt.Errorf("bad or duplicate run id %q", rec.ID))
 		}
 		seen[rec.ID] = true
 		for _, ref := range rec.Images {
 			if !owns(ref) {
-				return nil, nil, fmt.Errorf("run %s holds %q, which is not a sandbox snapshot ref of this daemon's driver", rec.ID, ref)
+				return fail(fmt.Errorf("run %s holds %q, which is not a sandbox snapshot ref of this daemon's driver", rec.ID, ref))
 			}
+		}
+		if rec.Base != "" && !owns(rec.Base) {
+			return fail(fmt.Errorf("run %s builds on %q, which is not a sandbox snapshot ref of this daemon's driver", rec.ID, rec.Base))
 		}
 		switch rec.State {
 		case StateRunning:
 			orphaned = append(orphaned, rec.Images...)
+			if rec.Base != "" {
+				orphaned = append(orphaned, rec.Base)
+			}
 		case StateStopped:
 			run, err := rec.stoppedRun(owns)
 			if err != nil {
-				return nil, nil, fmt.Errorf("run %s: %w", rec.ID, err)
+				return fail(fmt.Errorf("run %s: %w", rec.ID, err))
 			}
 			stopped = append(stopped, run)
 		default:
-			return nil, nil, fmt.Errorf("run %s has unknown state %q", rec.ID, rec.State)
+			return fail(fmt.Errorf("run %s has unknown state %q", rec.ID, rec.State))
 		}
 	}
-	return stopped, orphaned, nil
+	return stopped, orphaned, file.Tombstones, notes, dropped, nil
 }
 
 func validULID(id string) bool {
@@ -212,7 +313,44 @@ func (rec stateRun) stoppedRun(owns func(ref string) bool) (*Run, error) {
 		warmReq:     rec.Warm,
 		snapshot:    rec.Snapshot,
 		runningFor:  time.Duration(rec.RunningMs) * time.Millisecond,
+		Remote:      rec.Remote,
+		base:        rec.Base,
+		remoteGen:   rec.RemoteGen,
+		remoteHeld:  rec.RemoteHeld,
+		remoteKey:   rec.RemoteKey,
 	}, nil
+}
+
+// stoppedStateRun is a stopped run as the registry file holds it.
+func stoppedStateRun(run *Run) stateRun {
+	limits := run.limits
+	return stateRun{
+		ID:          run.ID,
+		State:       StateStopped,
+		Image:       run.Image,
+		Network:     run.Network,
+		User:        run.User,
+		Labels:      run.Labels,
+		OnExpire:    run.OnExpire,
+		ForkedFrom:  run.ForkedFrom,
+		CreatedAt:   run.CreatedAt,
+		ExpiresAt:   run.ExpiresAt,
+		StoppedAt:   run.StoppedAt,
+		RetainUntil: run.RetainUntil,
+		Env:         run.env,
+		EgressAllow: run.egressAllow,
+		Limits:      &limits,
+		Warm:        run.warmReq,
+		WarmState:   run.Warm,
+		Snapshot:    run.snapshot,
+		RunningMs:   int64(run.runningFor / time.Millisecond),
+		LeaseGen:    run.leaseGen,
+		Remote:      run.Remote,
+		Base:        run.base,
+		RemoteGen:   run.remoteGen,
+		RemoteHeld:  run.remoteHeld,
+		RemoteKey:   run.remoteKey,
+	}
 }
 
 // persist writes the registry file. A no-op without a state dir. A
@@ -220,15 +358,24 @@ func (rec stateRun) stoppedRun(owns func(ref string) bool) (*Run, error) {
 // tick; the operation that triggered it has already happened and is not
 // undone.
 func (m *Manager) persist() {
+	if err := m.persistNow(); err != nil {
+		m.log.Error("registry not persisted; stopped runs changed since the last write would not survive a restart", "path", m.statePath, "error", err)
+	}
+}
+
+// persistNow is persist for the write-ahead halves of remote storage:
+// a caller snapshot is not captured, and a delete is not begun, on a
+// note that has not landed on disk. It reports whether it did.
+func (m *Manager) persistNow() error {
 	if m.statePath == "" {
-		return
+		return nil
 	}
 	if err := m.writeState(); err != nil {
 		m.stateDirty.Store(true)
-		m.log.Error("registry not persisted; stopped runs changed since the last write would not survive a restart", "path", m.statePath, "error", err)
-		return
+		return err
 	}
 	m.stateDirty.Store(false)
+	return nil
 }
 
 func (m *Manager) writeState() error {
@@ -239,33 +386,19 @@ func (m *Manager) writeState() error {
 	for _, run := range m.runs {
 		switch {
 		case run.State == StateStopped:
-			limits := run.limits
-			file.Runs = append(file.Runs, stateRun{
-				ID:          run.ID,
-				State:       StateStopped,
-				Image:       run.Image,
-				Network:     run.Network,
-				User:        run.User,
-				Labels:      run.Labels,
-				OnExpire:    run.OnExpire,
-				ForkedFrom:  run.ForkedFrom,
-				CreatedAt:   run.CreatedAt,
-				ExpiresAt:   run.ExpiresAt,
-				StoppedAt:   run.StoppedAt,
-				RetainUntil: run.RetainUntil,
-				Env:         run.env,
-				EgressAllow: run.egressAllow,
-				Limits:      &limits,
-				Warm:        run.warmReq,
-				WarmState:   run.Warm,
-				Snapshot:    run.snapshot,
-				RunningMs:   int64(run.runningFor / time.Millisecond),
-				LeaseGen:    run.leaseGen,
-			})
-		case len(run.images) > 0:
-			file.Runs = append(file.Runs, stateRun{ID: run.ID, State: StateRunning, Images: run.images})
+			file.Runs = append(file.Runs, stoppedStateRun(run))
+		case len(run.images) > 0 || run.base != "":
+			file.Runs = append(file.Runs, stateRun{ID: run.ID, State: StateRunning, Images: run.images, Base: run.base})
 		}
 	}
+	if len(m.tombstones) > 0 {
+		file.Tombstones = maps.Clone(m.tombstones)
+	}
+	for _, note := range m.snapshotNotes {
+		file.SnapshotNotes = append(file.SnapshotNotes, *note)
+	}
+	file.Fetching = slices.Sorted(maps.Keys(m.fetching))
+	slices.SortFunc(file.SnapshotNotes, func(a, b snapshotNote) int { return strings.Compare(a.Ref, b.Ref) })
 	m.mu.Unlock()
 	slices.SortFunc(file.Runs, func(a, b stateRun) int { return strings.Compare(a.ID, b.ID) })
 	return writeStateFile(m.statePath, file)

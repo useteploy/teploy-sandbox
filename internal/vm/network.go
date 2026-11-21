@@ -295,6 +295,7 @@ func realNetSys() netSys {
 	command := func(ctx context.Context, ns string, stdin string, name string, args ...string) ([]byte, error) {
 		var stdout, stderr bytes.Buffer
 		cmd := exec.CommandContext(ctx, name, args...)
+		cmd.Env = childEnv(os.Environ())
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		if stdin != "" {
 			cmd.Stdin = strings.NewReader(stdin)

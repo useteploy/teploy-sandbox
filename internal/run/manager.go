@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -130,6 +131,11 @@ type Run struct {
 	RetainUntil *time.Time `json:"retainUntil,omitempty"`
 	// ForkedFrom is the run this one was forked from, when it was.
 	ForkedFrom string `json:"forkedFrom,omitempty"`
+	// Remote is the off-host side of a stopped run, when the daemon has
+	// remote storage (see remote.go): whether the stop is durable there
+	// and whether this host still has a copy. Guarded by Manager.mu and
+	// copy-on-write, like Lease.
+	Remote *RemoteState `json:"remote,omitempty"`
 	// Lease is the run's writable-takeover lease when one is held (see
 	// lease.go). Guarded by Manager.mu and copy-on-write: the pointer is
 	// replaced, never mutated, so the copies Get/List hand out stay
@@ -158,6 +164,16 @@ type Run struct {
 	// delete while that container exists: they go when it does.
 	snapshot string
 	images   []string
+	// base is the snapshot of the run's last upload to remote storage,
+	// kept on this host for as long as the next upload can be sent
+	// against it. remoteGen is the generation of the run's remote record
+	// this daemon last wrote or read (0: it has none), remoteHeld whether
+	// that record says this daemon runs the run, and remoteKey the run's
+	// wrapped data key. All guarded by Manager.mu.
+	base       string
+	remoteGen  uint64
+	remoteHeld bool
+	remoteKey  string
 	// leftover is a container a failed resume could not remove. It still
 	// holds the run's container name, so it must go before the next try.
 	leftover string
@@ -242,9 +258,36 @@ type Manager struct {
 	// StoppedRetention is how long a stopped run is kept before the reaper
 	// deletes it and its snapshot.
 	StoppedRetention time.Duration
+	// OffHost is remote storage for stopped runs; nil keeps every
+	// snapshot on this host only, as before it existed (see remote.go).
+	OffHost OffHost
+	// LocalCache is LocalKeep (or "") or LocalDrop: what happens to the
+	// local copy of a snapshot once it is durable in remote storage.
+	LocalCache string
+	// PublishTimeout bounds one upload or restore.
+	PublishTimeout time.Duration
+	// RemoteSyncInterval and RemoteGCInterval pace remote upkeep.
+	RemoteSyncInterval time.Duration
+	RemoteGCInterval   time.Duration
+	// SnapshotRetry is how long a caller snapshot whose upload failed is
+	// retried before it stays on this host only; zero is no retry, the
+	// permanent semantics a failed upload has always had.
+	SnapshotRetry time.Duration
+	// RemoteScrubInterval paces the check that what this daemon reports
+	// durable still is (ScrubRemote); negative turns it off.
+	RemoteScrubInterval time.Duration
+	// Transfers is how many uploads and restores run at once
+	// (DefaultTransfers when zero); with more than one, uploads take at
+	// most all but one of them. Set before the first one.
+	Transfers int
 
 	mu   sync.Mutex
 	runs map[string]*Run
+
+	// snapshotNotes are caller snapshots' standing with remote storage:
+	// an upload owed and being retried, in flight, or a delete owed
+	// (remote_snapshots.go). Keyed by the local ref.
+	snapshotNotes map[string]*snapshotNote
 
 	// statePath is the durable registry file ("" = memory only). persistMu
 	// orders writers so an older registry can never replace a newer one;
@@ -252,6 +295,42 @@ type Manager struct {
 	statePath  string
 	persistMu  sync.Mutex
 	stateDirty atomic.Bool
+
+	// tombstones are runs destroyed here whose remote record does not
+	// say so yet, with the generation that will. remoteSeen is the
+	// generation at which each remote run this daemon has no record of
+	// was last looked at. orphans are the snapshots held by runs the
+	// previous daemon life lost, kept until the first sync has decided
+	// which of those runs come back. All guarded by mu.
+	tombstones  map[string]uint64
+	remoteSeen  map[string]uint64
+	orphans     []string
+	lastSync    time.Time
+	lastGC      time.Time
+	lastScrub   time.Time
+	maintaining atomic.Bool
+	publishing  atomic.Bool
+
+	// forking are the IDs of fork children whose record is in remote
+	// storage and whose VM is still booting: runs the registry does not
+	// list yet, and that a sync must not take for runs a crash lost.
+	// fetching are snapshots a create is restoring from remote storage
+	// before any run holds them; written to the registry file, so that a
+	// crash in between does not leave one nothing will ever name. pins
+	// are snapshots an upload that holds no run still reads, and
+	// releaseOwed those of them whose last holder let go meanwhile. All
+	// guarded by mu.
+	forking     map[string]struct{}
+	fetching    map[string]int
+	pins        map[string]int
+	releaseOwed map[string]bool
+
+	// transfers bounds uploads and restores together; uploads bounds the
+	// uploads among them to one fewer, so that a restore always has a
+	// transfer no upload can hold (transferSlot).
+	transferOnce sync.Once
+	transfers    chan struct{}
+	uploads      chan struct{}
 }
 
 func NewManager(runtime Runtime, log *slog.Logger) *Manager {
@@ -261,8 +340,17 @@ func NewManager(runtime Runtime, log *slog.Logger) *Manager {
 		now:     time.Now,
 		runs:    make(map[string]*Run),
 
+		tombstones:    make(map[string]uint64),
+		snapshotNotes: make(map[string]*snapshotNote),
+		remoteSeen:    make(map[string]uint64),
+		forking:       make(map[string]struct{}),
+		fetching:      make(map[string]int),
+		pins:          make(map[string]int),
+		releaseOwed:   make(map[string]bool),
+
 		SandboxUser:      DefaultSandboxUser,
 		StoppedRetention: DefaultStoppedRetention,
+		SnapshotRetry:    DefaultSnapshotRetry,
 	}
 }
 
@@ -273,6 +361,14 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	if strings.TrimSpace(req.Image) == "" {
 		return nil, fmt.Errorf("%w: image is required", ErrBadRequest)
 	}
+	// "snapshot:<id>" names a snapshot in remote storage by the name it
+	// has on every host; from here on it is this host's reference. Only
+	// with remote storage: without it the string is the driver's.
+	image, portable, err := m.resolveImage(req.Image)
+	if err != nil {
+		return nil, err
+	}
+	req.Image = image
 	// A driver that cannot honour every create says so first, in its own
 	// words, rather than through whichever later check happens to trip.
 	if admitter, ok := m.runtime.(CreateAdmitter); ok {
@@ -351,7 +447,61 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		Labels:    maps.Clone(req.Labels),
 		OnExpire:  onExpire,
 	}
+	// absent: a snapshot reference of this daemon's for a snapshot this
+	// host does not have. That is a snapshot named by its ID as much as
+	// "snapshot:<id>" is — a reference is the ID between a fixed prefix
+	// and suffix — and it is about to be fetched from remote storage.
+	absent := false
+	if m.OffHost != nil && m.ownsSnapshotRef(req.Image) {
+		if has, err := m.OffHost.HasLocal(ctx, req.Image); err == nil && !has {
+			absent = true
+		}
+	}
+	if portable || absent {
+		// Named by its ID: a caller's snapshot, never a run's stop.
+		if err := m.admitPortable(ctx, req.Image); err != nil {
+			return nil, err
+		}
+	}
+	// A snapshot that is in remote storage and not on this host is
+	// fetched first. One that is in neither is "not found". What the
+	// fetch materialized is the run's to release: the registry would
+	// otherwise never name it, and nothing collects what the registry
+	// does not name. Until the run exists the registry file names it as
+	// being fetched, so a crash between the fetch and the boot leaves
+	// something the next start removes.
+	// Only what is not here yet: a snapshot this host already has may be
+	// a caller's own, which no restart may take for a fetch.
+	fetching := absent
+	if fetching {
+		m.mu.Lock()
+		m.fetching[req.Image]++
+		m.mu.Unlock()
+		m.persist()
+	}
+	settle := func() {
+		if !fetching {
+			return
+		}
+		m.mu.Lock()
+		if m.fetching[req.Image]--; m.fetching[req.Image] <= 0 {
+			delete(m.fetching, req.Image)
+		}
+		m.mu.Unlock()
+		m.persist()
+	}
+	fetched, err := m.ensureLocal(ctx, req.Image)
+	if err != nil {
+		settle()
+		return nil, err
+	}
+	if fetched {
+		run.images = []string{req.Image}
+	}
 	created, err := m.launch(ctx, boot, run)
+	// Registered with the image it holds, or the image released: either
+	// way it is no longer only a fetch.
+	settle()
 	if err != nil {
 		return nil, err
 	}
@@ -631,7 +781,21 @@ func (m *Manager) List() []*Run {
 	return runs
 }
 
+// Destroy removes a run. With remote storage a run this daemon has never
+// heard of is looked up first, like a resume or a fork of one: a run
+// stopped on another daemon is destroyed from here, through the same
+// write that fences a resume.
 func (m *Manager) Destroy(ctx context.Context, id string) error {
+	if m.OffHost != nil {
+		m.mu.Lock()
+		_, known := m.runs[id]
+		m.mu.Unlock()
+		if !known {
+			if err := m.refreshRemote(ctx, id, false, true); err != nil {
+				return err
+			}
+		}
+	}
 	return m.destroyIf(ctx, id, nil)
 }
 
@@ -673,6 +837,10 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 	// driver a proxy's port exists only inside its run's own network
 	// namespace, and is not given out again while that namespace does.
 	m.closeEgress(id)
+	// A run that has a record in remote storage is noted as destroyed
+	// before its VM goes: a daemon that dies in between must not take it
+	// for a run a crash lost, and bring it back from its last stop.
+	owed := m.noteRemoteGone(current)
 	attempt, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	err := m.runtime.Remove(attempt, current.ContainerID)
@@ -681,17 +849,30 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 		delete(m.runs, id)
 	} else {
 		current.removing = false
+		if owed {
+			// Still running: nothing is owed after all.
+			delete(m.tombstones, id)
+		}
 	}
 	m.mu.Unlock()
 	if err != nil {
+		if owed {
+			m.persist()
+		}
 		return err
 	}
 	m.releaseWarm(current)
-	if len(current.images) > 0 {
+	if len(current.images) > 0 || current.base != "" {
 		// The container is gone, so the snapshots it was created from can
 		// go too; the registry stops listing them as owned.
-		m.releaseImages(current.images)
+		m.releaseImages(append(slices.Clone(current.images), current.base))
 		m.persist()
+	}
+	if owed {
+		// Now that the run is gone, say so in remote storage.
+		attempt, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		m.flushTombstones(attempt)
 	}
 	return nil
 }
@@ -757,17 +938,70 @@ func (m *Manager) ownsSnapshotRef(ref string) bool {
 // they exist precisely so state survives the TTL reaper (a parked agent
 // run restores from one days later). Callers own deletion.
 func (m *Manager) Snapshot(ctx context.Context, id string) (string, error) {
+	ref, _, err := m.SnapshotRemote(ctx, id)
+	return ref, err
+}
+
+// SnapshotRemote is Snapshot, and with remote storage it also uploads
+// the snapshot before it answers. The upload's outcome is the second
+// result (nil without remote storage); a snapshot whose upload failed
+// still exists, on this host only, and is retried by the upkeep until it
+// lands or SnapshotRetry passes — the answer's ID names it in remote
+// storage either way, and the listing says whether it ever arrived.
+func (m *Manager) SnapshotRemote(ctx context.Context, id string) (string, *SnapshotRemote, error) {
 	current, release, err := m.beginCapture(id)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	defer release()
-	ref, err := m.capture(ctx, current)
-	if err != nil {
-		return "", err
+	held := true
+	defer func() {
+		if held {
+			release()
+		}
+	}()
+	ref := m.newSnapshotRef()
+	if m.OffHost != nil {
+		// The note is written ahead of the capture, and the write is
+		// confirmed: a snapshot taken on a note that never landed would
+		// be retried by nothing.
+		m.mu.Lock()
+		m.snapshotNotes[ref] = &snapshotNote{Ref: ref, Run: id, Key: current.remoteKey, Base: current.base, AddedAt: m.now(), State: noteUploading}
+		m.mu.Unlock()
+		if err := m.persistNow(); err != nil {
+			m.mu.Lock()
+			delete(m.snapshotNotes, ref)
+			m.mu.Unlock()
+			m.persist()
+			return "", nil, fmt.Errorf("registry not persisted, so the snapshot could not be retried if its upload failed: %w", err)
+		}
+	}
+	// CachePath (not just CacheDir): a warm run's workspace lives ON the
+	// mounted volume, and the snapshot must bake those bytes in or the
+	// restore boots an empty workspace.
+	if err := m.runtime.Snapshot(ctx, current.ContainerID, current.CachePath, ref); err != nil {
+		if m.OffHost != nil {
+			m.mu.Lock()
+			delete(m.snapshotNotes, ref)
+			m.mu.Unlock()
+			m.persist()
+		}
+		return "", nil, err
 	}
 	m.log.Info("run snapshotted", "id", id, "image", ref, "warm", current.CachePath != "")
-	return ref, nil
+	if m.OffHost == nil {
+		return ref, nil, nil
+	}
+	// The capture exists: the run is let go. An upload can take hours,
+	// and the run is its caller's to exec in, stop, destroy or let
+	// expire meanwhile. What the upload still reads on this host — the
+	// snapshot, which the note keeps (a delete answers 409 while it is
+	// uploading), and the previous upload its stream is sent against —
+	// is pinned until it ends, whatever becomes of the run.
+	unpin := m.pin(current.base)
+	defer unpin()
+	held = false
+	release()
+	return ref, m.publishSnapshot(ctx, current, ref), nil
 }
 
 // capture commits current's filesystem to a fresh snapshot ref. The
@@ -785,21 +1019,91 @@ func (m *Manager) capture(ctx context.Context, current *Run) (string, error) {
 
 // DeleteSnapshot removes a snapshot. Only refs in the driver's own
 // snapshot namespace are deletable through the API — the daemon must never
-// be usable to remove arbitrary host images or volumes.
+// be usable to remove arbitrary host images or volumes. A snapshot in
+// remote storage may also be named by its universal ID
+// ("snapshot:<id>", the spelling the listing answers), so a snapshot can
+// be deleted on a host other than the one that took it.
 func (m *Manager) DeleteSnapshot(ctx context.Context, ref string) error {
+	if image, _, err := m.resolveImage(ref); err == nil {
+		ref = image
+	}
 	if !m.ownsSnapshotRef(ref) {
 		return fmt.Errorf("%w: not a sandbox snapshot ref: %s", ErrBadRequest, ref)
 	}
 	// A snapshot the registry itself holds (a stopped run's filesystem, or
 	// the image a resumed or forked run booted from) is not the caller's
-	// to delete: it goes with the run that owns it.
+	// to delete: it goes with the run that owns it. One exception, the
+	// same model the create path uses: a run that booted from a CALLER's
+	// snapshot holds only a local copy of something that is durable in
+	// remote storage. The bucket copy is the caller's to delete now; the
+	// local copy is the run's to release when it ends.
 	if holder := m.imageHolder(ref); holder != "" {
-		return fmt.Errorf("%w: snapshot %s belongs to run %s; delete the run instead", ErrBusy, ref, holder)
+		if m.OffHost == nil {
+			return fmt.Errorf("%w: snapshot %s belongs to run %s; delete the run instead", ErrBusy, ref, holder)
+		}
+		remote, err := m.OffHost.HasRemote(ctx, ref)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrRemoteUnavailable, err)
+		}
+		if !remote {
+			// Its only copy is the one the run holds.
+			return fmt.Errorf("%w: snapshot %s belongs to run %s; delete the run instead", ErrBusy, ref, holder)
+		}
 	}
-	if err := m.runtime.RemoveImage(ctx, ref); err != nil {
+	if m.OffHost == nil {
+		if err := m.runtime.RemoveImage(ctx, ref); err != nil {
+			return err
+		}
+		m.log.Info("snapshot deleted", "image", ref)
+		return nil
+	}
+	// The delete is written ahead like the upload: a note in the
+	// deleting state, completed by the upkeep if a crash interrupts it,
+	// so no window of the delete leaks a snapshot permanently. A retry
+	// in flight owns the ref for now — racing it could resurrect what
+	// this call removes, so the delete is refused instead.
+	m.mu.Lock()
+	if note, ok := m.snapshotNotes[ref]; ok {
+		switch note.State {
+		case noteUploading:
+			m.mu.Unlock()
+			return fmt.Errorf("%w: snapshot %s is uploading to remote storage; delete it again once that has finished", ErrBusy, ref)
+		case noteDeleting:
+			// A delete already owed: this call finishes it.
+		default:
+			note.State = noteDeleting
+		}
+	} else {
+		m.snapshotNotes[ref] = &snapshotNote{Ref: ref, State: noteDeleting, AddedAt: m.now()}
+	}
+	m.mu.Unlock()
+	if err := m.persistNow(); err != nil {
+		m.log.Error("registry not persisted; the snapshot delete is not begun, so nothing can be left half deleted", "image", ref, "error", err)
+		return fmt.Errorf("registry not persisted: %w", err)
+	}
+	// With remote storage a snapshot may be here, there, or both. The
+	// remote copy goes first: a failure then leaves the local one, and
+	// the delete can be asked for again — or the upkeep finishes it.
+	// A local copy a run here booted from stays with that run.
+	if err := m.deleteSnapshotHeld(ctx, ref, m.imageHolder(ref) != "", false); err != nil {
+		if errors.Is(err, ErrNotCallerSnapshot) {
+			// Refused for good: nothing is owed, and the note written
+			// ahead must not make the upkeep ask again forever.
+			m.mu.Lock()
+			if note, ok := m.snapshotNotes[ref]; ok && note.State == noteDeleting {
+				delete(m.snapshotNotes, ref)
+			}
+			m.mu.Unlock()
+		}
+		m.persist()
 		return err
 	}
-	m.log.Info("snapshot deleted", "image", ref)
+	m.mu.Lock()
+	if note, ok := m.snapshotNotes[ref]; ok && note.State == noteDeleting {
+		delete(m.snapshotNotes, ref)
+	}
+	m.mu.Unlock()
+	m.persist()
 	return nil
 }
 
@@ -941,7 +1245,10 @@ func (m *Manager) Reap(ctx context.Context) int {
 			// asked to keep its state, so it waits for a tick where the
 			// stop succeeds — until StopGrace, when the default case below
 			// destroys it like any other expired run.
-			_, err := m.stopIf(ctx, current.ID, func(live *Run) bool { return !live.ExpiresAt.After(now) })
+			// Not published here: an upload must not hold up the
+			// deadlines of the runs behind this one. The upkeep
+			// started below does it.
+			_, err := m.stopIf(ctx, current.ID, func(live *Run) bool { return !live.ExpiresAt.After(now) }, false)
 			switch {
 			case errors.Is(err, errNotDue), errors.Is(err, ErrStopped):
 				// Stopped (and perhaps resumed) by a caller meanwhile.
@@ -973,6 +1280,7 @@ func (m *Manager) Reap(ctx context.Context) int {
 	if m.stateDirty.Load() {
 		m.persist()
 	}
+	m.kickMaintenance()
 	return reaped
 }
 
@@ -1015,7 +1323,10 @@ func (m *Manager) Shutdown(ctx context.Context) {
 	runs := m.List()
 	for _, run := range runs {
 		if run.State == StateRunning && run.OnExpire == OnExpireStop && !run.pendingCleanup {
-			if _, err := m.Stop(ctx, run.ID); err != nil {
+			// Every run is stopped before any is uploaded: a stop that
+			// did not happen loses the run, an upload that did not is
+			// made up for at the next start.
+			if _, err := m.stopIf(ctx, run.ID, nil, false); err != nil {
 				m.log.Error("shutdown stop failed; the run's state is lost with its container", "id", run.ID, "error", err)
 			}
 		}
@@ -1026,6 +1337,12 @@ func (m *Manager) Shutdown(ctx context.Context) {
 		}
 	}
 	m.persist()
+	if m.OffHost != nil {
+		// With what is left of the budget. A stop that is not durable
+		// when it runs out stays on this host and is published by the
+		// next daemon life.
+		m.publishPending(ctx)
+	}
 }
 
 // ValidateWorkPath confines a files-API path to the workdir: relative,

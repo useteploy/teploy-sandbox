@@ -55,6 +55,18 @@ type Volumes struct {
 	// mu serializes every change to the clone topology. The operations are
 	// short; correctness is worth more than interleaving them.
 	mu sync.Mutex
+
+	// bases remembers, by guid, the base images found by walking a
+	// volume's origins (see Transfer.BaseOf): a golden image that is no
+	// longer the configured one still has runs descending from it.
+	basesMu sync.Mutex
+	bases   map[string]string
+
+	// receiving counts, by dataset name, the base images a restore is
+	// receiving onto right now. Under mu: Reclaim must not take a base
+	// whose clone — the thing that would otherwise pin it — is not on
+	// the pool yet.
+	receiving map[string]int
 }
 
 // NewVolumes lays the driver's volumes out under root, cloning fresh runs
@@ -66,6 +78,8 @@ func NewVolumes(zfs ZFS, root, golden, owner string, log *slog.Logger) *Volumes 
 		waitDevice:  waitForPath,
 		flushDevice: fsyncPath,
 		checkDevice: partitionsHidden,
+		bases:       map[string]string{},
+		receiving:   map[string]int{},
 	}
 }
 
@@ -392,6 +406,16 @@ func (v *Volumes) collect(ctx context.Context, start string, remove bool) error 
 			// The golden image or someone else's volume: not ours to judge.
 			continue
 		}
+		switch dataset.Kind {
+		case kindRestore:
+			// A restore in progress: its own to finish or remove.
+			continue
+		case kindBase:
+			// A received base image is kept like a golden image: the
+			// next run restored here descends from it too. It goes
+			// whole, and only when the pool is short (Reclaim).
+			continue
+		}
 		snapshots, err := v.zfs.Snapshots(ctx, dataset.Name)
 		if err != nil {
 			return err
@@ -459,7 +483,9 @@ func (v *Volumes) heir(ctx context.Context, snapshot SnapshotInfo) (string, erro
 		if err != nil {
 			return "", err
 		}
-		if v.mine(dataset) {
+		// A volume a restore is still receiving is not an heir: it is
+		// not anything yet.
+		if v.mine(dataset) && (dataset.Kind == kindRun || dataset.Kind == kindSnapshot) {
 			return clone, nil
 		}
 	}
@@ -477,6 +503,11 @@ func (v *Volumes) collectLogged(ctx context.Context, volume string) {
 // to a run whose VM did not survive the previous daemon life. Snapshot
 // references are left alone — the registry and callers own those. Returns
 // the number of run volumes removed.
+//
+// What an unfinished restore left goes before the dead snapshots are
+// reclaimed, not after: a commit that a crash cut short leaves holders
+// that are let go and still cloned by a volume marked as a restore, and
+// they can only go once that volume has.
 func (v *Volumes) Sweep(ctx context.Context) (int, error) {
 	if v.owner == "" {
 		return 0, errors.New("volume sweep requires daemon ownership identity")
@@ -495,6 +526,9 @@ func (v *Volumes) Sweep(ctx context.Context) (int, error) {
 			}
 			removed++
 		}
+	}
+	if err := v.sweepTransfers(ctx); err != nil {
+		return removed, err
 	}
 	for _, dataset := range volumes {
 		if v.mine(dataset) && dataset.Kind == kindSnapshot {

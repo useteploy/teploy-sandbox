@@ -90,6 +90,11 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/runs/{id}/warm", s.auth(s.handleWarmInfo))
 	mux.Handle("GET /v1/warmcache/{repo...}", s.auth(s.handleWarmGet))
 	mux.Handle("DELETE /v1/warmcache/{repo...}", s.auth(s.handleWarmDrop))
+	mux.Handle("POST /v1/remote/sync", s.auth(s.handleRemoteSync))
+	mux.Handle("POST /v1/remote/collect", s.auth(s.handleRemoteCollect))
+	mux.Handle("POST /v1/remote/rotate", s.auth(s.handleRemoteRotate))
+	mux.Handle("POST /v1/remote/scrub", s.auth(s.handleRemoteScrub))
+	mux.Handle("GET /v1/remote/snapshots", s.auth(s.handleRemoteSnapshots))
 	mux.Handle("PUT /v1/runs/{id}/files/{path...}", s.auth(s.handlePutFile))
 	mux.Handle("GET /v1/runs/{id}/files/{path...}", s.auth(s.handleGetFile))
 	return mux
@@ -123,9 +128,10 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		errors.Is(err, run.ErrLeaseSuperseded),
 		errors.Is(err, run.ErrBusy),
 		errors.Is(err, run.ErrStopped),
-		errors.Is(err, run.ErrRunning):
+		errors.Is(err, run.ErrRunning),
+		errors.Is(err, run.ErrRemoteConflict):
 		s.writeProblem(w, problem(http.StatusConflict, err.Error()))
-	case errors.Is(err, run.ErrAtCapacity):
+	case errors.Is(err, run.ErrAtCapacity), errors.Is(err, run.ErrRemoteUnavailable):
 		s.writeProblem(w, problem(http.StatusServiceUnavailable, err.Error()))
 	default:
 		s.Log.Error("request failed", "error", err)
@@ -187,14 +193,12 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		TTLSec int `json:"ttlSec,omitempty"`
-	}
+	var req run.ResumeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
 		return
 	}
-	resumed, err := s.Manager.Resume(r.Context(), r.PathValue("id"), req.TTLSec)
+	resumed, err := s.Manager.ResumeWith(r.Context(), r.PathValue("id"), req)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -228,13 +232,19 @@ func (s *Server) handleCapacity(w http.ResponseWriter, _ *http.Request) {
 	if driver == "" {
 		driver = "docker"
 	}
+	runs := map[string]int{"running": load.Running, "stopped": load.Stopped}
+	if s.Manager.OffHost != nil {
+		// Of the stopped runs, the ones whose snapshot is in remote
+		// storage only: they take no space on this host.
+		runs["stoppedRemote"] = load.StoppedRemote
+	}
 	body := map[string]any{
 		"driver":     driver,
 		"nestedVirt": s.NestedVirt,
 		"runtime":    runtimeName,
 		"cpus":       runtime.NumCPU(),
 		"memoryMb":   hostMemoryMB(),
-		"runs":       map[string]int{"running": load.Running, "stopped": load.Stopped},
+		"runs":       runs,
 		"allocated": map[string]any{
 			"cpus":     load.CPUs,
 			"memoryMb": load.MemoryMB,
@@ -261,12 +271,88 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
-	image, err := s.Manager.Snapshot(r.Context(), r.PathValue("id"))
+	image, remote, err := s.Manager.SnapshotRemote(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	s.writeJSON(w, http.StatusCreated, map[string]any{"image": image})
+	body := map[string]any{"image": image}
+	if remote != nil {
+		// Only from a daemon with remote storage: whether the snapshot
+		// is durable off the host, and the name it has on every daemon.
+		body["remote"] = remote
+	}
+	s.writeJSON(w, http.StatusCreated, body)
+}
+
+// handleRemoteSync brings the registry in line with remote storage now
+// rather than at the next upkeep: runs stopped on other daemons appear.
+func (s *Server) handleRemoteSync(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.Manager.SyncRemote(r.Context())
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"remote": stats.Remote, "changed": stats.Changed})
+}
+
+// handleRemoteCollect runs a garbage collection of remote storage now.
+func (s *Server) handleRemoteCollect(w http.ResponseWriter, r *http.Request) {
+	if err := s.Manager.CollectRemote(r.Context()); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleRemoteRotate re-wraps remote storage's keys under the current
+// master now: the half of key rotation that is not a daemon's own
+// writes. The answer says whether the previous master is still needed.
+func (s *Server) handleRemoteRotate(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.Manager.RotateRemote(r.Context())
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"manifestsRewrapped": stats.Manifests, "manifestsCurrent": stats.ManifestsCurrent, "manifestsSkipped": stats.ManifestsSkipped,
+		"recordsRewrapped": stats.Records, "recordsCurrent": stats.RecordsCurrent,
+		"recordsRunning": stats.RecordsRunning, "recordsConflicted": stats.RecordsConflicted,
+		"recordsUnfenced": stats.RecordsUnfenced, "recordsDestroyed": stats.RecordsDestroyed,
+		"recordsRunningPrevious": stats.RecordsRunningPrevious, "recordsDestroyedPrevious": stats.RecordsDestroyedPrevious,
+		"localKeysRewrapped": stats.LocalKeys, "localKeysFailed": stats.LocalKeysFailed,
+		// Whether the previous master key must stay configured, and in
+		// words why.
+		"previousKeyNeeded": stats.PreviousKeyNeeded, "previousKeyNeededFor": stats.PreviousKeyNeededFor,
+	})
+}
+
+// handleRemoteScrub checks now, instead of at the next scheduled round,
+// that every stopped run this daemon reports durable is whole in remote
+// storage.
+func (s *Server) handleRemoteScrub(w http.ResponseWriter, r *http.Request) {
+	if s.Manager.OffHost == nil {
+		s.writeError(w, fmt.Errorf("%w: this daemon has no remote storage", run.ErrBadRequest))
+		return
+	}
+	stats := s.Manager.ScrubRemote(r.Context())
+	s.writeJSON(w, http.StatusOK, map[string]any{"checked": stats.Checked, "notWhole": stats.NotWhole, "unreachable": stats.Unreachable})
+}
+
+// handleRemoteSnapshots lists the caller snapshots in the bucket: the
+// durability probe for a snapshot whose upload failed and is retried
+// (membership means durable), and the roster of what a create with
+// image "snapshot:<id>" can boot anywhere.
+func (s *Server) handleRemoteSnapshots(w http.ResponseWriter, r *http.Request) {
+	snapshots, err := s.Manager.RemoteSnapshots(r.Context())
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if snapshots == nil {
+		snapshots = []run.RemoteSnapshot{}
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"snapshots": snapshots})
 }
 
 func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {

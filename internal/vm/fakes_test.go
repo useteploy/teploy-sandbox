@@ -3,6 +3,7 @@ package vm
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,23 +30,39 @@ type fakeZFS struct {
 	datasets  map[string]*fakeDataset
 	snapshots map[string]*fakeSnapshot
 	txg       int
-	// calls is every mutation, in order.
+	// calls is every mutation, in order; sends every stream sent, as
+	// "[from ]snapshot".
 	calls []string
+	sends []string
 	// fail makes the named call ("destroy pool/x") return an error once.
 	fail map[string]error
+	// blockClone, when not nil, is consumed by the next Clone, which
+	// waits for it to close (or its context to end) and then fails.
+	blockClone chan struct{}
 	// poolProps are the properties set on the pool, which a volume
 	// without its own value inherits.
 	poolProps map[string]string
+	guids     int
+	guidBase  int
+	// available and used are what Space reports.
+	available, used int64
+	// receiveAnything turns off Receive's check of a stream's first
+	// record: for tests of what holds when that check is not there.
+	receiveAnything bool
 }
 
 type fakeDataset struct {
 	origin string
 	props  map[string]string
 	files  map[string][]byte
+	// filesystem: not a volume. The driver makes none; a stream can.
+	filesystem bool
 }
 
 type fakeSnapshot struct {
-	txg   int
+	txg int
+	// guid is the snapshot's identity, which a stream carries with it.
+	guid  string
 	props map[string]string
 	files map[string][]byte
 }
@@ -60,11 +77,17 @@ const (
 func newFakeZFS() *fakeZFS {
 	z := &fakeZFS{datasets: map[string]*fakeDataset{}, snapshots: map[string]*fakeSnapshot{}, fail: map[string]error{}, poolProps: map[string]string{propVolmode: volmodeDev}}
 	z.datasets[testPool+"/golden"] = &fakeDataset{props: map[string]string{}, files: map[string][]byte{}}
-	z.snapshots[testGolden] = &fakeSnapshot{txg: z.tick(), props: map[string]string{}, files: map[string][]byte{}}
+	z.snapshots[testGolden] = &fakeSnapshot{txg: z.tick(), guid: z.newGUID(), props: map[string]string{}, files: map[string][]byte{}}
 	return z
 }
 
 func (z *fakeZFS) tick() int { z.txg++; return z.txg }
+
+// newGUID is unique to a pool: guidBase tells two fake pools apart.
+func (z *fakeZFS) newGUID() string {
+	z.guids++
+	return fmt.Sprint(z.guidBase + 7000 + z.guids)
+}
 
 func (z *fakeZFS) record(call string) error {
 	z.calls = append(z.calls, call)
@@ -98,16 +121,24 @@ func (z *fakeZFS) Dataset(_ context.Context, name string) (Dataset, error) {
 }
 
 func (z *fakeZFS) Volumes(_ context.Context, root string) ([]Dataset, error) {
+	return z.list(root, false), nil
+}
+
+func (z *fakeZFS) Filesystems(_ context.Context, root string) ([]Dataset, error) {
+	return z.list(root, true), nil
+}
+
+func (z *fakeZFS) list(root string, filesystems bool) []Dataset {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	var volumes []Dataset
-	for name := range z.datasets {
-		if strings.HasPrefix(name, root+"/") {
-			volumes = append(volumes, z.describe(name))
+	var listed []Dataset
+	for name, dataset := range z.datasets {
+		if strings.HasPrefix(name, root+"/") && dataset.filesystem == filesystems {
+			listed = append(listed, z.describe(name))
 		}
 	}
-	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
-	return volumes, nil
+	sort.Slice(listed, func(i, j int) bool { return listed[i].Name < listed[j].Name })
+	return listed
 }
 
 func (z *fakeZFS) clonesOf(snapshot string) []string {
@@ -149,7 +180,21 @@ func (z *fakeZFS) Exists(_ context.Context, name string) (bool, error) {
 	return isDataset || isSnapshot || name == strings.SplitN(testPool, "/", 2)[0] || name == testPool, nil
 }
 
-func (z *fakeZFS) Clone(_ context.Context, snapshot, dataset string, props map[string]string) error {
+func (z *fakeZFS) Clone(ctx context.Context, snapshot, dataset string, props map[string]string) error {
+	if z.blockClone != nil {
+		// A test's hold on the next clone: it fails once, with the
+		// caller's context error when that has run out.
+		wait := z.blockClone
+		z.blockClone = nil
+		select {
+		case <-wait:
+		case <-ctx.Done():
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return errors.New("clone held and released by a test")
+	}
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	if err := z.record("clone " + snapshot + " " + dataset); err != nil {
@@ -192,7 +237,7 @@ func (z *fakeZFS) Snapshot(_ context.Context, name string) error {
 	if _, exists := z.snapshots[name]; exists {
 		return fmt.Errorf("cannot create snapshot '%s': dataset already exists", name)
 	}
-	z.snapshots[name] = &fakeSnapshot{txg: z.tick(), props: map[string]string{}, files: cloneFiles(dataset.files)}
+	z.snapshots[name] = &fakeSnapshot{txg: z.tick(), guid: z.newGUID(), props: map[string]string{}, files: cloneFiles(dataset.files)}
 	return nil
 }
 
@@ -265,7 +310,16 @@ func (z *fakeZFS) Destroy(_ context.Context, name string) error {
 func (z *fakeZFS) Property(_ context.Context, name, key string) (string, error) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
+	if snapshot, ok := z.snapshots[name]; ok && key == "guid" {
+		return snapshot.guid, nil
+	}
 	if dataset, ok := z.datasets[name]; ok {
+		if key == "type" {
+			if dataset.filesystem {
+				return "filesystem", nil
+			}
+			return "volume", nil
+		}
 		if value, ok := dataset.props[key]; ok {
 			return value, nil
 		}
@@ -288,6 +342,105 @@ func (z *fakeZFS) SetProperty(_ context.Context, name, key, value string) error 
 		return nil
 	}
 	return fmt.Errorf("cannot open '%s': dataset does not exist", name)
+}
+
+// fakeStream is what the fake pool sends: the snapshot's identity, the
+// identity of what it is incremental against, and its files. A real
+// stream carries only the difference; the rules around it are the same.
+type fakeStream struct {
+	GUID     string
+	FromGUID string
+	Files    map[string][]byte
+	// Filesystem: the stream of a filesystem, which a volume's pool
+	// must never be made to hold.
+	Filesystem bool `json:",omitempty"`
+}
+
+func (z *fakeZFS) Send(_ context.Context, snapshot, from string, w io.Writer) error {
+	z.mu.Lock()
+	source, ok := z.snapshots[snapshot]
+	if !ok {
+		z.mu.Unlock()
+		return fmt.Errorf("cannot open '%s': dataset does not exist", snapshot)
+	}
+	stream := fakeStream{GUID: source.guid, Files: cloneFiles(source.files)}
+	if from != "" {
+		base, ok := z.snapshots[from]
+		if !ok {
+			z.mu.Unlock()
+			return fmt.Errorf("cannot open '%s': dataset does not exist", from)
+		}
+		if base.txg >= source.txg {
+			z.mu.Unlock()
+			return fmt.Errorf("incremental source (%s) is not earlier than it", from)
+		}
+		stream.FromGUID = base.guid
+	}
+	// Not among calls: a send changes nothing.
+	z.sends = append(z.sends, strings.TrimSpace(from+" "+snapshot))
+	z.mu.Unlock()
+	encoded, err := json.Marshal(stream)
+	if err != nil {
+		return err
+	}
+	// A length in front, so that a stream cut short is seen as one.
+	header := fmt.Sprintf("%016d", len(encoded))
+	_, err = w.Write(append([]byte(header), encoded...))
+	return err
+}
+
+func (z *fakeZFS) Receive(_ context.Context, snapshot, origin string, props map[string]string, expect StreamIdentity, r io.Reader) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	if err := z.record("receive " + snapshot); err != nil {
+		return err
+	}
+	if len(data) < 16 {
+		return errors.New("cannot receive: incomplete stream")
+	}
+	var length int
+	if _, err := fmt.Sscanf(string(data[:16]), "%d", &length); err != nil || len(data)-16 != length {
+		return errors.New("cannot receive new filesystem stream: incomplete stream")
+	}
+	var stream fakeStream
+	if err := json.Unmarshal(data[16:], &stream); err != nil {
+		return errors.New("cannot receive: invalid stream")
+	}
+	// As the real Receive holds a stream to its first record.
+	if !z.receiveAnything && (stream.Filesystem || stream.GUID != expect.GUID || stream.FromGUID != expect.FromGUID) {
+		return fmt.Errorf("zfs receive %s refused: the stream is not the one the manifest names", snapshot)
+	}
+	dataset := datasetOf(snapshot)
+	if _, exists := z.datasets[dataset]; exists {
+		return fmt.Errorf("cannot receive new filesystem stream: destination '%s' exists", dataset)
+	}
+	switch {
+	case stream.FromGUID != "" && origin == "":
+		return errors.New("cannot receive incremental stream: no origin given")
+	case stream.FromGUID != "":
+		base, ok := z.snapshots[origin]
+		if !ok {
+			return fmt.Errorf("cannot receive: local origin '%s' does not exist", origin)
+		}
+		if base.guid != stream.FromGUID {
+			return fmt.Errorf("cannot receive: local origin for clone %s does not match the stream", origin)
+		}
+	case origin != "":
+		return errors.New("cannot receive: a full stream has no origin")
+	}
+	z.datasets[dataset] = &fakeDataset{origin: origin, props: maps.Clone(props), files: cloneFiles(stream.Files), filesystem: stream.Filesystem}
+	z.snapshots[snapshot] = &fakeSnapshot{txg: z.tick(), guid: stream.GUID, props: map[string]string{}, files: cloneFiles(stream.Files)}
+	return nil
+}
+
+func (z *fakeZFS) Space(context.Context, string) (int64, int64, error) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	return z.available, z.used, nil
 }
 
 // names lists every dataset and snapshot, sorted: the whole pool.
@@ -742,4 +895,20 @@ func (c *scriptedCommander) Run(_ context.Context, name string, args ...string) 
 
 func zfsError(stderr string) error {
 	return &CommandError{Command: "zfs", Stderr: stderr, Err: errors.New("exit status 1")}
+}
+
+// liveRefs lists the snapshot references in the pool that are usable.
+func (z *fakeZFS) liveRefs() []string {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	var refs []string
+	for name, snapshot := range z.snapshots {
+		dataset := z.datasets[datasetOf(name)]
+		if dataset != nil && dataset.props[propKind] == kindSnapshot && snapshot.props[propDead] == "" &&
+			strings.HasSuffix(datasetOf(name), strings.SplitN(name, "@", 2)[1]) {
+			refs = append(refs, name)
+		}
+	}
+	sort.Strings(refs)
+	return refs
 }

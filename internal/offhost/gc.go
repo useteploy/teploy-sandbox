@@ -33,9 +33,12 @@ type CollectStats struct {
 	// Undated is how many upload attempts could not be aged because the
 	// service gave no readable modification time; they are kept.
 	Undated int
-	// Deferred says snapshots that were due were left for the next
-	// round, because the bucket changed while this one was looking.
+	// Deferred says snapshots that were due were all left for the next
+	// round, because the bucket changed while this one was looking in a
+	// way it could not read. Spared is how many of them were kept because
+	// something written while it looked refers to them now.
 	Deferred bool
+	Spared   int
 }
 
 // MaxChainLimit is the most incremental streams that may follow one
@@ -426,21 +429,26 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 		s.log.Warn("objects under this daemon's prefix are not its own, and are left alone; is another fleet's prefix inside this one?", "objects", stats.Foreign)
 	}
 
-	// Snapshots that are due go only if the bucket is still what this
-	// round saw: a manifest or a record written since may be the first
-	// thing to build on one of them.
+	// Snapshots that are due go only if nothing written since this round
+	// looked refers to them: a manifest or a record written since may be
+	// the first thing to build on one of them (spare).
 	if len(due) > 0 && len(vanished) > 0 {
 		stats.Deferred = true
 	}
 	if len(due) > 0 && !stats.Deferred {
-		unchanged, err := s.unchanged(ctx, seenRuns, func(id string) bool { return snapshots[id] != nil && snapshots[id].manifest != nil })
+		spared, settled, err := s.spare(ctx, seenRuns, manifests, due)
 		if err != nil {
 			return stats, err
 		}
-		stats.Deferred = !unchanged
+		if !settled {
+			stats.Deferred = true
+		} else if spared > 0 {
+			stats.Spared = spared
+			s.log.Info("remote storage changed during this collection; snapshots that were due and are referred to now are kept", "snapshots", spared)
+		}
 	}
 	if stats.Deferred {
-		s.log.Info("remote storage changed during this collection; snapshots that were due are left for the next", "snapshots", len(due))
+		s.log.Info("remote storage changed during this collection in a way that could not be read; snapshots that were due are left for the next", "snapshots", len(due))
 	} else {
 		for id := range due {
 			// The manifest goes first: from then on the snapshot does
@@ -490,32 +498,74 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	return stats, nil
 }
 
-// unchanged lists the bucket again and reports whether it holds only the
-// runs, at the generations, and the manifests this round already saw.
-func (s *Store) unchanged(ctx context.Context, runs map[string]uint64, knownManifest func(id string) bool) (bool, error) {
+// spare lists the bucket again and takes out of due every snapshot that
+// something written since this round looked now refers to: the snapshot
+// a record names that is new or has moved on, a manifest that was not
+// there before, and all that either builds on. It reports how many it
+// took out. settled is false when what changed could not be read (a
+// manifest listed and gone again): nothing is deleted on such a view.
+//
+// Only what is new is read. A fleet is never still for the length of a
+// collection, and a round that gave up on every change in the bucket,
+// related or not, would never delete a snapshot at all — which keeps,
+// for good, the disks of runs their owners destroyed.
+func (s *Store) spare(ctx context.Context, runs map[string]uint64, manifests map[string]*summary, due map[string]bool) (spared int, settled bool, err error) {
 	again, err := s.Runs(ctx)
 	if err != nil {
-		return false, err
+		return 0, false, err
 	}
-	if !maps.Equal(again, runs) {
-		return false, nil
+	fresh := map[string]bool{}
+	for id, generation := range again {
+		if seen, known := runs[id]; known && seen == generation {
+			continue
+		}
+		record, _, err := s.readRecord(ctx, id, generation)
+		if errors.Is(err, s3.ErrNotFound) {
+			return 0, false, nil
+		}
+		if err != nil {
+			return 0, false, fmt.Errorf("collect: record of %s: %w", id, err)
+		}
+		if record.State != RecordDestroyed && record.Snapshot != "" {
+			fresh[record.Snapshot] = true
+		}
 	}
-	same := true
+	var added []string
 	prefix := s.prefix + "snap/"
-	stop := errors.New("changed")
 	err = s.objects.Walk(ctx, prefix, func(object s3.Object) error {
 		rest, ok := strings.CutPrefix(object.Key, prefix)
 		if !ok {
 			return nil
 		}
-		if id, name, ok := strings.Cut(rest, "/"); ok && name == "manifest" && validID(id) && !knownManifest(id) {
-			same = false
-			return stop
+		if id, name, ok := strings.Cut(rest, "/"); ok && name == "manifest" && validID(id) && manifests[id] == nil {
+			added = append(added, id)
 		}
 		return nil
 	})
-	if err != nil && !errors.Is(err, stop) {
-		return false, err
+	if err != nil {
+		return 0, false, err
 	}
-	return same, nil
+	now := maps.Clone(manifests)
+	for _, id := range added {
+		manifest, _, err := s.Manifest(ctx, id)
+		if errors.Is(err, ErrNoSnapshot) {
+			return 0, false, nil
+		}
+		if err != nil {
+			return 0, false, fmt.Errorf("collect: %w", err)
+		}
+		now[id] = &summary{parent: manifest.Parent, purpose: manifest.Purpose, attempt: manifest.Attempt,
+			chunks: len(manifest.Chunks), stored: manifest.StoredBytes}
+		fresh[id] = true
+	}
+	if err := markChains(fresh, now); err != nil {
+		return 0, false, fmt.Errorf("collect: %w", err)
+	}
+	for id := range fresh {
+		if due[id] {
+			delete(due, id)
+			spared++
+		}
+	}
+	return spared, true, nil
 }

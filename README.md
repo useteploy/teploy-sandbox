@@ -762,9 +762,10 @@ durable, in the log and in `remote.error`. If this host still has its
 snapshot the next upkeep uploads it again; if it does not (`local:
 false`), the run stays listed as `failed` and nothing can restore it —
 the log line begins `STOPPED RUN AT RISK`. Nothing is deleted on a
-scrub's findings. Collection reports, fleet-wide, every snapshot whose
-manifest names chunks that are not there, caller snapshots and base
-images included.
+scrub's findings. Collection reports, fleet-wide, every snapshot that
+cannot be restored — its manifest names chunks that are not there, or it
+builds on a snapshot that is gone or missing chunks — caller snapshots
+and base images included, which no scrub looks at.
 
 **Resuming anywhere.** Each daemon lists the bucket every
 `--remote-sync-interval` (and on `POST /v1/remote/sync`), and a resume,
@@ -848,10 +849,14 @@ service's modification times are a second condition; where they cannot
 be read, chunks without a manifest are not collected at all. What a
 manifest builds on is kept for as long as the manifest is, referenced or
 not: an upload's manifest exists a moment before its record. A round
-that cannot read a record or a manifest deletes nothing at all; a round
-in which a manifest it listed is not there when read, or in which a
-manifest or record appeared while it looked, deletes no snapshot (old
-generations and other uploads' leftover chunks still go). Only objects
+that cannot read a record or a manifest deletes nothing at all, and a
+round in which a manifest it listed is not there when read deletes no
+snapshot (old generations and other uploads' leftover chunks still go).
+Before a round deletes snapshots it lists the bucket once more and reads
+what is new — records that appeared or moved on, manifests that were not
+there — and keeps whatever those name or build on; the rest of what was
+due goes, so a fleet that is never still does not keep a destroyed run's
+disk for good. Only objects
 shaped exactly like the daemon's own are ever considered; anything else
 under the prefix is counted in the log and left. `POST
 /v1/remote/collect` runs a round now.

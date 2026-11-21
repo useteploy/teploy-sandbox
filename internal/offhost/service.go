@@ -737,7 +737,7 @@ func (s *Service) Collect(ctx context.Context) error {
 	}
 	s.log.Info("remote storage collected", "snapshotsDeleted", stats.Snapshots, "objectsDeleted", stats.Objects,
 		"bytesDeleted", stats.Bytes, "snapshotsKept", stats.Kept, "snapshotsNotWhole", len(stats.Broken),
-		"objectsNotOurs", stats.Foreign, "deferred", stats.Deferred, "took", time.Since(start).String())
+		"objectsNotOurs", stats.Foreign, "deferred", stats.Deferred, "spared", stats.Spared, "took", time.Since(start).String())
 	return nil
 }
 

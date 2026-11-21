@@ -509,7 +509,7 @@ func TestABaseCollectedUnderAnUploadThatBuildsOnIt(t *testing.T) {
 		restores(t, uploader, snapT, host.data[snapT])
 	})
 
-	t.Run("a manifest written while the collection looks defers it", func(t *testing.T) {
+	t.Run("a manifest written while the collection looks spares what it builds on", func(t *testing.T) {
 		memory, _, uploader, collector, host, service, advance := arrange(t)
 		advance(48 * time.Hour)
 		// The collector has listed and read everything, and is about to
@@ -528,7 +528,7 @@ func TestABaseCollectedUnderAnUploadThatBuildsOnIt(t *testing.T) {
 			}
 		})
 		stats, err := collector.Collect(bg, grace)
-		if err != nil || stats.Snapshots != 0 || !stats.Deferred {
+		if err != nil || stats.Snapshots != 0 || stats.Spared != 1 {
 			t.Fatalf("a collection the bucket changed under: %+v, %v", stats, err)
 		}
 		restores(t, uploader, snapT, host.data[snapT])
@@ -1134,4 +1134,115 @@ func TestACollectionNamesASnapshotWhoseChainIsBroken(t *testing.T) {
 	if stats.Objects != 0 {
 		t.Fatalf("a collection deleted %d objects of snapshots it found not whole", stats.Objects)
 	}
+}
+
+// The look a collection takes before it deletes a snapshot (review A4)
+// gave the whole round up when anything at all in the bucket had changed
+// since it began: any run stopped, resumed or destroyed anywhere in the
+// fleet while the collector read its way through every manifest. A fleet
+// that is never still for that long never deleted a snapshot again, and
+// the disks of destroyed runs stayed in the bucket for good. Only what
+// the change refers to is kept now.
+func TestACollectionIsNotPutOffByWhatDoesNotConcernIt(t *testing.T) {
+	const grace = 24 * time.Hour
+	const otherRun, otherSnap = "01HZZZZZZZZZZZZZZZZZZZZZZQ", "01hzzzzzzzzzzzzzzzzzzzzzzq"
+	memory := offhosttest.NewMemory()
+	keys := testKeyring(t, 1)
+	clock := time.Now()
+	memory.Now = func() time.Time { return clock }
+	collectorBucket := offhosttest.NewFaulty(memory)
+	uploader, collector := integrityStore(t, memory, keys), integrityStore(t, collectorBucket, keys)
+	uploader.now, collector.now = func() time.Time { return clock }, func() time.Time { return clock }
+	host := newPool()
+	host.data[snapS], host.data[snapT], host.data[otherSnap] = randomBytes(t, 1500), randomBytes(t, 1500), randomBytes(t, 900)
+	service := NewService(uploader, host, Config{Daemon: "a"}, quiet())
+	// A run is stopped and destroyed: its snapshot is garbage.
+	first, err := service.Upload(bg, run.UploadRequest{Run: runR, Ref: "snap:" + snapS, Purpose: PurposeStop})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Advance(bg, run.RemoteRecord{Run: runR, Generation: 1, State: RecordStopped, Snapshot: "snap:" + snapS, Key: first.Key}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Advance(bg, run.RemoteRecord{Run: runR, Generation: 2, State: RecordDestroyed, Key: first.Key}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collector.Collect(bg, grace); err != nil { // first sees it unreferenced
+		t.Fatal(err)
+	}
+	clock = clock.Add(48 * time.Hour)
+	// While the collector looks, an unrelated run stops elsewhere.
+	walks := 0
+	collectorBucket.Set(func(f *offhosttest.Faulty) {
+		f.Listed = func(prefix string, listed []s3.Object) []s3.Object {
+			if walks++; walks == 2 { // run/ and snap/ are listed; the look before deleting is still to come
+				other, err := service.Upload(bg, run.UploadRequest{Run: otherRun, Ref: "snap:" + otherSnap, Purpose: PurposeStop})
+				if err != nil {
+					t.Error(err)
+				}
+				if _, err := service.Advance(bg, run.RemoteRecord{Run: otherRun, Generation: 1, State: RecordStopped, Snapshot: "snap:" + otherSnap, Key: other.Key}); err != nil {
+					t.Error(err)
+				}
+			}
+			return listed
+		}
+	})
+	stats, err := collector.Collect(bg, grace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Snapshots != 1 || stats.Deferred || stats.Spared != 0 {
+		t.Fatalf("a destroyed run's snapshot, with an unrelated run stopping meanwhile: %+v", stats)
+	}
+	if left := memory.Keys(uploader.snapshotPrefix(snapS)); len(left) != 0 {
+		t.Fatalf("the destroyed run's snapshot is still in the bucket: %v", left)
+	}
+	restores(t, uploader, otherSnap, host.data[otherSnap])
+}
+
+// The other half of the same look: a record written while the collector
+// reads is what keeps the snapshot it names. Here the record of a stop
+// lands two days after its upload (storage was down for the record), in
+// the middle of the round that would have deleted the snapshot.
+func TestARecordWrittenWhileACollectionLooksKeepsItsSnapshot(t *testing.T) {
+	const grace = 24 * time.Hour
+	memory := offhosttest.NewMemory()
+	keys := testKeyring(t, 1)
+	clock := time.Now()
+	memory.Now = func() time.Time { return clock }
+	collectorBucket := offhosttest.NewFaulty(memory)
+	uploader, collector := integrityStore(t, memory, keys), integrityStore(t, collectorBucket, keys)
+	uploader.now, collector.now = func() time.Time { return clock }, func() time.Time { return clock }
+	host := newPool()
+	host.data[baseB], host.data[snapS] = randomBytes(t, 2500), randomBytes(t, 1500)
+	host.base[snapS] = baseB
+	service := NewService(uploader, host, Config{Daemon: "a"}, quiet())
+	uploaded, err := service.Upload(bg, run.UploadRequest{Run: runR, Ref: "snap:" + snapS, Purpose: PurposeStop})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collector.Collect(bg, grace); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(48 * time.Hour)
+	walks := 0
+	collectorBucket.Set(func(f *offhosttest.Faulty) {
+		f.Listed = func(prefix string, listed []s3.Object) []s3.Object {
+			if walks++; walks == 2 {
+				if _, err := service.Advance(bg, run.RemoteRecord{Run: runR, Generation: 1, State: RecordStopped, Snapshot: "snap:" + snapS, Key: uploaded.Key}); err != nil {
+					t.Error(err)
+				}
+			}
+			return listed
+		}
+	})
+	stats, err := collector.Collect(bg, grace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The snapshot and the base image it builds on.
+	if stats.Snapshots != 0 || stats.Spared != 2 {
+		t.Fatalf("a collection under which a record was written: %+v", stats)
+	}
+	restores(t, uploader, snapS, host.data[snapS])
 }

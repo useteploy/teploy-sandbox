@@ -189,7 +189,9 @@ func vcpus(limit float64) int {
 // kept, or the run boots its own disk: a resume or a fork) boots one. From
 // then on the two are the same: the VM is claimed for the run, which is
 // where everything that belongs to the run happens (its network device,
-// its guest's network and clock), and nothing of that is done before.
+// its guest's network and clock), and nothing of that is done before. A
+// pool VM that is killed while it is claimed is given back and replaced,
+// once, by a VM booted for the run, under the same admission (deadClaim).
 //
 // The returned container ID is the VM's name: the spec's name for a VM
 // booted here, the pool's name for one taken from it (its volume, cgroup,
@@ -235,58 +237,189 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 	}
 	defer admitted()
 
-	// Rollbacks run under a fresh deadline: the request's may be what
-	// just expired.
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
 	cpus := vcpus(spec.CPUs)
 	start := time.Now()
-	name, source := spec.Name, "boot"
+	name, source := spec.Name, sourceBoot
 	var machine Machine
-	if pool := d.warmPool(); pool != nil && ref == "" {
+	pool := d.warmPool()
+	if pool != nil && ref == "" {
 		if warm := pool.take(cpus, spec.MemoryMB); warm != nil {
-			name, machine, source = warm.name, warm.machine, "warm pool"
+			name, machine, source = warm.name, warm.machine, sourcePool
 			// The refill, once this claim is done with the CPU.
 			defer pool.poke()
 		}
 	}
-	if machine == nil {
-		booted := d.warmPool().coldBoot()
-		var leftover bool
-		machine, leftover, err = d.boot(ctx, name, ref, cpus, spec.MemoryMB)
-		booted()
-		if errors.Is(err, ErrNoSnapshot) {
-			err = fmt.Errorf("%w: %v", run.ErrBadRequest, err)
-		}
-		if err != nil {
-			if !leftover {
-				return "", err
+	for {
+		if machine == nil {
+			name = spec.Name
+			booting := pool.coldBoot()
+			var leftover bool
+			machine, leftover, err = d.boot(ctx, name, ref, cpus, spec.MemoryMB)
+			booting()
+			if errors.Is(err, ErrNoSnapshot) {
+				err = fmt.Errorf("%w: %v", run.ErrBadRequest, err)
 			}
-			if machine != nil {
-				// Tracked, so the Remove the manager retries finds it.
-				d.track(name, &instance{machine: machine, network: spec.Name})
+			if err != nil {
+				if !leftover {
+					return "", err
+				}
+				if machine != nil {
+					// Tracked, so the Remove the manager retries finds it.
+					d.track(name, &instance{machine: machine, network: spec.Name})
+				}
+				return name, err
 			}
-			return name, err
 		}
-	}
-	booted := time.Since(start)
+		booted := time.Since(start)
 
-	// From here the VM is this run's, and only this run's: a VM that was
-	// claimed is never handed to another run, nor put back in the pool.
-	env, err := d.claim(ctx, name, machine, spec, proxyPort)
-	if err != nil {
-		cleanupErr := d.discard(cleanupCtx, name, machine, spec.Name)
-		if cleanupErr != nil {
+		// From here the VM is this run's, and only this run's: a VM that
+		// was claimed is never handed to another run, nor put back in the
+		// pool.
+		env, err := d.claim(ctx, name, machine, spec, proxyPort)
+		if err == nil {
+			if source == sourcePool {
+				pool.claimed()
+			}
+			d.track(name, &instance{machine: machine, env: env, network: spec.Name})
+			d.log.Info("vm handed to its run", "name", name, "run", spec.Name, "from", source, "tier", spec.Network,
+				"vm", booted.String(), "total", time.Since(start).String())
+			return name, nil
+		}
+		// Rollbacks run under a deadline of their own: the request's may be
+		// what just expired. It starts here, where the rollback does, and
+		// not where the create did: a boot may take longer than the whole
+		// of it (BootTimeout), and a rollback whose deadline had passed
+		// before it began would give nothing back.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+		// At most twice: a create claims at most two VMs.
+		defer cancel()
+		if source == sourcePool {
+			// Before anything is removed: a discard kills the machine, and
+			// a VM the discard killed is not one that died under its claim.
+			replace, cleanupErr := d.deadClaim(ctx, cleanupCtx, pool, name, machine, spec, err)
+			if cleanupErr != nil {
+				d.track(name, &instance{machine: machine, network: spec.Name})
+				return name, errors.Join(err, cleanupErr)
+			}
+			if replace {
+				// Once: a VM booted for the run is not from the pool, and
+				// a create whose own VM dies fails like any other.
+				machine, source = nil, sourceReplacement
+				continue
+			}
+		}
+		if cleanupErr := d.discard(cleanupCtx, name, machine, spec.Name); cleanupErr != nil {
 			d.track(name, &instance{machine: machine, network: spec.Name})
 			return name, errors.Join(err, cleanupErr)
 		}
 		return "", err
 	}
-	d.track(name, &instance{machine: machine, env: env, network: spec.Name})
-	d.log.Info("vm handed to its run", "name", name, "run", spec.Name, "from", source, "tier", spec.Network,
-		"vm", booted.String(), "total", time.Since(start).String())
-	return name, nil
 }
+
+// rollbackTimeout bounds giving back a VM whose claim failed.
+const rollbackTimeout = 30 * time.Second
+
+// Where a run's VM came from, as the log says it.
+const (
+	sourceBoot        = "boot"
+	sourcePool        = "warm pool"
+	sourceReplacement = "boot, the pool's VM having died"
+)
+
+// claimDeathGrace is how long a claim that lost its VM's sockets waits for
+// the VM's process to be reaped before it decides the VM lives. A dead
+// hypervisor's sockets fail at once, but its exit is only seen once the
+// process has been waited for and its output pipes drained.
+const claimDeathGrace = 1500 * time.Millisecond
+
+// deadClaim is the answer to a pool VM whose claim failed with claimErr:
+// whether the create boots a VM of its own instead, having given back
+// everything of the dead one. It is yes only when the VM's process was
+// killed from outside (KilledFromOutside: the OOM killer, an operator),
+// which is no fault of the run's and would not happen to a VM booted for
+// it; and only while the caller still waits. A VM that died of its claim
+// (its hypervisor refused a system call of the hot-plug, its guest
+// panicked bringing up the device, it powered off) would die the same way
+// booted for the run, and is reported, not replaced. Every death at a
+// claim counts in the pool's backoff, as one in the pool does.
+//
+// A non-nil error means the dead VM could not be given back; the caller
+// tracks it, and replace is false.
+func (d *Driver) deadClaim(ctx, cleanupCtx context.Context, pool *warmPool, name string, machine Machine, spec run.CreateSpec, claimErr error) (replace bool, err error) {
+	wait := time.Duration(0)
+	var unreachable *vmUnreachable
+	if ctx.Err() == nil && errors.As(claimErr, &unreachable) {
+		wait = claimDeathGrace
+	}
+	if !exitedWithin(cleanupCtx, machine, wait) {
+		return false, nil
+	}
+	exit := machine.Exit()
+	deaths := pool.diedAtClaim()
+	attrs := []any{"name", name, "run", spec.Name, "tier", spec.Network, "exit", exit.String(), "inARow", deaths,
+		"error", claimErr.Error(), "diagnostics", machine.Diagnostics()}
+	switch {
+	case !exit.KilledFromOutside():
+		d.log.Error("vm warm pool: a VM died of its claim; the create fails, and the pool backs off", attrs...)
+		return false, nil
+	case ctx.Err() != nil:
+		d.log.Warn("vm warm pool: a VM was killed under its claim, and its create was given up; not booting another", attrs...)
+		return false, nil
+	}
+	d.log.Warn("vm warm pool: a VM was killed under its claim; booting one for the run", attrs...)
+	return true, d.unclaim(cleanupCtx, name, machine, spec.Name)
+}
+
+// exitedWithin reports whether machine's process is gone, waiting up to
+// wait (and no longer than ctx) for it to be seen so.
+func exitedWithin(ctx context.Context, machine Machine, wait time.Duration) bool {
+	select {
+	case <-machine.Exited():
+		return true
+	default:
+	}
+	if wait <= 0 {
+		return false
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-machine.Exited():
+		return true
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	return false
+}
+
+// unclaim gives back everything of a VM that died under its claim: its
+// confinement (Kill releases the cgroup, UID and device node once the
+// process is gone), its network device and its volume. What is the run's
+// stays for the VM that replaces it: its place in the network, where an
+// allowlist run's proxy listens (Unplug), and the proxy itself, which the
+// manager holds.
+func (d *Driver) unclaim(ctx context.Context, name string, machine Machine, network string) error {
+	if err := machine.Kill(ctx); err != nil {
+		return err
+	}
+	if d.network != nil {
+		if err := d.network.Unplug(ctx, network); err != nil {
+			return fmt.Errorf("take back the network device of %s: %w", network, err)
+		}
+	}
+	if err := d.volumes.RemoveRun(ctx, name); err != nil {
+		return fmt.Errorf("remove volume of %s: %w", name, err)
+	}
+	return nil
+}
+
+// vmUnreachable is a claim that failed because the VM's process did not
+// answer at all (its sockets refused or broke), as opposed to one that
+// answered no: the first is what a VM that just died looks like.
+type vmUnreachable struct{ err error }
+
+func (e *vmUnreachable) Error() string { return e.err.Error() }
+func (e *vmUnreachable) Unwrap() error { return e.err }
 
 // admit counts a create against the daemon's limit on VMs, until the
 // returned function is called. A VM a run has, and one that could not be
@@ -369,7 +502,12 @@ func (d *Driver) claim(ctx context.Context, name string, machine Machine, spec r
 		_ = guestNet.Tap.Close()
 		attachTook = time.Since(start)
 		if err != nil {
-			return nil, fmt.Errorf("vm %s: %w", name, err)
+			err = fmt.Errorf("vm %s: %w", name, err)
+			var refused *hypervisorRefusal
+			if !errors.As(err, &refused) {
+				err = &vmUnreachable{err}
+			}
+			return nil, err
 		}
 	}
 	start := time.Now()
@@ -462,7 +600,9 @@ func prepareGuest(ctx context.Context, machine Machine, network *GuestNetwork) e
 	code, timedOut, err := machine.Agent().Exec(ctx, guestSetupScript(time.Now(), network), "/", nil, guestSetupTimeout, &stdout, &stderr)
 	switch {
 	case err != nil:
-		return fmt.Errorf("guest setup: %w", err)
+		// The agent's answer is an exit code: no answer is the VM's
+		// process failing to answer.
+		return &vmUnreachable{fmt.Errorf("guest setup: %w", err)}
 	case timedOut:
 		return errors.New("guest setup: the guest did not finish in time")
 	case code != 0:

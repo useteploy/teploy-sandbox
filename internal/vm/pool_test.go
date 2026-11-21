@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -597,5 +598,323 @@ func TestAFullDaemonRefusesBeforeItMakesAnything(t *testing.T) {
 	egress.mu.Unlock()
 	if opened != 0 || len(network.attached) != 0 || len(rig.hypervisor.started) != 1 {
 		t.Fatalf("a refused create was given %d proxies and %d places in the network; %d VMs booted", opened, len(network.attached), len(rig.hypervisor.started))
+	}
+}
+
+// newWarmNetworkedRig is newWarmRig with guest networking, whose network
+// keeps places as the real one does (fakeNetwork.strict) and whose proxies
+// make them.
+func newWarmNetworkedRig(t *testing.T, config WarmConfig) (*testRig, *fakeNetwork, *fakeEgress) {
+	t.Helper()
+	rig := newWarmRig(t, config)
+	network := newFakeNetwork(t)
+	network.strict = true
+	egress := &fakeEgress{network: network}
+	rig.driver.network = network
+	rig.manager.Egress = egress
+	return rig, network, egress
+}
+
+// dieAtClaim has a pool VM die inside its guest setup, the claim's last
+// step, as a real VM dies: its sockets fail at once, and its process is
+// seen gone lag later.
+func dieAtClaim(machine *fakeMachine, exit MachineExit, lag time.Duration, also func()) {
+	machine.mu.Lock()
+	defer machine.mu.Unlock()
+	machine.setupFunc = func(string, io.Writer) (int, bool, error) {
+		if also != nil {
+			also()
+		}
+		machine.die(exit, lag)
+		return -1, false, errors.New("read vsock: connection reset by peer")
+	}
+}
+
+func (m *fakeMachine) killed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Contains(m.events, "kill")
+}
+
+var killedFromOutside = MachineExit{Signal: syscall.SIGKILL}
+
+// A pool VM killed while a create claims it (the OOM killer) does not
+// fail the create: the dead VM is given back, whole, and the run gets a
+// VM booted for it, on its own tier. An allowlist run keeps its place in
+// the network and its one proxy; the dead VM's device goes.
+func TestAPoolVMKilledUnderItsClaimIsReplaced(t *testing.T) {
+	for _, tier := range []string{run.NetworkNone, run.NetworkAllowlist, run.NetworkOpen} {
+		t.Run(tier, func(t *testing.T) {
+			rig, network, egress := newWarmNetworkedRig(t, WarmConfig{Sizes: []WarmSize{{1, 512, 1}}})
+			waitPool(t, rig.driver, "full", full)
+			dead := rig.warmVMs(1, 512)[0]
+			machine := rig.hypervisor.machine(dead)
+			dieAtClaim(machine, killedFromOutside, 0, nil)
+
+			created, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Network: tier, Limits: &run.Limits{MemoryMB: 512, CPUs: 1}})
+			must(t, err)
+			name := containerName(created.ID)
+			if current, _ := rig.manager.Get(created.ID); current.ContainerID != name {
+				t.Fatalf("the run has %s, want a VM booted for it (%s)", current.ContainerID, name)
+			}
+			// The dead VM: killed (Kill is what gives its cgroup, UID and
+			// device node back once the process is gone), its volume gone.
+			if !machine.killed() {
+				t.Fatal("the dead VM was not killed, so its confinement was not released")
+			}
+			if ok, _ := rig.zfs.Exists(bg, testPool+"/"+dead); ok {
+				t.Fatal("the dead VM's volume is still there")
+			}
+			replacement := rig.hypervisor.machine(name)
+			if replacement == nil || replacement.isDead() || len(replacement.setups) != 1 {
+				t.Fatalf("the VM booted for the run: %+v", replacement)
+			}
+			network.mu.Lock()
+			history, attached, port := slices.Clone(network.history), network.attached[name], network.ports[name]
+			network.mu.Unlock()
+			egress.mu.Lock()
+			opened, closed := egress.next, slices.Clone(egress.closed)
+			egress.mu.Unlock()
+			switch tier {
+			case run.NetworkNone:
+				if len(history) != 0 || opened != 0 {
+					t.Fatalf("a run on none touched the network: %v, %d proxies", history, opened)
+				}
+			case run.NetworkAllowlist:
+				// The run's place and proxy stay; the dead VM's device goes,
+				// and the new VM's is on the same proxy.
+				want := []string{"listen " + name, "attach " + name + " allowlist", "unplug " + name, "attach " + name + " allowlist"}
+				if !slices.Equal(history, want) {
+					t.Fatalf("network:\n%v\nwant\n%v", history, want)
+				}
+				if opened != 1 || len(closed) != 0 || port != 40001 {
+					t.Fatalf("the run's proxy: opened %d times, closed %v, the VM on port %d", opened, closed, port)
+				}
+			case run.NetworkOpen:
+				// The dead VM's namespace goes; the new VM is given its own.
+				want := []string{"attach " + name + " open", "detach " + name, "attach " + name + " open"}
+				if !slices.Equal(history, want) {
+					t.Fatalf("network:\n%v\nwant\n%v", history, want)
+				}
+			}
+			if tier != run.NetworkNone && (attached == nil || attached.MAC != replacement.netMAC) {
+				t.Fatalf("the run's device is not the new VM's: %+v, VM %q", attached, replacement.netMAC)
+			}
+
+			must(t, rig.manager.Destroy(bg, created.ID))
+			network.mu.Lock()
+			left, places := len(network.attached), len(network.places)
+			network.mu.Unlock()
+			if left != 0 || places != 0 {
+				t.Fatalf("after destroy: %d devices, %d places", left, places)
+			}
+			waitPool(t, rig.driver, "full again", full)
+		})
+	}
+}
+
+// Two pool VMs that die under claims: the create that lost the first does
+// not take the second (which another create may still have), and is not
+// failed when the second dies too. It boots its own.
+func TestACreateWhosePoolVMDiesDoesNotTakeAnother(t *testing.T) {
+	rig := newWarmRig(t, WarmConfig{Sizes: []WarmSize{{1, 512, 2}}})
+	waitPool(t, rig.driver, "full", full)
+	pooled := rig.warmVMs(1, 512)
+	for _, name := range pooled {
+		dieAtClaim(rig.hypervisor.machine(name), killedFromOutside, 0, nil)
+	}
+	created, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Limits: &run.Limits{MemoryMB: 512, CPUs: 1}})
+	must(t, err)
+	if current, _ := rig.manager.Get(created.ID); current.ContainerID != containerName(created.ID) {
+		t.Fatalf("the run has %s, want a VM booted for it", current.ContainerID)
+	}
+	second := rig.hypervisor.machine(pooled[1])
+	if second.isDead() || len(second.setups) != 0 || !slices.Contains(rig.warmVMs(1, 512), pooled[1]) {
+		t.Fatalf("the create took the pool's second VM too: dead %v, setups %d, pool %v", second.isDead(), len(second.setups), rig.warmVMs(1, 512))
+	}
+}
+
+// A dead hypervisor's sockets fail at once, and its exit is seen only once
+// it has been reaped: a claim that fails in between still finds the VM
+// dead.
+func TestAKilledPoolVMIsSeenDeadAfterItsSocketsFail(t *testing.T) {
+	rig := newWarmRig(t, WarmConfig{Sizes: []WarmSize{{1, 512, 1}}})
+	waitPool(t, rig.driver, "full", full)
+	dead := rig.warmVMs(1, 512)[0]
+	dieAtClaim(rig.hypervisor.machine(dead), killedFromOutside, 300*time.Millisecond, nil)
+	created, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Limits: &run.Limits{MemoryMB: 512, CPUs: 1}})
+	must(t, err)
+	if current, _ := rig.manager.Get(created.ID); current.ContainerID != containerName(created.ID) {
+		t.Fatalf("the run has %s, want a VM booted for it", current.ContainerID)
+	}
+}
+
+// A VM that dies of its claim (its hypervisor killed by its seccomp
+// filter on the hot-plug, its guest powering off or panicking) would die
+// the same way booted for the run: the create fails at once, without a
+// boot, and the pool backs off as from any death.
+func TestAPoolVMThatDiesOfItsClaimIsNotReplaced(t *testing.T) {
+	for what, exit := range map[string]MachineExit{
+		"seccomp": {Signal: syscall.SIGSYS},
+		"guest":   {Code: 1},
+	} {
+		t.Run(what, func(t *testing.T) {
+			rig := newWarmRig(t, WarmConfig{Sizes: []WarmSize{{1, 512, 2}}})
+			waitPool(t, rig.driver, "full", full)
+			pool := rig.driver.warmPool()
+			pool.mu.Lock()
+			pool.retryBase = time.Minute
+			pool.mu.Unlock()
+			pooled := rig.warmVMs(1, 512)
+			for _, name := range pooled {
+				dieAtClaim(rig.hypervisor.machine(name), exit, 0, nil)
+			}
+			// Two creates, each given a VM that dies of its claim.
+			for range pooled {
+				if _, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Limits: &run.Limits{MemoryMB: 512, CPUs: 1}}); err == nil {
+					t.Fatal("a create whose VM died of its claim succeeded")
+				}
+			}
+			rig.hypervisor.mu.Lock()
+			started := len(rig.hypervisor.started)
+			rig.hypervisor.mu.Unlock()
+			if started != len(pooled) {
+				t.Fatalf("%d VMs booted, want only the pool's %d", started, len(pooled))
+			}
+			// The deaths add up: taking a VM is not a sign that the pool's
+			// VMs live.
+			pool.mu.Lock()
+			deaths, pause := pool.deaths, time.Until(pool.retryAt)
+			pool.mu.Unlock()
+			if deaths != len(pooled) || pause < 50*time.Second {
+				t.Fatalf("deaths %d, next boot in %s: the pool did not back off", deaths, pause)
+			}
+			for _, name := range pooled {
+				if !rig.hypervisor.machine(name).killed() {
+					t.Fatalf("the confinement of dead VM %s was not released", name)
+				}
+				if ok, _ := rig.zfs.Exists(bg, testPool+"/"+name); ok {
+					t.Fatalf("the volume of dead VM %s is still there", name)
+				}
+			}
+		})
+	}
+}
+
+// A create whose caller has given up is not served again: its pool VM's
+// death is counted, and nothing is booted for it.
+func TestAGivenUpCreateIsNotReplaced(t *testing.T) {
+	rig := newWarmRig(t, WarmConfig{Sizes: []WarmSize{{1, 512, 1}}})
+	waitPool(t, rig.driver, "full", full)
+	pool := rig.driver.warmPool()
+	pool.mu.Lock()
+	pool.retryBase = time.Minute
+	pool.mu.Unlock()
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	dieAtClaim(rig.hypervisor.machine(rig.warmVMs(1, 512)[0]), killedFromOutside, 0, cancel)
+	if _, err := rig.manager.Create(ctx, run.CreateRequest{Image: GoldenImage, Limits: &run.Limits{MemoryMB: 512, CPUs: 1}}); err == nil {
+		t.Fatal("a given-up create succeeded")
+	}
+	rig.hypervisor.mu.Lock()
+	started := len(rig.hypervisor.started)
+	rig.hypervisor.mu.Unlock()
+	pool.mu.Lock()
+	deaths := pool.deaths
+	pool.mu.Unlock()
+	if started != 1 || deaths != 1 {
+		t.Fatalf("%d VMs booted (want the pool's one), deaths %d", started, deaths)
+	}
+}
+
+// A rollback's deadline starts when the rollback does. One that started
+// with the create would be spent by the boot before it (a boot may take
+// four times as long), and the VM whose claim failed would be given back
+// with a deadline that had already passed: killed, and nothing of it
+// released. Both VMs a create can claim: one booted for it, and the one
+// booted in place of a pool VM that was killed.
+func TestARollbackHasItsWholeDeadlineHoweverLongTheBootTook(t *testing.T) {
+	for what, pooled := range map[string]bool{"booted for the run": false, "booted for a killed pool VM": true} {
+		t.Run(what, func(t *testing.T) {
+			config := WarmConfig{}
+			if pooled {
+				config.Sizes = []WarmSize{{1, 512, 1}}
+			}
+			rig := newWarmRig(t, config)
+			if pooled {
+				waitPool(t, rig.driver, "full", full)
+				dieAtClaim(rig.hypervisor.machine(rig.warmVMs(1, 512)[0]), killedFromOutside, 0, nil)
+			}
+			var mu sync.Mutex
+			var failed *fakeMachine
+			var failedAt time.Time
+			rig.hypervisor.mu.Lock()
+			rig.hypervisor.onStart = func(machine *fakeMachine) {
+				machine.setupFunc = func(string, io.Writer) (int, bool, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					if failed == nil {
+						failed, failedAt = machine, time.Now()
+					}
+					return 1, false, nil
+				}
+			}
+			rig.hypervisor.mu.Unlock()
+			if _, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Limits: &run.Limits{MemoryMB: 512, CPUs: 1}}); err == nil {
+				t.Fatal("a create whose guest setup failed succeeded")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if failed == nil || !failed.killed() {
+				t.Fatalf("the VM booted for the run was not removed: %+v", failed)
+			}
+			failed.mu.Lock()
+			deadline := failed.killDeadline
+			failed.mu.Unlock()
+			if left := deadline.Sub(failedAt); left < rollbackTimeout {
+				t.Fatalf("the rollback was given %s of its %s: its deadline began before the claim failed", left, rollbackTimeout)
+			}
+		})
+	}
+}
+
+// A pool VM whose sockets failed and whose process is still not seen gone
+// when the grace is over is not known to be dead, and nothing is booted
+// beside a VM that may live: the create fails, and the VM is killed and
+// given back as any VM whose claim failed.
+func TestAPoolVMNotSeenGoneInTimeIsNotReplaced(t *testing.T) {
+	rig, network, _ := newWarmNetworkedRig(t, WarmConfig{Sizes: []WarmSize{{1, 512, 1}}})
+	waitPool(t, rig.driver, "full", full)
+	pool := rig.driver.warmPool()
+	pool.mu.Lock()
+	pool.retryBase = time.Minute
+	pool.mu.Unlock()
+	dead := rig.warmVMs(1, 512)[0]
+	machine := rig.hypervisor.machine(dead)
+	dieAtClaim(machine, killedFromOutside, 10*claimDeathGrace, nil)
+	start := time.Now()
+	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Network: run.NetworkAllowlist, Limits: &run.Limits{MemoryMB: 512, CPUs: 1}}); err == nil {
+		t.Fatal("a create succeeded beside a pool VM that was not seen gone")
+	}
+	if waited := time.Since(start); waited < claimDeathGrace {
+		t.Fatalf("the create gave up after %s, before the grace of %s", waited, claimDeathGrace)
+	}
+	rig.hypervisor.mu.Lock()
+	started := len(rig.hypervisor.started)
+	rig.hypervisor.mu.Unlock()
+	if started != 1 {
+		t.Fatalf("%d VMs booted, want only the pool's one", started)
+	}
+	if !machine.killed() {
+		t.Fatal("the VM was not killed")
+	}
+	if ok, _ := rig.zfs.Exists(bg, testPool+"/"+dead); ok {
+		t.Fatal("the VM's volume is still there")
+	}
+	network.mu.Lock()
+	left, places := len(network.attached), len(network.places)
+	network.mu.Unlock()
+	if left != 0 || places != 0 {
+		t.Fatalf("left in the network: %d devices, %d places", left, places)
 	}
 }

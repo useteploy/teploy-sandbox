@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -586,5 +587,29 @@ func TestAddNetReadsABoundedAnswer(t *testing.T) {
 	// hundred KiB at most) or was never written.
 	if total := <-sent; total > 4<<20 {
 		t.Fatalf("the daemon took %d bytes of an answer that never ended (it reads at most %d)", total, apiAnswerLimit)
+	}
+}
+
+// How a process ended, read the way the driver reads a hypervisor's end:
+// only SIGKILL is a kill from outside; a filter's SIGSYS and an exit code
+// are the process's own end.
+func TestExitOfTellsAKillFromTheProcesssOwnEnd(t *testing.T) {
+	for script, want := range map[string]MachineExit{
+		"kill -KILL $$": {Signal: syscall.SIGKILL},
+		"kill -SYS $$":  {Signal: syscall.SIGSYS},
+		"exit 3":        {Code: 3},
+	} {
+		cmd := exec.Command("/bin/sh", "-c", script)
+		_ = cmd.Run()
+		got := exitOf(cmd.ProcessState)
+		if got != want {
+			t.Errorf("%q: %s, want %s", script, got, want)
+		}
+		if got.KilledFromOutside() != (want.Signal == syscall.SIGKILL) {
+			t.Errorf("%q: killed from outside %v", script, got.KilledFromOutside())
+		}
+	}
+	if got := exitOf(nil); got.KilledFromOutside() || got.Code != -1 {
+		t.Errorf("a process never waited for: %s", got)
 	}
 }

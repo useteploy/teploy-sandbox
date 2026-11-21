@@ -447,7 +447,17 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		Labels:    maps.Clone(req.Labels),
 		OnExpire:  onExpire,
 	}
-	if portable {
+	// absent: a snapshot reference of this daemon's for a snapshot this
+	// host does not have. That is a snapshot named by its ID as much as
+	// "snapshot:<id>" is — a reference is the ID between a fixed prefix
+	// and suffix — and it is about to be fetched from remote storage.
+	absent := false
+	if m.OffHost != nil && m.ownsSnapshotRef(req.Image) {
+		if has, err := m.OffHost.HasLocal(ctx, req.Image); err == nil && !has {
+			absent = true
+		}
+	}
+	if portable || absent {
 		// Named by its ID: a caller's snapshot, never a run's stop.
 		if err := m.admitPortable(ctx, req.Image); err != nil {
 			return nil, err
@@ -460,17 +470,14 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	// does not name. Until the run exists the registry file names it as
 	// being fetched, so a crash between the fetch and the boot leaves
 	// something the next start removes.
-	fetching := false
-	if m.OffHost != nil && m.ownsSnapshotRef(req.Image) {
-		// Only what is not here yet: a snapshot this host already has
-		// may be a caller's own, which no restart may take for a fetch.
-		if has, err := m.OffHost.HasLocal(ctx, req.Image); err == nil && !has {
-			fetching = true
-			m.mu.Lock()
-			m.fetching[req.Image]++
-			m.mu.Unlock()
-			m.persist()
-		}
+	// Only what is not here yet: a snapshot this host already has may be
+	// a caller's own, which no restart may take for a fetch.
+	fetching := absent
+	if fetching {
+		m.mu.Lock()
+		m.fetching[req.Image]++
+		m.mu.Unlock()
+		m.persist()
 	}
 	settle := func() {
 		if !fetching {

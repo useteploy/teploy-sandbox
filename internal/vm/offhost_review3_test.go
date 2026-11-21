@@ -6,6 +6,7 @@ package vm
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -262,5 +263,36 @@ func TestARestoreDoesNotWaitBehindEveryUpload(t *testing.T) {
 		if stopped := <-done; stopped == nil || stopped.Remote.State != run.RemoteDurable {
 			t.Fatalf("a stop that waited for a transfer: %+v", stopped)
 		}
+	}
+}
+
+// "An ID names a caller's snapshot only" was enforced for the spelling
+// "snapshot:<id>". A daemon's own reference for the same ID is that ID
+// between a fixed prefix and suffix, and a create given that spelling
+// for a snapshot the host does not have fetched it from remote storage
+// and booted it unasked-about: another run's stop, by its ID after all.
+func TestAStopSnapshotIsNotFetchedForACreateUnderAnySpelling(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	a, b := newHost(t, bucket, "host-a", nil), newHost(t, bucket, "host-b", nil)
+	created := a.startRun(t, payload(t, 200))
+	_, snapshot, err := a.manager.SnapshotRemote(bg, created.ID)
+	if err != nil || snapshot.State != run.RemoteDurable {
+		t.Fatalf("snapshot: %+v, %v", snapshot, err)
+	}
+	stopped := a.stop(t, created.ID)
+	ref, ok := b.service.Ref(stopped.Remote.Snapshot)
+	if !ok {
+		t.Fatal("no local spelling")
+	}
+	if _, err := b.manager.Create(bg, run.CreateRequest{Image: ref}); !errors.Is(err, run.ErrBadRequest) || !errors.Is(err, run.ErrNotCallerSnapshot) {
+		t.Fatalf("create on host-b from host-a's stop snapshot, spelled as host-b's own reference = %v, want a refusal that says whose it is", err)
+	}
+	if refs := b.zfs.liveRefs(); len(refs) != 0 {
+		t.Fatalf("host-b fetched %v", refs)
+	}
+	// A caller's snapshot is fetched under either spelling.
+	callers, _ := b.service.Ref(snapshot.ID)
+	if _, err := b.manager.Create(bg, run.CreateRequest{Image: callers}); err != nil {
+		t.Fatalf("create from a caller's snapshot by this host's spelling of it: %v", err)
 	}
 }

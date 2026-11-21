@@ -227,7 +227,8 @@ func (m *Manager) publishHeld(ctx context.Context, id string) error {
 // after the one this daemon knows, and returns the generation it wrote
 // after. A conflict is looked into before it is believed:
 //
-//   - the newest record is this very write (its answer was lost): done;
+//   - the newest record is this very write (its answer was lost), or
+//     any daemon's "stopped" with this same snapshot: done;
 //   - the run has no record at all, or the newest one is this daemon's
 //     own and not "destroyed" (the registry lost track of a generation it
 //     wrote: a crash between a claim and its note, a registry rewritten
@@ -258,7 +259,11 @@ func (m *Manager) advanceStopped(ctx context.Context, id string, generation uint
 		case latestErr != nil:
 			// Cannot tell what the conflict is: not a verdict.
 			return generation, key, "", fmt.Errorf("%w: %v", ErrRemoteUnavailable, latestErr)
-		case latest.Mine && latest.State == RecordStopped && latest.Snapshot == snapshot && latest.Generation > generation:
+		case latest.State == RecordStopped && latest.Snapshot == snapshot && latest.Generation > generation:
+			// The newest record already says what this write would have:
+			// this very write, or another daemon's of the same stop (it
+			// gave the run back after a resume that failed, repaired it,
+			// or rotated its key). Nothing moved on without this copy.
 			return latest.Generation - 1, latest.Key, "", nil
 		case latest.Mine && latest.State == RecordDestroyed:
 			return generation, key, "this daemon's own record says the run was destroyed", err
@@ -626,6 +631,18 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 
 	durable := view.Remote != nil && view.Remote.State == RemoteDurable
 	hasLocal := view.Remote == nil || view.Remote.Local
+	// follow: this daemon may go by the record alone, because it holds
+	// nothing the record does not have — its view was durable, or the
+	// pool itself says there is no copy of the view's snapshot here (a
+	// run adopted from another daemon and since found not whole, say).
+	// Marking such a view superseded would keep nothing, and would only
+	// stop the run from ever being resumed here.
+	follow := durable
+	if !follow && !missing && view.Remote != nil && !view.Remote.Local {
+		if has, err := m.OffHost.HasLocal(ctx, view.snapshot); err == nil && !has {
+			follow = true
+		}
+	}
 	supersede := func(reason string) {
 		m.mu.Lock()
 		if live, ok := m.runs[id]; ok && (live.Remote == nil || live.Remote.State != RemoteSuperseded) {
@@ -657,7 +674,7 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		republish(0, "the run's record is gone from remote storage")
 		return nil
 	case latest.State == RecordDestroyed:
-		if !durable {
+		if !follow {
 			if latest.Mine {
 				supersede("this daemon's own record says the run was destroyed")
 			} else {
@@ -671,8 +688,14 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 	case latest.Generation < view.remoteGen:
 		republish(latest.Generation, fmt.Sprintf("remote storage has generation %d of the run's record, and this daemon knows %d", latest.Generation, view.remoteGen))
 		return nil
-	case latest.Mine && latest.State == RecordStopped && latest.Snapshot == view.snapshot:
-		// A stop of ours that was written and never acknowledged. The
+	case latest.State == RecordStopped && latest.Snapshot == view.snapshot && (latest.Mine || !durable):
+		// A stop of ours that was written and never acknowledged; or the
+		// very stop this daemon holds, written again by another daemon
+		// while this one's view was not durable: it repaired the run
+		// after a scrub, or gave it back after a resume that failed on
+		// the snapshot not being whole. Neither is the run moving on
+		// without this copy — the record names it — and calling that a
+		// takeover would retire the one copy a repair can come from. The
 		// record is there; whether the snapshot is, is asked like
 		// anywhere else before the word "durable" is used.
 		if err := m.OffHost.Verify(ctx, view.snapshot); errors.Is(err, ErrRemoteIncomplete) {
@@ -709,7 +732,7 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 	case latest.State == RecordStopped:
 		// Resumed and stopped again somewhere else: the remote record
 		// is the run now.
-		if !durable {
+		if !follow {
 			supersede(fmt.Sprintf("daemon %s stopped the run at generation %d", latest.Owner, latest.Generation))
 			return nil
 		}
@@ -720,7 +743,7 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		m.replaceHeld(id, adopted)
 		return nil
 	case latest.State == RecordRunning && takeover:
-		if !durable {
+		if !follow {
 			return fmt.Errorf("%w: this daemon has a copy of run %s that was never made durable; fork or delete it before taking the run over", ErrRemoteConflict, id)
 		}
 		adopted, err := m.takeover(ctx, latest)
@@ -731,7 +754,7 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		return nil
 	default:
 		// Running on another daemon.
-		if !durable {
+		if !follow {
 			supersede(fmt.Sprintf("daemon %s holds the run at generation %d", latest.Owner, latest.Generation))
 			return nil
 		}

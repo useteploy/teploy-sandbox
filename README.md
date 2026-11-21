@@ -632,7 +632,15 @@ pool, and the network and lifecycle tests then get pool VMs; the
 `TestVMWarmPool` and `TestVMWarmPoolRaces` tests bring their own pool
 either way)
 
-### Off-host storage
+### Off-host storage (experimental)
+
+> **Not for real data yet.** This feature is off unless `--remote-endpoint`
+> is set. It has passed its unit suites and three independent reviews, but
+> it has never run against a real object storage service or, in its current
+> form, a real hypervisor and ZFS pool. Until the live runs listed in
+> `AUDIT_OPEN.md` pass, treat a remote copy as a convenience, keep
+> `--remote-local keep` (the default), and do not rely on it as the only
+> copy of anything.
 
 With `--remote-endpoint` a stopped run's disk is also kept in an
 S3-compatible bucket, so the host that ran it is disposable: any daemon

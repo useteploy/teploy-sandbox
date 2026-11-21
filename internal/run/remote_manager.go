@@ -956,11 +956,25 @@ func (m *Manager) unclaimHeld(ctx context.Context, id string) {
 		m.log.Error("a run claimed for a resume that failed was not given back in remote storage; retrying", "id", id, "error", err)
 		return
 	}
-	now := m.now()
+	// "Durable" was true before the claim. The resume that just failed
+	// may have failed on exactly that no longer being so (a chunk gone):
+	// it is asked before it is said again.
+	state := RemoteState{State: RemoteDurable, Snapshot: name, Local: local}
+	if verifyErr := m.OffHost.Verify(attempt, snapshot); errors.Is(verifyErr, ErrRemoteIncomplete) {
+		state = RemoteState{State: RemoteFailed, Snapshot: name, Local: local, Error: verifyErr.Error()}
+		if local {
+			m.log.Error("a stopped run reported durable is not whole in remote storage; it is no longer reported durable and is uploaded again from this host's copy", "id", id, "image", snapshot, "reason", verifyErr.Error())
+		} else {
+			m.log.Error("STOPPED RUN AT RISK: reported durable, not whole in remote storage, and this host has no copy; it is no longer reported durable", "id", id, "image", snapshot, "reason", verifyErr.Error())
+		}
+	} else {
+		now := m.now()
+		state.DurableAt = &now
+	}
 	m.mu.Lock()
 	if live, ok := m.runs[id]; ok {
 		live.remoteGen, live.remoteHeld, live.remoteKey = generation+1, false, key
-		setRemoteLocked(live, RemoteState{State: RemoteDurable, Snapshot: name, Local: local, DurableAt: &now})
+		setRemoteLocked(live, state)
 	}
 	m.mu.Unlock()
 	m.persist()

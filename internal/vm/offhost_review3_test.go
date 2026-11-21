@@ -80,6 +80,11 @@ func TestAFailedResumeElsewhereDoesNotStopTheRepair(t *testing.T) {
 	if _, err := b.manager.Resume(bg, created.ID, 0); err == nil {
 		t.Fatal("a run with a chunk gone resumed")
 	}
+	// The resume that failed on the missing chunk gives the run back; it
+	// must not call it durable again in the same breath.
+	if got := b.get(t, created.ID); got.State != run.StateStopped || got.Remote.State != run.RemoteFailed || got.Remote.Local {
+		t.Fatalf("host-b after a resume that failed on a missing chunk reports %s, %+v", got.State, *got.Remote)
+	}
 	a.manager.Maintain(bg)
 	a.manager.Maintain(bg)
 	got := a.get(t, created.ID)

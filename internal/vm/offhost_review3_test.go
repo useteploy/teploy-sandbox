@@ -164,3 +164,53 @@ func TestAViewWithNoCopyFollowsTheRecord(t *testing.T) {
 		t.Fatal("bytes differ")
 	}
 }
+
+// The second look publishHeld takes, after the run's record names the
+// snapshot, is what the README leans on for a collection that deletes a
+// base image between an upload's own check and its record. Nothing
+// tested it: with the look taken out every test passed. Here a collector
+// on another daemon takes the base image in exactly that moment.
+func TestAStopIsNotDurableWhenItsBaseWentBeforeTheRecord(t *testing.T) {
+	memory := offhosttest.NewMemory()
+	bucket := offhosttest.NewFaulty(memory)
+	a := newHostObjs(t, memory, bucket, "host-a", nil, nil)
+	b := newHost(t, memory, "host-b", nil)
+	data := payload(t, 400)
+	created := a.startRun(t, data)
+	taken := false
+	bucket.Set(func(f *offhosttest.Faulty) {
+		f.AfterPut = func(key string) error {
+			if taken || !strings.Contains(key, "/v1/run/") {
+				return nil
+			}
+			taken = true
+			for _, object := range memory.Keys("fleet/v1/snap/base-") {
+				memory.Remove(object)
+			}
+			return nil
+		}
+	})
+	stopped, err := a.manager.Stop(bg, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !taken {
+		t.Fatal("the stop wrote no record")
+	}
+	if stopped.Remote.State == run.RemoteDurable {
+		t.Fatalf("a stop whose base image is gone from the bucket is reported %+v", *stopped.Remote)
+	}
+	// The copy is still here: the upkeep uploads the base and the stop
+	// again, and the run resumes elsewhere.
+	a.manager.Maintain(bg)
+	if got := a.get(t, created.ID); got.Remote.State != run.RemoteDurable {
+		t.Fatalf("after the upkeep: %+v", *got.Remote)
+	}
+	b.sync(t)
+	if _, err := b.manager.Resume(bg, created.ID, 0); err != nil {
+		t.Fatalf("resume elsewhere: %v", err)
+	}
+	if !bytes.Equal(b.read(t, created.ID), data) {
+		t.Fatal("bytes differ")
+	}
+}

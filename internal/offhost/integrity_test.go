@@ -602,9 +602,17 @@ func TestCollectLeavesWhatIsNotItsOwn(t *testing.T) {
 		"fleet/v1/snap/nested/v1/snap/01hzzzzzzzzzzzzzzzzzzzzzzb/00000000000000ab/00000000",
 		"fleet/v1/run/nested/v1/run/01HZZZZZZZZZZZZZZZZZZZZZZA/00000000000000000001",
 		"fleet/v1/snap/01hzzzzzzzzzzzzzzzzzzzzzzc/notes.txt",
+		// Under a snapshot's own prefix, and shaped like nothing a store
+		// writes: not an upload attempt, not a chunk of one.
+		"fleet/v1/snap/01hzzzzzzzzzzzzzzzzzzzzzzc/not-an-attempt/00000000",
+		"fleet/v1/snap/01hzzzzzzzzzzzzzzzzzzzzzzc/00000000000000ab/chunk-one",
 	}
 	for _, key := range theirs {
-		memory.SetRaw(key, []byte("not ours"))
+		// Written, not planted: with a modification time, and an old one.
+		// An object without a time is never collected whatever its name.
+		if err := memory.Put(bg, key, []byte("not ours"), putOptions{}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for name, listed := range map[string]func(string, []s3.Object) []s3.Object{
 		"a service that honours the prefix": nil,

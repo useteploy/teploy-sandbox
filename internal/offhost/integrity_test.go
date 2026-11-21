@@ -1291,3 +1291,58 @@ func TestADestroyedRecordOutlivesTheRetention(t *testing.T) {
 		t.Fatalf("a destroyed run's records were never collected: %v", left)
 	}
 }
+
+// A collection deleted a due snapshot's manifest and then everything
+// under the snapshot's name, as listed afterwards. A base image is
+// uploaded again under the same name by the next host that needs it, and
+// an upload that began once the manifest was gone — it looked, found no
+// base image, and sent one — had its fresh chunks and manifest taken by
+// that second listing, after it had verified them. Only the chunks the
+// deleted manifest named are the round's to delete.
+func TestACollectionTakesOnlyTheUploadItDecidedOn(t *testing.T) {
+	const grace = 24 * time.Hour
+	memory := offhosttest.NewMemory()
+	keys := testKeyring(t, 1)
+	clock := time.Now()
+	memory.Now = func() time.Time { return clock }
+	collectorBucket := offhosttest.NewFaulty(memory)
+	uploader, collector := integrityStore(t, memory, keys), integrityStore(t, collectorBucket, keys)
+	uploader.now, collector.now = func() time.Time { return clock }, func() time.Time { return clock }
+	host := newPool()
+	host.data[baseB], host.data[snapS], host.data[snapT] = randomBytes(t, 2500), randomBytes(t, 1500), randomBytes(t, 3500)
+	host.base[snapS], host.base[snapT] = baseB, baseB
+	service := NewService(uploader, host, Config{Daemon: "a"}, quiet())
+	// Day 0: a first run puts the base in the bucket and is destroyed.
+	if _, err := service.Upload(bg, run.UploadRequest{Run: runR, Ref: "snap:" + snapS, Purpose: PurposeStop}); err != nil {
+		t.Fatal(err)
+	}
+	if err := uploader.DeleteSnapshot(bg, snapS); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collector.Collect(bg, grace); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(48 * time.Hour)
+	// The collector has deleted the base image's manifest and asks what
+	// there is to delete under it. Before the service answers, a stop on
+	// the uploader's host finds no base image and uploads one.
+	uploaded := false
+	collectorBucket.Set(func(f *offhosttest.Faulty) {
+		f.Listed = func(prefix string, listed []s3.Object) []s3.Object {
+			if uploaded || !strings.HasPrefix(prefix, collector.snapshotPrefix(baseB)) {
+				return listed
+			}
+			uploaded = true
+			if _, err := service.Upload(bg, run.UploadRequest{Run: runR, Ref: "snap:" + snapT, Purpose: PurposeStop}); err != nil {
+				t.Error(err)
+			}
+			answered, _ := memory.ListAll(bg, prefix)
+			return answered
+		}
+	})
+	stats, err := collector.Collect(bg, grace)
+	if err != nil || stats.Snapshots != 1 || !uploaded {
+		t.Fatalf("the test did not provoke the race: %+v, %v, uploaded %v", stats, err, uploaded)
+	}
+	restores(t, uploader, snapT, host.data[snapT])
+}

@@ -453,9 +453,12 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	if stats.Deferred {
 		s.log.Info("remote storage changed during this collection in a way that could not be read; snapshots that were due are left for the next", "snapshots", len(due))
 	} else {
+		// The manifests go first, all of them, straight after the look:
+		// from then on none of these snapshots exists, and an upload
+		// that was about to build on one finds that out when it checks
+		// (Verify), instead of in however long the chunks of the ones
+		// before it take to delete.
 		for id := range due {
-			// The manifest goes first: from then on the snapshot does
-			// not exist, and the rest is chunks nothing names.
 			entry := snapshots[id]
 			if err := s.objects.Delete(ctx, entry.manifest.Key); err != nil {
 				return stats, err
@@ -464,7 +467,15 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 			stats.Objects++
 			stats.Bytes += entry.manifest.Size
 			delete(s.unreferenced, id)
-			count, size, err := s.deleteUnder(ctx, s.snapshotPrefix(id))
+		}
+		// Then the chunks those manifests named, and only those. Whatever
+		// else is under a snapshot's name is not what this round decided
+		// on: another attempt's leftovers go the way of all chunks no
+		// manifest names, and an upload of the same snapshot begun since
+		// (a base image another host needs again) is not this round's to
+		// take.
+		for id := range due {
+			count, size, err := s.deleteUnder(ctx, s.attemptPrefix(id, manifests[id].attempt))
 			stats.Objects += count
 			stats.Bytes += size
 			if err != nil {

@@ -420,7 +420,7 @@ func serve(args []string) error {
 	if pool != nil {
 		manager.Egress = pool
 	}
-	offHost, err := remote.open(context.Background(), snapshots, *stateDir, log)
+	offHost, err := remote.open(context.Background(), snapshots, *stateDir, retention, log)
 	if err != nil {
 		return err
 	}

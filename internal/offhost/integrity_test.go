@@ -1246,3 +1246,48 @@ func TestARecordWrittenWhileACollectionLooksKeepsItsSnapshot(t *testing.T) {
 	}
 	restores(t, uploader, snapS, host.data[snapS])
 }
+
+// A "destroyed" record was kept for thirty graces and nothing else, and
+// the shortest grace a daemon may be given is an hour: thirty hours. A
+// daemon down over a weekend, holding a copy of a run destroyed on
+// Friday, found no record on Monday, could not tell a destroyed run from
+// lost objects, and published the run again: a disk its owner had
+// deleted, resumable again for the rest of its retention. The record now
+// outlives the retention, after which every copy is its own daemon's
+// reaper's to remove.
+func TestADestroyedRecordOutlivesTheRetention(t *testing.T) {
+	const grace, retention = time.Hour, 14 * 24 * time.Hour
+	memory := offhosttest.NewMemory()
+	clock := time.Now()
+	memory.Now = func() time.Time { return clock }
+	store := integrityStore(t, memory, testKeyring(t, 1))
+	store.now = func() time.Time { return clock }
+	store.Tombstones = retention
+	key, err := store.Keys().NewKey(runR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Advance(bg, Record{Run: runR, Generation: 1, State: RecordStopped}, key, "a", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Advance(bg, Record{Run: runR, Generation: 2, State: RecordDestroyed}, key, "a", false); err != nil {
+		t.Fatal(err)
+	}
+	destroyed := clock
+	for _, step := range []time.Duration{0, tombstoneGraces * grace, 3 * 24 * time.Hour, 8 * 24 * time.Hour} {
+		clock = clock.Add(step)
+		if _, err := store.Collect(bg, grace); err != nil {
+			t.Fatal(err)
+		}
+		if record, _, err := store.Latest(bg, runR); err != nil || record.State != RecordDestroyed {
+			t.Fatalf("%s after a run was destroyed, with a retention of %s, its record is %+v, %v", clock.Sub(destroyed), retention, record, err)
+		}
+	}
+	clock = clock.Add(3 * 24 * time.Hour)
+	if _, err := store.Collect(bg, grace); err != nil {
+		t.Fatal(err)
+	}
+	if left := memory.Keys(store.runPrefix(runR)); len(left) != 0 {
+		t.Fatalf("a destroyed run's records were never collected: %v", left)
+	}
+}

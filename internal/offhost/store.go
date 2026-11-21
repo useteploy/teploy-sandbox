@@ -141,6 +141,14 @@ type Store struct {
 	// about (Parallel + 1) × ChunkBytes.
 	ChunkBytes int
 	Parallel   int
+	// Tombstones is the least time the records of a destroyed run are
+	// kept, however short the grace: the daemons' retention for stopped
+	// runs. A daemon that holds a copy of a run destroyed elsewhere and
+	// does not see the "destroyed" record publishes the run again (it
+	// cannot tell a destroyed run from lost objects). While the record
+	// outlives every copy's retention there is no such daemon: one that
+	// was away for longer comes back to copies its own reaper removes.
+	Tombstones time.Duration
 	// conditional is whether the service honours conditional writes
 	// (Probe).
 	conditional bool

@@ -75,7 +75,7 @@ func addRemoteFlags(flags *flag.FlagSet) *remoteFlags {
 		gcInterval: flags.Duration("remote-gc-interval", envDuration("SBX_REMOTE_GC_INTERVAL", run.DefaultRemoteGCInterval),
 			"remote storage: how often objects nothing refers to are looked for"),
 		gcGrace: flags.Duration("remote-gc-grace", envDuration("SBX_REMOTE_GC_GRACE", 24*time.Hour),
-			fmt.Sprintf("remote storage: how long this daemon must have seen an object as garbage before it deletes it (at least %s); a destroyed run's record is kept thirty times as long", offhost.MinGCGrace)),
+			fmt.Sprintf("remote storage: how long this daemon must have seen an object as garbage before it deletes it (at least %s); a destroyed run's record is kept thirty times as long, and no shorter than --stopped-retention", offhost.MinGCGrace)),
 		syncInterval: flags.Duration("remote-sync-interval", envDuration("SBX_REMOTE_SYNC_INTERVAL", run.DefaultRemoteSyncInterval),
 			"remote storage: how often runs stopped, resumed or destroyed on other daemons are looked for"),
 		snapshotRetry: flags.Duration("remote-snapshot-retry", envDuration("SBX_REMOTE_SNAPSHOT_RETRY", run.DefaultSnapshotRetry),
@@ -252,7 +252,10 @@ func (f *remoteFlags) validate() error {
 
 // open builds remote storage from the flags. It returns nil when none is
 // configured.
-func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, stateDir string, log *slog.Logger) (*offhost.Service, error) {
+//
+// retention is --stopped-retention: the record of a destroyed run is
+// kept in the bucket for at least that long.
+func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, stateDir string, retention time.Duration, log *slog.Logger) (*offhost.Service, error) {
 	if *f.endpoint == "" {
 		return nil, nil
 	}
@@ -331,6 +334,7 @@ func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, sta
 	store := offhost.NewStore(client, *f.prefix, keys, log)
 	store.ChunkBytes = *f.chunkMB << 20
 	store.Parallel = *f.parallel
+	store.Tombstones = retention
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	// A daemon that cannot reach its storage does not start: it could

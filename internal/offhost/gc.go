@@ -63,7 +63,8 @@ const MinGCGrace = time.Hour
 // daemon sees a run whose record is missing, which it keeps and
 // publishes again (it cannot tell a destroyed run from lost objects). A
 // daemon that syncs sees the record long before this; one that was
-// away for longer brings the runs it still holds back.
+// away for longer brings the runs it still holds back — unless its own
+// retention for them has run out by then, which Store.Tombstones is for.
 const tombstoneGraces = 30
 
 // observation is what an upload attempt without a manifest looked like
@@ -126,7 +127,7 @@ func envelopeMaster(stored []byte) string {
 //   - chunks no manifest names: the leftovers of an upload that failed,
 //     was interrupted, or lost to another upload of the same snapshot;
 //   - the records of a destroyed run, once they are tombstoneGraces
-//     graces old; generations older than the one before a run's newest,
+//     graces old and no younger than Tombstones; generations older than the one before a run's newest,
 //     and that one too when the newest was written under another master
 //     key (a rotation replaced it).
 //
@@ -153,7 +154,9 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	var stats CollectStats
 	now := s.now()
 	old := func(at time.Time) bool { return !now.Before(at.Add(grace)) }
-	buried := func(at time.Time) bool { return !at.IsZero() && !now.Before(at.Add(tombstoneGraces*grace)) }
+	buried := func(at time.Time) bool {
+		return !at.IsZero() && !now.Before(at.Add(max(tombstoneGraces*grace, s.Tombstones)))
+	}
 
 	// Runs: every record object, grouped.
 	type runObjects struct {

@@ -229,7 +229,7 @@ func TestRemoteOpenRefusals(t *testing.T) {
 	for name, test := range cases {
 		t.Setenv("SBX_REMOTE_SECRET_KEY", "secret")
 		args := append([]string{"--remote-bucket", "b", "--remote-access-key", "a"}, test.args...)
-		service, err := parseRemoteFlags(t, args...).open(context.Background(), noSnapshots{}, t.TempDir(), quietLogger())
+		service, err := parseRemoteFlags(t, args...).open(context.Background(), noSnapshots{}, t.TempDir(), time.Hour, quietLogger())
 		if err == nil || service != nil || !strings.Contains(err.Error(), test.want) {
 			t.Errorf("%s: %v (want an error naming %q)", name, err, test.want)
 		}

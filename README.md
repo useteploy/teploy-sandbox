@@ -821,9 +821,13 @@ runs it now, or that it was destroyed. A run whose record is missing —
 a provider that lost objects, records deleted by hand — is kept, shown
 as `failed` with the reason, and published again from this host's copy.
 One consequence to know: the record that says "destroyed" is kept for
-thirty times `--remote-gc-grace` (30 days by default) and then
-collected, so a daemon that was away for longer than that and still
-holds a copy of a run destroyed meanwhile brings the run back.
+thirty times `--remote-gc-grace` (30 days by default), and never for
+less than `--stopped-retention`, and then collected. A daemon that was
+away for longer than that and still holds a copy of a run destroyed
+meanwhile publishes the run again; because the record outlives the
+retention, such a copy is past its own retention by then and the
+daemon's reaper destroys it within a tick or two of coming back. Give
+every daemon of a fleet the same `--stopped-retention`.
 
 **Without conditional writes.** The daemon tests the service at start. If
 `If-None-Match` is not honoured, uploads, restores and forks work as
@@ -841,7 +845,8 @@ runs early. Destroying a run writes a last generation ("destroyed").
 Every `--remote-gc-interval` each daemon deletes snapshots that no run's
 newest record names, no caller owns and no snapshot that is staying
 builds on; chunks no manifest names (failed or interrupted uploads); the
-records of destroyed runs, thirty graces after; and old generations.
+records of destroyed runs, thirty graces after and not before
+`--stopped-retention` has passed; and old generations.
 
 Nothing is deleted before **the collecting daemon itself** has seen it
 as garbage for `--remote-gc-grace` on its own clock — a snapshot
@@ -892,7 +897,8 @@ still needed and for what, in `previousKeyNeeded` and
   under the old master until the next collection has pruned it;
 - runs that are running: the record of each is rewritten by its own next
   stop, and until then a takeover of it needs the old master;
-- destroyed runs' records, until collection removes them (thirty graces);
+- destroyed runs' records, until collection removes them (thirty graces,
+  or `--stopped-retention` when that is longer);
 - records that changed during the pass (run it again), and, on a service
   without conditional writes, stopped runs' records another daemon wrote
   or that `--remote-unfenced` lets another daemon change: those wait for

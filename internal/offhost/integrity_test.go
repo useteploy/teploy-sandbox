@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1091,5 +1092,46 @@ func TestGarbageWithoutATimeIsNotCollected(t *testing.T) {
 	bucket.Set(func(f *offhosttest.Faulty) { f.Listed = nil })
 	if stats, err := store.Collect(bg, time.Hour); err != nil || stats.Objects != 1 {
 		t.Fatalf("with times: %+v, %v", stats, err)
+	}
+}
+
+// A collection is the only thing that ever looks at a caller's snapshot
+// again (a daemon's scrub covers the stopped runs it reports durable),
+// and it compared each manifest with its own chunks only: a snapshot
+// whose base image had been collected under it — the window the second
+// review left open — had every chunk of its own, and was reported by
+// nothing until somebody tried to boot it.
+func TestACollectionNamesASnapshotWhoseChainIsBroken(t *testing.T) {
+	memory := offhosttest.NewMemory()
+	store := integrityStore(t, memory, testKeyring(t, 1))
+	host := newPool()
+	host.data[baseB], host.data[snapS], host.data[snapT] = randomBytes(t, 2500), randomBytes(t, 1500), randomBytes(t, 1200)
+	host.base[snapS], host.base[snapT] = baseB, baseB
+	service := NewService(store, host, Config{Daemon: "a"}, quiet())
+	first, err := service.Upload(bg, run.UploadRequest{Run: runR, Ref: "snap:" + snapS, Purpose: PurposeSnapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second snapshot of the run, sent against the first.
+	if _, err := service.Upload(bg, run.UploadRequest{Run: runR, Ref: "snap:" + snapT, Base: "snap:" + snapS, Key: first.Key, Purpose: PurposeSnapshot}); err != nil {
+		t.Fatal(err)
+	}
+	if stats, err := store.Collect(bg, time.Hour); err != nil || len(stats.Broken) != 0 {
+		t.Fatalf("collect of whole snapshots: %+v, %v", stats, err)
+	}
+	// The base image goes, manifest and chunks: what a collector on
+	// another daemon does in the window.
+	for _, key := range memory.Keys(store.snapshotPrefix(baseB)) {
+		memory.Remove(key)
+	}
+	stats, err := store.Collect(bg, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{snapS, snapT}; !slices.Equal(stats.Broken, want) {
+		t.Fatalf("snapshots whose base image is gone: a collection names %v as not whole, want %v", stats.Broken, want)
+	}
+	if stats.Objects != 0 {
+		t.Fatalf("a collection deleted %d objects of snapshots it found not whole", stats.Objects)
 	}
 }

@@ -22,8 +22,10 @@ type CollectStats struct {
 	Bytes     int64
 	// Kept is how many snapshots something still needs.
 	Kept int
-	// Broken are snapshots whose manifest names chunks the listing does
-	// not have: not restorable, whatever refers to them.
+	// Broken are snapshots that cannot be restored, whatever refers to
+	// them: the manifest names chunks the listing does not have, or the
+	// snapshot builds, at any remove, on one that has no manifest or is
+	// itself missing chunks.
 	Broken []string
 	// Foreign is how many objects under the store's prefix are not
 	// shaped like anything this store writes. They are never touched.
@@ -278,6 +280,7 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	}
 	manifests := map[string]*summary{}
 	vanished := map[string]bool{}
+	broken := map[string]string{}
 	for id, entry := range snapshots {
 		if entry.manifest == nil {
 			continue
@@ -301,8 +304,34 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 			needed[id] = true
 		}
 		if listed := entry.attempts[manifest.Attempt]; listed == nil || listed.count != len(manifest.Chunks) || listed.bytes != manifest.StoredBytes {
-			stats.Broken = append(stats.Broken, id)
+			broken[id] = "its manifest names chunks that are not there"
 		}
+	}
+	// And the ones whose own chunks are all there and whose chain is not:
+	// a snapshot that builds on one that is gone restores no better. No
+	// daemon's scrub looks at a caller's snapshot, so this is the only
+	// place one in that state is ever named.
+	for id := range manifests {
+		if broken[id] != "" {
+			continue
+		}
+		hops := 0
+		for parent := manifests[id].parent; parent != ""; parent = manifests[parent].parent {
+			if hops++; hops > maxChainWalk || vanished[parent] {
+				break
+			}
+			if manifests[parent] == nil {
+				broken[id] = fmt.Sprintf("it builds on snapshot %s, which has no manifest", parent)
+				break
+			}
+			if own := broken[parent]; own != "" && !strings.HasPrefix(own, "it builds on") {
+				broken[id] = fmt.Sprintf("it builds on snapshot %s, which is missing chunks", parent)
+				break
+			}
+		}
+	}
+	for id := range broken {
+		stats.Broken = append(stats.Broken, id)
 	}
 	if err := markChains(needed, manifests); err != nil {
 		return stats, fmt.Errorf("collect: %w", err)
@@ -352,7 +381,7 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	}
 	sort.Strings(stats.Broken)
 	for _, id := range stats.Broken {
-		s.log.Error("a snapshot in remote storage is not whole: its manifest names chunks that are not there; it cannot be restored", "snapshot", id, "referenced", needed[id])
+		s.log.Error("a snapshot in remote storage is not whole and cannot be restored", "snapshot", id, "why", broken[id], "purpose", manifests[id].purpose, "referenced", needed[id])
 	}
 
 	// Chunks no manifest names, by upload attempt.

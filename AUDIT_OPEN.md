@@ -2661,10 +2661,13 @@ their fix.
   verifies. A caller can see a spurious 409 on a resume during a pass.
 - **Secrets removed from the environment** (read): nothing reads them
   again; there is no reload; the hypervisor's jail re-execs with a
-  fixed `PATH` only. `iptables` (the egress firewall) is started with
-  the daemon's environment and before `remote.open` has run, so a
-  secret given by variable is in that child's environment while it
-  runs. Key files remain the answer.
+  fixed `PATH` only. The commands that are started with the daemon's
+  whole environment (`docker`, and `iptables` for its egress firewall)
+  belong to the docker driver, under which remote storage does not
+  start. The vm driver's own commands that run before `remote.open`
+  (the preflight's `zfs` and udev probe) go through the same wrapper
+  and get no secret either. Key files remain the answer for what
+  `/proc/<pid>/environ` of the daemon itself still shows.
 - **The minimum grace only at the flag**: accepted; C4 is the one place
   a short grace hurt.
 - **Tombstones**: see C4.

@@ -590,10 +590,14 @@ func TestVMOffHost(t *testing.T) {
 	if left := hypervisorProcesses(t, configB.RunDir); len(left) != 0 {
 		t.Fatalf("a VM runs after two failed restores: %v", left)
 	}
-	if current, err := b.manager.Get(id); err != nil || current.State != run.StateStopped || current.Remote.State != run.RemoteDurable {
+	// Stopped, and no longer called durable: the resume that failed on
+	// the missing chunk gave the run back and looked before saying so
+	// again (a chunk with a bit flipped has its size, and is only found
+	// by reading it; one that is gone is found by the look).
+	if current, err := b.manager.Get(id); err != nil || current.State != run.StateStopped || current.Remote.State != run.RemoteFailed {
 		t.Fatalf("the run after two failed resumes: %+v, %v", current, err)
 	}
-	t.Logf("after both failed restores the pool lists exactly what it did before them (%d names), no VM runs, and the run is still stopped and durable", len(clean))
+	t.Logf("after both failed restores the pool lists exactly what it did before them (%d names), no VM runs, and the run is still stopped, and reported not whole", len(clean))
 	// With the chunk back the run resumes: nothing was spent.
 	if err := objects.Put(ctx, target.Key, original, s3.PutOptions{}); err != nil {
 		t.Fatal(err)

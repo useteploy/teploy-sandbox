@@ -680,6 +680,13 @@ registry full of runs pointed at the wrong bucket finds none of their
 records there. To move a daemon to other storage on purpose, remove
 `remote-fleet-id`; what it has copies of is then published there again.
 
+A state directory is one daemon's. **Never start a second daemon on a
+copy of one** (a cloned machine image, a backup restored beside the
+original): two daemons with the same `daemon-id` each take the runs the
+other is running for runs of their own that a restart lost, and bring
+them back as stopped while they still run. Nothing detects this. A copy
+must lose `daemon-id` and its registry before it starts.
+
 **The master key.** 32 random bytes, in a file only the daemon's user
 can read (a file readable by group or others is refused), as 64 hex
 digits, as base64, or raw:

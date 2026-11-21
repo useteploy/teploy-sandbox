@@ -2594,3 +2594,185 @@ Left as they are:
 - A pool VM that was killed and whose claim failed at `Attach` is
   replaced although an allowlist run's place went with the failed
   `Attach`: one boot is spent before the second claim is refused.
+
+## 2026-11-20 — off-host storage: third independent review, of the fixes
+
+A reviewer who wrote neither the slice nor its fixes went through what
+the second review's fixes changed (`985d2e5..9d3575e`), after merging
+`main` (the warm pool's claim fallback) into the branch. Like the entry
+before it, **nothing here has run live**: no hypervisor, pool or S3
+service was available, and everything below is unit tests on the fakes,
+or reading where it says so. The live list at the end of the previous
+entry stands, with the additions at the end of this one.
+
+### The merge of `main`
+
+`README.md` and `AUDIT_OPEN.md` conflicted (both sides appended a
+section; both are kept). `internal/vm` merged without conflict. The
+fallback's replacement boot is inside `Driver.Create` and only happens
+for a create of the golden image (a pool VM is never taken for a
+snapshot); no off-host path — resume, fork, `snapshot:<id>` — reaches
+it, and what it gives back (`unclaim`: the dead VM's volume, cgroup and
+tap) is a clone of the golden image that the restore marks and the
+startup sweep's new cases do not concern. Read, and the whole unit suite
+of both sides passes together.
+
+### Found and fixed, each with a test that fails without the fix
+
+| | Finding | Fix | Test |
+|---|---|---|---|
+| C1 Medium-high | **A repair was read as a takeover.** A scrub marks a run that is not whole `failed` on every daemon that looks. The next `stopped` record another daemon wrote — the repair by the daemon with the copy, or the give-back of a resume that failed on the missing chunk — was "the run moved on without this copy": the view was `superseded` for good. On the daemon holding the only whole copy this also ended the repair, and the run resumed nowhere (its data reachable only by a fork on that host). The same from the publish side when the upkeep's upload flight ran before its sync | A newest record that says `stopped` with the snapshot this daemon holds is that same stop, whoever wrote it: verified and adopted, or published again from where the record is (`reconcileRun`, `advanceStopped`). A view that is not durable and has no copy on the host follows the record instead of being kept as superseded | `TestARepairElsewhereIsNotATakeover`, `TestAFailedResumeElsewhereDoesNotStopTheRepair`, `TestAPublishThatMeetsTheSameStopIsNotSuperseded`, `TestAViewWithNoCopyFollowsTheRecord` |
+| C2 Medium | **Collection never deleted a snapshot on a busy fleet.** A4's second look gave the whole round up when any record or manifest anywhere was new since the round began, and a round reads every record and manifest in between. A fleet in which some run stops, resumes or is destroyed more often than that takes kept every destroyed run's disk in the bucket for good | The second look reads only what is new and keeps what it names and everything that builds on (`Store.spare`, `CollectStats.Spared`); the rest goes. A change that cannot be read still puts the round off | `TestACollectionIsNotPutOffByWhatDoesNotConcernIt`, `TestARecordWrittenWhileACollectionLooksKeepsItsSnapshot`, the A4 test's third order |
+| C3 Medium | **A fresh upload deleted with the snapshot it replaced** (an instance of A4's open window that had a fix). A round deleted a due snapshot's manifest and then everything listed under its name. A base image uploaded again once the manifest was gone lost its new chunks and manifest to that listing, after its upload and the stop built on it had verified | Only the chunks the deleted manifest named go; other attempts are aged like all chunks no manifest names, in the same round. All due manifests are deleted before any chunk | `TestACollectionTakesOnlyTheUploadItDecidedOn`, `TestLeftoversUnderACollectedSnapshotGoToo` |
+| C4 Medium | **`destroyed` records could be gone in thirty hours.** They are kept for thirty graces and the grace may be one hour. A daemon down for a weekend republished the runs destroyed meanwhile that it had copies of: a disk its owner deleted, resumable for the rest of its retention | Kept for thirty graces or `--stopped-retention`, whichever is longer (`Store.Tombstones`). A daemon away for longer comes back to copies past their own retention, which its reaper removes | `TestADestroyedRecordOutlivesTheRetention` |
+| C5 Medium-low | **A stop snapshot booted by ID after all.** Only `snapshot:<id>` was held to "an ID names a caller's snapshot". A daemon's own reference is the ID between a fixed prefix and suffix; a create given one the host had no snapshot for fetched it from the bucket unasked: another run's stop as a new run | A reference that is not on the host is admitted like an ID | `TestAStopSnapshotIsNotFetchedForACreateUnderAnySpelling` |
+| C6 Medium-low | **A restore waited behind every upload.** B7's bound was one pool; as many stops as there are transfers held all of them for up to two hours each, and a resume that had to fetch waited with the run already claimed | With more than one transfer, uploads take at most all but one | `TestARestoreDoesNotWaitBehindEveryUpload` |
+| C7 Low | A resume that failed because the snapshot is not whole gave the run back and called it durable again in the same breath | The give-back verifies first (`unclaimHeld`) | in `TestAFailedResumeElsewhereDoesNotStopTheRepair` |
+| C8 Low | Collection named a snapshot not whole by its own chunks only. A caller's snapshot whose base image was collected under it (A4's window) has all its chunks, restores nowhere, and no scrub looks at caller snapshots | The chain is followed; the log says which, why and of what purpose | `TestACollectionNamesASnapshotWhoseChainIsBroken` |
+| C9 tests | Two of the second review's fixes passed with the fix taken out: the look `publishHeld` takes after the record had no test, and `TestCollectLeavesWhatIsNotItsOwn` planted its foreign objects without a modification time, which nothing collects whatever its name | A test for the first; the objects are written with an old time, and two are under a real snapshot's prefix | `TestAStopIsNotDurableWhenItsBaseWentBeforeTheRecord` |
+
+### Re-verified of the earlier findings
+
+Each by taking its fix out and seeing its test fail: A1 (chunks kept
+once the manifest was attempted; `Already` verifies), A2 (watched for
+the grace), A3 (rotation's take-back), A4 (marking from manifests not
+due), A5, A6 (the listing's prefix, and after C9 the shapes), B1, B2,
+B6, B8, R1 (object set type), and eviction's look. All fail without
+their fix.
+
+### The departures, looked at
+
+- **Rotation without compare-and-swap** (read). A resurrected manifest
+  needs the rotator's write and its check to both fall between a
+  collector's listing of the snapshot and that collector's first delete
+  under it; with C3 a collector no longer deletes a manifest it did not
+  decide on, so such a manifest stays until the next round ages it. It
+  is no longer a loss whichever way it falls: everything that would use
+  it verifies (`ensureBase`, `usableParent`, `Already`, the restore). A
+  caller snapshot resurrected this way is listed again, unrestorable,
+  until deleted again. A second rotator only overwrites the same
+  document under the same key. One interleaving does lose, and is left:
+  a rotator reads a manifest, an upload retracts it and writes another
+  attempt, the rotator's write puts the old one back. It needs a whole
+  upload inside one listing of the rotator's.
+- **Records rotated when fenced** (read): a rotation and a claim both
+  create generation N+1 and one is refused; the owner is preserved, and
+  the owning daemon's next sync finds its own record at N+1 and
+  verifies. A caller can see a spurious 409 on a resume during a pass.
+- **Secrets removed from the environment** (read): nothing reads them
+  again; there is no reload; the hypervisor's jail re-execs with a
+  fixed `PATH` only. `iptables` (the egress firewall) is started with
+  the daemon's environment and before `remote.open` has run, so a
+  secret given by variable is in that child's environment while it
+  runs. Key files remain the answer.
+- **The minimum grace only at the flag**: accepted; C4 is the one place
+  a short grace hurt.
+- **Tombstones**: see C4.
+- **The BEGIN record** (read against the definitions, not run):
+  `drr_type` at 0, `drr_payloadlen` at 4, then `drr_begin`: magic 8,
+  versioninfo 16, creation time 24, object set type 32 (32 bits),
+  flags 36, `toguid` 40, `fromguid` 48, name 56 to 312 — the size of
+  `dmu_replay_record_t`. The magic is `0x2F5bacbac`; the header type is
+  the low two bits of versioninfo (1 a substream, 2 a package), so the
+  feature bits above them (compressed, large blocks, embedded data)
+  pass; `DMU_OST_ZVOL` is 3. A stream in the other byte order is read
+  in it. A wrong offset refuses every restore and admits nothing.
+  Whether `toguid`/`fromguid` equal the `guid` properties the manifests
+  record is the first item on the live list, as before.
+
+### The window that is still open (A4), exactly
+
+After C3 it is: a collector's second look (`spare`) passes the place
+where an upload's manifest will be, then the upload writes its
+manifest, verifies its chain, writes its record and verifies again, and
+only then does the collector delete the manifest of what the upload
+builds on. The collector's side of that is the rest of one listing and
+one delete per due snapshot; it was that plus every chunk of every
+snapshot deleted before the base. It reaches only uploads that finish
+in that moment on a parent nothing else has referred to for a whole
+grace: in practice the first stop on a host whose golden image no
+stopped run has used for a day.
+
+`--remote-local keep` does **not** make it harmless: it makes it
+repairable. The stop is reported durable and is not, until that host's
+next scrub (6h by default) finds the base gone and the upkeep uploads it
+and the stop again from the local copy. A host lost inside those hours
+loses the run. With `drop` it is lost at once. A caller's snapshot in
+the same position has no scrub at all: after C8 a collection names it,
+and nothing repairs it though the host that took it still has it.
+
+A fix exists and is not cheap enough to make blind. A two-phase delete:
+the collector first copies a due snapshot's manifest to
+`snap/<id>/condemned` and deletes `manifest` — from then on every
+verification of that snapshot fails — and an upload, before it builds
+on a snapshot, writes `snap/<id>/pin/<random>` under it. The collector
+then lists the snapshot's own prefix: a pin puts the manifest back, and
+everything it builds on with it; none, and the chunks go. Whichever of
+the two writes is second sees the first, on a service whose listings
+show what was written. Pins and condemned copies are aged like other
+garbage, and a later round finishes or undoes what a crashed one left.
+It needs a real service to be tried against, and belongs before `drop`
+is recommended to anyone.
+
+### Not fixed, and why
+
+- **Verification is sizes only, and nothing repairs what only a read
+  finds.** A chunk of the right size and the wrong bytes passes every
+  check until a restore, which fails closed (SHA-256, then the tag). The
+  daemon whose restore failed keeps calling the run durable, and so does
+  the daemon that still has a whole copy and could upload it again. A
+  provider can always withhold, so this is not a new power of its; it
+  is bit rot that goes unrepaired with the repair at hand. Wants a
+  scrub that reads (the manifest has every chunk's SHA-256; no key is
+  needed beyond the manifest's), and a restore that fails on content to
+  tell the run's holder.
+- **A service that reports sizes differently from what was written**
+  fails every upload after sending it, three times per try, and the
+  upkeep tries again every round with no backoff: nothing is lost and
+  everything is uploaded continuously. The live check of listings
+  (item 3 of the previous entry) has to pass before this is left
+  running anywhere.
+- **Two daemons on one state directory** (a cloned image): see the
+  README. Each adopts the other's running runs as its own lost ones.
+  Nothing detects it.
+- **The fleet identity on a service without conditional writes**: two
+  daemons that first start in the same moment can each remember a
+  different name, and the one whose write lost refuses its next start
+  with the "another bucket" message. Fails closed; remove
+  `remote-fleet-id` on that host.
+- **A caller snapshot that is not whole is not uploaded again**, even
+  from the host that still holds it; only stopped runs are repaired.
+- A stop still holds its run for its upload; restores and base-image
+  uploads are still one at a time; `Maintain`'s uploads are still one
+  after another (all as the previous entry says).
+
+### With remote storage off
+
+Checked by reading: the three differences the previous entry lists are
+harmless. Host commands lose seven variables none of them reads. A
+single dataset is looked up with `-t filesystem,volume`: every caller
+goes on to require the daemon's owner mark, which no filesystem has
+unless an operator put it there. The startup sweep lists filesystems
+under the pool root once (one more `zfs list -r`, of the same cost as
+the volume listing beside it) and destroys only those carrying this
+daemon's mark; the driver sets that mark on volumes only, and never on
+the root, so nothing inherits it. `DELETE` of an unknown ID consults the
+bucket only when there is one. Nothing in this entry changes a daemon
+without `--remote-endpoint`.
+
+### What has to run live before anyone's data depends on this
+
+The seven items of the previous entry, and:
+
+8. **Collection with the new look** on a bucket that changes under it:
+   a stop elsewhere during a round does not put the round off, and a
+   record or manifest written during it keeps what it names.
+9. **A scrub failure across two daemons**: lose a chunk, scrub both,
+   resume on the one without a copy (it fails and the run is reported
+   failed, not durable), let the other repair, resume on the first.
+   `TestVMOffHost` now expects `failed` after its deleted-chunk resume.
+10. **A daemon restarted after `--stopped-retention`** with copies of
+    runs destroyed meanwhile: gone within a reaper tick or two, with a
+    `destroyed` record still or again in the bucket.
+11. **Four stops uploading and a resume that has to fetch**, with the
+    default four transfers: the resume does not wait for the uploads.

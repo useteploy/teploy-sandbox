@@ -395,9 +395,12 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	var doomedAttempts []attemptRef
 	watched := map[string]bool{}
 	for id, entry := range snapshots {
-		if vanished[id] || due[id] {
+		if vanished[id] {
 			continue
 		}
+		// A snapshot that is due is no exception: the chunks its manifest
+		// names go with it below, and any other attempt under its name
+		// is aged here like under any other.
 		manifest := manifests[id]
 		for attempt, info := range entry.attempts {
 			if manifest != nil && attempt == manifest.attempt {

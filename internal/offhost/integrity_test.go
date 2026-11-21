@@ -1346,3 +1346,29 @@ func TestACollectionTakesOnlyTheUploadItDecidedOn(t *testing.T) {
 	}
 	restores(t, uploader, snapT, host.data[snapT])
 }
+
+// With a due snapshot's chunks deleted by the attempt its manifest named,
+// another attempt's leftovers under the same snapshot are still garbage,
+// and go in the same round once they are old enough: with no grace (what
+// the live suite collects with, to see the bucket empty) at once.
+func TestLeftoversUnderACollectedSnapshotGoToo(t *testing.T) {
+	memory := offhosttest.NewMemory()
+	past := time.Now().Add(-48 * time.Hour)
+	memory.Now = func() time.Time { return past }
+	store := integrityStore(t, memory, testKeyring(t, 1))
+	host := newPool()
+	host.data[snapS] = randomBytes(t, 1500)
+	if _, err := NewService(store, host, Config{Daemon: "a"}, quiet()).Upload(bg, run.UploadRequest{Run: runR, Ref: "snap:" + snapS, Purpose: PurposeStop}); err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.Put(bg, store.chunkKey(snapS, "00000000000000ab", 0), []byte("an upload that lost"), putOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := store.Collect(bg, 0)
+	if err != nil || stats.Snapshots != 1 {
+		t.Fatalf("collect: %+v, %v", stats, err)
+	}
+	if left := memory.Keys(store.snapshotPrefix(snapS)); len(left) != 0 {
+		t.Fatalf("left under a collected snapshot: %v", left)
+	}
+}

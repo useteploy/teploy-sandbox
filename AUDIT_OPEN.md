@@ -2910,6 +2910,16 @@ The point was correctness and confinement on real x86-64.
   because it changes what the runbook's image is and the figures
   against the arm64 runs.
 
+- **A unit test that can flake, seen once in CI on this branch.**
+  `TestAPoolVMNotSeenGoneInTimeIsNotReplaced` failed once ("2 VMs
+  booted, want only the pool's one") in both CI jobs of one push and
+  passed on the re-run, on the pull request's run and 80 times locally
+  (with and without `-race`). By reading: the pool's periodic refill
+  look (every 2 s) can fall inside the create's 1.5 s claim grace,
+  before the death at claim pauses the pool, and then boots a refill.
+  Not caused by this branch (the boot path only gained one call after
+  the agent answers); not fixed here.
+
 ### Re-run on the branch (kernel at its default `/var` path, no `SBX_VM_KERNEL`)
 
 - Root-only unit tests: all pass (245), no skip, the four named tests

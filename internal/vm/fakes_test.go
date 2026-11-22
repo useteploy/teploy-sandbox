@@ -44,8 +44,10 @@ type fakeZFS struct {
 	poolProps map[string]string
 	guids     int
 	guidBase  int
-	// available and used are what Space reports.
+	// available and used are what Space reports; spaceAsked is the last
+	// dataset it was asked about.
 	available, used int64
+	spaceAsked      string
 	// receiveAnything turns off Receive's check of a stream's first
 	// record: for tests of what holds when that check is not there.
 	receiveAnything bool
@@ -437,9 +439,10 @@ func (z *fakeZFS) Receive(_ context.Context, snapshot, origin string, props map[
 	return nil
 }
 
-func (z *fakeZFS) Space(context.Context, string) (int64, int64, error) {
+func (z *fakeZFS) Space(_ context.Context, name string) (int64, int64, error) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
+	z.spaceAsked = name
 	return z.available, z.used, nil
 }
 

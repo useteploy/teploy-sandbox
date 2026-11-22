@@ -3024,3 +3024,141 @@ with the run's other files):
 - The off-host tests (step 10b) on x86-64, and the whole suite green
   pool off and pool on in one run each. The x86-64 and bare-metal items
   stay open.
+
+## 2026-11-21 — recoverable execs, capacity disk, per-run usage, wire contract
+
+Additive daemon asks: `recoverable` execs with `X-Exec-Id` and
+`GET /v1/runs/{id}/execs[/{execId}[/output]]`; `disk` in
+`GET /v1/capacity`; `cpuSeconds`/`rxBytes`/`txBytes`/`diskBytes`/
+`sampledAt` in `usage` behind `--usage-interval` (default off);
+`docs/wire-contract.md`. Not reviewed yet (a review is another session).
+
+### Limits, by design in this slice
+
+- Exec records are memory only. A daemon restart loses every record and
+  every running command (running runs do not survive a restart); the
+  lookup answers 404 with that reason at once. A control plane that sees
+  that 404 for an exec it started knows only "outcome unknown".
+- Output is the last 1 MiB per exec (plus 128 KiB of stream bits), 8
+  records per run, 64 per daemon: about 72 MiB worst case. Running
+  records are never evicted, so a 65th concurrent recoverable exec (or
+  9th on one run) is a 503. One run holds at most an eighth of the
+  slots; a caller with eight or more runs can still take them all (the
+  daemon has one token and no notion of callers: that bound belongs to
+  the control plane). Finished records live 15 minutes. All constants,
+  not flags.
+- A recoverable exec's `timeoutSec` is capped at
+  `--exec-recoverable-max-timeout` (default 1h, at most 24h): a running
+  one holds a slot until it ends, and an hour covers builds and suites.
+  It can be cancelled (`DELETE …/execs/{execId}`). Under Docker that
+  kills only the `docker exec` client: the record and the run's
+  in-flight slot are released, but the in-container process runs on to
+  its own timeout or the run's stop (not fixed: Docker cannot signal an
+  exec's process from outside without tracking its pid in the
+  container).
+- A recoverable exec counts as in flight like any exec, so a caller's
+  stop, snapshot, fork or lease takeover is 409 `busy` while it runs.
+  Unlike a connected exec, a detached one has no client to end it, so
+  (fixed after review) a stop the daemon makes itself (expiry with
+  `onExpire: "stop"`, graceful shutdown) first cancels the run's
+  recoverable execs and waits up to 10 s; before that fix such a stop
+  was refused and a shutdown lost the run's state. Plain execs still
+  block those stops as on `main`.
+- Text-mode resume offsets are exact only when the output is valid UTF-8
+  and the stream did not break inside a character; base64 mode is exact.
+- `signal` is inferred from exit code 128+n; a command that exits 137
+  itself reads as SIGKILL.
+- Usage sampling runs at most four runs at a time; disk is read on the
+  first round and every tenth (it is the expensive read), not at a stop,
+  whose sample has a 3 s budget.
+- Usage numbers are observations, not a ledger: usage after the last
+  sample is lost on destroy, expiry-destroy and crash (a stop takes a
+  final sample). Counters reset to zero for a fork and for a run resumed
+  on another daemon (as `runningSec`). `diskBytes` is a level.
+- Docker usage needs the daemon on the Docker host with cgroup v2. CPU
+  and network are read only after checking the container's pid is in a
+  cgroup named after its full ID, and the cgroup file is read again
+  afterwards to catch a reused pid; a daemon that cannot see the host's
+  `/proc` (containerised, remote Docker, Docker Desktop/colima from the
+  host OS) reports `diskBytes` only. `docker container inspect --size`
+  walks the writable layer on every sample. Under gVisor (`runsc`) the
+  cgroup and namespace of `State.Pid` are assumed to be the sandbox's:
+  not verified.
+- VM `cpuSeconds` includes the hypervisor's own threads (it is the VM's
+  cgroup). VM network counters come from the tap only; a `none` run has
+  no device and reports no rx/tx (Docker reports 0 there). VM
+  `diskBytes` is ZFS `used` of the clone.
+- `disk` in capacity: the ZFS pool's own `used`/`available` (not the
+  driver's dataset; a quota on the dataset is not reflected), or statfs
+  of Docker's data root (`freeBytes` is f_bavail). Absent when the probe
+  fails or exceeds 5 s.
+
+### Tests and what ran live
+
+Unit tests (each shown to fail with its change reverted locally):
+dropped stream does not kill a recoverable exec and its exit/output are
+fetched after; failed stream writes do not fail the command's copy;
+resume by counted base64 offset with no duplicates, paging, bad
+offsets; timeout and inferred signal; plain exec unchanged (same bytes,
+no header, still killed by a dropped stream); records dropped with the
+run; restart answers 404 with the reason quickly; output bound (3 MiB
+written, last 1 MiB held, truncated read, tail); ring buffer against a
+model, including its memory bound; per-run/total bounds and eviction;
+expiry; capacity disk (Docker statfs via a fake CLI, ZFS pool name,
+absent on failure); usage off by default (no samples, JSON unchanged),
+monotonic across stop/resume/restart, high-water mark within one
+container, fork at zero; Docker sampler cgroup check; tap counter
+direction.
+
+- Ran live: `TestRealRecoverableExecAndUsage` against real Docker
+  (colima, so the daemon was not on the Docker host): the dropped stream,
+  the command finishing, resume by offset and `diskBytes` passed; CPU,
+  network and capacity `disk` were not exercised (Linux-host only).
+- Not run live: `vm_usage_integration_test.go` (`TestVMRecoverableExecs`,
+  `TestVMUsage`), Docker CPU/network/disk on a Linux Docker host, and
+  anything under gVisor.
+
+### Review fixes (2026-11-21, same day)
+
+An independent review of PR #6 found one blocker and several smaller
+items; each fix has a test that fails without it (shown locally):
+
+- Lock-order deadlock (blocker): destroy dropped a run's exec records
+  under the manager lock while the reaper's sweep held the registry lock
+  and asked the manager about runs. The drop now happens after the
+  manager lock is released, and the sweep releases the registry lock
+  before asking. Regression: the reviewer's repro,
+  `TestExecSweepAndDestroyDoNotDeadlock`. Every other registry call site
+  takes the manager lock (if at all) only before or after, never around.
+- Detached execs and daemon-made stops, cancel endpoint, timeout cap,
+  per-run share (above). HTTP test of the 503 path and of the refused
+  exec giving back its in-flight reservation.
+- Found while testing the cancel endpoint: the recoverable path did not
+  flush its headers, so a command that printed nothing held back
+  `X-Exec-Id` until its first output. It is flushed at once now (the
+  plain path is untouched).
+- Docker's data root is asked for once and cached; capacity is a statfs.
+- statfs uses f_frsize on Linux (no test: the two are equal on the
+  filesystems at hand); cgroup paths with `..` are not followed; usage
+  fields are hidden with sampling off.
+
+### Second review fixes (2026-11-21)
+
+- The Docker data-root lookup no longer holds its lock across `docker
+  info`: one command at a time, on its own 30 s deadline, shared by every
+  caller, each of which waits only as long as its own context. Test: a
+  fake docker that blocks; a 200 ms caller behind a 3 s one returns in
+  time and the command runs once.
+- The reaper re-checks, on the live record, that a run is still due
+  before cancelling its execs (it decides from a copy): a run stopped and
+  resumed during a slow tick keeps its execs. Test.
+- A cancel that lands after the command ended by itself (an exit code of
+  its own, no error) no longer reports `cancelled`; the exit code stands.
+  Test.
+- Usage samples carry the run's container generation (bumped at every
+  stop): a VM keeps its name across stop and resume, so a sample started
+  under the old VM could land on the new one. Test.
+- `--usage-interval` must be 0 or at least 1s. Test.
+- `disk` for Docker is a statfs of the data root's path on the daemon's
+  own filesystem: wrong or absent against a remote Docker or a Docker VM
+  (Docker Desktop, colima). Documented, not changed.

@@ -52,3 +52,14 @@ func TestProbeWritableDir(t *testing.T) {
 		t.Fatal("a dir that cannot be created must fail")
 	}
 }
+
+func TestUsageIntervalBounds(t *testing.T) {
+	for interval, ok := range map[time.Duration]bool{
+		0: true, time.Second: true, time.Minute: true,
+		-time.Second: false, time.Millisecond: false, 999 * time.Millisecond: false,
+	} {
+		if err := checkUsageInterval(interval); (err == nil) != ok {
+			t.Errorf("%s: %v", interval, err)
+		}
+	}
+}

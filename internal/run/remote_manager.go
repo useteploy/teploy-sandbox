@@ -544,6 +544,7 @@ func (m *Manager) forgetHeld(id string) {
 	refs := []string{live.snapshot, live.base}
 	delete(m.runs, id)
 	m.mu.Unlock()
+	m.execLog.dropRun(id)
 	m.releaseImages(refs)
 	m.persist()
 }

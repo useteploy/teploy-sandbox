@@ -2910,7 +2910,7 @@ The point was correctness and confinement on real x86-64.
   because it changes what the runbook's image is and the figures
   against the arm64 runs.
 
-- **A unit test that can flake, seen once in CI on this branch.**
+- **Two unit tests that can flake, each seen once in CI on this branch.**
   `TestAPoolVMNotSeenGoneInTimeIsNotReplaced` failed once ("2 VMs
   booted, want only the pool's one") in both CI jobs of one push and
   passed on the re-run, on the pull request's run and 80 times locally
@@ -2918,7 +2918,13 @@ The point was correctness and confinement on real x86-64.
   look (every 2 s) can fall inside the create's 1.5 s claim grace,
   before the death at claim pauses the pool, and then boots a refill.
   Not caused by this branch (the boot path only gained one call after
-  the agent answers); not fixed here.
+  the agent answers); not fixed here. Likewise
+  `TestReleaseKeepsTheUIDUntilTheCgroupIsEmpty` failed once in CI's
+  `verify` job ("device or resource busy" on the retried release) and
+  passed in `vm-root` and on the pull request's run: its fake cgroups
+  give a removal 200 ms, which a loaded runner can spend before the
+  first retry. Neither failed in 8 local runs of the whole package
+  (`-cpu 1,2`).
 
 ### Re-run on the branch (kernel at its default `/var` path, no `SBX_VM_KERNEL`)
 

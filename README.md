@@ -963,9 +963,10 @@ Live suite: `TestVMOffHost` in the `vmintegration` suite, with
 
 ### Validating on a fresh x86-64 host
 
-Everything above was developed and run live on arm64 only (nested KVM);
-x86-64 has been compiled and unit-tested by CI, never run with a
-hypervisor. The steps below take a fresh host to a run of the whole live
+Everything above was developed and run live on arm64 (nested KVM); the
+first run on x86-64 hardware (2026-11-21, a small laptop; see
+`AUDIT_OPEN.md`) found the defects these steps now account for, but not
+yet a whole green suite on a host of the size below. The steps below take a fresh host to a run of the whole live
 suite and to the figures that close the x86-64 and bare-metal items in
 `AUDIT_OPEN.md`. Follow them in order; each command is meant to be run
 as written, from the checkout unless it says otherwise. Not every
@@ -985,6 +986,11 @@ image is the one described here.
    `policy drop` forward chain blocks open runs (see Guest networking
    above).
    `ls -l /dev/kvm` must show the device.
+   (Debian 13 has been used as well: ZFS comes from `zfs-dkms` in
+   `contrib`, which needs `linux-headers-$(uname -r)` and builds the
+   module itself, and `netcat-openbsd` is not installed by default. It
+   is then not only the CPU architecture that differs from the arm64
+   runs.)
 2. **Packages.**
    `sudo apt-get update && sudo apt-get install -y zfsutils-linux nftables conntrack iproute2 qemu-utils cloud-guest-utils e2fsprogs git curl python3`
    (`curl` and `python3` are also used on the host by the network tests,
@@ -1022,13 +1028,17 @@ image is the one described here.
    `sudo install -d -m 0755 /var/lib/teploy-sandbox/vm` and
    `sudo curl -fsSL -o /var/lib/teploy-sandbox/vm/vmlinux-x86_64 https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v7.2.8-20261009/vmlinux-x86_64`,
    then `sudo chmod 0644 /var/lib/teploy-sandbox/vm/vmlinux-x86_64`
-   (an unprivileged VM process must read it). The daemon and the suite
-   look for `/var/lib/teploy-sandbox/vm/Image` (the arm64 name) unless
-   told otherwise, and refuse to start without a kernel: set
-   `SBX_VM_KERNEL=/var/lib/teploy-sandbox/vm/vmlinux-x86_64` (the
-   daemon's `--vm-kernel`). Leave `SBX_VM_CMDLINE` unset: the default
+   (an unprivileged VM process must read it). That is where the daemon
+   and the suite look on x86-64 unless told otherwise (`--vm-kernel`,
+   `SBX_VM_KERNEL`; on arm64 the default is
+   `/var/lib/teploy-sandbox/vm/Image`), and they refuse to start without
+   a kernel. Wherever the host keeps it, a VM's jail holds it at
+   `/kernel`. Leave `SBX_VM_CMDLINE` unset: the default
    command line already names the x86-64 console (`ttyS0`) and the root
-   partition (`/dev/vda1`).
+   partition (`/dev/vda1`). This kernel has no IPv6 (`CONFIG_IPV6` is
+   not set in `ch_defconfig`); the daemon gives guests none anyway, and
+   the network tests log their IPv6 checks as not applicable and run the
+   rest.
 6. **Host setup**: `sudo env SBX_VM_WARM=1x512=2,1x1024=1 scripts/install-host.sh sbx`.
    It writes the udev rule, opens `/dev/kvm` to the `kvm` group, checks
    the cgroup controllers, the network tools and kernel features, the
@@ -1096,25 +1106,61 @@ image is the one described here.
    in step 11 only reads what came after.
 10. **The live suite**, twice: without a warm pool and with one. Each
     run takes about 30 minutes, and the network tests need outbound
-    internet (the open tier is tested against public hosts). Build once,
+    internet (the open tier is tested against public hosts). The three
+    off-host tests (`TestVMOffHost`, `TestVMKeyRotation`,
+    `TestVMCallerSnapshots`) need an S3-compatible service and are left
+    out here (`-test.skip`); step 10b runs them. Build once,
     then note the time, so that step 11 reads only these runs' kernel
     log:
 
     ```sh
     CGO_ENABLED=0 go test -c -tags vmintegration -o vm.test .
     start="$(date '+%F %T')"
-    sudo env SBX_VM_KERNEL=/var/lib/teploy-sandbox/vm/vmlinux-x86_64 SBX_VM_HYPERVISOR=/usr/local/bin/cloud-hypervisor \
+    offhost='TestVMOffHost|TestVMKeyRotation|TestVMCallerSnapshots'
+    sudo env SBX_VM_HYPERVISOR=/usr/local/bin/cloud-hypervisor \
       SBX_VM_POOL=sbx SBX_VM_GOLDEN=sbx/golden-guestd@v1 \
-      ./vm.test -test.run TestVM -test.v -test.timeout 2h 2>&1 | tee vm-pool-off.log
-    sudo env SBX_VM_KERNEL=/var/lib/teploy-sandbox/vm/vmlinux-x86_64 SBX_VM_HYPERVISOR=/usr/local/bin/cloud-hypervisor \
+      ./vm.test -test.run TestVM -test.skip "$offhost" -test.v -test.timeout 2h 2>&1 | tee vm-pool-off.log
+    sudo env SBX_VM_HYPERVISOR=/usr/local/bin/cloud-hypervisor \
       SBX_VM_POOL=sbx SBX_VM_GOLDEN=sbx/golden-guestd@v1 SBX_VM_WARM=1x512=2,1x1024=1 \
-      ./vm.test -test.run TestVM -test.v -test.timeout 2h 2>&1 | tee vm-pool-on.log
+      ./vm.test -test.run TestVM -test.skip "$offhost" -test.v -test.timeout 2h 2>&1 | tee vm-pool-on.log
     ```
 
     Both must end in `PASS`, again with no `--- SKIP`.
     `TestVMWarmPoolRaces` is sensitive to timing: if it alone fails,
     re-run it alone (`-test.run TestVMWarmPoolRaces`) before believing
-    the failure, and record both runs.
+    the failure, and record both runs. On a host smaller than step 1's
+    the warm-pool tests (`TestVMWarmPool`, `TestVMWarmPoolRaces`) fail
+    for memory (the pool only boots a VM while the host keeps its
+    headroom free; see `--vm-warm-headroom-mb`), and
+    `TestVMMemoryStaysInsideItsCgroup` logs "skipping the 2048 MiB guest"
+    (and 4096) instead of measuring them: neither is a defect, and
+    neither closes the audit items.
+
+10b. **The off-host tests**, against a local S3-compatible service.
+    They make a second pool of their own in an 8 GB sparse file
+    (`SBX_OFFHOST_POOL_FILE`, by default in `/var/tmp`) and run two
+    daemons at once. The service the earlier runs used is versitygw
+    1.11 with its POSIX backend, on loopback; any service that meets the
+    requirements in "Off-host storage" above will do (MinIO's single
+    binary, for one). With versitygw:
+
+    ```sh
+    curl -fsSL https://github.com/versity/versitygw/releases/download/v1.11.0/versitygw_v1.11.0_Linux_x86_64.tar.gz |
+      tar -xz --strip-components=1 versitygw_v1.11.0_Linux_x86_64/versitygw
+    mkdir -p s3data
+    key=$(openssl rand -hex 16) secret=$(openssl rand -hex 24)
+    ROOT_ACCESS_KEY="$key" ROOT_SECRET_KEY="$secret" ./versitygw --port 127.0.0.1:7070 posix "$PWD/s3data" > versitygw.log 2>&1 &
+    sleep 1
+    curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 --user "$key:$secret" -X PUT http://127.0.0.1:7070/sbx-test
+    sudo env SBX_VM_HYPERVISOR=/usr/local/bin/cloud-hypervisor \
+      SBX_VM_POOL=sbx SBX_VM_GOLDEN=sbx/golden-guestd@v1 \
+      SBX_S3_TEST_ENDPOINT=http://127.0.0.1:7070 SBX_S3_TEST_BUCKET=sbx-test \
+      SBX_S3_TEST_ACCESS_KEY="$key" SBX_S3_TEST_SECRET_KEY="$secret" SBX_S3_TEST_DATA="$PWD/s3data" \
+      ./vm.test -test.run "$offhost" -test.v -test.timeout 1h 2>&1 | tee vm-offhost.log
+    kill %1
+    ```
+
+    It must end in `PASS` with no `--- SKIP`.
 11. **What to record**, in a new dated entry in `AUDIT_OPEN.md`, to
     close its open x86-64 and bare-metal items:
     - the host: CPU model, bare metal or not, memory, disk, Ubuntu and
@@ -1122,9 +1168,12 @@ image is the one described here.
       (`cloud-hypervisor --version`) and the guest kernel's release tag;
     - that both runs passed (or what failed, and the re-runs);
     - **no seccomp kills** with the real x86-64 hypervisor under the
-      daemon's own filter: `sudo journalctl -k --since "$start" | grep -E 'type=1326|seccomp'`
+      daemon's own filter: `sudo journalctl -k --since "$start" | grep 'type=1326'`
       prints nothing after both runs (a kill of the daemon's filter is
-      logged as `type=1326` with `sig=31`);
+      logged as `type=1326` with `sig=31`). Do not grep for `seccomp`
+      alone: every kernel stack trace of a filtered process has a
+      `__seccomp_filter` frame, including the out-of-memory report that
+      `TestVMCgroupLimitIsEnforced` causes on purpose;
     - **warm and cold create timings**: the `WARM` and `COLD` lines
       `TestVMWarmPool` logs (create to first exec, per tier);
     - **memory overhead**: the lines `TestVMMemoryStaysInsideItsCgroup`
@@ -1146,7 +1195,7 @@ image is the one described here.
     ```sh
     go build -o teploy-sandbox .
     sudo ./teploy-sandbox serve --driver vm --token-file /var/lib/teploy-sandbox/check/token \
-      --vm-kernel /var/lib/teploy-sandbox/vm/vmlinux-x86_64 --vm-pool sbx --vm-golden sbx/golden-guestd@v1
+      --vm-pool sbx --vm-golden sbx/golden-guestd@v1
     ```
 
     and in another (the daemon mints the token file on its first start):
@@ -1167,14 +1216,16 @@ image is the one described here.
 
     Record the guest's kernel lines for the device, and the daemon's
     `vm network device ready` log line for that run (`guestSetup` is the
-    guest's part; on arm64 the rescan was 157 to 168 ms of it). The loop
+    guest's part; on arm64 the rescan was 157 to 168 ms of it). The
+    device's name in the guest differs by architecture (`ens5` on
+    x86-64, `enp0s5` on arm64); nothing depends on it, the guest setup
+    finds the device by its MAC. The loop
     boots default-size VMs, idle, until the host has 2 GiB available:
     record the count, which is the measured figure. Stop the daemon with
     Ctrl-C when done.
 
-The off-host storage tests are not part of these steps: they need an
-S3-compatible service as well, and are described at the end of
-"Off-host storage" above (`TestVMOffHost`).
+The off-host storage tests are step 10b: they need an S3-compatible
+service as well (see the end of "Off-host storage" above).
 
 ## Writable leases
 

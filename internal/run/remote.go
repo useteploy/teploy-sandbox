@@ -86,6 +86,12 @@ var (
 	// ErrNotCallerSnapshot: the snapshot is a run's stop, which goes
 	// with its run and is not a caller's to delete or boot by ID.
 	ErrNotCallerSnapshot = errors.New("snapshot belongs to a run")
+	// ErrRemoteListing: remote storage's listing did not show what was
+	// just written (a chunk that a request by name finds). Not a verdict
+	// on the snapshot, and not storage being unreachable either: a
+	// service whose listings are behind its writes, which every upload
+	// will meet again.
+	ErrRemoteListing = errors.New("remote storage's listing does not show what was written")
 )
 
 // RemoteRecord is one generation of a run's remote record.
@@ -224,6 +230,25 @@ type OffHost interface {
 	// Pressure is whether local storage is short enough that copies
 	// which are safe in remote storage should go.
 	Pressure(ctx context.Context) (bool, error)
+	// ScrubContent reads up to budget bytes of the chunks of the given
+	// snapshots and of everything they build on, going on from where
+	// the last call stopped, and holds each chunk to the SHA-256 its
+	// manifest records. Damaged lists the refs whose chain holds a chunk
+	// a read has found damaged (now or before): Verify reports those not
+	// whole from then on.
+	ScrubContent(ctx context.Context, refs []string, budget int64) (ContentScrub, error)
+}
+
+// ContentScrub is what one round of the scrub that reads found.
+type ContentScrub struct {
+	// ReadBytes is what was fetched; Snapshots how many snapshots were
+	// read through in this round; Complete whether every snapshot asked
+	// about has now been read through since the pass began (the next
+	// round begins a new pass).
+	ReadBytes int64
+	Snapshots int
+	Complete  bool
+	Damaged   []string
 }
 
 // RemoteSnapshot is one caller snapshot in the bucket. Membership is

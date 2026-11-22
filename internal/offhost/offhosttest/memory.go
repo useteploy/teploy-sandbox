@@ -210,6 +210,63 @@ type Faulty struct {
 	// Listed rewrites a listing before the caller sees it: stale, cut
 	// short, without times, or ignoring the prefix.
 	Listed func(prefix string, listed []s3.Object) []s3.Object
+	// BeforeDelete and AfterDelete run around a delete reaching the
+	// bucket: a race ordered by hand at one exact request.
+	BeforeDelete func(key string)
+	AfterDelete  func(key string)
+	// Headed rewrites the answer to a HEAD (a service that reports a
+	// size other than what was written).
+	Headed func(object s3.Object) s3.Object
+}
+
+func (f *Faulty) Head(ctx context.Context, key string) (s3.Object, error) {
+	object, err := f.Memory.Head(ctx, key)
+	f.mu.Lock()
+	rewrite := f.Headed
+	f.mu.Unlock()
+	if err == nil && rewrite != nil {
+		object = rewrite(object)
+	}
+	return object, err
+}
+
+func (f *Faulty) Delete(ctx context.Context, key string) error {
+	f.mu.Lock()
+	before, after := f.BeforeDelete, f.AfterDelete
+	f.mu.Unlock()
+	if before != nil {
+		before(key)
+	}
+	if err := f.Memory.Delete(ctx, key); err != nil {
+		return err
+	}
+	if after != nil {
+		after(key)
+	}
+	return nil
+}
+
+// Frozen is the bucket as it is now, for a listing that is behind:
+// Listing answers every later listing from this moment's contents (a
+// replica that has not caught up), whatever was written or deleted
+// since.
+type Frozen struct{ objects []s3.Object }
+
+// Freeze takes the bucket as it is now.
+func (m *Memory) Freeze() *Frozen {
+	listed, _ := m.ListAll(context.Background(), "")
+	return &Frozen{objects: listed}
+}
+
+// Listing is the frozen bucket's listing of prefix, for Faulty.Listed.
+func (f *Frozen) Listing(prefix string, _ []s3.Object) []s3.Object {
+	var out []s3.Object
+	for _, object := range f.objects {
+		if strings.HasPrefix(object.Key, prefix) {
+			out = append(out, object)
+		}
+	}
+	return out
 }
 
 // NewFaulty wraps a bucket.

@@ -304,7 +304,9 @@ func (m *Manager) advanceStopped(ctx context.Context, id string, generation uint
 // publishPending retries every stopped run that is not durable yet.
 // That includes runs with no remote state at all: a registry written
 // before remote storage was configured has stopped runs that were never
-// uploaded, and without this they would never reach another host.
+// uploaded, and without this they would never reach another host. A run
+// whose uploads keep failing verification the same way waits longer
+// between tries (backoffDue).
 func (m *Manager) publishPending(ctx context.Context) {
 	for _, current := range m.List() {
 		if current.State != StateStopped {
@@ -313,13 +315,75 @@ func (m *Manager) publishPending(ctx context.Context) {
 		if current.Remote != nil && current.Remote.State != RemotePending && current.Remote.State != RemoteFailed {
 			continue
 		}
+		if !m.backoffDue("run:" + current.ID) {
+			continue
+		}
 		_, release, err := m.beginStopped(current.ID)
 		if err != nil {
 			continue
 		}
-		_ = m.publishHeld(ctx, current.ID)
+		err = m.publishHeld(ctx, current.ID)
 		release()
+		m.noteUploadOutcome("run:"+current.ID, err)
 	}
+}
+
+// Backoff of retried uploads. A service that reports sizes differently
+// from what was written (or that loses what was just written) fails
+// every upload after the whole stream has gone up, and the upkeep would
+// send it again every round, for good. The same verification failure a
+// second time in a row makes the upkeep wait before the next try,
+// doubling up to a ceiling; any other outcome ends the wait. A stop, a
+// snapshot request or a resume is never held back: only the upkeep's own
+// retries are.
+const (
+	uploadBackoffBase = 5 * time.Minute
+	uploadBackoffMax  = 6 * time.Hour
+)
+
+type uploadBackoff struct {
+	err      string
+	failures int
+	next     time.Time
+}
+
+// backoffDue reports whether the upkeep may retry the upload keyed so.
+func (m *Manager) backoffDue(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state := m.backoff[key]
+	return state == nil || !m.now().Before(state.next)
+}
+
+// noteUploadOutcome records how a retried upload went. Only a failure
+// of the check after an upload — a verdict (ErrRemoteIncomplete) or a
+// listing that does not show what was written (ErrRemoteListing) —
+// repeated word for word is backed off: storage that cannot be reached
+// costs nothing to retry and must be retried at once when it is back,
+// and a failure that changes is worth trying again at once.
+func (m *Manager) noteUploadOutcome(key string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err == nil || !(errors.Is(err, ErrRemoteIncomplete) || errors.Is(err, ErrRemoteListing)) {
+		delete(m.backoff, key)
+		return
+	}
+	if m.backoff == nil {
+		m.backoff = map[string]*uploadBackoff{}
+	}
+	state := m.backoff[key]
+	if state == nil || state.err != err.Error() {
+		m.backoff[key] = &uploadBackoff{err: err.Error(), failures: 1, next: m.now()}
+		return
+	}
+	state.failures++
+	delay := uploadBackoffBase << min(state.failures-2, 16)
+	if delay <= 0 || delay > uploadBackoffMax {
+		delay = uploadBackoffMax
+	}
+	state.next = m.now().Add(delay)
+	m.log.Error("an upload failed verification the same way again; the upkeep waits before the next try (is remote storage reporting sizes differently from what was written?)",
+		"upload", key, "failures", state.failures, "wait", delay.String(), "error", state.err)
 }
 
 // hasLocal reports whether this host has a snapshot. Without remote
@@ -1370,6 +1434,14 @@ type ScrubStats struct {
 	Checked     int `json:"checked"`
 	NotWhole    int `json:"notWhole"`
 	Unreachable int `json:"unreachable"`
+	// ContentReadBytes is what the scrub that reads fetched in this
+	// round; ContentSnapshots how many snapshots it read through;
+	// Damaged how many runs it took "durable" back from because a chunk
+	// of their chain is not the chunk that was uploaded (they count in
+	// NotWhole too).
+	ContentReadBytes int64 `json:"contentReadBytes"`
+	ContentSnapshots int   `json:"contentSnapshots"`
+	Damaged          int   `json:"damaged"`
 }
 
 // ScrubRemote asks remote storage again about every stopped run this
@@ -1422,12 +1494,61 @@ func (m *Manager) ScrubRemote(ctx context.Context) ScrubStats {
 			stats.Unreachable++
 		}
 	}
+	if m.RemoteScrubReadBytes > 0 && ctx.Err() == nil {
+		m.scrubContent(ctx, &stats)
+	}
 	if stats.NotWhole > 0 || stats.Unreachable > 0 {
-		m.log.Error("remote storage scrub", "checked", stats.Checked, "notWhole", stats.NotWhole, "unreachable", stats.Unreachable)
+		m.log.Error("remote storage scrub", "checked", stats.Checked, "notWhole", stats.NotWhole, "unreachable", stats.Unreachable,
+			"contentReadBytes", stats.ContentReadBytes, "damaged", stats.Damaged)
 	} else {
-		m.log.Info("remote storage scrub", "checked", stats.Checked)
+		m.log.Info("remote storage scrub", "checked", stats.Checked, "contentReadBytes", stats.ContentReadBytes, "contentSnapshots", stats.ContentSnapshots)
 	}
 	return stats
+}
+
+// scrubContent is the scrub that reads: up to RemoteScrubReadBytes of
+// the chunks of the stopped runs this daemon still reports durable (and
+// of everything they build on), held to the SHA-256 in their manifests.
+// A run whose chain has a damaged chunk is no longer reported durable:
+// with a whole copy of the damaged snapshot on this host, the upkeep's
+// next upload replaces it from there; without one the run says why and
+// the log says it is at risk.
+func (m *Manager) scrubContent(ctx context.Context, stats *ScrubStats) {
+	type target struct {
+		id         string
+		generation uint64
+	}
+	byRef := map[string][]target{}
+	var refs []string
+	m.mu.Lock()
+	for id, current := range m.runs {
+		if current.State == StateStopped && current.Remote != nil && current.Remote.State == RemoteDurable {
+			if byRef[current.snapshot] == nil {
+				refs = append(refs, current.snapshot)
+			}
+			byRef[current.snapshot] = append(byRef[current.snapshot], target{id, current.remoteGen})
+		}
+	}
+	m.mu.Unlock()
+	sort.Strings(refs)
+	found, err := m.OffHost.ScrubContent(ctx, refs, m.RemoteScrubReadBytes)
+	stats.ContentReadBytes, stats.ContentSnapshots = found.ReadBytes, found.Snapshots
+	if err != nil {
+		m.log.Warn("the scrub that reads could not finish its round; it goes on from there next time", "error", err)
+	}
+	for _, ref := range found.Damaged {
+		for _, current := range byRef[ref] {
+			// The same question the scrub asks, which now has the
+			// damaged chunk in its answer.
+			if m.confirmDurable(ctx, current.id, ref, current.generation) {
+				continue
+			}
+			if view, err := m.Get(current.id); err == nil && view.Remote != nil && view.Remote.State == RemoteFailed {
+				stats.NotWhole++
+				stats.Damaged++
+			}
+		}
+	}
 }
 
 // SnapshotRemote is the off-host side of a caller's snapshot.

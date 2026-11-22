@@ -8,9 +8,13 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,6 +53,7 @@ func TestRemoteFlagBounds(t *testing.T) {
 		"no transfers":                       {"--remote-transfers", "0"},
 		"a negative scrub interval":          {"--remote-scrub-interval", "-1h"},
 		"an unknown local policy":            {"--remote-local", "maybe"},
+		"a negative read budget":             {"--remote-scrub-read-mb", "-1"},
 	}
 	for name, args := range refused {
 		if err := parseRemoteFlags(t, args...).validate(); err == nil {
@@ -60,11 +65,15 @@ func TestRemoteFlagBounds(t *testing.T) {
 		"the shortest grace": {"--remote-gc-grace", "1h", "--remote-snapshot-retry", "30m"},
 		"no retry":           {"--remote-snapshot-retry", "0"},
 		"no scrub":           {"--remote-scrub-interval", "0"},
+		"no reading scrub":   {"--remote-scrub-read-mb", "0"},
 	}
 	for name, args := range accepted {
 		if err := parseRemoteFlags(t, args...).validate(); err != nil {
 			t.Errorf("%s was refused: %v", name, err)
 		}
+	}
+	if got := *parseRemoteFlags(t).scrubReadMB; got != DefaultScrubReadMB || got <= 0 {
+		t.Fatalf("the scrub that reads defaults to %d MiB a round", got)
 	}
 	if run.DefaultSnapshotRetry >= 24*time.Hour {
 		t.Fatal("the default snapshot retry is not shorter than the default grace")
@@ -243,3 +252,99 @@ func TestRemoteOpenRefusals(t *testing.T) {
 
 // noSnapshots stands in for a driver's snapshots where none is reached.
 type noSnapshots struct{ offhost.Snapshots }
+
+// --remote-local drop (2026-11-21): accepted, and said to be
+// experimental, on a service with conditional writes, where the
+// two-phase delete holds; refused on one without, where two collections
+// can condemn one snapshot at once.
+func TestDropNeedsConditionalWrites(t *testing.T) {
+	ctx := context.Background()
+	keys, err := offhost.NewKeyring(bytes.Repeat([]byte{7}, offhost.KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, conditional := range []bool{true, false} {
+		bucket := offhosttest.NewMemory()
+		bucket.Unconditional = !conditional
+		store := offhost.NewStore(bucket, "fleet", keys, quietLogger())
+		if err := store.Probe(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var logged bytes.Buffer
+		log := slog.New(slog.NewTextHandler(&logged, nil))
+		err := checkLocalPolicy(run.LocalDrop, store, log)
+		switch {
+		case conditional && (err != nil || !strings.Contains(logged.String(), "experimental")):
+			t.Fatalf("drop on a service with conditional writes: %v (log %q)", err, logged.String())
+		case !conditional && (err == nil || !strings.Contains(err.Error(), "conditional writes")):
+			t.Fatalf("drop on a service without conditional writes: %v", err)
+		}
+		if err := checkLocalPolicy(run.LocalKeep, store, log); err != nil {
+			t.Fatalf("keep (conditional writes %t): %v", conditional, err)
+		}
+	}
+}
+
+// tinyS3 is just enough of a service for open: objects by path, with or
+// without `If-None-Match`. It checks no signature.
+type tinyS3 struct {
+	mu          sync.Mutex
+	objects     map[string][]byte
+	conditional bool
+}
+
+func (s *tinyS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, exists := s.objects[r.URL.Path]
+	switch r.Method {
+	case http.MethodPut:
+		if exists && s.conditional && r.Header.Get("If-None-Match") == "*" {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			_, _ = io.WriteString(w, "<Error><Code>PreconditionFailed</Code></Error>")
+			return
+		}
+		s.objects[r.URL.Path] = body
+	case http.MethodGet, http.MethodHead:
+		if !exists {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, "<Error><Code>NoSuchKey</Code></Error>")
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		if r.Method == http.MethodGet {
+			_, _ = w.Write(data)
+		}
+	case http.MethodDelete:
+		delete(s.objects, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// And the rule is where a daemon starts: open refuses drop on a service
+// without conditional writes, before anything is uploaded.
+func TestOpenRefusesDropWithoutConditionalWrites(t *testing.T) {
+	raw := make([]byte, offhost.KeySize)
+	if _, err := rand.Read(raw); err != nil {
+		t.Fatal(err)
+	}
+	keyFile := filepath.Join(t.TempDir(), "remote.key")
+	if err := os.WriteFile(keyFile, []byte(hex.EncodeToString(raw)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, conditional := range []bool{true, false} {
+		server := httptest.NewServer(&tinyS3{objects: map[string][]byte{}, conditional: conditional})
+		t.Setenv("SBX_REMOTE_SECRET_KEY", "secret")
+		flags := parseRemoteFlags(t, "--remote-endpoint", server.URL, "--remote-bucket", "b", "--remote-path-style",
+			"--remote-access-key", "a", "--remote-key-file", keyFile, "--remote-local", "drop")
+		service, err := flags.open(context.Background(), noSnapshots{}, t.TempDir(), time.Hour, quietLogger())
+		server.Close()
+		if conditional && (err != nil || service == nil) {
+			t.Fatalf("drop on a service with conditional writes: %v", err)
+		}
+		if !conditional && (err == nil || service != nil || !strings.Contains(err.Error(), "conditional writes")) {
+			t.Fatalf("drop on a service without conditional writes: %v", err)
+		}
+	}
+}

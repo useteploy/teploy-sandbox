@@ -23,7 +23,7 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 | `POST /v1/runs/{id}/fork` | `{ttlSec?, labels?, onExpire?}` → 201, a new run started from this one's filesystem and settings, with `forkedFrom` |
 | `GET /v1/capacity` | `{server, driver, runtime, cpus, memoryMb, runs: {running, stopped}, allocated: {cpus, memoryMb}, warmPool?}` — the host's size and the sum of running runs' limits (and of the VM driver's warm pool, when it has one) |
 | `GET /v1/remote/snapshots` | Only with remote storage: the caller snapshots in the bucket → `{snapshots: [{id, run?, createdAt, storedBytes}]}` — membership is the durability probe for a snapshot whose upload failed and is retried |
-| `POST /v1/remote/sync`, `POST /v1/remote/collect`, `POST /v1/remote/rotate`, `POST /v1/remote/scrub` | Only with remote storage (400 without): look for runs stopped on other daemons now → `{remote, changed}`; garbage-collect the bucket now → 204; re-wrap the bucket's keys under the current master → `{manifestsRewrapped, recordsRewrapped, …, previousKeyNeeded, previousKeyNeededFor: [...]}`; check now that every stopped run this daemon reports durable is whole in the bucket → `{checked, notWhole, unreachable}` |
+| `POST /v1/remote/sync`, `POST /v1/remote/collect`, `POST /v1/remote/rotate`, `POST /v1/remote/scrub` | Only with remote storage (400 without): look for runs stopped on other daemons now → `{remote, changed}`; garbage-collect the bucket now → 204; re-wrap the bucket's keys under the current master → `{manifestsRewrapped, recordsRewrapped, …, previousKeyNeeded, previousKeyNeededFor: [...]}`; check now that every stopped run this daemon reports durable is whole in the bucket, and read the next `--remote-scrub-read-mb` of their chunks → `{checked, notWhole, unreachable, contentReadBytes, contentSnapshots, damaged}` |
 | `GET /v1/runs`, `GET /health` | List; `{status, version}` |
 
 Run IDs are ULIDs and every response carries a `server` field — nothing
@@ -637,10 +637,11 @@ either way)
 > **Not for real data yet.** This feature is off unless `--remote-endpoint`
 > is set. It has passed its unit suites and three independent reviews, but
 > it has never run against a real object storage service or, in its current
-> form, a real hypervisor and ZFS pool. Until the live runs listed in
-> `AUDIT_OPEN.md` pass, treat a remote copy as a convenience, keep
-> `--remote-local keep` (the default), and do not rely on it as the only
-> copy of anything.
+> form, a real hypervisor and ZFS pool; the two-phase delete, the scrub that
+> reads and the upload backoff (2026-11-21) have not been reviewed or run
+> live at all. Until the live runs listed in `AUDIT_OPEN.md` pass, treat a
+> remote copy as a convenience, keep `--remote-local keep` (the default),
+> and do not rely on it as the only copy of anything.
 
 With `--remote-endpoint` a stopped run's disk is also kept in an
 S3-compatible bucket, so the host that ran it is disposable: any daemon
@@ -671,10 +672,11 @@ serve --driver vm --state-dir /var/lib/teploy-sandbox/state \
 | `--remote-chunk-mb`, `--remote-parallel` | 16, 4 | Object size and objects in flight; one transfer holds about (parallel + 1) chunks in memory, whatever the disk's size |
 | `--remote-transfers` | 4 | Uploads and restores at once, across all runs. The rest wait. With more than one, one is never taken by an upload, so a resume that has to fetch is not behind every upload in flight |
 | `--remote-max-chain` | 8 | Incremental uploads in a row before one is sent against the base image again (1 to 64: no daemon restores through a longer chain) |
-| `--remote-local` | `keep` | `keep` a durable snapshot's local copy for a fast resume here, or `drop` it at once |
+| `--remote-local` | `keep` | `keep` a durable snapshot's local copy for a fast resume here, or `drop` it at once. **`drop` is experimental**, and refused on a service without conditional writes (see "Garbage, and the two-phase delete") |
 | `--remote-pool-reserve` | 15 | Percent of the pool to keep free; below it, local copies of durable snapshots go, oldest stop first |
 | `--remote-sync-interval`, `--remote-gc-interval`, `--remote-gc-grace` | 1m, 1h, 24h | The grace is at least 1h |
 | `--remote-scrub-interval` | 6h | How often every stopped run this daemon reports durable is checked again in the bucket (0: never) |
+| `--remote-scrub-read-mb` | 256 | How many MiB of chunks each scrub reads back and holds to their SHA-256, going on next scrub from where it stopped (0: sizes only) |
 | `--remote-unfenced` | off | See "Without conditional writes" |
 
 It needs `--state-dir` and a reachable bucket: a daemon that cannot
@@ -720,6 +722,10 @@ v1/snap/<id>/<attempt>/<index>   one encrypted chunk of a snapshot's stream
 v1/snap/<id>/manifest            the snapshot: its chunks (size and SHA-256
                                  of each), the stream's SHA-256, and the
                                  snapshot the stream is incremental against
+v1/snap/<id>/condemned           a copy of the manifest while a collection
+                                 decides whether the snapshot goes
+v1/snap/<id>/pin/<random>        "about to build on this snapshot" (empty;
+                                 aged out like garbage)
 v1/run/<run id>/<generation>     one generation of a run's record
 v1/fleet-id                      the random name of this prefix
 ```
@@ -749,8 +755,11 @@ run settings.
 
 **Durable means** the manifest and then the run's record are in the
 bucket, **and the bucket was looked at**: every chunk the manifest names
-is there with its recorded size, and so is every snapshot the stream
-builds on, back to the base image. That check is made after the manifest
+is there with its recorded size (and none is one this daemon has read
+and found damaged), and so is every snapshot the stream builds on, back
+to the base image. Each check pins what it reads first, so that no
+collection deletes it afterwards (the two-phase delete, below). That
+check is made after the manifest
 is written and again after the record names the snapshot; an upload that
 fails it takes its manifest back, makes sure of the base image again and
 starts over. `POST /stop` uploads before it answers, and the run then
@@ -777,7 +786,32 @@ durable, in the log and in `remote.error`. If this host still has its
 snapshot the next upkeep uploads it again; if it does not (`local:
 false`), the run stays listed as `failed` and nothing can restore it —
 the log line begins `STOPPED RUN AT RISK`. Nothing is deleted on a
-scrub's findings. Collection reports, fleet-wide, every snapshot that
+scrub's findings.
+
+Sizes are not contents. **The scrub that reads** fetches, each scrub, up
+to `--remote-scrub-read-mb` of the chunks of those same runs and of
+everything their streams build on, and holds each to the SHA-256 its
+manifest records (the manifest is authenticated; nothing is decrypted).
+It goes on next time from where it stopped; a base image many runs share
+is read once a pass. A chunk whose bytes differ is read a second time
+before anything is concluded. Damaged, it makes every run built on it
+stop being reported durable (`remote.error` says which chunk); with a
+whole copy of the damaged snapshot on this host, the upkeep uploads it
+again and the new manifest **replaces** the old one in one write (it is
+never taken back first: a read can be wrong where a listing cannot), and
+the run is durable again; without one the run is `failed` and the log
+says it is at risk. A resume or a fetch that meets a damaged chunk does
+the same: the resume fails, the run stays stopped, and it is reported
+`failed` with the reason, not `durable`. What a daemon has read is its
+own knowledge, kept in memory: another daemon finds the damage by its
+own scrub or restore.
+
+An upload that the upkeep retries and that fails the check after it the
+same way twice in a row (a service that reports sizes other than what
+was written, or whose listings do not show what was just written) waits
+before the next try: 5 minutes, doubling to 6 hours. Any other failure,
+and any success, ends the wait; a stop, a snapshot or a resume is never
+held back by it. Collection reports, fleet-wide, every snapshot that
 cannot be restored — its manifest names chunks that are not there, or it
 builds on a snapshot that is gone or missing chunks — caller snapshots
 and base images included, which no scrub looks at.
@@ -851,7 +885,7 @@ last itself (409 otherwise): nothing in the bucket could stop two
 daemons. `--remote-unfenced` lifts that for deployments where a
 controller already sends each run to one daemon at a time.
 
-**Retention and garbage.** `--stopped-retention` applies to the bucket:
+**Retention and garbage, and the two-phase delete.** `--stopped-retention` applies to the bucket:
 whichever daemon's reaper gets there first destroys the run in it. The
 daemon that stopped a run counts from the stop; every other daemon
 counts the same length from when it first saw the run, on its own
@@ -883,6 +917,38 @@ disk for good. Only objects
 shaped exactly like the daemon's own are ever considered; anything else
 under the prefix is counted in the log and left. `POST
 /v1/remote/collect` runs a round now.
+
+A snapshot that is due is not simply deleted: an upload may have just
+checked it and be about to build on it. It goes by a **two-phase
+delete**. The collection copies the manifest to `condemned` (a write only
+one collection can make, on a service with conditional writes), deletes
+the manifest — from then on every check of the snapshot fails — and
+lists the snapshot's prefix. Every check an upload, a scrub or a rotation
+makes writes a pin under each snapshot it is about to read, first. A pin
+in that listing puts the manifest back, with every manifest the snapshot
+builds on that the same round condemned; none, and the chunks the
+manifest named go, then the copy. Whichever of the manifest's delete and
+the pin comes second sees the first: an upload that found the manifest
+pinned before it was deleted, so the listing shows the pin. A listing
+that does not show the collection's own two writes is behind and decides
+nothing (the manifest goes back), and so does a collection that took
+more than half the grace between its last look at the bucket and its
+decision. A condemnation that another collection is deciding about keeps
+what it builds on; one left for longer than the grace (its collection
+died) is put back if it is whole, finished if its chunks are already in
+pieces. Pins and stray copies are deleted once watched for the grace.
+On a service whose modification times cannot be read none of this
+garbage is collected, like chunks.
+
+Every daemon sharing a bucket must run a version with the two-phase
+delete: an older one neither pins nor condemns. It holds only on a
+service whose listings show every write that finished before they began
+(below). And `--remote-local drop` is accepted only on a service with
+conditional writes, where only one collection can condemn a snapshot at
+a time: without them, two collections that both condemn it may each
+decide differently, and a durable stop could then be deleted with no
+copy left anywhere. `drop` stays experimental until the live checks in
+`AUDIT_OPEN.md` have passed.
 
 Clocks, then: none decides who runs a run. A daemon's own clock times
 its grace and its retention; the service's modification times are
@@ -947,11 +1013,17 @@ not in the bucket yet.
 Requirements of the service: SigV4 over every header that carries a
 condition, PUT/GET/HEAD/DELETE, ListObjectsV2 that honours `prefix`
 (a listing with a key outside it is refused, not acted on), and
-read-after-write consistency of objects and listings (a listing that
+read-after-write consistency of objects and listings. A listing that
 does not show a chunk which is there is detected and retried, never
-taken for a missing chunk). Run live against versitygw 1.11 (POSIX
-backend) before the changes of 2026-11-20; see `AUDIT_OPEN.md` for what
-has not run live since.
+taken for a missing chunk; but a listing that misses a **pin** cannot be
+told from one with no pin, and the two-phase delete is only as good as
+the guarantee that a listing begun after a write finished shows it.
+Among the providers checked on 2026-11-21, AWS S3, Cloudflare R2, Tigris
+(within one region) and Google Cloud Storage document that guarantee for
+listings, and AWS S3, R2 and Tigris document `If-None-Match: *` on PUT;
+for the others it is not documented either way (see `AUDIT_OPEN.md`).
+Run live against versitygw 1.11 (POSIX backend) before the changes of
+2026-11-20; see `AUDIT_OPEN.md` for what has not run live since.
 
 Live suite: `TestVMOffHost` in the `vmintegration` suite, with
 `SBX_S3_TEST_ENDPOINT`, `SBX_S3_TEST_BUCKET`, `SBX_S3_TEST_ACCESS_KEY` and

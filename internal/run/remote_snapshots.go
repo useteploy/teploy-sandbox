@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 )
@@ -85,6 +86,7 @@ func (m *Manager) retrySnapshotNotes(ctx context.Context) {
 		due = append(due, *note)
 	}
 	m.mu.Unlock()
+	due = slices.DeleteFunc(due, func(note snapshotNote) bool { return !m.backoffDue("snapshot:" + note.Ref) })
 	if len(expired) > 0 {
 		m.persist()
 		for _, note := range expired {
@@ -121,6 +123,7 @@ func (m *Manager) retrySnapshotNote(ctx context.Context, note snapshotNote) {
 	unpin := m.pin(note.Base)
 	defer unpin()
 	uploaded, err := m.upload(attempt, UploadRequest{Run: note.Run, Ref: note.Ref, Base: note.Base, Key: note.Key, Purpose: PurposeSnapshot})
+	m.noteUploadOutcome("snapshot:"+note.Ref, err)
 	if err != nil {
 		m.log.Error("a caller snapshot is still not durable off the host; retrying", "image", note.Ref, "run", note.Run, "error", err)
 		m.mu.Lock()

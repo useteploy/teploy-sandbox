@@ -70,7 +70,9 @@ type RotateStats struct {
 // A manifest is overwritten in place. That write cannot be made
 // conditional on what was read, so it is checked afterwards: a snapshot
 // deleted between the read and the write would otherwise exist again
-// with no chunks, and its manifest is taken back.
+// with no chunks, and its manifest is taken back. And it is pinned
+// before it is read, like any snapshot an upload checks: a collection
+// cannot condemn it under the pass without seeing that.
 func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats RotateStats, err error) {
 	s.collectMu.Lock()
 	defer s.collectMu.Unlock()
@@ -137,6 +139,13 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 		return stats, err
 	}
 	for _, id := range ids {
+		// Pinned before it is read, as by an upload: a collection that
+		// condemns this snapshot after the read puts the manifest back
+		// (and with it whatever this pass writes), and one that condemned
+		// it before makes the read find nothing to rewrite.
+		if err := s.Pin(ctx, id); err != nil {
+			return stats, fmt.Errorf("rotate: pin %s: %w", id, err)
+		}
 		stored, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject)
 		if errors.Is(err, s3.ErrNotFound) {
 			continue // deleted since the listing

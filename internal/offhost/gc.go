@@ -1,6 +1,7 @@
 package offhost
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -39,6 +40,12 @@ type CollectStats struct {
 	// something written while it looked refers to them now.
 	Deferred bool
 	Spared   int
+	// Condemned is how many snapshots were found condemned and not
+	// decided on (this round's own are not counted); Restored how many
+	// condemned manifests were put back, by this round's decision or
+	// because a collection that condemned them never finished; Markers
+	// how many pins and condemned copies were deleted.
+	Condemned, Restored, Markers int
 }
 
 // MaxChainLimit is the most incremental streams that may follow one
@@ -73,6 +80,9 @@ type observation struct {
 	first time.Time
 	count int
 	bytes int64
+	// modified is the service's time of the object watched, for the
+	// objects that are watched one by one (pins and condemned copies).
+	modified time.Time
 }
 
 // summary is what Collect keeps of a manifest: not its chunk list.
@@ -142,6 +152,11 @@ func envelopeMaster(stored []byte) string {
 //
 // Only objects shaped exactly like this store's are considered at all;
 // whatever else is under the prefix is counted and left.
+//
+// A snapshot that is due is deleted by the two-phase delete (condemn,
+// and condemn.go): condemned first, then deleted only if no upload
+// pinned it in between. Pins, condemned copies another collection left
+// behind, and copies beside a manifest are dealt with here too.
 //
 // If any record or manifest cannot be read (the service fails, the key is
 // wrong, an object is damaged), nothing is deleted at all: an incomplete
@@ -229,7 +244,8 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	}
 
 	// Snapshots: every object, counted by snapshot and upload attempt.
-	// Nothing is held per object.
+	// Nothing is held per object but pins, which are few per snapshot
+	// and short-lived.
 	type attemptInfo struct {
 		count   int
 		bytes   int64
@@ -237,8 +253,10 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 		undated bool
 	}
 	type snapshotEntry struct {
-		manifest *s3.Object
-		attempts map[string]*attemptInfo
+		manifest  *s3.Object
+		condemned *s3.Object
+		pins      []s3.Object
+		attempts  map[string]*attemptInfo
 	}
 	snapshots := map[string]*snapshotEntry{}
 	snapPrefix := s.prefix + "snap/"
@@ -254,7 +272,8 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 			return nil
 		}
 		attempt, index, chunk := strings.Cut(name, "/")
-		if name != "manifest" && (!chunk || !validAttempt(attempt) || !validIndex(index)) {
+		pin := chunk && attempt == pinDir && validPin(index)
+		if name != "manifest" && name != condemnedName && !pin && (!chunk || !validAttempt(attempt) || !validIndex(index)) {
 			stats.Foreign++
 			return nil
 		}
@@ -263,8 +282,15 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 			entry = &snapshotEntry{attempts: map[string]*attemptInfo{}}
 			snapshots[id] = entry
 		}
-		if name == "manifest" {
+		switch {
+		case name == "manifest":
 			entry.manifest = &object
+			return nil
+		case name == condemnedName:
+			entry.condemned = &object
+			return nil
+		case pin:
+			entry.pins = append(entry.pins, object)
 			return nil
 		}
 		info := entry.attempts[attempt]
@@ -313,6 +339,111 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 			broken[id] = "its manifest names chunks that are not there"
 		}
 	}
+
+	// Condemned copies: a collection (this daemon's or another's) has
+	// condemned the snapshot and not yet decided, or crashed before it
+	// finished. Read like manifests: what such a snapshot builds on is
+	// kept while it may come back, and its own chunks are not anyone's
+	// garbage while a copy of its manifest names them.
+	type condemnation struct {
+		raw      []byte
+		summary  *summary
+		manifest *Manifest
+		// stale: this daemon has watched it stand for the grace.
+		stale bool
+	}
+	condemnations := map[string]*condemnation{}
+	var leftovers []string // condemned copies beside a manifest, aged
+	watched := map[string]bool{}
+	for id, entry := range snapshots {
+		if entry.condemned == nil {
+			continue
+		}
+		raw, err := s.objects.Get(ctx, s.condemnedKey(id), maxSmallObject)
+		if errors.Is(err, s3.ErrNotFound) {
+			// Its collection finished between the listing and now:
+			// what it builds on cannot be told any more.
+			vanished[id] = true
+			continue
+		}
+		if err != nil {
+			return stats, fmt.Errorf("collect: condemned copy of %s: %w", id, err)
+		}
+		manifest, err := s.parseManifest(id, raw)
+		if err != nil {
+			return stats, fmt.Errorf("collect: condemned copy of %s: %w", id, err)
+		}
+		name := id + "/" + condemnedName
+		watched[name] = true
+		seen, known := s.garbage[name]
+		modified := entry.condemned.LastModified
+		if !known || !seen.modified.Equal(modified) {
+			seen = observation{first: now, modified: modified}
+			s.garbage[name] = seen
+		}
+		aged := old(seen.first) && !modified.IsZero() && old(modified)
+		if entry.manifest != nil {
+			// The manifest is there: a condemnation that never got to
+			// deleting it, or a restore that never got to deleting
+			// this. Garbage, once it has stood for the grace.
+			if aged {
+				leftovers = append(leftovers, id)
+			}
+			continue
+		}
+		condemnations[id] = &condemnation{raw: raw, manifest: manifest, stale: aged,
+			summary: &summary{parent: manifest.Parent, purpose: manifest.Purpose, attempt: manifest.Attempt,
+				chunks: len(manifest.Chunks), stored: manifest.StoredBytes}}
+		stats.Condemned++
+	}
+
+	// Pins: every one keeps its snapshot, and all that snapshot builds
+	// on, until this daemon has watched it for the grace.
+	pinned := map[string]bool{}
+	var doomedPins []string
+	doomedPin := map[string]bool{}
+	seenPins := map[string]bool{}
+	for id, entry := range snapshots {
+		for _, object := range entry.pins {
+			seenPins[object.Key] = true
+			name := strings.TrimPrefix(object.Key, snapPrefix)
+			watched[name] = true
+			seen, known := s.garbage[name]
+			if !known {
+				seen = observation{first: now, modified: object.LastModified}
+				s.garbage[name] = seen
+			}
+			if old(seen.first) && !object.LastModified.IsZero() && old(object.LastModified) {
+				doomedPins = append(doomedPins, object.Key)
+				doomedPin[object.Key] = true
+				continue
+			}
+			pinned[id] = true
+		}
+	}
+
+	// What a chain is made of: manifests, and the copies of the
+	// condemned ones, which may yet come back. What is protected is not
+	// deleted in this round, without being referred to: a pin, or a
+	// condemnation another collection is deciding about right now, and
+	// everything either builds on. The time a snapshot has been seen
+	// unreferenced keeps running through it; a pin is there to cover a
+	// moment, not to keep what nothing refers to.
+	chains := maps.Clone(manifests)
+	protected := map[string]bool{}
+	for id, condemned := range condemnations {
+		chains[id] = condemned.summary
+		if !condemned.stale {
+			protected[id] = true
+		}
+	}
+	for id := range pinned {
+		protected[id] = true
+	}
+	if err := markChains(protected, chains); err != nil {
+		return stats, fmt.Errorf("collect: %w", err)
+	}
+
 	// And the ones whose own chunks are all there and whose chain is not:
 	// a snapshot that builds on one that is gone restores no better. No
 	// daemon's scrub looks at a caller's snapshot, so this is the only
@@ -322,8 +453,12 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 			continue
 		}
 		hops := 0
-		for parent := manifests[id].parent; parent != ""; parent = manifests[parent].parent {
+		for parent := manifests[id].parent; parent != ""; parent = chains[parent].parent {
 			if hops++; hops > maxChainWalk || vanished[parent] {
+				break
+			}
+			if manifests[parent] == nil && condemnations[parent] != nil {
+				// Being decided about; not broken by that alone.
 				break
 			}
 			if manifests[parent] == nil {
@@ -339,7 +474,7 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	for id := range broken {
 		stats.Broken = append(stats.Broken, id)
 	}
-	if err := markChains(needed, manifests); err != nil {
+	if err := markChains(needed, chains); err != nil {
 		return stats, fmt.Errorf("collect: %w", err)
 	}
 	for id := range manifests {
@@ -366,13 +501,13 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 			s.unreferenced[id] = now
 		}
 		modified := entry.manifest.LastModified
-		if old(first) && !modified.IsZero() && old(modified) {
+		if old(first) && !modified.IsZero() && old(modified) && entry.condemned == nil && !protected[id] {
 			due[id] = true
 		} else {
 			needed[id] = true
 		}
 	}
-	if err := markChains(needed, manifests); err != nil {
+	if err := markChains(needed, chains); err != nil {
 		return stats, fmt.Errorf("collect: %w", err)
 	}
 	for id := range due {
@@ -390,10 +525,11 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 		s.log.Error("a snapshot in remote storage is not whole and cannot be restored", "snapshot", id, "why", broken[id], "purpose", manifests[id].purpose, "referenced", needed[id])
 	}
 
-	// Chunks no manifest names, by upload attempt.
+	// Chunks no manifest names, by upload attempt. Those a condemned
+	// copy names are not among them: they are the snapshot's own until
+	// its collection has decided.
 	type attemptRef struct{ id, attempt string }
 	var doomedAttempts []attemptRef
-	watched := map[string]bool{}
 	for id, entry := range snapshots {
 		if vanished[id] {
 			continue
@@ -402,8 +538,17 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 		// names go with it below, and any other attempt under its name
 		// is aged here like under any other.
 		manifest := manifests[id]
+		var condemnedAttempt string
+		if condemned := condemnations[id]; condemned != nil {
+			condemnedAttempt = condemned.summary.attempt
+		}
 		for attempt, info := range entry.attempts {
-			if manifest != nil && attempt == manifest.attempt {
+			if (manifest != nil && attempt == manifest.attempt) || attempt == condemnedAttempt {
+				continue
+			}
+			if entry.condemned != nil && manifest != nil {
+				// A leftover condemned copy may name an attempt the
+				// manifest does not: kept until the copy goes.
 				continue
 			}
 			name := id + "/" + attempt
@@ -437,12 +582,14 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 
 	// Snapshots that are due go only if nothing written since this round
 	// looked refers to them: a manifest or a record written since may be
-	// the first thing to build on one of them (spare).
+	// the first thing to build on one of them (spare). And then only by
+	// the two-phase delete (condemn).
 	if len(due) > 0 && len(vanished) > 0 {
 		stats.Deferred = true
 	}
+	looked := s.now()
 	if len(due) > 0 && !stats.Deferred {
-		spared, settled, err := s.spare(ctx, seenRuns, manifests, due)
+		spared, settled, err := s.spare(ctx, seenRuns, manifests, seenPins, due)
 		if err != nil {
 			return stats, err
 		}
@@ -455,46 +602,68 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	}
 	if stats.Deferred {
 		s.log.Info("remote storage changed during this collection in a way that could not be read; snapshots that were due are left for the next", "snapshots", len(due))
-	} else {
-		// The manifests go first, all of them, straight after the look:
-		// from then on none of these snapshots exists, and an upload
-		// that was about to build on one finds that out when it checks
-		// (Verify), instead of in however long the chunks of the ones
-		// before it take to delete.
-		for id := range due {
-			entry := snapshots[id]
-			if err := s.objects.Delete(ctx, entry.manifest.Key); err != nil {
-				return stats, err
-			}
-			stats.Snapshots++
-			stats.Objects++
-			stats.Bytes += entry.manifest.Size
-			delete(s.unreferenced, id)
-		}
-		// Then the chunks those manifests named, and only those. Whatever
-		// else is under a snapshot's name is not what this round decided
-		// on: another attempt's leftovers go the way of all chunks no
-		// manifest names, and an upload of the same snapshot begun since
-		// (a base image another host needs again) is not this round's to
-		// take.
-		for id := range due {
-			count, size, err := s.deleteUnder(ctx, s.attemptPrefix(id, manifests[id].attempt))
-			stats.Objects += count
-			stats.Bytes += size
-			if err != nil {
-				return stats, err
-			}
+	} else if len(due) > 0 {
+		if err := s.condemn(ctx, due, manifests, chains, doomedPin, looked, grace, &stats); err != nil {
+			return stats, err
 		}
 	}
+
+	// A condemnation another collection left behind (it crashed, or was
+	// stopped for longer than the grace): put back whatever may still be
+	// wanted, finish deleting what is already in pieces.
+	var stale []string
+	for id, condemned := range condemnations {
+		if condemned.stale {
+			stale = append(stale, id)
+		}
+	}
+	sort.Strings(stale)
+	for _, id := range stale {
+		condemned := condemnations[id]
+		whole := s.checkChunks(ctx, condemned.manifest)
+		if whole != nil && !errors.Is(whole, ErrIncomplete) {
+			return stats, fmt.Errorf("collect: condemned snapshot %s: %w", id, whole)
+		}
+		if whole == nil || needed[id] || pinned[id] || stats.Deferred {
+			s.log.Warn("a condemned snapshot was left undecided by a collection that did not finish; its manifest is put back", "snapshot", id, "referenced", needed[id], "pinned", pinned[id])
+			if err := s.restoreCondemned(ctx, id, condemned.raw); err != nil {
+				return stats, err
+			}
+			stats.Restored++
+			continue
+		}
+		// Chunks already gone: the collection that condemned it had
+		// decided, and nothing could have been built on it since.
+		count, size, err := s.deleteUnder(ctx, s.attemptPrefix(id, condemned.summary.attempt))
+		stats.Objects += count
+		stats.Bytes += size
+		if err != nil {
+			return stats, err
+		}
+		if err := s.objects.Delete(ctx, s.condemnedKey(id)); err != nil {
+			return stats, err
+		}
+		stats.Markers++
+		stats.Snapshots++
+	}
+
 	for _, doomed := range doomedAttempts {
 		// Once more, now: a manifest written since this round listed may
-		// name exactly these chunks.
+		// name exactly these chunks, and so may a copy a collection that
+		// began since has condemned.
 		current, _, err := s.Manifest(ctx, doomed.id)
 		if err != nil && !errors.Is(err, ErrNoSnapshot) {
 			return stats, fmt.Errorf("collect: %w", err)
 		}
 		if err == nil && current.Attempt == doomed.attempt {
 			continue
+		}
+		if raw, err := s.objects.Get(ctx, s.condemnedKey(doomed.id), maxSmallObject); err == nil {
+			if condemned, err := s.parseManifest(doomed.id, raw); err != nil || condemned.Attempt == doomed.attempt {
+				continue
+			}
+		} else if !errors.Is(err, s3.ErrNotFound) {
+			return stats, fmt.Errorf("collect: %w", err)
 		}
 		count, size, err := s.deleteUnder(ctx, s.attemptPrefix(doomed.id, doomed.attempt))
 		stats.Objects += count
@@ -503,6 +672,23 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 			return stats, err
 		}
 		delete(s.garbage, doomed.id+"/"+doomed.attempt)
+	}
+	// Condemned copies beside a manifest, and pins, once watched for the
+	// grace. Each pin by the name that was watched: a pin is never
+	// written twice under one name.
+	for _, id := range leftovers {
+		if err := s.objects.Delete(ctx, s.condemnedKey(id)); err != nil {
+			return stats, err
+		}
+		delete(s.garbage, id+"/"+condemnedName)
+		stats.Markers++
+	}
+	for _, key := range doomedPins {
+		if err := s.objects.Delete(ctx, key); err != nil {
+			return stats, err
+		}
+		delete(s.garbage, strings.TrimPrefix(key, snapPrefix))
+		stats.Markers++
 	}
 	// Records one at a time and in order: see above.
 	for _, object := range doomedRecords {
@@ -515,18 +701,201 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	return stats, nil
 }
 
+// condemn deletes the snapshots that are due by the two-phase delete:
+//
+//  1. Each due snapshot's manifest is copied to "condemned" (a write that
+//     only one collection can make, on a service with conditional
+//     writes), read again to be sure it is still the one decided on, and
+//     deleted. From here on every Verify of the snapshot fails.
+//  2. The prefix of each is listed. The listing must show this
+//     collection's own two writes (the copy there, the manifest gone);
+//     one that does not is behind, and nothing is concluded from it. Any
+//     pin that this round did not itself find aged means an upload may
+//     have checked the snapshot and be building on it: the manifest is
+//     put back, and the manifest of everything the snapshot builds on
+//     that this round condemned too.
+//  3. If more than half the grace has passed since the round's last look
+//     at the bucket (looked), every condemned manifest is put back: a pin
+//     is only certain to stand for the grace after it was written, and a
+//     collection that was stopped in between cannot tell what it missed.
+//  4. Of the rest, the chunks the manifest named are deleted, and then
+//     the condemned copy: a collection that dies in between leaves a copy
+//     whose chunks are in pieces, which a later round finishes.
+func (s *Store) condemn(ctx context.Context, due map[string]bool, manifests, chains map[string]*summary, doomedPin map[string]bool, looked time.Time, grace time.Duration, stats *CollectStats) error {
+	ids := make([]string, 0, len(due))
+	for id := range due {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	condemned := map[string][]byte{}
+	keep := map[string]bool{}
+	finished := false
+	defer func() {
+		if finished {
+			return
+		}
+		// Cut short: whatever was condemned and not decided is put back.
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		defer cancel()
+		for id, raw := range condemned {
+			if err := s.restoreCondemned(cleanup, id, raw); err != nil {
+				s.log.Error("a condemned snapshot's manifest could not be put back; a later collection does", "snapshot", id, "error", err)
+			}
+		}
+	}()
+	for _, id := range ids {
+		raw, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject)
+		if errors.Is(err, s3.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if manifest, err := s.parseManifest(id, raw); err != nil || manifest.Attempt != manifests[id].attempt {
+			continue // not the manifest this round decided on
+		}
+		err = s.objects.Put(ctx, s.condemnedKey(id), raw, s3.PutOptions{IfAbsent: s.conditional, ContentType: "application/json"})
+		if errors.Is(err, s3.ErrPreconditionFailed) {
+			// Another collection condemned it first, or one left its
+			// copy behind: not this round's.
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		again, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject)
+		if err != nil || !bytes.Equal(again, raw) {
+			// Written again since it was read: not what was decided on.
+			if err != nil && !errors.Is(err, s3.ErrNotFound) {
+				return err
+			}
+			_ = s.objects.Delete(ctx, s.condemnedKey(id))
+			continue
+		}
+		condemned[id] = raw
+		if err := s.objects.Delete(ctx, s.manifestKey(id)); err != nil {
+			return err
+		}
+	}
+	for id := range condemned {
+		sawCopy, sawManifest, pins := false, false, 0
+		prefix := s.snapshotPrefix(id)
+		err := s.objects.Walk(ctx, prefix, func(object s3.Object) error {
+			switch name := strings.TrimPrefix(object.Key, prefix); {
+			case name == condemnedName:
+				sawCopy = true
+			case name == "manifest":
+				sawManifest = true
+			case strings.HasPrefix(name, pinDir+"/") && !doomedPin[object.Key]:
+				pins++
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		switch {
+		case !sawCopy || sawManifest:
+			s.log.Warn("the listing after a condemnation does not show it; the manifest is put back", "snapshot", id, "copyListed", sawCopy, "manifestListed", sawManifest)
+			keep[id] = true
+		case pins > 0:
+			s.log.Info("a condemned snapshot was pinned by an upload; its manifest is put back", "snapshot", id, "pins", pins)
+			keep[id] = true
+		}
+	}
+	if grace > 0 && !s.now().Before(looked.Add(grace/2)) {
+		s.log.Warn("a collection took more than half the grace between its last look and its decision; every snapshot it condemned is put back", "condemned", len(condemned))
+		for id := range condemned {
+			keep[id] = true
+		}
+	}
+	// Everything a snapshot that stays builds on stays.
+	for id := range maps.Clone(keep) {
+		hops := 0
+		for parent := chains[id].parent; parent != "" && chains[parent] != nil && hops <= maxChainWalk; parent = chains[parent].parent {
+			hops++
+			if _, ok := condemned[parent]; ok {
+				keep[parent] = true
+			}
+		}
+	}
+	for id := range keep {
+		raw, ok := condemned[id]
+		if !ok {
+			continue
+		}
+		if err := s.restoreCondemned(ctx, id, raw); err != nil {
+			return err
+		}
+		delete(condemned, id)
+		stats.Restored++
+	}
+	for _, id := range ids {
+		raw, ok := condemned[id]
+		if !ok {
+			continue
+		}
+		// From here a failure leaves the copy and chunks in pieces,
+		// which a later round finishes; it is not put back.
+		delete(condemned, id)
+		stats.Snapshots++
+		stats.Objects++ // the manifest
+		count, size, err := s.deleteUnder(ctx, s.attemptPrefix(id, manifests[id].attempt))
+		stats.Objects += count
+		stats.Bytes += size + int64(len(raw))
+		if err != nil {
+			return err
+		}
+		if err := s.objects.Delete(ctx, s.condemnedKey(id)); err != nil {
+			return err
+		}
+		stats.Markers++
+		delete(s.unreferenced, id)
+	}
+	finished = true
+	return nil
+}
+
+// restoreCondemned puts a condemned snapshot's manifest back and then
+// deletes the condemned copy. A manifest that is there by then (an
+// upload of the same snapshot wrote one) is left as it is: on a service
+// with conditional writes the write is refused, and on one without, the
+// manifest is looked for first.
+func (s *Store) restoreCondemned(ctx context.Context, id string, raw []byte) error {
+	present := false
+	if !s.conditional {
+		if _, err := s.objects.Head(ctx, s.manifestKey(id)); err == nil {
+			present = true
+		} else if !errors.Is(err, s3.ErrNotFound) {
+			return err
+		}
+	}
+	if !present {
+		err := s.objects.Put(ctx, s.manifestKey(id), raw, s3.PutOptions{IfAbsent: s.conditional, ContentType: "application/json"})
+		if err != nil && !errors.Is(err, s3.ErrPreconditionFailed) {
+			return fmt.Errorf("put back the manifest of condemned snapshot %s: %w", id, err)
+		}
+	}
+	if err := s.objects.Delete(ctx, s.condemnedKey(id)); err != nil {
+		return fmt.Errorf("condemned snapshot %s: its manifest is back, its copy not deleted: %w", id, err)
+	}
+	return nil
+}
+
 // spare lists the bucket again and takes out of due every snapshot that
 // something written since this round looked now refers to: the snapshot
 // a record names that is new or has moved on, a manifest that was not
-// there before, and all that either builds on. It reports how many it
-// took out. settled is false when what changed could not be read (a
-// manifest listed and gone again): nothing is deleted on such a view.
+// there before, a pin that was not there before, and all that any of
+// those builds on. A snapshot another collection has condemned since is
+// left to it. It reports how many it took out. settled is false when
+// what changed could not be read (a manifest listed and gone again):
+// nothing is deleted on such a view.
 //
 // Only what is new is read. A fleet is never still for the length of a
 // collection, and a round that gave up on every change in the bucket,
 // related or not, would never delete a snapshot at all — which keeps,
 // for good, the disks of runs their owners destroyed.
-func (s *Store) spare(ctx context.Context, runs map[string]uint64, manifests map[string]*summary, due map[string]bool) (spared int, settled bool, err error) {
+func (s *Store) spare(ctx context.Context, runs map[string]uint64, manifests map[string]*summary, seenPins map[string]bool, due map[string]bool) (spared int, settled bool, err error) {
 	again, err := s.Runs(ctx)
 	if err != nil {
 		return 0, false, err
@@ -554,8 +923,17 @@ func (s *Store) spare(ctx context.Context, runs map[string]uint64, manifests map
 		if !ok {
 			return nil
 		}
-		if id, name, ok := strings.Cut(rest, "/"); ok && name == "manifest" && validID(id) && manifests[id] == nil {
+		id, name, ok := strings.Cut(rest, "/")
+		if !ok || !validID(id) {
+			return nil
+		}
+		switch {
+		case name == "manifest" && manifests[id] == nil:
 			added = append(added, id)
+		case strings.HasPrefix(name, pinDir+"/") && !seenPins[object.Key]:
+			fresh[id] = true
+		case name == condemnedName && due[id]:
+			fresh[id] = true
 		}
 		return nil
 	})

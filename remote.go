@@ -40,6 +40,7 @@ type remoteFlags struct {
 	syncInterval  *time.Duration
 	snapshotRetry *time.Duration
 	scrubInterval *time.Duration
+	scrubReadMB   *int
 	transfers     *int
 	insecureHTTP  *bool
 	unfenced      *bool
@@ -69,7 +70,7 @@ func addRemoteFlags(flags *flag.FlagSet) *remoteFlags {
 		maxChain: flags.Int("remote-max-chain", int(envFloat("SBX_REMOTE_MAX_CHAIN", offhost.DefaultMaxChain)),
 			fmt.Sprintf("remote storage: how many incremental uploads may follow one another before a stop is uploaded against the base image again, which bounds what a restore has to fetch (1 to %d)", offhost.MaxChainLimit)),
 		local: flags.String("remote-local", envOr("SBX_REMOTE_LOCAL", run.LocalKeep),
-			"remote storage: what happens to a snapshot's local copy once it is durable: \"keep\" it for a fast resume on this host (dropped when the pool runs short), or \"drop\" it at once"),
+			"remote storage: what happens to a snapshot's local copy once it is durable: \"keep\" it for a fast resume on this host (dropped when the pool runs short), or \"drop\" it at once (experimental; only on a service with conditional writes)"),
 		reserve: flags.Int("remote-pool-reserve", int(envFloat("SBX_REMOTE_POOL_RESERVE", 15)),
 			"remote storage: the share of the pool, in percent, to keep free: below it, local copies of durable snapshots are dropped, oldest stop first (0 never drops for space)"),
 		gcInterval: flags.Duration("remote-gc-interval", envDuration("SBX_REMOTE_GC_INTERVAL", run.DefaultRemoteGCInterval),
@@ -82,6 +83,8 @@ func addRemoteFlags(flags *flag.FlagSet) *remoteFlags {
 			"remote storage: how long a caller snapshot whose upload failed is retried before it stays on that host only (0: not retried, the old behaviour); shorter than remote-gc-grace"),
 		scrubInterval: flags.Duration("remote-scrub-interval", envDuration("SBX_REMOTE_SCRUB_INTERVAL", run.DefaultRemoteScrubInterval),
 			"remote storage: how often every stopped run this daemon reports durable is checked again in the bucket (manifest, every chunk, and everything its stream builds on); 0 never"),
+		scrubReadMB: flags.Int("remote-scrub-read-mb", int(envFloat("SBX_REMOTE_SCRUB_READ_MB", DefaultScrubReadMB)),
+			"remote storage: how many MiB of chunks each scrub reads back and checks against the SHA-256 its manifest records (bit rot), going on next scrub from where it stopped; snapshots shared by many runs are read once a pass. 0 reads nothing (sizes are still checked)"),
 		transfers: flags.Int("remote-transfers", int(envFloat("SBX_REMOTE_TRANSFERS", run.DefaultTransfers)),
 			"remote storage: uploads and restores at once across all runs; each holds about (remote-parallel + 1) chunks in memory. With more than one, uploads take at most all but one, which is left for restores"),
 		insecureHTTP: flags.Bool("remote-insecure-http", envBool("SBX_REMOTE_INSECURE_HTTP"),
@@ -226,6 +229,31 @@ func checkFleetIdentity(ctx context.Context, store *offhost.Store, stateDir stri
 	return nil
 }
 
+// DefaultScrubReadMB is how much the scrub that reads fetches per round
+// by default: about a GiB a day per daemon at the default interval, so
+// that the egress it costs is small next to a restore's.
+const DefaultScrubReadMB = 256
+
+// checkLocalPolicy decides whether --remote-local may be what it was
+// given, once the service has been probed. "drop" leaves the bucket as
+// the only copy of a stopped run the moment it is durable. That rests on
+// the two-phase delete (offhost.Collect) keeping a collection from
+// deleting what an upload has just checked, and the two-phase delete
+// rests on only one collection condemning a snapshot at a time, which
+// only a conditional write can decide. Without conditional writes
+// "drop" is refused; with them it is accepted, and said to be
+// experimental, until the live checks in AUDIT_OPEN.md have passed.
+func checkLocalPolicy(local string, store *offhost.Store, log *slog.Logger) error {
+	if local != run.LocalDrop {
+		return nil
+	}
+	if !store.Conditional() {
+		return errors.New("--remote-local drop needs a service with conditional writes (If-None-Match), and this one has none: two collections could then condemn the same snapshot at once, and a stop reported durable could be deleted with no other copy anywhere. Use --remote-local keep")
+	}
+	log.Warn("--remote-local drop is experimental: a durable stop's local copy is dropped at once, so a snapshot the bucket loses (a collection under an upload in a way the two-phase delete does not cover, bit rot the scrub has not read yet, a provider's loss) has no copy to be repaired from. See AUDIT_OPEN.md for what has not run live")
+	return nil
+}
+
 // validate checks the flags that are numbers and choices.
 func (f *remoteFlags) validate() error {
 	if *f.chunkMB < 1 || *f.chunkMB > 1024 || *f.parallel < 1 || *f.parallel > 64 || *f.maxChain < 1 || *f.maxChain > offhost.MaxChainLimit ||
@@ -234,6 +262,9 @@ func (f *remoteFlags) validate() error {
 	}
 	if *f.local != run.LocalKeep && *f.local != run.LocalDrop {
 		return fmt.Errorf("remote-local must be %q or %q, got %q", run.LocalKeep, run.LocalDrop, *f.local)
+	}
+	if *f.scrubReadMB < 0 || *f.scrubReadMB > 1<<20 {
+		return errors.New("remote-scrub-read-mb must be 0 to 1048576")
 	}
 	if *f.snapshotRetry < 0 {
 		return errors.New("remote-snapshot-retry must not be negative")
@@ -345,6 +376,9 @@ func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, sta
 	}
 	if err := checkFleetIdentity(probeCtx, store, stateDir); err != nil {
 		return nil, fmt.Errorf("remote storage: %w", err)
+	}
+	if err := checkLocalPolicy(*f.local, store, log); err != nil {
+		return nil, err
 	}
 	if !store.Conditional() {
 		if *f.unfenced {

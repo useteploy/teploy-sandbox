@@ -276,6 +276,10 @@ type Manager struct {
 	// RemoteScrubInterval paces the check that what this daemon reports
 	// durable still is (ScrubRemote); negative turns it off.
 	RemoteScrubInterval time.Duration
+	// RemoteScrubReadBytes is how much of the chunks of what this daemon
+	// reports durable each scrub reads and holds to their SHA-256 (the
+	// scrub that reads, ScrubRemote); zero reads nothing.
+	RemoteScrubReadBytes int64
 	// Transfers is how many uploads and restores run at once
 	// (DefaultTransfers when zero); with more than one, uploads take at
 	// most all but one of them. Set before the first one.
@@ -324,6 +328,11 @@ type Manager struct {
 	fetching    map[string]int
 	pins        map[string]int
 	releaseOwed map[string]bool
+
+	// backoff paces uploads the upkeep retries after the same
+	// verification failure over and over (publishBackoff). Guarded by mu;
+	// not persisted.
+	backoff map[string]*uploadBackoff
 
 	// transfers bounds uploads and restores together; uploads bounds the
 	// uploads among them to one fewer, so that a restore always has a

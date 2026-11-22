@@ -118,6 +118,14 @@ type Incomplete struct {
 	// no manifest at all.
 	Attempt string
 	Detail  string
+	// Content says Broken's chunks are all there with their sizes and
+	// one of them was read and is not the chunk that was uploaded (its
+	// SHA-256 differs from the manifest's): bit rot, found by a scrub
+	// that reads or by a restore. Only an upload from a whole local copy
+	// puts that right, and it replaces the manifest rather than taking
+	// it back first: the verdict comes from a read, and a read can be
+	// wrong where a listing of what is gone cannot.
+	Content bool
 }
 
 func (e *Incomplete) Error() string {
@@ -160,6 +168,13 @@ type Store struct {
 	collectMu    sync.Mutex
 	unreferenced map[string]time.Time
 	garbage      map[string]observation
+
+	// bad is what reading found: per snapshot, the upload attempt whose
+	// chunk did not match its SHA-256. It is this daemon's knowledge
+	// only, and forgotten when the snapshot's manifest names another
+	// attempt (a repair) or the daemon restarts.
+	badMu sync.Mutex
+	bad   map[string]badChunk
 }
 
 // NewStore keeps everything under prefix ("" or "some/path") in objects.
@@ -171,7 +186,8 @@ func NewStore(objects Objects, prefix string, keys *Keyring, log *slog.Logger) *
 		prefix += "/"
 	}
 	return &Store{objects: objects, prefix: prefix + "v1/", keys: keys, log: log, now: time.Now,
-		ChunkBytes: DefaultChunkBytes, Parallel: DefaultParallel, unreferenced: map[string]time.Time{}, garbage: map[string]observation{}}
+		ChunkBytes: DefaultChunkBytes, Parallel: DefaultParallel, unreferenced: map[string]time.Time{}, garbage: map[string]observation{},
+		bad: map[string]badChunk{}}
 }
 
 func (s *Store) snapshotPrefix(id string) string { return s.prefix + "snap/" + id + "/" }
@@ -317,6 +333,17 @@ func (s *Store) Manifest(ctx context.Context, id string) (*Manifest, Key, error)
 	if err != nil {
 		return nil, Key{}, err
 	}
+	return s.openManifest(id, stored)
+}
+
+// parseManifest opens a stored manifest of id: the manifest object, or
+// a condemned copy of it, which is the same bytes.
+func (s *Store) parseManifest(id string, stored []byte) (*Manifest, error) {
+	manifest, _, err := s.openManifest(id, stored)
+	return manifest, err
+}
+
+func (s *Store) openManifest(id string, stored []byte) (*Manifest, Key, error) {
 	document, key, err := s.keys.open("manifest", id, stored)
 	if err != nil {
 		return nil, Key{}, err
@@ -384,7 +411,7 @@ func (s *Store) checkChunks(ctx context.Context, manifest *Manifest) error {
 		case err != nil:
 			return fmt.Errorf("verify snapshot %s: %w", manifest.ID, err)
 		case object.Size == manifest.Chunks[index].Size:
-			return fmt.Errorf("verify snapshot %s: the listing does not show chunk %d, which is there; remote storage's listings are behind its writes", manifest.ID, index)
+			return fmt.Errorf("verify snapshot %s: %w: the listing does not show chunk %d, which is there; remote storage's listings are behind its writes", manifest.ID, run.ErrRemoteListing, index)
 		}
 	}
 	return &Incomplete{Snapshot: manifest.ID, Broken: manifest.ID, Attempt: manifest.Attempt,
@@ -398,6 +425,16 @@ func (s *Store) checkChunks(ctx context.Context, manifest *Manifest) error {
 // snapshot itself has no manifest; ErrIncomplete (an *Incomplete) when
 // anything in the chain is missing; any other error means it could not
 // be checked, which is not a verdict.
+//
+// Every snapshot of the chain is pinned (Pin) before its manifest is
+// read: a collection that condemns one of them after this read sees the
+// pin and puts the manifest back (see Collect, "two-phase delete"), and
+// one that condemned it before makes this read fail. What Verify
+// answers whole stays whole for whoever goes on to build on it.
+//
+// A snapshot a read found damaged (bit rot, see CheckContent and
+// Download) is not whole either, though every chunk is there with its
+// size: the *Incomplete then says Content.
 func (s *Store) Verify(ctx context.Context, id string) (*Manifest, Key, error) {
 	var first *Manifest
 	var firstKey Key
@@ -405,6 +442,9 @@ func (s *Store) Verify(ctx context.Context, id string) (*Manifest, Key, error) {
 	for hops := 0; ; hops++ {
 		if hops > maxChainWalk {
 			return nil, Key{}, fmt.Errorf("%w: the chain of %s does not end within %d snapshots", ErrCorrupt, id, maxChainWalk)
+		}
+		if err := s.Pin(ctx, current); err != nil {
+			return nil, Key{}, fmt.Errorf("verify snapshot %s: %w", current, err)
 		}
 		manifest, key, err := s.Manifest(ctx, current)
 		if errors.Is(err, ErrNoSnapshot) && current != id {
@@ -419,6 +459,10 @@ func (s *Store) Verify(ctx context.Context, id string) (*Manifest, Key, error) {
 				incomplete.Snapshot = id
 			}
 			return nil, Key{}, err
+		}
+		if bad, ok := s.badOf(manifest); ok {
+			return nil, Key{}, &Incomplete{Snapshot: id, Broken: manifest.ID, Attempt: manifest.Attempt, Content: true,
+				Detail: fmt.Sprintf("chunk %d was read and is not the chunk that was uploaded (%s)", bad.index, bad.how)}
 		}
 		if first == nil {
 			first, firstKey = manifest, key
@@ -688,6 +732,18 @@ func (s *Store) writeManifest(ctx, parent context.Context, manifest *Manifest, s
 		if existing.Attempt == manifest.Attempt {
 			return manifest, nil
 		}
+		if _, damaged := s.badOf(existing); damaged {
+			// The manifest that stands names a chunk a read found
+			// damaged. This upload is whole: it replaces that manifest
+			// in one write, so the snapshot never stops existing on the
+			// way (a read can be wrong, and the old chunks stay until a
+			// collection ages them).
+			if err := s.objects.Put(ctx, s.manifestKey(manifest.ID), sealed, s3.PutOptions{ContentType: "application/json"}); err != nil {
+				return nil, fmt.Errorf("replace the manifest of %s, which names a damaged chunk: %w", manifest.ID, err)
+			}
+			s.log.Warn("a snapshot with a damaged chunk was uploaded again from this host's copy", "snapshot", manifest.ID, "replaced", existing.Attempt)
+			return manifest, nil
+		}
 		checkErr := s.checkChunks(ctx, existing)
 		if checkErr == nil {
 			// Ours are the chunks nothing names: the deferred cleanup
@@ -732,16 +788,9 @@ func (s *Store) Download(ctx context.Context, manifest *Manifest, key Key, w io.
 		if want.Size <= chunkOverhead || want.Size > int64(manifest.ChunkBytes)+chunkOverhead {
 			return nil, fmt.Errorf("%w: chunk %d of %s has an impossible size", ErrCorrupt, index, manifest.ID)
 		}
-		object, err := s.objects.Get(ctx, s.chunkKey(manifest.ID, manifest.Attempt, index), want.Size)
-		if errors.Is(err, s3.ErrNotFound) {
-			return nil, fmt.Errorf("%w: chunk %d of %s is missing", ErrCorrupt, index, manifest.ID)
-		}
+		object, err := s.readChunk(ctx, manifest, index)
 		if err != nil {
-			return nil, fmt.Errorf("download chunk %d of %s: %w", index, manifest.ID, err)
-		}
-		digest := sha256.Sum256(object)
-		if int64(len(object)) != want.Size || hex.EncodeToString(digest[:]) != want.SHA256 {
-			return nil, fmt.Errorf("%w: chunk %d of %s is not the chunk that was uploaded (size or SHA-256 differs)", ErrCorrupt, index, manifest.ID)
+			return nil, err
 		}
 		plain, err := aead.Open(object[nonceSize:nonceSize], object[:nonceSize], object[nonceSize:], chunkAAD(manifest.ID, manifest.Attempt, index))
 		if err != nil {

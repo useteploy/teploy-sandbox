@@ -135,6 +135,9 @@ func (m *Manager) remotePayloadLocked(current *Run) []byte {
 	// this daemon's copy.
 	record.Snapshot, record.Base, record.Remote = "", "", nil
 	record.RemoteGen, record.RemoteHeld, record.RemoteKey = 0, false, ""
+	// Whether the run moved is this daemon's to know; wherever the record
+	// is read it has moved.
+	record.AccessMoved = false
 	payload, err := json.Marshal(record)
 	if err != nil {
 		// A run that was built from validated parts always marshals.
@@ -614,6 +617,17 @@ func (m *Manager) adopt(ctx context.Context, record RemoteRecord, held bool) (*R
 	adopted.remoteGen = record.Generation
 	adopted.remoteHeld = held
 	adopted.remoteKey = record.Key
+	// A run read from its remote record is not this daemon continuing its
+	// own state: its next resume revokes the grants issued before it
+	// moved (access.go). With access off nothing is marked (the registry
+	// stays as it was); a run whose epoch is first set when access is
+	// turned on starts at that moment anyway.
+	if m.access != nil {
+		adopted.accessMoved = true
+		if adopted.accessEpoch == 0 {
+			adopted.accessEpoch = m.accessFloor()
+		}
+	}
 	state := RemoteState{State: RemoteDurable, Snapshot: record.SnapshotID, Local: m.hasLocal(ctx, record.Snapshot)}
 	if held {
 		state.State = RemotePending

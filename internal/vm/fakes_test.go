@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"os"
 	"slices"
 	"sort"
@@ -17,6 +18,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/useteploy/teploy-sandbox/internal/guest"
 )
 
 // fakeZFS models the part of ZFS the driver depends on, with the rules
@@ -644,6 +647,9 @@ type fakeMachine struct {
 	bootedErr                  error
 	// bootRead is what BootRead answers.
 	bootRead int64
+	// connectFunc answers a connect (guest protocol v2); nil is an agent
+	// older than v2.
+	connectFunc func(port int) (net.Conn, error)
 }
 
 func (m *fakeMachine) Agent() Agent            { return (*fakeAgent)(m) }
@@ -821,6 +827,20 @@ func (a *fakeAgent) Ping(ctx context.Context) (string, error) {
 		m.hypervisor.mu.Unlock()
 	}
 	return "fake-agent", nil
+}
+
+func (a *fakeAgent) Connect(_ context.Context, port int) (net.Conn, error) {
+	if err := a.alive(); err != nil {
+		return nil, err
+	}
+	m := (*fakeMachine)(a)
+	m.mu.Lock()
+	connect := m.connectFunc
+	m.mu.Unlock()
+	if connect == nil {
+		return nil, &guest.Error{Code: guest.CodeUnsupportedVersion, Message: "protocol version 2 is not supported; this agent speaks 1"}
+	}
+	return connect(port)
 }
 
 func (a *fakeAgent) Sync(context.Context) error {

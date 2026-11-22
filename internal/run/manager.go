@@ -141,6 +141,9 @@ type Run struct {
 	// replaced, never mutated, so the copies Get/List hand out stay
 	// consistent snapshots.
 	Lease *LeaseState `json:"lease,omitempty"`
+	// Access is the run's access state (access.go), on the copies Get and
+	// List hand out, and only when the daemon has access on.
+	Access *AccessView `json:"access,omitempty"`
 
 	// leaseGen is the run's monotonic lease generation counter — it only
 	// grows, so credentials from any earlier lease stay dead forever.
@@ -191,6 +194,16 @@ type Run struct {
 	// sample started under one is dropped if it lands under the next,
 	// which a VM's reused name would not tell apart.
 	usageGen uint64
+	// The run's access state (access.go): its epoch, its ports (copy on
+	// write), whether it moved here from remote storage since it last
+	// ran (its next resume raises the epoch), whether its access streams
+	// are being closed for a stop, and what its streams moved. Guarded
+	// by Manager.mu.
+	accessEpoch   int64
+	accessPorts   []PortSpec
+	accessMoved   bool
+	accessClosing bool
+	accessBytes   accessBytes
 }
 
 // RunUsage is what a run has consumed so far.
@@ -208,6 +221,13 @@ type RunUsage struct {
 	TxBytes    *int64     `json:"txBytes,omitempty"`
 	DiskBytes  *int64     `json:"diskBytes,omitempty"`
 	SampledAt  *time.Time `json:"sampledAt,omitempty"`
+	// What the run's access streams moved (access.go), only with access
+	// on: Rx is what the guest received through them, Tx what it sent,
+	// and the Anon pair the part of each through public ports.
+	AccessRxBytes     *int64 `json:"accessRxBytes,omitempty"`
+	AccessTxBytes     *int64 `json:"accessTxBytes,omitempty"`
+	AccessAnonRxBytes *int64 `json:"accessAnonRxBytes,omitempty"`
+	AccessAnonTxBytes *int64 `json:"accessAnonTxBytes,omitempty"`
 }
 
 // WarmState is the warm-cache view of a run: which repo's volume it
@@ -373,6 +393,9 @@ type Manager struct {
 
 	// execLog holds the recoverable execs (execlog.go): memory only.
 	execLog *execRegistry
+
+	// access is nil unless access is on (access.go).
+	access *accessState
 }
 
 func NewManager(runtime Runtime, log *slog.Logger) *Manager {
@@ -770,6 +793,11 @@ func (m *Manager) launch(ctx context.Context, b bootRequest, run *Run) (*Run, er
 	run.limits = b.limits
 	run.warmReq = b.warm
 	m.mu.Lock()
+	if m.access != nil && run.accessEpoch == 0 {
+		// A new run (a create or a fork): a fresh epoch, and a fork's
+		// child has no ports of its own.
+		run.accessEpoch = m.accessFloor()
+	}
 	run.runningSince = m.now()
 	m.runs[b.id] = run
 	view := m.viewLocked(run)
@@ -793,6 +821,7 @@ func (m *Manager) viewLocked(run *Run) *Run {
 		// for a stopped run that carries totals from a life with it on.
 		usageViewLocked(run, &view.Usage)
 	}
+	m.accessViewLocked(run, &view)
 	return &view
 }
 
@@ -880,6 +909,8 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 		return m.destroyStopped(ctx, &stopped)
 	}
 	m.mu.Unlock()
+	// Its access streams end before its VM does.
+	m.closeAccessRun(id, "destroyed")
 	// Revoke egress immediately; keep the volume/registry until removal succeeds.
 	// The port a closed proxy had does not become another run's door for
 	// the run that is still being removed: under the Docker driver the

@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/useteploy/teploy-sandbox/internal/guest"
 	"github.com/useteploy/teploy-sandbox/internal/run"
 )
 
@@ -790,6 +791,40 @@ func (d *Driver) ReadFile(ctx context.Context, containerID, path string) ([]byte
 		return nil, err
 	}
 	return current.machine.Agent().ReadFile(ctx, path)
+}
+
+// portConnector is an agent that opens streams to guest ports (guest
+// protocol version 2): *guest.Client.
+type portConnector interface {
+	Connect(ctx context.Context, port int) (net.Conn, error)
+}
+
+// DialPort opens a byte stream to a TCP port on the run's guest loopback,
+// through the guest agent over vsock: no route, tap, firewall rule or
+// connection tracking entry is involved, so it works on every network
+// tier, "none" included. Each stream is its own vsock connection.
+func (d *Driver) DialPort(ctx context.Context, containerID string, port int) (net.Conn, error) {
+	current, err := d.instance(containerID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", run.ErrStopped, err)
+	}
+	connector, ok := current.machine.Agent().(portConnector)
+	if !ok {
+		return nil, run.ErrUnsupportedDriver
+	}
+	conn, err := connector.Connect(ctx, port)
+	switch {
+	case err == nil:
+		return conn, nil
+	case guest.IsCode(err, guest.CodeRefused):
+		return nil, fmt.Errorf("%w: %v", run.ErrPortRefused, err)
+	case guest.IsCode(err, guest.CodeUnsupportedVersion):
+		return nil, fmt.Errorf("%w: the agent is older than guest protocol version 2; rebuild the golden image (scripts/build-golden.sh) with this release's teploy-guestd", run.ErrGuestAgent)
+	case guest.IsCode(err, guest.CodeBusy):
+		return nil, fmt.Errorf("%w: %v", run.ErrGuestAgent, err)
+	default:
+		return nil, fmt.Errorf("%w: %v", run.ErrGuestAgent, err)
+	}
 }
 
 // Remove kills the run's VM and destroys its volume. Removing something

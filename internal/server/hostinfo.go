@@ -43,3 +43,7 @@ func parseMemTotalMB(meminfo []byte) int {
 	}
 	return 0
 }
+
+// HostMemoryMB is the host's total memory in MiB, 0 when it cannot be
+// told (anything but Linux).
+func HostMemoryMB() int { return hostMemoryMB() }

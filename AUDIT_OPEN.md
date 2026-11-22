@@ -2779,3 +2779,78 @@ The seven items of the previous entry, and:
     `destroyed` record still or again in the bucket.
 11. **Four stops uploading and a resume that has to fetch**, with the
     default four transfers: the resume does not wait for the uploads.
+
+## 2026-11-21 — recoverable execs, capacity disk, per-run usage, wire contract
+
+Additive daemon asks: `recoverable` execs with `X-Exec-Id` and
+`GET /v1/runs/{id}/execs[/{execId}[/output]]`; `disk` in
+`GET /v1/capacity`; `cpuSeconds`/`rxBytes`/`txBytes`/`diskBytes`/
+`sampledAt` in `usage` behind `--usage-interval` (default off);
+`docs/wire-contract.md`. Not reviewed yet (a review is another session).
+
+### Limits, by design in this slice
+
+- Exec records are memory only. A daemon restart loses every record and
+  every running command (running runs do not survive a restart); the
+  lookup answers 404 with that reason at once. A control plane that sees
+  that 404 for an exec it started knows only "outcome unknown".
+- Output is the last 1 MiB per exec (plus 128 KiB of stream bits), 16
+  records per run, 64 per daemon: about 72 MiB worst case. Running
+  records are never evicted, so a 65th concurrent recoverable exec (or
+  17th on one run) is a 503. Finished records live 15 minutes. All
+  constants, not flags.
+- There is no way to kill a recoverable exec early: it is bounded by
+  `timeoutSec` (default 120, no maximum, as for every exec) and by its
+  run. A recoverable exec still counts as in flight, so it blocks stop,
+  snapshot, fork and lease takeover until it ends, exactly as a
+  connected exec did.
+- Text-mode resume offsets are exact only when the output is valid UTF-8
+  and the stream did not break inside a character; base64 mode is exact.
+- `signal` is inferred from exit code 128+n; a command that exits 137
+  itself reads as SIGKILL.
+- Usage numbers are observations, not a ledger: usage after the last
+  sample is lost on destroy, expiry-destroy and crash (a stop takes a
+  final sample). Counters reset to zero for a fork and for a run resumed
+  on another daemon (as `runningSec`). `diskBytes` is a level.
+- Docker usage needs the daemon on the Docker host with cgroup v2. CPU
+  and network are read only after checking the container's pid is in a
+  cgroup named after its full ID, and the cgroup file is read again
+  afterwards to catch a reused pid; a daemon that cannot see the host's
+  `/proc` (containerised, remote Docker, Docker Desktop/colima from the
+  host OS) reports `diskBytes` only. `docker container inspect --size`
+  walks the writable layer on every sample. Under gVisor (`runsc`) the
+  cgroup and namespace of `State.Pid` are assumed to be the sandbox's:
+  not verified.
+- VM `cpuSeconds` includes the hypervisor's own threads (it is the VM's
+  cgroup). VM network counters come from the tap only; a `none` run has
+  no device and reports no rx/tx (Docker reports 0 there). VM
+  `diskBytes` is ZFS `used` of the clone.
+- `disk` in capacity: the ZFS pool's own `used`/`available` (not the
+  driver's dataset; a quota on the dataset is not reflected), or statfs
+  of Docker's data root (`freeBytes` is f_bavail). Absent when the probe
+  fails or exceeds 5 s.
+
+### Tests and what ran live
+
+Unit tests (each shown to fail with its change reverted locally):
+dropped stream does not kill a recoverable exec and its exit/output are
+fetched after; failed stream writes do not fail the command's copy;
+resume by counted base64 offset with no duplicates, paging, bad
+offsets; timeout and inferred signal; plain exec unchanged (same bytes,
+no header, still killed by a dropped stream); records dropped with the
+run; restart answers 404 with the reason quickly; output bound (3 MiB
+written, last 1 MiB held, truncated read, tail); ring buffer against a
+model, including its memory bound; per-run/total bounds and eviction;
+expiry; capacity disk (Docker statfs via a fake CLI, ZFS pool name,
+absent on failure); usage off by default (no samples, JSON unchanged),
+monotonic across stop/resume/restart, high-water mark within one
+container, fork at zero; Docker sampler cgroup check; tap counter
+direction.
+
+- Ran live: `TestRealRecoverableExecAndUsage` against real Docker
+  (colima, so the daemon was not on the Docker host): the dropped stream,
+  the command finishing, resume by offset and `diskBytes` passed; CPU,
+  network and capacity `disk` were not exercised (Linux-host only).
+- Not run live: `vm_usage_integration_test.go` (`TestVMRecoverableExecs`,
+  `TestVMUsage`), Docker CPU/network/disk on a Linux Docker host, and
+  anything under gVisor.

@@ -12,16 +12,20 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 
 ## API (bearer token on everything except /health)
 
+The full wire contract — every field, status code, retry rule and
+stability promise — is [docs/wire-contract.md](docs/wire-contract.md).
+
 | Route | Does |
 |---|---|
 | `POST /v1/runs` | `{image, env?, ttlSec?, network?, egressAllow?, limits?, warm?, user?, labels?, onExpire?}` → the run: `{id, server, state, expiresAt, user, onExpire, usage, labels?, warm?}` — network `none` (default), `allowlist` or `open` (see Egress); defaults 1 CPU / 1 GB / 256 pids, never the `teploy` app network; `user` `default` (absent) or `root` (see Run user); `warm: {repo, path?}` gives the run a private volume for the repo (below) |
-| `POST /v1/runs/{id}/exec` | `{cmd, cwd?, timeoutSec?, env?, owner?, generation?, outputEncoding?}` (`env`: name → value, set in the command's environment; POSIX names, no NUL, ≤64 vars / 64 KiB, else 400; values reach the container through a private (0600, removed after) `--env-file`, never argv and never the docker CLI's own environment; so no line breaks) → SSE: `stdout`/`stderr` chunks, then `exit` `{exitCode, timedOut}`; while the run holds a lease, only the holder's `owner`+`generation` may exec (409 otherwise) |
+| `POST /v1/runs/{id}/exec` | `{cmd, cwd?, timeoutSec?, env?, owner?, generation?, outputEncoding?, recoverable?}` (`env`: name → value, set in the command's environment; POSIX names, no NUL, ≤64 vars / 64 KiB, else 400; values reach the container through a private (0600, removed after) `--env-file`, never argv and never the docker CLI's own environment; so no line breaks) → SSE: `stdout`/`stderr` chunks, then `exit` `{exitCode, timedOut}`; while the run holds a lease, only the holder's `owner`+`generation` may exec (409 otherwise); `recoverable: true` answers with `X-Exec-Id` and keeps the command running if the stream drops (see Recoverable execs) |
+| `GET /v1/runs/{id}/execs`, `GET /v1/runs/{id}/execs/{execId}`, `GET /v1/runs/{id}/execs/{execId}/output?since=&limit=` | A recoverable exec's status (`running`/`exited`/`timedOut`/`failed`, `exitCode`, `signal?`, `detached`) and its output from an offset or the tail (see Recoverable execs) |
 | `PUT/GET /v1/runs/{id}/files/{path}` | Confined to `/work`; traversal rejected. PUT takes the lease credential as `?owner=&generation=` query and is fenced like exec; GET is open, lease or not |
 | `DELETE /v1/runs/{id}` | Destroy now (the reaper enforces TTLs regardless, default 30 min); on a stopped run, deletes the record and its snapshot |
 | `POST /v1/runs/{id}/stop` | Capture the filesystem, remove the container, keep the run → the run, `state: "stopped"` (see Persistent runs) |
 | `POST /v1/runs/{id}/resume` | `{ttlSec?, takeover?}` → the same run, same `id`, `state: "running"`, new deadline (`takeover`: see Off-host storage) |
 | `POST /v1/runs/{id}/fork` | `{ttlSec?, labels?, onExpire?}` → 201, a new run started from this one's filesystem and settings, with `forkedFrom` |
-| `GET /v1/capacity` | `{server, driver, runtime, cpus, memoryMb, runs: {running, stopped}, allocated: {cpus, memoryMb}, warmPool?}` — the host's size and the sum of running runs' limits (and of the VM driver's warm pool, when it has one) |
+| `GET /v1/capacity` | `{server, driver, runtime, cpus, memoryMb, runs: {running, stopped}, allocated: {cpus, memoryMb}, warmPool?, disk?}` — the host's size and the sum of running runs' limits (and of the VM driver's warm pool, when it has one); `disk: {kind, name, usedBytes, freeBytes}` is the ZFS pool (`zfs-pool`) or Docker's data root filesystem (`docker-data-dir`), absent when unknown |
 | `GET /v1/remote/snapshots` | Only with remote storage: the caller snapshots in the bucket → `{snapshots: [{id, run?, createdAt, storedBytes}]}` — membership is the durability probe for a snapshot whose upload failed and is retried |
 | `POST /v1/remote/sync`, `POST /v1/remote/collect`, `POST /v1/remote/rotate`, `POST /v1/remote/scrub` | Only with remote storage (400 without): look for runs stopped on other daemons now → `{remote, changed}`; garbage-collect the bucket now → 204; re-wrap the bucket's keys under the current master → `{manifestsRewrapped, recordsRewrapped, …, previousKeyNeeded, previousKeyNeededFor: [...]}`; check now that every stopped run this daemon reports durable is whole in the bucket → `{checked, notWhole, unreachable}` |
 | `GET /v1/runs`, `GET /health` | List; `{status, version}` |
@@ -47,6 +51,7 @@ Every run carries, in every response that returns one:
 | `labels` | The caller's own metadata from create: at most 16; keys `^[a-z0-9]([a-z0-9._-]{0,62})$`; values at most 256 bytes, no control characters. Anything else is a 400 |
 | `onExpire` | `destroy` (default: the run is removed at its deadline, as always) or `stop` (it is stopped there instead). Anything else is a 400 |
 | `usage.runningSec` | Seconds spent `running`, summed across every stop and resume, current stretch included |
+| `usage.cpuSeconds`, `usage.rxBytes`, `usage.txBytes`, `usage.diskBytes`, `usage.sampledAt` | Only with `--usage-interval` (below): sampled CPU time, network bytes received/sent, written bytes, and when |
 | `stoppedAt`, `retainUntil` | Only while stopped. At `retainUntil` the run and its snapshot are deleted |
 | `forkedFrom` | The source run's `id`, on a fork |
 
@@ -93,6 +98,37 @@ delete an image while a container created from it exists, so a stop
 snapshot outlives the resume that used it and goes when that container
 does — at the next stop, or at destroy. The same holds for the capture
 behind a fork, which goes with the child.
+
+### Usage observations
+
+`serve --usage-interval` / `SBX_USAGE_INTERVAL` (a Go duration; default
+0, which samples nothing and leaves `usage` as `{runningSec}`) samples
+every running run on that interval, and once more when it stops:
+
+| Field | Docker driver | VM driver |
+|---|---|---|
+| `cpuSeconds` | `usage_usec` of the container's cgroup v2 `cpu.stat` | `usage_usec` of the hypervisor's cgroup (vCPUs and the hypervisor's own threads) |
+| `rxBytes`, `txBytes` | `/proc/<pid>/net/dev` of the container's namespace, every interface but `lo` | the tap's counters, read in the run's namespace, from the guest's side; absent on `none` (no device) |
+| `diskBytes` | `SizeRw` of `docker container inspect --size` (the writable layer) | the volume's ZFS `used` (what the clone holds beyond its image) |
+
+- The counters only grow for the life of a run on this daemon. Every new
+  container or VM counts from zero, so a stop folds the last sample into
+  totals kept with the run (and in the registry file, so they survive a
+  restart) and the resumed container adds on top. A fork starts at zero;
+  so does a run resumed on another daemon from remote storage, as
+  `runningSec` does. `diskBytes` is a level, the latest observation.
+- They are observations, not a billing ledger. Usage between the last
+  sample and the container's end is missing unless a stop's final sample
+  caught it (a destroy, an expiry destroy and a crash take none); a part
+  the driver could not read is absent, never zero; `sampledAt` says how
+  old they are.
+- Docker: the CPU and network reads go through the host's `/proc` and
+  `/sys/fs/cgroup` for the container's `State.Pid`, and only once that
+  process is in a cgroup named after the container's full ID. A daemon
+  that cannot see the Docker host's process table (in a container, or
+  talking to a remote Docker) reports `diskBytes` only. cgroup v1 hosts
+  get no `cpuSeconds`. `--size` makes Docker walk the writable layer:
+  pick an interval that is cheap for the runs you host.
 
 ### Surviving a restart
 
@@ -1172,6 +1208,34 @@ image is the one described here.
 The off-host storage tests are not part of these steps: they need an
 S3-compatible service as well, and are described at the end of
 "Off-host storage" above (`TestVMOffHost`).
+
+## Recoverable execs
+
+An exec with `"recoverable": true` in its body is detached from its
+request: the stream is exactly the same, but a client that loses it (a
+dropped connection, a proxy restarting) does not kill the command, and
+can come back for the outcome and the rest of the output by the ID in
+the `X-Exec-Id` response header (or find it in `GET /v1/runs/{id}/execs`).
+
+- The record holds the status and the last 1 MiB of output, stdout and
+  stderr in the order the stream sent them, each byte at an offset. With
+  `outputEncoding: "base64"` the number of bytes a client decoded is the
+  offset to resume from: `GET …/execs/{execId}/output?since=<that>`
+  returns exactly the rest (base64 `data` per chunk, `next` to continue,
+  `done` at the end, `truncated` if the bytes had already left the 1 MiB
+  window). Without `since` it is the last `limit` bytes (default 64 KiB).
+- Bounds: 16 records per run, 64 per daemon; finished records make room
+  oldest first, running ones never, so a recoverable exec with every slot
+  running is a 503. A finished record is kept 15 minutes; a run's records
+  go when the run is destroyed. The command is still bounded by its
+  `timeoutSec` and still ends with its run.
+- **Daemon restart loses every record** (they are memory only), and
+  every running command with its run. A lookup then answers at once:
+  404, with a `detail` saying records are lost on restart.
+- Without the field nothing changes: no header, no record, and a dropped
+  stream ends the command as it always has.
+
+Full shapes: [docs/wire-contract.md](docs/wire-contract.md#recoverable-execs).
 
 ## Writable leases
 

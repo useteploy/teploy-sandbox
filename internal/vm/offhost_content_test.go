@@ -322,7 +322,9 @@ func TestARememberedDamageIsReadAgain(t *testing.T) {
 		t.Fatalf("scrub: %+v", stats)
 	}
 	bucket.SetRaw(key, good) // it reads whole again
-	restarted := newHost(t, bucket, "host-a", a, reading(1<<20), drop)
+	// The restarted daemon reads nothing else (fourth fix round, nit a):
+	// the remembered chunk is read again whatever the read budget.
+	restarted := newHost(t, bucket, "host-a", a, reading(0), drop)
 	stats := restarted.manager.ScrubRemote(bg)
 	if stats.Rechecked != 1 {
 		t.Fatalf("the scrub after the chunk mended: %+v", stats)

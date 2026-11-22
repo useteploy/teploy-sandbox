@@ -130,9 +130,10 @@ func TestAnOldRoundLeavesStaleCopiesToTheNext(t *testing.T) {
 }
 
 // Finding 7: a condemnation another collection is deciding about, of a
-// snapshot a record names, is put back early — but (third fix round)
-// only once this daemon has watched the copy for half a grace, when the
-// collection that wrote it is past its own bound. Not at first sight:
+// snapshot a record names, is put back early — but (third and fourth
+// fix rounds) only once this daemon has watched the copy for three
+// quarters of a grace, a quarter after the collection that wrote it
+// has passed its own bound. Not at first sight:
 // that undid a live collection (TestR7bImmediatePutBackUnderALiveCollector).
 func TestACondemnedSnapshotThatIsReferredToIsPutBackAtOnce(t *testing.T) {
 	w := newA4World(t)
@@ -146,10 +147,16 @@ func TestACondemnedSnapshotThatIsReferredToIsPutBackAtOnce(t *testing.T) {
 	if err != nil || stats.Restored != 0 {
 		t.Fatalf("a condemnation of a referenced snapshot at first sight: %+v, %v", stats, err)
 	}
+	// Half a grace is not enough (TestR7cEarlyTakeoverRightAfterTheOwnersBound):
+	// the owner may have passed its last check just before its bound.
 	w.advance(13 * time.Hour)
+	if stats, err := w.second.Collect(bg, twoPhaseGrace); err != nil || stats.Restored != 0 {
+		t.Fatalf("half a grace later: %+v, %v", stats, err)
+	}
+	w.advance(5 * time.Hour) // eighteen hours: three quarters of the grace
 	stats, err = w.second.Collect(bg, twoPhaseGrace)
 	if err != nil || stats.Restored != 1 {
-		t.Fatalf("half a grace later: %+v, %v", stats, err)
+		t.Fatalf("three quarters of a grace later: %+v, %v", stats, err)
 	}
 	restores(t, w.uploader, snapT, w.host.data[snapT])
 }

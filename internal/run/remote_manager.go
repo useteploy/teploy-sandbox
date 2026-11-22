@@ -1552,6 +1552,11 @@ func (m *Manager) ScrubRemote(ctx context.Context) ScrubStats {
 	if m.RemoteScrubReadBytes > 0 && ctx.Err() == nil {
 		m.scrubContent(ctx, &stats)
 	}
+	// Whatever the read budget: one chunk per failed run, and the only
+	// way such a run ever gets back to durable without a copy here.
+	if ctx.Err() == nil {
+		m.recheckDamage(ctx, &stats)
+	}
 	if stats.NotWhole > 0 || stats.Unreachable > 0 {
 		m.log.Error("remote storage scrub", "checked", stats.Checked, "notWhole", stats.NotWhole, "unreachable", stats.Unreachable,
 			"contentReadBytes", stats.ContentReadBytes, "damaged", stats.Damaged)
@@ -1604,7 +1609,6 @@ func (m *Manager) scrubContent(ctx context.Context, stats *ScrubStats) {
 			}
 		}
 	}
-	m.recheckDamage(ctx, stats)
 }
 
 // recheckDamage reads again the one damaged chunk each failed run

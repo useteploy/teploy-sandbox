@@ -69,7 +69,7 @@ type confinement struct {
 	// a test says otherwise.
 	bootReadBudget int64
 	bootPoll       time.Duration
-	sys  confineSys
+	sys            confineSys
 }
 
 // confineSys is the host as confinement uses it; tests replace it.

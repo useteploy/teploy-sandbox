@@ -3037,6 +3037,22 @@ with the run's other files):
   and the back-off (unit tests only; the suite has no guest that will
   not start its agent).
 
+### Second review round (same day)
+
+A second review asked for: the back-off charged by raised-rate bytes
+read, not by failures (entry C); the docs to say plainly that a read
+limit below the defaults applies after boot and is no cap on a caller
+who can create runs freely, with a host-wide budget for raised boots
+recorded as a follow-up (entry C); the raw IPv6 check to fail when
+sending outlasted its captures, and guest a's own capture to see its
+frames leave (entry B); the boot watch to fail closed when it cannot
+count (entry C). Unit tests for each fail without the change. Re-run
+on the laptop, pool off: root-only unit tests all pass (254), none
+skipped; `TestVMLimits`, `TestVMDestroyIsNotHeldByQueuedIO`,
+`TestVMNetworkIsolation`, `TestVMNetworkFailsClosed` pass; no
+`type=1326`. Not run live: the back-off and the fail-closed watch (no
+guest in the suite fails its boot after reading, or hides its io.stat).
+
 ### Still needs a host of the runbook's size (16 GB, a disk for the pool)
 
 - `TestVMWarmPool` and `TestVMWarmPoolRaces` in the suite (here the pool

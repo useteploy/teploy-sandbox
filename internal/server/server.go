@@ -351,7 +351,8 @@ func (s *Server) handleRemoteScrub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stats := s.Manager.ScrubRemote(r.Context())
-	s.writeJSON(w, http.StatusOK, map[string]any{"checked": stats.Checked, "notWhole": stats.NotWhole, "unreachable": stats.Unreachable})
+	s.writeJSON(w, http.StatusOK, map[string]any{"checked": stats.Checked, "notWhole": stats.NotWhole, "unreachable": stats.Unreachable,
+		"contentReadBytes": stats.ContentReadBytes, "contentSnapshots": stats.ContentSnapshots, "damaged": stats.Damaged, "rechecked": stats.Rechecked})
 }
 
 // handleRemoteSnapshots lists the caller snapshots in the bucket: the

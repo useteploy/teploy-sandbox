@@ -327,7 +327,14 @@ func TestVMOffHost(t *testing.T) {
 	// --- encrypted at rest: no chunk holds the marker, a chunk does not
 	// compress, and the run's env is not in its record.
 	snapshotID := stopped.Remote.Snapshot
-	chunks := bucketKeys("v1/snap/" + snapshotID + "/")
+	// The snapshot's objects: its manifest and chunks, not the pins every
+	// check writes beside them (the two-phase delete, 2026-11-21).
+	var chunks []s3.Object
+	for _, object := range bucketKeys("v1/snap/" + snapshotID + "/") {
+		if !strings.Contains(object.Key, "/pin/") && !strings.HasSuffix(object.Key, "/condemned") {
+			chunks = append(chunks, object)
+		}
+	}
 	if len(chunks) < 3 {
 		t.Fatalf("the snapshot is %d objects", len(chunks))
 	}

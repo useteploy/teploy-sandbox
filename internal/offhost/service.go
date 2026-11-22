@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/useteploy/teploy-sandbox/internal/run"
@@ -126,6 +129,17 @@ type Service struct {
 	// ends: a request must not wait out someone else's transfer.
 	restoring gate
 	basing    gate
+
+	// Where the scrub that reads is: what it has read through in this
+	// pass (by snapshot, the upload attempt), and where it stopped.
+	contentMu   sync.Mutex
+	contentDone map[string]string
+	contentAt   contentCursor
+	// passStart picks where in the sorted snapshots a new pass begins
+	// (random): the cursor is not kept across restarts, and a daemon
+	// restarted more often than a pass takes must not read the same
+	// first snapshots every time and never the last.
+	passStart func(n int) int
 }
 
 var _ run.OffHost = (*Service)(nil)
@@ -194,7 +208,7 @@ func (s *Service) Upload(ctx context.Context, req run.UploadRequest) (run.Upload
 	}
 	var last error
 	for try := 0; try < uploadTries; try++ {
-		result, again, err := s.upload(ctx, req, id)
+		result, again, err := s.upload(ctx, req, id, 0)
 		if err == nil {
 			result.Took = time.Since(start)
 			return result, nil
@@ -212,18 +226,74 @@ func (s *Service) Upload(ctx context.Context, req run.UploadRequest) (run.Upload
 // manager's ErrRemoteIncomplete.
 func (s *Service) remoteError(err error) error {
 	if errors.Is(err, ErrIncomplete) && !errors.Is(err, run.ErrRemoteIncomplete) {
-		return fmt.Errorf("%w: %w", run.ErrRemoteIncomplete, err)
+		err = fmt.Errorf("%w: %w", run.ErrRemoteIncomplete, err)
+	}
+	var incomplete *Incomplete
+	var damaged *run.DamageError
+	if errors.As(err, &incomplete) && incomplete.Content && !errors.As(err, &damaged) {
+		// The manager keeps which chunk, across restarts.
+		err = &run.DamageError{Damage: run.RemoteDamage{Snapshot: incomplete.Broken, Attempt: incomplete.Attempt, Chunk: incomplete.Chunk}, Err: err}
 	}
 	return err
 }
 
+// RecheckDamage reads a remembered damaged chunk again (readChunk, which
+// forgets the damage when it reads whole).
+func (s *Service) RecheckDamage(ctx context.Context, damage run.RemoteDamage) (bool, error) {
+	if !validID(damage.Snapshot) {
+		return false, nil
+	}
+	manifest, _, err := s.store.Manifest(ctx, damage.Snapshot)
+	if errors.Is(err, ErrNoSnapshot) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if manifest.Attempt != damage.Attempt {
+		return true, nil
+	}
+	if damage.Chunk < 0 || damage.Chunk >= len(manifest.Chunks) {
+		return false, nil
+	}
+	if _, err := s.store.readChunk(ctx, manifest, damage.Chunk); err != nil {
+		if errors.Is(err, ErrCorrupt) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// RememberDamage is a damaged chunk this daemon found before a restart.
+func (s *Service) RememberDamage(damage run.RemoteDamage) {
+	if validID(damage.Snapshot) && validAttempt(damage.Attempt) && damage.Chunk >= 0 {
+		s.store.markBad(damage.Snapshot, damage.Attempt, damage.Chunk, "found before this daemon restarted")
+	}
+}
+
 // upload is one try of Upload. again says the failure is one a fresh
-// try can get past.
-func (s *Service) upload(ctx context.Context, req run.UploadRequest, id string) (result run.UploadResult, again bool, err error) {
+// try can get past. depth counts repairs of snapshots a chain builds on,
+// each of which is an upload of its own.
+func (s *Service) upload(ctx context.Context, req run.UploadRequest, id string, depth int) (result run.UploadResult, again bool, err error) {
+	replaces := ""
 	existing, key, err := s.store.Manifest(ctx, id)
 	switch {
 	case err == nil:
 		_, _, verifyErr := s.store.Verify(ctx, id)
+		var incomplete *Incomplete
+		if errors.As(verifyErr, &incomplete) && incomplete.Content && incomplete.Broken != id && depth < maxChainWalk {
+			// A snapshot this one builds on was read and found damaged.
+			// If this host has it, it is uploaded again, and this one
+			// stands as it is.
+			repaired, repairErr := s.repair(ctx, incomplete.Broken, depth+1)
+			if repairErr != nil {
+				return run.UploadResult{}, false, repairErr
+			}
+			if repaired {
+				_, _, verifyErr = s.store.Verify(ctx, id)
+			}
+		}
 		if verifyErr == nil {
 			return run.UploadResult{ID: id, Key: s.sameOwner(key, req), Already: true, Incremental: existing.Parent != "" && !IsBaseID(existing.Parent)}, false, nil
 		}
@@ -238,6 +308,16 @@ func (s *Service) upload(ctx context.Context, req run.UploadRequest, id string) 
 			return run.UploadResult{}, false, fmt.Errorf("%w; this host has no copy to upload it from again", verifyErr)
 		}
 		s.log.Error("a snapshot that was uploaded is not whole in remote storage; uploading it again from this host's copy", "snapshot", id, "detail", verifyErr.Error())
+		if errors.As(verifyErr, &incomplete) && incomplete.Content {
+			// A chunk of it, or of what it builds on that this host
+			// could not repair, was read and found damaged. The manifest
+			// stays until the new upload replaces it in one write
+			// (writeManifest), and comes back if the new one turns out
+			// not whole: a read can be wrong, and nothing is taken back on
+			// a read's word.
+			replaces = existing.Attempt
+			break
+		}
 		if err := s.store.retract(ctx, id, existing.Attempt); err != nil {
 			return run.UploadResult{}, false, err
 		}
@@ -261,7 +341,7 @@ func (s *Service) upload(ctx context.Context, req run.UploadRequest, id string) 
 	if !ok {
 		return run.UploadResult{}, false, fmt.Errorf("snapshot %s is neither on this host nor in remote storage", id)
 	}
-	manifest := Manifest{ID: id, Purpose: req.Purpose, Run: req.Run, GUID: guid}
+	manifest := Manifest{ID: id, Purpose: req.Purpose, Run: req.Run, GUID: guid, replaces: replaces}
 
 	incremental := false
 	if req.Base != "" && req.Base != req.Ref {
@@ -297,7 +377,7 @@ func (s *Service) upload(ctx context.Context, req run.UploadRequest, id string) 
 		if errors.Is(err, ErrIncomplete) {
 			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 			defer cancel()
-			if retractErr := s.store.retract(cleanup, id, uploaded.Attempt); retractErr != nil {
+			if retractErr := s.store.takeBack(cleanup, uploaded); retractErr != nil {
 				s.log.Error("the manifest of an upload whose chain is not whole could not be taken back", "snapshot", id, "error", retractErr)
 			}
 			return run.UploadResult{}, true, err
@@ -385,7 +465,7 @@ func (s *Service) stream(ctx context.Context, manifest Manifest, key Key) (*Mani
 		cleanup, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 		defer cancelCleanup()
 		if uploaded.Attempt != "" {
-			_ = s.store.retract(cleanup, manifest.ID, uploaded.Attempt)
+			_ = s.store.takeBack(cleanup, uploaded)
 		}
 		return nil, fmt.Errorf("%w: %s: %w", ErrStream, manifest.ID, sendErr)
 	}
@@ -408,10 +488,24 @@ func (s *Service) ensureBase(ctx context.Context, base string) (string, error) {
 		return "", err
 	}
 	defer s.basing.unlock()
+	// Pinned before it is read, like every check: a collection that
+	// condemns the base after this read puts it back.
+	if err := s.store.Pin(ctx, base); err != nil {
+		return "", err
+	}
+	replaces := ""
 	existing, _, err := s.store.Manifest(ctx, base)
 	switch {
 	case err == nil:
 		checkErr := s.store.checkChunks(ctx, existing)
+		if _, damaged := s.store.badOf(existing); checkErr == nil && damaged {
+			// Every chunk there, one read and found damaged: uploaded
+			// again, and the new manifest replaces this one in one write
+			// (and comes back if the new one is not whole).
+			s.log.Error("the base image in remote storage has a damaged chunk; uploading it again", "base", base)
+			replaces = existing.Attempt
+			break
+		}
 		if checkErr == nil {
 			return guid, nil
 		}
@@ -430,12 +524,37 @@ func (s *Service) ensureBase(ctx context.Context, base string) (string, error) {
 		return "", err
 	}
 	start := time.Now()
-	uploaded, err := s.stream(ctx, Manifest{ID: base, Purpose: PurposeBase, GUID: guid}, key)
+	uploaded, err := s.stream(ctx, Manifest{ID: base, Purpose: PurposeBase, GUID: guid, replaces: replaces}, key)
 	if err != nil {
 		return "", err
 	}
 	s.log.Info("base image uploaded", "base", base, "storedBytes", uploaded.StoredBytes, "took", time.Since(start).String())
 	return guid, nil
+}
+
+// repair uploads a snapshot a read found damaged again from this host's
+// copy, keeping what its manifest says it is (purpose, run, key).
+// repaired is false when this host has no copy of that very snapshot.
+func (s *Service) repair(ctx context.Context, id string, depth int) (repaired bool, err error) {
+	manifest, key, err := s.store.Manifest(ctx, id)
+	if errors.Is(err, ErrNoSnapshot) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	guid, ok, err := s.snaps.Stat(ctx, id)
+	if err != nil || !ok || guid != manifest.GUID {
+		return false, err
+	}
+	if IsBaseID(id) {
+		if _, err := s.ensureBase(ctx, id); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	_, _, err = s.upload(ctx, run.UploadRequest{Run: manifest.Run, Ref: s.snaps.Ref(id), Key: key.Wrapped, Purpose: manifest.Purpose}, id, depth)
+	return err == nil, err
 }
 
 // Verify checks that the snapshot ref is whole in remote storage, with
@@ -806,4 +925,129 @@ func (s *Service) Pressure(ctx context.Context) (bool, error) {
 		s.log.Warn("unused base images not reclaimed", "error", err)
 	}
 	return short()
+}
+
+// contentCursor is where the scrub that reads stopped: the snapshot, the
+// upload attempt (a cursor is only good for the chunks of one), and the
+// next chunk.
+type contentCursor struct {
+	id, attempt string
+	next        int
+}
+
+// ScrubContent reads chunks and holds them to their manifests' SHA-256
+// (Store.CheckContent): the snapshots refs name and everything their
+// streams build on, each once per pass, at most budget bytes per call,
+// going on next time from where this call stopped. A base image many
+// runs share is read once a pass, not once per run.
+//
+// A damaged chunk is remembered by the store, which makes Verify report
+// every snapshot built on it not whole; Damaged names the refs whose
+// chain has one. A missing chunk or manifest is left to Verify, which
+// sees it without reading anything.
+func (s *Service) ScrubContent(ctx context.Context, refs []string, budget int64) (run.ContentScrub, error) {
+	var out run.ContentScrub
+	chains := map[string][]*Manifest{}
+	ids := map[string]bool{}
+	for _, ref := range refs {
+		id, err := s.id(ref)
+		if err != nil {
+			continue
+		}
+		for current, hops := id, 0; current != "" && hops <= maxChainWalk; hops++ {
+			manifest, _, err := s.store.Manifest(ctx, current)
+			if errors.Is(err, ErrNoSnapshot) {
+				break
+			}
+			if err != nil {
+				return out, err
+			}
+			chains[ref] = append(chains[ref], manifest)
+			ids[manifest.ID] = true
+			if !validID(manifest.Parent) {
+				break
+			}
+			current = manifest.Parent
+		}
+	}
+	order := make([]string, 0, len(ids))
+	for id := range ids {
+		order = append(order, id)
+	}
+	sort.Strings(order)
+
+	s.contentMu.Lock()
+	defer s.contentMu.Unlock()
+	if s.contentDone == nil {
+		s.contentDone = map[string]string{}
+	}
+	if len(s.contentDone) == 0 && s.contentAt.id == "" && len(order) > 1 {
+		start := rand.IntN(len(order))
+		if s.passStart != nil {
+			start = s.passStart(len(order)) % len(order)
+		}
+		order = append(order[start:], order[:start]...)
+	}
+	// The snapshot the last call stopped in goes first.
+	if s.contentAt.id != "" && ids[s.contentAt.id] {
+		for i, id := range order {
+			if id == s.contentAt.id {
+				order = append([]string{id}, append(order[:i:i], order[i+1:]...)...)
+				break
+			}
+		}
+	}
+	var failure error
+	for _, id := range order {
+		if _, done := s.contentDone[id]; done {
+			continue
+		}
+		if out.ReadBytes >= budget {
+			break
+		}
+		from, expect := 0, ""
+		if s.contentAt.id == id {
+			from, expect = s.contentAt.next, s.contentAt.attempt
+		}
+		next, attempt, read, done, err := s.store.CheckContent(ctx, id, from, budget-out.ReadBytes, expect)
+		out.ReadBytes += read
+		var incomplete *Incomplete
+		switch {
+		case errors.As(err, &incomplete), errors.Is(err, ErrNoSnapshot):
+			// Damaged (remembered by the store), missing, or gone: done
+			// with for this pass either way.
+			s.contentDone[id] = attempt
+			s.contentAt = contentCursor{}
+			continue
+		case err != nil:
+			failure = err
+		case done:
+			s.contentDone[id] = attempt
+			s.contentAt = contentCursor{}
+			out.Snapshots++
+			continue
+		default:
+			s.contentAt = contentCursor{id: id, attempt: attempt, next: next}
+		}
+		break
+	}
+	out.Complete = true
+	for id := range ids {
+		if _, done := s.contentDone[id]; !done {
+			out.Complete = false
+		}
+	}
+	if out.Complete {
+		s.contentDone = map[string]string{}
+		s.contentAt = contentCursor{}
+	}
+	for _, ref := range refs {
+		for _, manifest := range chains[ref] {
+			if _, damaged := s.store.badOf(manifest); damaged {
+				out.Damaged = append(out.Damaged, ref)
+				break
+			}
+		}
+	}
+	return out, failure
 }

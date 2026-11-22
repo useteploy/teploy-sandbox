@@ -206,10 +206,100 @@ func TestUploadsThatFailVerificationTheSameWayBackOff(t *testing.T) {
 	if n := round(17 * time.Minute); n == 0 {
 		t.Fatal("no retry once the doubled backoff had passed")
 	}
+	// A later stop of the same run is a different upload: the wait the
+	// earlier one earned does not hold it back (fix round, finding 6).
+	at(18 * time.Minute)
+	if _, err := a.manager.Resume(bg, created.ID, 0); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if _, err := a.manager.Stop(bg, created.ID); err != nil {
+		t.Fatalf("stop again: %v", err)
+	}
+	if n := round(19 * time.Minute); n == 0 {
+		t.Fatal("a later stop's upload was held back by the earlier stop's wait")
+	}
 	// The service mends: the next try after the wait makes it durable.
 	lying.Set(func(f *offhosttest.Faulty) { f.Listed, f.Headed = nil, nil })
-	round(40 * time.Minute)
+	round(60 * time.Minute)
 	if got := a.get(t, created.ID); got.Remote.State != run.RemoteDurable {
 		t.Fatalf("once the service reports sizes truly: %+v", *got.Remote)
+	}
+}
+
+// Fix round, finding 4: what the scrub that reads found survives a
+// restart. Before, the restarted daemon's upkeep found the snapshot
+// whole by sizes and called the run durable again, damaged chunk and
+// all, with no copy anywhere to repair it from.
+func TestDamageFoundBeforeARestartIsNotForgotten(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	drop := func(_ *offhost.Config, m *run.Manager) { m.LocalCache = run.LocalDrop }
+	a := newHost(t, bucket, "host-a", nil, reading(1<<20), drop)
+	created := a.startRun(t, payload(t, 500))
+	stopped := a.stop(t, created.ID)
+	rotChunk(t, a, stopped.Remote.Snapshot, 1)
+	if stats := a.manager.ScrubRemote(bg); stats.Damaged != 1 {
+		t.Fatalf("scrub: %+v", stats)
+	}
+	got := a.get(t, created.ID)
+	if got.Remote.Damage == nil || got.Remote.Damage.Snapshot != stopped.Remote.Snapshot || got.Remote.Damage.Chunk != 1 {
+		t.Fatalf("the damage is not in the run's remote state: %+v", *got.Remote)
+	}
+	restarted := newHost(t, bucket, "host-a", a, reading(1<<20), drop)
+	restarted.manager.Maintain(bg)
+	got = restarted.get(t, created.ID)
+	if got.Remote.State == run.RemoteDurable || got.Remote.Damage == nil {
+		t.Fatalf("after a restart the damaged run is %+v", *got.Remote)
+	}
+}
+
+// And with a copy, the restarted daemon repairs it rather than calling it
+// durable by sizes: the manifest names a new upload afterwards.
+func TestDamageFoundBeforeARestartIsRepairedFromTheCopy(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	a := newHost(t, bucket, "host-a", nil, reading(1<<20))
+	created := a.startRun(t, payload(t, 500))
+	stopped := a.stop(t, created.ID)
+	before, _, _ := a.store.Manifest(bg, stopped.Remote.Snapshot)
+	rotChunk(t, a, stopped.Remote.Snapshot, 1)
+	a.manager.ScrubRemote(bg)
+	restarted := newHost(t, bucket, "host-a", a, reading(1<<20))
+	restarted.manager.Maintain(bg)
+	if got := restarted.get(t, created.ID); got.Remote.State != run.RemoteDurable || got.Remote.Damage != nil {
+		t.Fatalf("after the restart and an upkeep: %+v", *got.Remote)
+	}
+	if after, _, _ := restarted.store.Manifest(bg, stopped.Remote.Snapshot); after.Attempt == before.Attempt {
+		t.Fatal("called durable without being uploaded again")
+	}
+}
+
+// Fix round, finding 8: the give-back after a failed resume called the
+// run durable on any answer that was not "not whole" — including no
+// answer at all. Only a check that passed says durable.
+func TestAGiveBackThatCannotCheckDoesNotSayDurable(t *testing.T) {
+	memory := offhosttest.NewMemory()
+	a := newHost(t, memory, "host-a", nil)
+	flaky := offhosttest.NewFaulty(memory)
+	b := newHostObjs(t, memory, flaky, "host-b", nil, nil)
+	created := a.startRun(t, payload(t, 400))
+	a.stop(t, created.ID)
+	b.sync(t)
+	flaky.Set(func(f *offhosttest.Faulty) {
+		f.GetErr = func(key string) error {
+			if strings.Contains(key, "/snap/") {
+				return &s3.Error{Status: 503, Code: "SlowDown"}
+			}
+			return nil
+		}
+	})
+	if _, err := b.manager.Resume(bg, created.ID, 0); err == nil {
+		t.Fatal("a resume with snapshots unreadable succeeded")
+	}
+	if got := b.get(t, created.ID); got.Remote.State == run.RemoteDurable {
+		t.Fatalf("given back as durable without a check: %+v", *got.Remote)
+	}
+	flaky.Set(func(f *offhosttest.Faulty) { f.GetErr = nil })
+	b.manager.Maintain(bg)
+	if got := b.get(t, created.ID); got.Remote.State != run.RemoteDurable {
+		t.Fatalf("once storage answers again: %+v", *got.Remote)
 	}
 }

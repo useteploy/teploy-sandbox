@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"sort"
 	"strings"
@@ -218,7 +219,13 @@ func (m *Manager) publishHeld(ctx context.Context, id string) error {
 	case errors.Is(err, ErrRemoteConflict):
 		setRemoteLocked(live, RemoteState{State: RemoteSuperseded, Local: local, Error: reason})
 	default:
-		setRemoteLocked(live, RemoteState{State: RemoteFailed, Local: local, Error: err.Error()})
+		damage := damageOf(err)
+		if damage == nil && live.Remote != nil && !errors.Is(err, ErrRemoteIncomplete) {
+			// Not a verdict (storage did not answer): what was known
+			// about the damage still holds.
+			damage = live.Remote.Damage
+		}
+		setRemoteLocked(live, RemoteState{State: RemoteFailed, Local: local, Error: err.Error(), Damage: damage})
 	}
 	m.mu.Unlock()
 	m.releaseImages(released)
@@ -308,25 +315,48 @@ func (m *Manager) advanceStopped(ctx context.Context, id string, generation uint
 // whose uploads keep failing verification the same way waits longer
 // between tries (backoffDue).
 func (m *Manager) publishPending(ctx context.Context) {
-	for _, current := range m.List() {
-		if current.State != StateStopped {
+	owed := map[string]string{}
+	m.mu.Lock()
+	for id, current := range m.runs {
+		if current.State == StateStopped && (current.Remote == nil || current.Remote.State == RemotePending || current.Remote.State == RemoteFailed) {
+			owed[id] = stopUploadKey(id, current.snapshot)
+		}
+	}
+	// A wait belongs to one stop's upload: a run destroyed, resumed or
+	// stopped again since has none.
+	live := map[string]bool{}
+	for _, key := range owed {
+		live[key] = true
+	}
+	for key := range m.backoff {
+		if strings.HasPrefix(key, "run:") && !live[key] {
+			delete(m.backoff, key)
+		}
+	}
+	m.mu.Unlock()
+	ids := make([]string, 0, len(owed))
+	for id := range owed {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		key := owed[id]
+		if !m.backoffDue(key) {
 			continue
 		}
-		if current.Remote != nil && current.Remote.State != RemotePending && current.Remote.State != RemoteFailed {
-			continue
-		}
-		if !m.backoffDue("run:" + current.ID) {
-			continue
-		}
-		_, release, err := m.beginStopped(current.ID)
+		_, release, err := m.beginStopped(id)
 		if err != nil {
 			continue
 		}
-		err = m.publishHeld(ctx, current.ID)
+		err = m.publishHeld(ctx, id)
 		release()
-		m.noteUploadOutcome("run:"+current.ID, err)
+		m.noteUploadOutcome(key, err)
 	}
 }
+
+// stopUploadKey names the upload of one stop for the backoff: the run and
+// the snapshot it is uploading.
+func stopUploadKey(id, snapshot string) string { return "run:" + id + "@" + snapshot }
 
 // Backoff of retried uploads. A service that reports sizes differently
 // from what was written (or that loses what was just written) fails
@@ -450,19 +480,19 @@ func (m *Manager) evictHeld(ctx context.Context, id string) bool {
 func (m *Manager) confirmDurable(ctx context.Context, id, ref string, generation uint64) bool {
 	if err := m.OffHost.Verify(ctx, ref); err != nil {
 		if errors.Is(err, ErrRemoteIncomplete) {
-			m.notDurable(id, ref, generation, generation, err.Error())
+			m.notDurable(id, ref, generation, generation, err.Error(), damageOf(err))
 		}
 		return false
 	}
 	latest, err := m.OffHost.Latest(ctx, id)
 	switch {
 	case errors.Is(err, ErrNotFound):
-		m.notDurable(id, ref, generation, 0, "the run's record is gone from remote storage")
+		m.notDurable(id, ref, generation, 0, "the run's record is gone from remote storage", nil)
 		return false
 	case err != nil:
 		return false
 	case latest.Generation < generation:
-		m.notDurable(id, ref, generation, latest.Generation, fmt.Sprintf("remote storage has generation %d of the run's record, and this daemon wrote %d", latest.Generation, generation))
+		m.notDurable(id, ref, generation, latest.Generation, fmt.Sprintf("remote storage has generation %d of the run's record, and this daemon wrote %d", latest.Generation, generation), nil)
 		return false
 	}
 	// A newer generation is another daemon's doing, which the sync sorts
@@ -475,7 +505,7 @@ func (m *Manager) confirmDurable(ctx context.Context, id, ref string, generation
 // published again at the next upkeep from the generation the record is
 // really at. Nothing is deleted. A run that changed since the check
 // began is left alone.
-func (m *Manager) notDurable(id, ref string, known, actual uint64, reason string) {
+func (m *Manager) notDurable(id, ref string, known, actual uint64, reason string, damage *RemoteDamage) {
 	m.mu.Lock()
 	live, ok := m.runs[id]
 	if !ok || live.State != StateStopped || live.snapshot != ref || live.remoteGen != known ||
@@ -485,7 +515,7 @@ func (m *Manager) notDurable(id, ref string, known, actual uint64, reason string
 	}
 	local := live.Remote.Local
 	live.remoteGen = actual
-	setRemoteLocked(live, RemoteState{State: RemoteFailed, Snapshot: live.Remote.Snapshot, Local: local, Error: reason})
+	setRemoteLocked(live, RemoteState{State: RemoteFailed, Snapshot: live.Remote.Snapshot, Local: local, Error: reason, Damage: damage})
 	m.mu.Unlock()
 	m.persist()
 	if local {
@@ -739,7 +769,7 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 	// republish: this daemon's copy is the run, and remote storage does
 	// not say so (any more). Nothing is deleted; the upkeep uploads and
 	// writes the record again from the generation the bucket is at.
-	republish := func(generation uint64, reason string) {
+	republish := func(generation uint64, reason string, damage *RemoteDamage) {
 		m.mu.Lock()
 		if live, ok := m.runs[id]; ok {
 			live.remoteGen, live.remoteHeld = generation, false
@@ -747,7 +777,7 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 			if live.Remote != nil {
 				name = live.Remote.Snapshot
 			}
-			setRemoteLocked(live, RemoteState{State: RemoteFailed, Snapshot: name, Local: hasLocal, Error: reason})
+			setRemoteLocked(live, RemoteState{State: RemoteFailed, Snapshot: name, Local: hasLocal, Error: reason, Damage: damage})
 		}
 		m.mu.Unlock()
 		m.persist()
@@ -755,7 +785,7 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 	}
 	switch {
 	case missing:
-		republish(0, "the run's record is gone from remote storage")
+		republish(0, "the run's record is gone from remote storage", nil)
 		return nil
 	case latest.State == RecordDestroyed:
 		if !follow {
@@ -770,7 +800,7 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		m.log.Info("run was destroyed in remote storage; dropped here", "id", id, "by", latest.Owner)
 		return ErrNotFound
 	case latest.Generation < view.remoteGen:
-		republish(latest.Generation, fmt.Sprintf("remote storage has generation %d of the run's record, and this daemon knows %d", latest.Generation, view.remoteGen))
+		republish(latest.Generation, fmt.Sprintf("remote storage has generation %d of the run's record, and this daemon knows %d", latest.Generation, view.remoteGen), nil)
 		return nil
 	case latest.State == RecordStopped && latest.Snapshot == view.snapshot && (latest.Mine || !durable):
 		// A stop of ours that was written and never acknowledged; or the
@@ -783,7 +813,7 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		// record is there; whether the snapshot is, is asked like
 		// anywhere else before the word "durable" is used.
 		if err := m.OffHost.Verify(ctx, view.snapshot); errors.Is(err, ErrRemoteIncomplete) {
-			republish(latest.Generation, err.Error())
+			republish(latest.Generation, err.Error(), damageOf(err))
 			return nil
 		} else if err != nil {
 			return fmt.Errorf("%w: %v", ErrRemoteUnavailable, err)
@@ -1044,14 +1074,21 @@ func (m *Manager) unclaimHeld(ctx context.Context, id string) {
 	// may have failed on exactly that no longer being so (a chunk gone):
 	// it is asked before it is said again.
 	state := RemoteState{State: RemoteDurable, Snapshot: name, Local: local}
-	if verifyErr := m.OffHost.Verify(attempt, snapshot); errors.Is(verifyErr, ErrRemoteIncomplete) {
-		state = RemoteState{State: RemoteFailed, Snapshot: name, Local: local, Error: verifyErr.Error()}
+	verifyErr := m.OffHost.Verify(attempt, snapshot)
+	switch {
+	case verifyErr != nil && !errors.Is(verifyErr, ErrRemoteIncomplete):
+		// Not asked, so not known: pending, and the upkeep publishes it
+		// (which verifies) when storage answers again.
+		state = RemoteState{State: RemotePending, Snapshot: name, Local: local, Error: verifyErr.Error()}
+		m.log.Warn("a run given back after a failed resume could not be checked in remote storage; it is not reported durable until it is", "id", id, "error", verifyErr)
+	case verifyErr != nil:
+		state = RemoteState{State: RemoteFailed, Snapshot: name, Local: local, Error: verifyErr.Error(), Damage: damageOf(verifyErr)}
 		if local {
 			m.log.Error("a stopped run reported durable is not whole in remote storage; it is no longer reported durable and is uploaded again from this host's copy", "id", id, "image", snapshot, "reason", verifyErr.Error())
 		} else {
 			m.log.Error("STOPPED RUN AT RISK: reported durable, not whole in remote storage, and this host has no copy; it is no longer reported durable", "id", id, "image", snapshot, "reason", verifyErr.Error())
 		}
-	} else {
+	default:
 		now := m.now()
 		state.DurableAt = &now
 	}
@@ -1399,11 +1436,17 @@ func (m *Manager) maintainStorage(ctx context.Context) {
 	}
 	m.mu.Lock()
 	gcDue := m.lastGC.IsZero() || !now.Before(m.lastGC.Add(gcInterval))
-	// Not at the first round of a daemon's life: every run it holds was
-	// verified when it was published, and a fleet that restarts together
-	// would otherwise list the bucket together.
-	if m.lastScrub.IsZero() {
-		m.lastScrub = now
+	// Not all at the first round of a daemon's life: a fleet that
+	// restarts together would list the bucket together. But not a whole
+	// interval later either: a daemon restarted more often than that
+	// would never scrub at all. The first scrub is due somewhere in the
+	// first interval, at random.
+	if m.lastScrub.IsZero() && scrubInterval > 0 {
+		jitter := m.scrubJitter
+		if jitter == nil {
+			jitter = func(d time.Duration) time.Duration { return rand.N(d) }
+		}
+		m.lastScrub = now.Add(-jitter(scrubInterval))
 	}
 	scrubDue := scrubInterval > 0 && !now.Before(m.lastScrub.Add(scrubInterval))
 	m.mu.Unlock()
@@ -1680,4 +1723,25 @@ func withoutRef(refs []string, ref string) []string {
 		return refs
 	}
 	return slices.DeleteFunc(slices.Clone(refs), func(candidate string) bool { return candidate == ref })
+}
+
+// rememberDamage hands remote storage, after a restart, the damaged
+// chunks the registry remembers (RemoteState.Damage): until a read finds
+// them whole or the snapshot is uploaded again, they keep the runs that
+// depend on them from being called durable, or losing their local copy.
+func (m *Manager) rememberDamage() {
+	if m.OffHost == nil {
+		return
+	}
+	var damages []RemoteDamage
+	m.mu.Lock()
+	for _, current := range m.runs {
+		if current.Remote != nil && current.Remote.Damage != nil {
+			damages = append(damages, *current.Remote.Damage)
+		}
+	}
+	m.mu.Unlock()
+	for _, damage := range damages {
+		m.OffHost.RememberDamage(damage)
+	}
 }

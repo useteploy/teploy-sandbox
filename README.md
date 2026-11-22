@@ -672,7 +672,7 @@ serve --driver vm --state-dir /var/lib/teploy-sandbox/state \
 | `--remote-chunk-mb`, `--remote-parallel` | 16, 4 | Object size and objects in flight; one transfer holds about (parallel + 1) chunks in memory, whatever the disk's size |
 | `--remote-transfers` | 4 | Uploads and restores at once, across all runs. The rest wait. With more than one, one is never taken by an upload, so a resume that has to fetch is not behind every upload in flight |
 | `--remote-max-chain` | 8 | Incremental uploads in a row before one is sent against the base image again (1 to 64: no daemon restores through a longer chain) |
-| `--remote-local` | `keep` | `keep` a durable snapshot's local copy for a fast resume here, or `drop` it at once. **`drop` is experimental**, and refused on a service without conditional writes (see "Garbage, and the two-phase delete") |
+| `--remote-local` | `keep` | `keep` a durable snapshot's local copy for a fast resume here. **`drop` (remove it at once) is refused for now**, on every service: see "Retention and garbage, and the two-phase delete" |
 | `--remote-pool-reserve` | 15 | Percent of the pool to keep free; below it, local copies of durable snapshots go, oldest stop first |
 | `--remote-sync-interval`, `--remote-gc-interval`, `--remote-gc-grace` | 1m, 1h, 24h | The grace is at least 1h |
 | `--remote-scrub-interval` | 6h | How often every stopped run this daemon reports durable is checked again in the bucket (0: never) |
@@ -802,9 +802,14 @@ never taken back first: a read can be wrong where a listing cannot), and
 the run is durable again; without one the run is `failed` and the log
 says it is at risk. A resume or a fetch that meets a damaged chunk does
 the same: the resume fails, the run stays stopped, and it is reported
-`failed` with the reason, not `durable`. What a daemon has read is its
-own knowledge, kept in memory: another daemon finds the damage by its
-own scrub or restore.
+`failed` with the reason, not `durable`. Which chunk is kept with the
+run in the registry file (`remote.damage`), so a restart does not
+forget it and call the run durable again by sizes; it goes when the
+snapshot is uploaded again or a read finds the chunk whole. Another
+daemon finds the damage by its own scrub or restore. Where the scrub's
+pass is is not kept: each pass begins at a random snapshot, and a
+daemon's first scrub is due at a random point in its first interval, so
+a daemon restarted often still scrubs everything in time.
 
 An upload that the upkeep retries and that fails the check after it the
 same way twice in a row (a service that reports sizes other than what
@@ -933,22 +938,37 @@ pinned before it was deleted, so the listing shows the pin. A listing
 that does not show the collection's own two writes is behind and decides
 nothing (the manifest goes back), and so does a collection that took
 more than half the grace between its last look at the bucket and its
-decision. A condemnation that another collection is deciding about keeps
-what it builds on; one left for longer than the grace (its collection
-died) is put back if it is whole, finished if its chunks are already in
-pieces. Pins and stray copies are deleted once watched for the grace.
+decision — asked again before each snapshot's chunks are deleted, by the
+monotonic and the wall clock both (a suspended machine's monotonic clock
+stands still; a wall clock that went back counts as the grace passed).
+A condemnation that another collection is deciding about keeps what it
+builds on, and is put back at once if a record or a staying manifest
+refers to it; one left for longer than the grace (its collection died)
+is put back if it is whole, finished if its chunks are already in
+pieces — but only if the copy is still the one that was watched, and
+only by a round that is itself younger than half the grace. A caller's
+delete of its own snapshot is the one delete that does not go through
+this: nothing is ever built on a caller's snapshot, and a restore from
+it in flight fails as a whole. Pins and stray copies are deleted once watched for the grace.
 On a service whose modification times cannot be read none of this
 garbage is collected, like chunks.
 
 Every daemon sharing a bucket must run a version with the two-phase
 delete: an older one neither pins nor condemns. It holds only on a
 service whose listings show every write that finished before they began
-(below). And `--remote-local drop` is accepted only on a service with
-conditional writes, where only one collection can condemn a snapshot at
-a time: without them, two collections that both condemn it may each
-decide differently, and a durable stop could then be deleted with no
-copy left anywhere. `drop` stays experimental until the live checks in
-`AUDIT_OPEN.md` have passed.
+(below), and only one collection can condemn a snapshot at a time only
+on a service with conditional writes.
+
+**`--remote-local drop` is refused**, on every service, and the daemon
+does not start with it. With `drop` the bucket is the only copy of a
+stopped run from the moment it is durable, so every window the
+two-phase delete leaves (listed in `AUDIT_OPEN.md`, 2026-11-21: a listing
+that hides a pin, a process paused for half a grace between two
+adjacent requests, two collectors without conditional writes, an older
+daemon on the bucket), every chunk the scrub has not read yet, and any
+loss by the provider would lose a run outright instead of leaving it
+repairable from this host's copy. It stays refused until the two-phase
+delete and the scrub that reads have run against the chosen service.
 
 Clocks, then: none decides who runs a run. A daemon's own clock times
 its grace and its retention; the service's modification times are
@@ -980,6 +1000,9 @@ still needed and for what, in `previousKeyNeeded` and
   stop, and until then a takeover of it needs the old master;
 - destroyed runs' records, until collection removes them (thirty graces,
   or `--stopped-retention` when that is longer);
+- manifests that were condemned, missing, or replaced while the pass
+  ran, and condemned copies under the old master (run it again once the
+  collection has decided: a copy can be put back as it is);
 - records that changed during the pass (run it again), and, on a service
   without conditional writes, stopped runs' records another daemon wrote
   or that `--remote-unfenced` lets another daemon change: those wait for

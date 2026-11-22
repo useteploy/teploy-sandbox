@@ -253,35 +253,16 @@ func TestRemoteOpenRefusals(t *testing.T) {
 // noSnapshots stands in for a driver's snapshots where none is reached.
 type noSnapshots struct{ offhost.Snapshots }
 
-// --remote-local drop (2026-11-21): accepted, and said to be
-// experimental, on a service with conditional writes, where the
-// two-phase delete holds; refused on one without, where two collections
-// can condemn one snapshot at once.
-func TestDropNeedsConditionalWrites(t *testing.T) {
-	ctx := context.Background()
-	keys, err := offhost.NewKeyring(bytes.Repeat([]byte{7}, offhost.KeySize))
-	if err != nil {
-		t.Fatal(err)
+// --remote-local drop (2026-11-21, fix round): refused, whatever the
+// service, until the two-phase delete and the scrub that reads have run
+// live.
+func TestDropIsRefused(t *testing.T) {
+	err := parseRemoteFlags(t, "--remote-local", "drop").validate()
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("drop: %v", err)
 	}
-	for _, conditional := range []bool{true, false} {
-		bucket := offhosttest.NewMemory()
-		bucket.Unconditional = !conditional
-		store := offhost.NewStore(bucket, "fleet", keys, quietLogger())
-		if err := store.Probe(ctx); err != nil {
-			t.Fatal(err)
-		}
-		var logged bytes.Buffer
-		log := slog.New(slog.NewTextHandler(&logged, nil))
-		err := checkLocalPolicy(run.LocalDrop, store, log)
-		switch {
-		case conditional && (err != nil || !strings.Contains(logged.String(), "experimental")):
-			t.Fatalf("drop on a service with conditional writes: %v (log %q)", err, logged.String())
-		case !conditional && (err == nil || !strings.Contains(err.Error(), "conditional writes")):
-			t.Fatalf("drop on a service without conditional writes: %v", err)
-		}
-		if err := checkLocalPolicy(run.LocalKeep, store, log); err != nil {
-			t.Fatalf("keep (conditional writes %t): %v", conditional, err)
-		}
+	if err := parseRemoteFlags(t, "--remote-local", "keep").validate(); err != nil {
+		t.Fatalf("keep: %v", err)
 	}
 }
 
@@ -323,8 +304,9 @@ func (s *tinyS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // And the rule is where a daemon starts: open refuses drop on a service
-// without conditional writes, before anything is uploaded.
-func TestOpenRefusesDropWithoutConditionalWrites(t *testing.T) {
+// with conditional writes and on one without, before anything is
+// uploaded.
+func TestOpenRefusesDrop(t *testing.T) {
 	raw := make([]byte, offhost.KeySize)
 	if _, err := rand.Read(raw); err != nil {
 		t.Fatal(err)
@@ -340,11 +322,8 @@ func TestOpenRefusesDropWithoutConditionalWrites(t *testing.T) {
 			"--remote-access-key", "a", "--remote-key-file", keyFile, "--remote-local", "drop")
 		service, err := flags.open(context.Background(), noSnapshots{}, t.TempDir(), time.Hour, quietLogger())
 		server.Close()
-		if conditional && (err != nil || service == nil) {
-			t.Fatalf("drop on a service with conditional writes: %v", err)
-		}
-		if !conditional && (err == nil || service != nil || !strings.Contains(err.Error(), "conditional writes")) {
-			t.Fatalf("drop on a service without conditional writes: %v", err)
+		if err == nil || service != nil || !strings.Contains(err.Error(), "refused") {
+			t.Fatalf("drop (conditional writes %t): %v", conditional, err)
 		}
 	}
 }

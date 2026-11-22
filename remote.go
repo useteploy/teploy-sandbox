@@ -70,7 +70,7 @@ func addRemoteFlags(flags *flag.FlagSet) *remoteFlags {
 		maxChain: flags.Int("remote-max-chain", int(envFloat("SBX_REMOTE_MAX_CHAIN", offhost.DefaultMaxChain)),
 			fmt.Sprintf("remote storage: how many incremental uploads may follow one another before a stop is uploaded against the base image again, which bounds what a restore has to fetch (1 to %d)", offhost.MaxChainLimit)),
 		local: flags.String("remote-local", envOr("SBX_REMOTE_LOCAL", run.LocalKeep),
-			"remote storage: what happens to a snapshot's local copy once it is durable: \"keep\" it for a fast resume on this host (dropped when the pool runs short), or \"drop\" it at once (experimental; only on a service with conditional writes)"),
+			"remote storage: what happens to a snapshot's local copy once it is durable: \"keep\" it for a fast resume on this host (dropped when the pool runs short). \"drop\" (remove it at once) is refused for now"),
 		reserve: flags.Int("remote-pool-reserve", int(envFloat("SBX_REMOTE_POOL_RESERVE", 15)),
 			"remote storage: the share of the pool, in percent, to keep free: below it, local copies of durable snapshots are dropped, oldest stop first (0 never drops for space)"),
 		gcInterval: flags.Duration("remote-gc-interval", envDuration("SBX_REMOTE_GC_INTERVAL", run.DefaultRemoteGCInterval),
@@ -234,25 +234,15 @@ func checkFleetIdentity(ctx context.Context, store *offhost.Store, stateDir stri
 // that the egress it costs is small next to a restore's.
 const DefaultScrubReadMB = 256
 
-// checkLocalPolicy decides whether --remote-local may be what it was
-// given, once the service has been probed. "drop" leaves the bucket as
-// the only copy of a stopped run the moment it is durable. That rests on
-// the two-phase delete (offhost.Collect) keeping a collection from
-// deleting what an upload has just checked, and the two-phase delete
-// rests on only one collection condemning a snapshot at a time, which
-// only a conditional write can decide. Without conditional writes
-// "drop" is refused; with them it is accepted, and said to be
-// experimental, until the live checks in AUDIT_OPEN.md have passed.
-func checkLocalPolicy(local string, store *offhost.Store, log *slog.Logger) error {
-	if local != run.LocalDrop {
-		return nil
-	}
-	if !store.Conditional() {
-		return errors.New("--remote-local drop needs a service with conditional writes (If-None-Match), and this one has none: two collections could then condemn the same snapshot at once, and a stop reported durable could be deleted with no other copy anywhere. Use --remote-local keep")
-	}
-	log.Warn("--remote-local drop is experimental: a durable stop's local copy is dropped at once, so a snapshot the bucket loses (a collection under an upload in a way the two-phase delete does not cover, bit rot the scrub has not read yet, a provider's loss) has no copy to be repaired from. See AUDIT_OPEN.md for what has not run live")
-	return nil
-}
+// dropRefused is why --remote-local drop is refused. With drop the bucket
+// is the only copy of a stopped run the moment it is durable, and what
+// keeps a collection from deleting it under an upload (the two-phase
+// delete) has not run against a real service or been through a review
+// of its fixes; the residual windows it documents (AUDIT_OPEN.md,
+// 2026-11-21) would each lose a run outright instead of leaving it
+// repairable from the local copy. Until those live checks pass, keep is
+// the only policy.
+const dropRefused = "--remote-local drop is refused for now: it leaves remote storage as the only copy of a stopped run, and the protections that would make that safe (the two-phase delete, the scrub that reads) have not run against a real service yet. Use --remote-local keep (the default); see AUDIT_OPEN.md, 2026-11-21"
 
 // validate checks the flags that are numbers and choices.
 func (f *remoteFlags) validate() error {
@@ -260,8 +250,11 @@ func (f *remoteFlags) validate() error {
 		*f.reserve < 0 || *f.reserve > 90 || *f.transfers < 1 || *f.transfers > 64 {
 		return fmt.Errorf("remote-chunk-mb must be 1 to 1024, remote-parallel 1 to 64, remote-max-chain 1 to %d (no daemon restores through a longer chain), remote-pool-reserve 0 to 90 and remote-transfers 1 to 64", offhost.MaxChainLimit)
 	}
-	if *f.local != run.LocalKeep && *f.local != run.LocalDrop {
-		return fmt.Errorf("remote-local must be %q or %q, got %q", run.LocalKeep, run.LocalDrop, *f.local)
+	if *f.local == run.LocalDrop {
+		return errors.New(dropRefused)
+	}
+	if *f.local != run.LocalKeep {
+		return fmt.Errorf("remote-local must be %q (%q is refused for now), got %q", run.LocalKeep, run.LocalDrop, *f.local)
 	}
 	if *f.scrubReadMB < 0 || *f.scrubReadMB > 1<<20 {
 		return errors.New("remote-scrub-read-mb must be 0 to 1048576")
@@ -376,9 +369,6 @@ func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, sta
 	}
 	if err := checkFleetIdentity(probeCtx, store, stateDir); err != nil {
 		return nil, fmt.Errorf("remote storage: %w", err)
-	}
-	if err := checkLocalPolicy(*f.local, store, log); err != nil {
-		return nil, err
 	}
 	if !store.Conditional() {
 		if *f.unfenced {

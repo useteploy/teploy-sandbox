@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/useteploy/teploy-sandbox/internal/s3"
@@ -123,6 +124,11 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 		stats.Records++
 	}
 
+	// Manifests, and condemned copies: a copy is a manifest that a
+	// collection may put back, as it is, at any moment; one under a
+	// previous master would bring that master back into use after this
+	// pass said it was no longer needed.
+	listed := map[string]bool{}
 	var ids []string
 	prefix := s.prefix + "snap/"
 	err = s.objects.Walk(ctx, prefix, func(object s3.Object) error {
@@ -130,7 +136,8 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 		if !ok {
 			return nil
 		}
-		if id, name, ok := strings.Cut(rest, "/"); ok && name == "manifest" && validID(id) {
+		if id, name, ok := strings.Cut(rest, "/"); ok && (name == "manifest" || name == condemnedName) && validID(id) && !listed[id] {
+			listed[id] = true
 			ids = append(ids, id)
 		}
 		return nil
@@ -138,6 +145,7 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 	if err != nil {
 		return stats, err
 	}
+	sort.Strings(ids)
 	for _, id := range ids {
 		// Pinned before it is read, as by an upload: a collection that
 		// condemns this snapshot after the read puts the manifest back
@@ -146,9 +154,33 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 		if err := s.Pin(ctx, id); err != nil {
 			return stats, fmt.Errorf("rotate: pin %s: %w", id, err)
 		}
+		// A condemned copy under a previous master: skipped, so that the
+		// pass says the previous master is still needed and to run again.
+		if copied, err := s.objects.Get(ctx, s.condemnedKey(id), maxSmallObject); err == nil {
+			_, key, err := s.keys.open("manifest", id, copied)
+			if err != nil {
+				return stats, fmt.Errorf("rotate: condemned copy of %s: %w", id, err)
+			}
+			if !s.keys.Current(key) {
+				s.log.Warn("a condemned snapshot's copy is under a previous master; run the rotation again once its collection has decided", "snapshot", id)
+				stats.ManifestsSkipped++
+				continue
+			}
+		} else if !errors.Is(err, s3.ErrNotFound) {
+			return stats, fmt.Errorf("rotate: condemned copy of %s: %w", id, err)
+		}
 		stored, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject)
 		if errors.Is(err, s3.ErrNotFound) {
-			continue // deleted since the listing
+			// Deleted, or condemned, since the listing. A condemned
+			// manifest may come back as it was: skipped, which keeps the
+			// previous master needed until a pass sees it settled.
+			if copied, err := s.objects.Get(ctx, s.condemnedKey(id), maxSmallObject); err == nil {
+				if _, key, err := s.keys.open("manifest", id, copied); err == nil && s.keys.Current(key) {
+					continue
+				}
+			}
+			stats.ManifestsSkipped++
+			continue
 		}
 		if err != nil {
 			return stats, fmt.Errorf("rotate: manifest of %s: %w", id, err)
@@ -201,6 +233,17 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 				return stats, fmt.Errorf("rotate: manifest of %s: %w", id, getErr)
 			}
 			s.log.Warn("a snapshot was deleted while its manifest was being rewritten; the manifest was taken back", "snapshot", id)
+			continue
+		}
+		// And is what stands what was written? A collection that put a
+		// condemned copy back after this write stands with the old
+		// wrapping.
+		if now, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject); err != nil || !bytes.Equal(now, sealed) {
+			if err != nil && !errors.Is(err, s3.ErrNotFound) {
+				return stats, fmt.Errorf("rotate: manifest of %s: %w", id, err)
+			}
+			s.log.Warn("a manifest was replaced or removed right after this pass rewrote it; run the rotation again", "snapshot", id)
+			stats.ManifestsSkipped++
 			continue
 		}
 		stats.Manifests++

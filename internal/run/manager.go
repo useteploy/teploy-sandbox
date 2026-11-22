@@ -333,6 +333,9 @@ type Manager struct {
 	// verification failure over and over (publishBackoff). Guarded by mu;
 	// not persisted.
 	backoff map[string]*uploadBackoff
+	// scrubJitter is how long before a daemon's start its last scrub
+	// counts as having been (random within the interval; tests set it).
+	scrubJitter func(time.Duration) time.Duration
 
 	// transfers bounds uploads and restores together; uploads bounds the
 	// uploads among them to one fewer, so that a restore always has a

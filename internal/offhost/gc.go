@@ -351,6 +351,9 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 		manifest *Manifest
 		// stale: this daemon has watched it stand for the grace.
 		stale bool
+		// modified is the copy's time as listed: it is acted on only if
+		// it is still that very copy.
+		modified time.Time
 	}
 	condemnations := map[string]*condemnation{}
 	var leftovers []string // condemned copies beside a manifest, aged
@@ -391,7 +394,7 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 			}
 			continue
 		}
-		condemnations[id] = &condemnation{raw: raw, manifest: manifest, stale: aged,
+		condemnations[id] = &condemnation{raw: raw, manifest: manifest, stale: aged, modified: modified,
 			summary: &summary{parent: manifest.Parent, purpose: manifest.Purpose, attempt: manifest.Attempt,
 				chunks: len(manifest.Chunks), stored: manifest.StoredBytes}}
 		stats.Condemned++
@@ -611,15 +614,45 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	// A condemnation another collection left behind (it crashed, or was
 	// stopped for longer than the grace): put back whatever may still be
 	// wanted, finish deleting what is already in pieces.
+	//
+	// And one another collection is deciding about right now, if
+	// something that stays builds on it (a record, or a manifest that is
+	// not due): it is put back at once, not a grace later.
 	var stale []string
 	for id, condemned := range condemnations {
-		if condemned.stale {
+		if condemned.stale || needed[id] {
 			stale = append(stale, id)
 		}
 	}
 	sort.Strings(stale)
 	for _, id := range stale {
 		condemned := condemnations[id]
+		if s.stalled(now, grace) {
+			// This round is old: what it saw of these copies may no longer
+			// be so. The next round looks again.
+			break
+		}
+		// Still the copy this round watched? A collection that has put
+		// it back and condemned it again since, or finished it, is not
+		// to be undone on an old view.
+		current, err := s.objects.Head(ctx, s.condemnedKey(id))
+		if errors.Is(err, s3.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return stats, fmt.Errorf("collect: condemned copy of %s: %w", id, err)
+		}
+		if !current.LastModified.Equal(condemned.modified) || current.Size != int64(len(condemned.raw)) {
+			continue
+		}
+		if !condemned.stale {
+			s.log.Warn("a snapshot being condemned is referred to; its manifest is put back", "snapshot", id)
+			if err := s.restoreCondemned(ctx, id, condemned.raw); err != nil {
+				return stats, err
+			}
+			stats.Restored++
+			continue
+		}
 		whole := s.checkChunks(ctx, condemned.manifest)
 		if whole != nil && !errors.Is(whole, ErrIncomplete) {
 			return stats, fmt.Errorf("collect: condemned snapshot %s: %w", id, whole)
@@ -683,12 +716,13 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 		delete(s.garbage, id+"/"+condemnedName)
 		stats.Markers++
 	}
-	for _, key := range doomedPins {
-		if err := s.objects.Delete(ctx, key); err != nil {
-			return stats, err
-		}
+	deleted, err := s.deleteKeys(ctx, doomedPins)
+	for _, key := range deleted {
 		delete(s.garbage, strings.TrimPrefix(key, snapPrefix))
-		stats.Markers++
+	}
+	stats.Markers += len(deleted)
+	if err != nil {
+		return stats, err
 	}
 	// Records one at a time and in order: see above.
 	for _, object := range doomedRecords {
@@ -718,6 +752,11 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 //     at the bucket (looked), every condemned manifest is put back: a pin
 //     is only certain to stand for the grace after it was written, and a
 //     collection that was stopped in between cannot tell what it missed.
+//     The same is asked again before each snapshot's chunks are deleted:
+//     the deletions themselves take time. "Passed" is by the monotonic
+//     clock or by the wall clock, whichever says more (a suspended
+//     machine's monotonic clock stands still), and a wall clock that went
+//     backwards counts as passed.
 //  4. Of the rest, the chunks the manifest named are deleted, and then
 //     the condemned copy: a collection that dies in between leaves a copy
 //     whose chunks are in pieces, which a later round finishes.
@@ -803,7 +842,7 @@ func (s *Store) condemn(ctx context.Context, due map[string]bool, manifests, cha
 			keep[id] = true
 		}
 	}
-	if grace > 0 && !s.now().Before(looked.Add(grace/2)) {
+	if s.stalled(looked, grace) {
 		s.log.Warn("a collection took more than half the grace between its last look and its decision; every snapshot it condemned is put back", "condemned", len(condemned))
 		for id := range condemned {
 			keep[id] = true
@@ -835,6 +874,21 @@ func (s *Store) condemn(ctx context.Context, due map[string]bool, manifests, cha
 		if !ok {
 			continue
 		}
+		if s.stalled(looked, grace) {
+			// The deletions so far took the round past half the grace: a
+			// pin written since the listing may already have been aged
+			// out by another collection, and another collection may have
+			// found this copy stale and put the manifest back for an
+			// upload to build on. What is left is put back, by the same
+			// rule as step 6, before each snapshot and not once.
+			s.log.Warn("a collection's deletions took it past half the grace; the snapshots it had not deleted yet are put back", "snapshot", id)
+			if err := s.restoreCondemned(ctx, id, raw); err != nil {
+				return err
+			}
+			delete(condemned, id)
+			stats.Restored++
+			continue
+		}
 		// From here a failure leaves the copy and chunks in pieces,
 		// which a later round finishes; it is not put back.
 		delete(condemned, id)
@@ -854,6 +908,23 @@ func (s *Store) condemn(ctx context.Context, due map[string]bool, manifests, cha
 	}
 	finished = true
 	return nil
+}
+
+// stalled reports whether half the grace or more has passed since since,
+// by either clock (see condemn, step 3). With no grace nothing stalls.
+func (s *Store) stalled(since time.Time, grace time.Duration) bool {
+	now := s.now()
+	return pastHalfGrace(now.Sub(since), now.Round(0).Sub(since.Round(0)), grace)
+}
+
+// pastHalfGrace decides on the time elapsed by the monotonic clock and by
+// the wall clock: either one at half the grace is enough, and a wall
+// clock that stepped backwards cannot be trusted to say it is not.
+func pastHalfGrace(monotonic, wall time.Duration, grace time.Duration) bool {
+	if grace <= 0 {
+		return false
+	}
+	return monotonic >= grace/2 || wall >= grace/2 || wall < 0
 }
 
 // restoreCondemned puts a condemned snapshot's manifest back and then

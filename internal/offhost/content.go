@@ -140,7 +140,7 @@ func (s *Store) CheckContent(ctx context.Context, id string, from int, budget in
 			if errors.Is(err, ErrCorrupt) {
 				bad, damaged := s.badOf(manifest)
 				if damaged {
-					return index, manifest.Attempt, read, false, &Incomplete{Snapshot: id, Broken: id, Attempt: manifest.Attempt, Content: true,
+					return index, manifest.Attempt, read, false, &Incomplete{Snapshot: id, Broken: id, Attempt: manifest.Attempt, Content: true, Chunk: bad.index,
 						Detail: fmt.Sprintf("chunk %d was read and is not the chunk that was uploaded (%s)", bad.index, bad.how)}
 				}
 				return index, manifest.Attempt, read, false, &Incomplete{Snapshot: id, Broken: id, Attempt: manifest.Attempt,

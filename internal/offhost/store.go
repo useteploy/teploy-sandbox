@@ -87,6 +87,15 @@ type Manifest struct {
 	StreamBytes  int64  `json:"streamBytes"`
 	StreamSHA256 string `json:"streamSha256"`
 	StoredBytes  int64  `json:"storedBytes"`
+
+	// replaces, set by the caller of Upload, is the upload attempt of a
+	// standing manifest this upload is to replace in one write (one a
+	// read found damaged); previous is that manifest as stored, kept by
+	// the upload that replaced it, so that a replacement found not whole
+	// puts it back instead of leaving no manifest at all. Neither is
+	// stored.
+	replaces string
+	previous []byte
 }
 
 // Chunk is one stored object of a stream.
@@ -126,6 +135,8 @@ type Incomplete struct {
 	// it back first: the verdict comes from a read, and a read can be
 	// wrong where a listing of what is gone cannot.
 	Content bool
+	// Chunk is the damaged chunk's index, when Content.
+	Chunk int
 }
 
 func (e *Incomplete) Error() string {
@@ -432,6 +443,11 @@ func (s *Store) checkChunks(ctx context.Context, manifest *Manifest) error {
 // one that condemned it before makes this read fail. What Verify
 // answers whole stays whole for whoever goes on to build on it.
 //
+// One delete does not look for pins: a caller's DeleteSnapshot of a
+// caller's own snapshot is single-phase. Nothing builds on a caller's
+// snapshot (it is never an upload's parent), and a restore from it that
+// is in flight fails as a whole when its chunks go.
+//
 // A snapshot a read found damaged (bit rot, see CheckContent and
 // Download) is not whole either, though every chunk is there with its
 // size: the *Incomplete then says Content.
@@ -461,7 +477,7 @@ func (s *Store) Verify(ctx context.Context, id string) (*Manifest, Key, error) {
 			return nil, Key{}, err
 		}
 		if bad, ok := s.badOf(manifest); ok {
-			return nil, Key{}, &Incomplete{Snapshot: id, Broken: manifest.ID, Attempt: manifest.Attempt, Content: true,
+			return nil, Key{}, &Incomplete{Snapshot: id, Broken: manifest.ID, Attempt: manifest.Attempt, Content: true, Chunk: bad.index,
 				Detail: fmt.Sprintf("chunk %d was read and is not the chunk that was uploaded (%s)", bad.index, bad.how)}
 		}
 		if first == nil {
@@ -493,6 +509,26 @@ func (s *Store) retract(ctx context.Context, id, attempt string) error {
 		return nil
 	}
 	return s.objects.Delete(ctx, s.manifestKey(id))
+}
+
+// takeBack undoes an upload's manifest that turned out not whole: the
+// manifest it replaced is put back if it replaced one, else it is
+// retracted. Either way only while what stands is still this upload's.
+func (s *Store) takeBack(ctx context.Context, manifest *Manifest) error {
+	if manifest.previous == nil {
+		return s.retract(ctx, manifest.ID, manifest.Attempt)
+	}
+	current, _, err := s.Manifest(ctx, manifest.ID)
+	if errors.Is(err, ErrNoSnapshot) {
+		return s.objects.Put(ctx, s.manifestKey(manifest.ID), manifest.previous, s3.PutOptions{IfAbsent: s.conditional, ContentType: "application/json"})
+	}
+	if err != nil {
+		return err
+	}
+	if current.Attempt != manifest.Attempt {
+		return nil
+	}
+	return s.objects.Put(ctx, s.manifestKey(manifest.ID), manifest.previous, s3.PutOptions{ContentType: "application/json"})
 }
 
 // HasSnapshot reports whether a complete snapshot of that ID is stored.
@@ -687,7 +723,7 @@ func (s *Store) Upload(ctx context.Context, manifest Manifest, key Key, stream i
 			// manifest must not stand: it would say the snapshot exists.
 			cleanup, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 			defer cancelCleanup()
-			if retractErr := s.retract(cleanup, manifest.ID, manifest.Attempt); retractErr != nil {
+			if retractErr := s.takeBack(cleanup, &manifest); retractErr != nil {
 				s.log.Error("the manifest of an upload that lost chunks could not be taken back; the snapshot is not restorable until it is uploaded again", "snapshot", manifest.ID, "error", retractErr)
 			}
 			s.log.Error("chunks of an upload were deleted while it ran: is a collector's clock wrong, or --remote-gc-grace shorter than an upload?", "snapshot", manifest.ID, "detail", err.Error())
@@ -701,6 +737,25 @@ func (s *Store) Upload(ctx context.Context, manifest Manifest, key Key, stream i
 // returns the manifest that stands: the one passed in, or another
 // upload's when that came first and is whole.
 func (s *Store) writeManifest(ctx, parent context.Context, manifest *Manifest, sealed []byte, named, discard *bool) (*Manifest, error) {
+	if manifest.replaces != "" {
+		// Replace the manifest that stands, if it is still the one to
+		// be replaced, in one unconditional write; keep what it was.
+		previous, err := s.objects.Get(ctx, s.manifestKey(manifest.ID), maxSmallObject)
+		if err != nil && !errors.Is(err, s3.ErrNotFound) {
+			return nil, fmt.Errorf("read the manifest of %s before replacing it: %w", manifest.ID, err)
+		}
+		if err == nil {
+			if standing, parseErr := s.parseManifest(manifest.ID, previous); parseErr == nil && standing.Attempt == manifest.replaces {
+				*named = true
+				if err := s.objects.Put(ctx, s.manifestKey(manifest.ID), sealed, s3.PutOptions{ContentType: "application/json"}); err != nil {
+					return nil, fmt.Errorf("replace the manifest of %s: %w", manifest.ID, err)
+				}
+				manifest.previous = previous
+				return manifest, nil
+			}
+		}
+		// Gone or changed since: written like any other upload's.
+	}
 	for try := 0; ; try++ {
 		*named = true
 		err := s.objects.Put(ctx, s.manifestKey(manifest.ID), sealed, s3.PutOptions{IfAbsent: s.conditional, ContentType: "application/json"})
@@ -854,6 +909,38 @@ func (s *Store) DeleteSnapshot(ctx context.Context, id string) error {
 	}
 	_, _, err := s.deleteUnder(ctx, s.snapshotPrefix(id))
 	return err
+}
+
+// deleteKeys deletes the objects named, a few at a time (pins: one
+// small object each, and a busy fleet has many), and reports which went
+// and the first failure after trying them all.
+func (s *Store) deleteKeys(ctx context.Context, keys []string) (deleted []string, err error) {
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		first error
+	)
+	limit := make(chan struct{}, 8)
+	for _, key := range keys {
+		wg.Add(1)
+		limit <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-limit }()
+			err := s.objects.Delete(ctx, key)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if first == nil {
+					first = err
+				}
+				return
+			}
+			deleted = append(deleted, key)
+		}()
+	}
+	wg.Wait()
+	return deleted, first
 }
 
 // deleteUnder deletes every object under prefix, a few at a time and as

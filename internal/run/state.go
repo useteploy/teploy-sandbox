@@ -175,6 +175,7 @@ func (m *Manager) LoadState(ctx context.Context, dir string) (int, error) {
 	if err := m.writeState(); err != nil {
 		return 0, fmt.Errorf("state file %s: %w", path, err)
 	}
+	m.rememberDamage()
 	return len(stopped), nil
 }
 

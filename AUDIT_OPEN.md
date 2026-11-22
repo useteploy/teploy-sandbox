@@ -2903,11 +2903,16 @@ anything that checks: pin, then read), C2 another daemon's collection.
 | 5 | C's listing in step 5 is behind (a replica as it was before step 2) and so also misses a pin U wrote just before | Nothing is concluded from it: the manifest goes back | `TestTwoPhaseAListingThatIsBehindDecidesNothing` (`Memory.Freeze`) |
 | 6 | C's listing shows C's own writes and not a pin written before them | **Not covered**: the chunks go under a verified upload. Excluded by the listing assumption | none (an assumption) |
 | 7 | C stalls between its second look and its decision for longer than half the grace; U's pin, watched for the grace by C2, is gone | Every condemned manifest goes back | `TestTwoPhaseACollectionThatStallsPutsBackWhatItCondemned` |
-| 8 | C stalls between step 6 and step 9 for longer than the grace; C2 finds the copy stale and puts the manifest back; U checks it; C deletes the chunks | **Not covered**: loss. Needs a whole grace (at least 1h) of pause between two adjacent requests of one process | none (residual) |
-| 9 | C2 decides the same snapshot due while C has condemned it | With conditional writes C2's step 2 is refused and it leaves the snapshot. **Without them** both can own it, one can see a pin the other does not, and the other deletes chunks under the restored manifest | `TestTwoPhaseOnlyOneCollectionCondemnsASnapshot`; without conditional writes: `drop` refused (`TestDropNeedsConditionalWrites`, `TestOpenRefusesDropWithoutConditionalWrites`) |
+| 8 | C's deletions (or a stall) carry it past half the grace while later condemned snapshots are still to go; C2 finds one of their copies stale and puts the manifest back; U builds on it | *Fix round:* the bound is asked again before each snapshot's chunks are deleted, and the rest are put back once past it. Left: a pause of half a grace or more between that check and the delete request right after it | `TestReviewDeletionLoopOutlivesTheGrace` (the reviewer's reproduction, two condemned snapshots in one round) |
+| 9 | C2 decides the same snapshot due while C has condemned it | With conditional writes C2's step 2 is refused and it leaves the snapshot. **Without them** both can own it, one can see a pin the other does not, and the other deletes chunks under the restored manifest | `TestTwoPhaseOnlyOneCollectionCondemnsASnapshot`; without conditional writes: open (`keep` repairs it; `drop` is refused everywhere: `TestDropIsRefused`, `TestOpenRefusesDrop`) |
 | 10 | C2's round meets C's undecided condemnation of a child | C2 keeps the child's chain (the base), which it would otherwise find due; C puts both back on a pin | `TestTwoPhaseASecondCollectionKeepsWhatACondemnedSnapshotBuildsOn` |
 | 11 | C2 meets a condemnation C left (C died) | Watched for the grace: put back if whole, finished if in pieces; before that, kept | `TestTwoPhaseACrashedCondemnationIsFinishedOrUndone` |
+| 11a | *Fix round.* C is alive after all: it has put the copy back and condemned it again since C2's listing | C2 acts only on the very copy it watched (HEAD: same time and size), so it leaves it | `TestAStaleTakeoverDoesNotUndoALiveCollection` |
+| 11b | *Fix round.* C2's own round is already half a grace old when it reaches the stale copies | It leaves them to the next round | `TestAnOldRoundLeavesStaleCopiesToTheNext` |
+| 11c | *Fix round.* C2 meets C's undecided condemnation of a snapshot a record (or a staying manifest) refers to | Put back at once, not a grace later | `TestACondemnedSnapshotThatIsReferredToIsPutBackAtOnce` |
+| 7a | *Fix round.* C's machine is suspended: its monotonic clock stands still while the wall clock moves on (or the wall clock steps back) | Either clock at half the grace, or a wall clock that went back, counts as stalled | `TestAStallIsMeasuredByEitherClock` |
 | 12 | A rotation pass reads and rewrites a manifest while C condemns it | The pass pins first: rows 1–4 apply to it as to an upload | `TestTwoPhaseARotationPassIsSeenByACondemnation` |
+| 12a | *Fix round.* The pass pins between C's delete and listing; or meets a condemned copy under the old master; or finds the manifest condemned between its listing and its read; or has its write replaced by C's put-back of the old bytes | The pass walks condemned copies too, and counts each of these as skipped, so it answers `previousKeyNeeded: true` ("run again") instead of letting the old master be retired while a manifest under it can still come back (which would stop every collection and `ensureBase` fleet-wide) | `TestTwoPhaseARotationInEveryOrder` (four orders) |
 | 13 | A re-upload of a snapshot that is not whole (U retracts the old manifest, writes a new one, pins, checks) entirely between C's steps 3 and 4 | **Not covered**: C deletes the fresh manifest and puts back the old one (not whole) on U's pin; what U built on it is lost. Four sequential requests of U inside one round trip of C, and only for a snapshot already not whole | none (residual) |
 | 14 | A daemon of an older version collects | A4's window as before 2026-11-21 | none (deployment rule, README) |
 
@@ -2926,7 +2931,7 @@ The rows of the 2026-11-20 table stand; these are added.
 | Chunks being deleted / copy deleted (9) | A copy, chunks in pieces | Once watched for the grace: the rest of the chunks, then the copy |
 | An error anywhere in 2–9 | — | Put back in the same process; what could not be is a stale copy for a later round |
 | Pin written / the upload's end, or the uploader dies | A pin | Protects the snapshot until watched for the grace, then deleted |
-| Scrub took "durable" back / repair uploaded | Run `failed` (persisted); the damage known only in memory | The next upkeep repairs from the local copy. After a restart before that, the damage is forgotten: the upkeep finds the snapshot whole by sizes and calls it durable again, until the next pass of the scrub that reads finds the chunk again |
+| Scrub took "durable" back / repair uploaded | Run `failed`, with the damaged chunk, in the registry file (`remote.damage`, fix round) | The next upkeep repairs from the local copy. After a restart the damage is handed back to remote storage (`RememberDamage`) before anything runs: the run is not called durable by sizes, nor its copy evicted, until the snapshot is uploaded again or a read finds the chunk whole |
 | Repair's chunks written / manifest replaced | The damaged manifest still stands; new chunks no manifest names | Retried by the upkeep; the new chunks are aged like any |
 | Backoff in force / restart | Nothing (memory only) | The next upkeep tries at once, and backs off again after two identical failures |
 
@@ -2992,7 +2997,26 @@ off (it costs nothing and must be retried at once when it is back); a
 failure that changes, or a success, ends the wait. Only the upkeep's own
 retries wait: a stop, a snapshot or a resume never does. Memory only.
 
-### `--remote-local drop`: allowed with conditional writes, experimental
+### `--remote-local drop`: refused (decision of the fix round)
+
+*[Superseded the same day. The first version of this branch accepted
+`drop` with conditional writes, as below. The independent review found
+that the two-phase delete as first built did not close the window by
+the argument it rests on (finding 1: the half-grace check was made once
+before an unbounded deletion loop), and the decision taken after it is:
+`drop` is refused on every service, and the daemon does not start with
+it (`remoteFlags.validate`, `dropRefused`). Why: with `drop` the bucket
+is the only copy the moment a stop is durable, so each residual of the
+table (rows 6, 8, 9 without conditional writes, 13, 14), each chunk the
+scrub has not read yet, and each loss by the provider loses a run
+outright where `keep` leaves it repairable; and none of the protocol has
+run against a real service or been through a review of its fixes. It
+stays refused until live items 12–16 have passed and a review of the
+fix round agrees. Tests: `TestDropIsRefused`, `TestOpenRefusesDrop`. The
+manager still implements the policy (the off-host fake tests set it
+directly), but nothing a daemon is started with reaches it.]*
+
+What the first version said:
 
 The 2026-11-20 recommendation was "`keep` until A4 has run live under
 collection load", because A4's result could only be repaired from the
@@ -3032,7 +3056,7 @@ failed, and passes with it in.
 | Replacing a damaged manifest; not taking it back first; repairing the chain; `ensureBase` seeing damage | `TestADamagedSnapshotIsRepairedFromALocalCopy` (one subtest each) |
 | The scrub that reads in `ScrubRemote` | `TestTheScrubThatReadsFindsBitRotAndTheCopyRepairsIt`, `TestTheScrubThatReadsWithoutACopySaysTheRunIsAtRisk` |
 | The backoff in `publishPending`; `ErrRemoteListing` among the backed-off | `TestUploadsThatFailVerificationTheSameWayBackOff`; `TestWhichUploadFailuresBackOff` covers what is and is not backed off |
-| `drop` refused without conditional writes, and where `open` calls it | `TestDropNeedsConditionalWrites`, `TestOpenRefusesDropWithoutConditionalWrites` |
+| `drop` refused (fix round: on every service), and where `open` meets it | `TestDropIsRefused`, `TestOpenRefusesDrop` |
 | The scrub answer's new fields | `TestRemoteScrubAnswersWhatItRead` |
 
 Also `TestRemoteFlagBounds` (the new flag). Existing tests changed, and
@@ -3057,8 +3081,9 @@ upload's pin is in it; and the "nothing deleted" check of
   (row 9). `keep` repairs that from the local copy at the next scrub, as
   before; `drop` is refused.
 - **What a daemon has read is not shared.** Damage one daemon found is
-  known to the others only through their own scrub or restore, and to
-  nobody after a restart (crash table). A marker in the bucket was not
+  known to the others only through their own scrub or restore.
+  *[Fix round: kept across a restart of the daemon that found it,
+  through the run's `remote.damage`.]* A marker in the bucket was not
   added: it would be unauthenticated, and a false one would make every
   daemon re-upload from its copies.
 - **Caller snapshots** are protected by the two-phase delete like
@@ -3111,3 +3136,46 @@ is set only when remote storage is. The Docker driver is untouched.
     backoff, and resume at once when it is fixed and the wait is over.
 17. **The extra requests**: pins per stop and per scrub, and what a
     collection costs with them, on a bucket with thousands of stops.
+
+### Fix round, after the first independent review (same day)
+
+A reviewer who wrote none of this went through the branch for data loss
+and recommended merging after fixes; their reproduction of finding 1 is
+adopted as a regression test (`TestReviewDeletionLoopOutlivesTheGrace`).
+Still **nothing here has run live**. Each fix has a test that failed
+with the fix taken out locally.
+
+| | Finding | Fix | Test (fails without the fix) |
+|---|---|---|---|
+| 1 | The half-grace check ran once, before a deletion loop of unbounded length. A round with several condemned snapshots deleted the first one's chunks long enough for another collection to find a later copy stale and put its manifest back, an upload to build on it and be reported durable, and then deleted that snapshot's chunks | The bound is asked before **each** snapshot's chunks are deleted; past it, the rest are put back. The stale side acts only on the very copy it watched (HEAD: same time and size) and only within half a grace of its own round's start | `TestReviewDeletionLoopOutlivesTheGrace`, `TestAStaleTakeoverDoesNotUndoALiveCollection`, `TestAnOldRoundLeavesStaleCopiesToTheNext` |
+| 2 | The stall guard used the monotonic clock only, which stands still while a machine is suspended | `stalled`/`pastHalfGrace`: monotonic or wall at half the grace, or a wall clock that went backwards, is a stall | `TestAStallIsMeasuredByEitherClock` |
+| 3 | Rotation listed only manifests: a condemned snapshot put back later came back under the old master while the pass answered `previousKeyNeeded: false`; retiring the old key then stops every collection (one record or manifest it cannot read stops a round) and `ensureBase` | The pass pins first, walks condemned copies too, and counts as skipped (so `previousKeyNeeded`, "run again"): a condemned copy under a previous master, a manifest missing after the pin unless a current-master copy stands for it, and a manifest that is not, when re-read after the write, the bytes the pass sealed | `TestTwoPhaseARotationInEveryOrder` (four orders) |
+| 4 | What the scrub that reads found, and where it was, lived in memory: after a restart a damaged run was durable again by sizes, and eviction could then drop the only whole local copy; a daemon restarted more often than the interval never scrubbed | The damaged chunk is kept with the run (`remote.damage` in the registry and on the wire) and handed back to the store at load (`RememberDamage`); it goes when the run is durable again. A pass begins at a random snapshot; the first scrub is due at a random point in the first interval | `TestDamageFoundBeforeARestartIsNotForgotten`, `TestDamageFoundBeforeARestartIsRepairedFromTheCopy`, `TestAScrubPassBeginsWhereItIsTold`, `TestAFreshDaemonScrubsWithinItsFirstInterval` |
+| 5 | A content verdict on a snapshot the chain builds on, with no copy of that one here, fell through to retracting the snapshot's own good manifest | For any content verdict the new upload replaces the manifest in one write (`Manifest.replaces`); a replacement found not whole puts the previous bytes back (`takeBack`) instead of retracting | `TestADamagedParentWithNoCopyHereReplacesNotRetracts` |
+| 6 | Backoff was keyed by run and never cleared: a later stop of the same run could wait up to 6h | Keyed by run and snapshot (`stopUploadKey`); waits for uploads no longer owed (runs destroyed, resumed, stopped again; snapshot notes gone) are dropped at each upkeep | `TestUploadsThatFailVerificationTheSameWayBackOff` (now with a second stop), `TestABackoffIsDroppedWithItsUpload` |
+| 7 | An undecided condemnation of a snapshot that something staying refers to waited a grace | Put back at once (same re-HEAD and round bound as the stale side) | `TestACondemnedSnapshotThatIsReferredToIsPutBackAtOnce` |
+| 8 | The give-back after a failed resume said durable on any answer that was not "not whole", including no answer | Durable only when the check passed; storage not answering leaves the run `pending` (the upkeep publishes, which verifies) | `TestAGiveBackThatCannotCheckDoesNotSayDurable` |
+| 9 | A caller's `DeleteSnapshot` ignores pins, against `Verify`'s comment | Documented, not changed: nothing builds on a caller's snapshot and a restore from it in flight fails as a whole (`Verify`'s comment, README) | none (documentation) |
+| 10 | Aged pins were deleted one request after another | `deleteKeys`, eight at a time | `TestAgedPinsAreDeletedConcurrently` |
+| — | `drop` | Refused on every service (see above) | `TestDropIsRefused`, `TestOpenRefusesDrop` |
+
+Reverts made for the proof: for 1, the per-snapshot bound, the re-HEAD
+and the round bound each off; 2, the wall-clock comparison; 3, the walk
+of condemned copies, "missing after the pin", and the re-read after the
+write, each off; 4, `rememberDamage` at load, the damage on `notDurable`,
+the pass's random start, and the scrub jitter; 5, replacing for any
+content verdict (only for the snapshot's own chunk, as before) and
+`takeBack` (retract instead); 6, keying by run alone, and each of the two
+prunes; 7, the immediate put-back; 8, durable on a check that did not
+answer; 10, one delete at a time; `drop`, the old accept-both rule.
+
+What the fix round changes in the rest of this entry: rows 7a, 8, 9,
+11a–c and 12a of the interleaving table; the scrub row of the crash
+table; and "What a daemon has read is not shared" below now holds only
+across daemons, not across a restart of one. New rows a review of the
+fix round should look at: the stale side's HEAD comparison trusts the
+service's modification time and size (a service that rewrites an object
+without changing either would defeat it); `pending` after a give-back
+that could not check is published by the upkeep, which writes the
+record once more as a new generation (state and snapshot unchanged)
+and verifies.

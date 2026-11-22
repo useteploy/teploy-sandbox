@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -84,6 +85,11 @@ func (m *Manager) retrySnapshotNotes(ctx context.Context) {
 			continue
 		}
 		due = append(due, *note)
+	}
+	for key := range m.backoff {
+		if ref, ok := strings.CutPrefix(key, "snapshot:"); ok && m.snapshotNotes[ref] == nil {
+			delete(m.backoff, key)
+		}
 	}
 	m.mu.Unlock()
 	due = slices.DeleteFunc(due, func(note snapshotNote) bool { return !m.backoffDue("snapshot:" + note.Ref) })

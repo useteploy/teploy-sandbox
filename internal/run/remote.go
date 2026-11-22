@@ -69,6 +69,40 @@ type RemoteState struct {
 	DurableAt   *time.Time `json:"durableAt,omitempty"`
 	// Error is why the last publish failed.
 	Error string `json:"error,omitempty"`
+	// Damage is the chunk a read found not to be the chunk that was
+	// uploaded, when that is why the run is not durable. It is kept in
+	// the registry so that a restart does not forget it: remote storage
+	// would otherwise find the snapshot whole by sizes and call the run
+	// durable again (and eviction could then drop the only whole copy).
+	Damage *RemoteDamage `json:"damage,omitempty"`
+}
+
+// RemoteDamage names one damaged chunk: the snapshot, the upload attempt
+// whose chunk it is, and its index.
+type RemoteDamage struct {
+	Snapshot string `json:"snapshot"`
+	Attempt  string `json:"attempt"`
+	Chunk    int    `json:"chunk"`
+}
+
+// DamageError is an error that says a snapshot is not whole because a
+// chunk was read and found damaged, and which one.
+type DamageError struct {
+	Damage RemoteDamage
+	Err    error
+}
+
+func (e *DamageError) Error() string { return e.Err.Error() }
+func (e *DamageError) Unwrap() error { return e.Err }
+
+// damageOf is the damaged chunk an error names, nil when it names none.
+func damageOf(err error) *RemoteDamage {
+	var damaged *DamageError
+	if errors.As(err, &damaged) {
+		d := damaged.Damage
+		return &d
+	}
+	return nil
 }
 
 var (
@@ -237,6 +271,10 @@ type OffHost interface {
 	// a read has found damaged (now or before): Verify reports those not
 	// whole from then on.
 	ScrubContent(ctx context.Context, refs []string, budget int64) (ContentScrub, error)
+	// RememberDamage tells remote storage again what a read found before
+	// this daemon restarted (RemoteState.Damage), until a read finds the
+	// chunk whole or the snapshot is uploaded again.
+	RememberDamage(damage RemoteDamage)
 }
 
 // ContentScrub is what one round of the scrub that reads found.

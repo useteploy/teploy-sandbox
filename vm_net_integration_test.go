@@ -508,11 +508,16 @@ func guestHasIPv6(t *testing.T, manager *run.Manager, id string) bool {
 func rawIPv6Closed(t *testing.T, manager *run.Manager, when, a, b string, nicA, nicB guestNIC, rules bool) {
 	t.Helper()
 	marker := fmt.Sprintf("teploy-raw-v6-%d", time.Now().UnixNano())
-	const seconds = 15
-	started := sh(t, manager, b, fmt.Sprintf(`rm -f /work/sniff.log; (setsid python3 /work/sniff.py %s %s %d /work/sniff.log >/dev/null 2>&1 &)
-for i in $(seq 50); do grep -q ready /work/sniff.log 2>/dev/null && break; sleep 0.1; done; cat /work/sniff.log`, nicB.dev, marker, seconds))
-	if !strings.Contains(started.stdout, "ready") {
-		t.Fatalf("%s: the capture in guest b did not start: %+v", when, started)
+	const seconds = 20
+	// A capture in guest b, and one in guest a, which must see a's own
+	// frames leave: that they were sent at all.
+	windowStart := time.Now()
+	for name, guest := range map[string]struct{ id, dev string }{"b": {b, nicB.dev}, "a": {a, nicA.dev}} {
+		started := sh(t, manager, guest.id, fmt.Sprintf(`rm -f /work/sniff.log; (setsid python3 /work/sniff.py %s %s %d /work/sniff.log >/dev/null 2>&1 &)
+for i in $(seq 50); do grep -q ready /work/sniff.log 2>/dev/null && break; sleep 0.1; done; cat /work/sniff.log`, guest.dev, marker, seconds))
+		if !strings.Contains(started.stdout, "ready") {
+			t.Fatalf("%s: the capture in guest %s did not start: %+v", when, name, started)
+		}
 	}
 	dir := t.TempDir()
 	script, hostLog := filepath.Join(dir, "sniff.py"), filepath.Join(dir, "host.log")
@@ -547,12 +552,24 @@ done`, nicA.dev, nicA.mac, nicB.mac, nicA.gatewayMAC, marker, rounds))
 	if sent.code != 0 {
 		t.Fatalf("%s: guest a could not send raw IPv6 frames: %+v", when, sent)
 	}
+	// Every frame inside every capture's window: the captures started
+	// after windowStart and each runs for its seconds.
+	if took := time.Since(windowStart); took > (seconds-2)*time.Second {
+		t.Fatalf("%s: guest a finished sending %s after the captures started, too close to their %d s: what came late would not be seen", when, took.Round(100*time.Millisecond), seconds)
+	}
 	if rules {
 		if dropped := ingressDrops(t, nicA.ns) - dropsBefore; dropped < rounds*perRound {
 			t.Fatalf("%s: the tap's ingress filter dropped %d frames, want at least the %d IPv6 frames guest a sent", when, dropped, rounds*perRound)
 		}
 	}
-	inB := sh(t, manager, b, fmt.Sprintf(`for i in $(seq %d); do grep -q seen /work/sniff.log && break; sleep 0.1; done; cat /work/sniff.log`, (seconds+10)*10))
+	waitLog := fmt.Sprintf(`for i in $(seq %d); do grep -q seen /work/sniff.log && break; sleep 0.1; done; cat /work/sniff.log`, (seconds+10)*10)
+	inB, inA := sh(t, manager, b, waitLog), sh(t, manager, a, waitLog)
+	var leftA, controlA int
+	if at := strings.Index(inA.stdout, "control"); at < 0 {
+		t.Fatalf("%s: the capture in guest a did not finish: %q", when, inA.stdout)
+	} else if _, err := fmt.Sscanf(inA.stdout[at:], "control %d seen %d", &controlA, &leftA); err != nil || leftA < rounds*perRound {
+		t.Fatalf("%s: control: guest a's capture saw %d of its %d frames leave (%q)", when, leftA, rounds*perRound, inA.stdout)
+	}
 	_ = capture.Wait()
 	onHost, _ := os.ReadFile(hostLog)
 	for where, log := range map[string]string{"in guest b": inB.stdout, "on the host's " + nicA.link: string(onHost)} {

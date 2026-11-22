@@ -77,6 +77,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/runs", s.auth(s.handleList))
 	mux.Handle("DELETE /v1/runs/{id}", s.auth(s.handleDestroy))
 	mux.Handle("POST /v1/runs/{id}/exec", s.auth(s.handleExec))
+	mux.Handle("GET /v1/runs/{id}/execs", s.auth(s.handleExecList))
+	mux.Handle("GET /v1/runs/{id}/execs/{execId}", s.auth(s.handleExecStatus))
+	mux.Handle("DELETE /v1/runs/{id}/execs/{execId}", s.auth(s.handleExecCancel))
+	mux.Handle("GET /v1/runs/{id}/execs/{execId}/output", s.auth(s.handleExecOutput))
 	mux.Handle("POST /v1/runs/{id}/snapshot", s.auth(s.handleSnapshot))
 	mux.Handle("POST /v1/runs/{id}/stop", s.auth(s.handleStop))
 	mux.Handle("POST /v1/runs/{id}/resume", s.auth(s.handleResume))
@@ -120,7 +124,7 @@ func (s *Server) writeProblem(w http.ResponseWriter, p Problem) {
 
 func (s *Server) writeError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, run.ErrNotFound):
+	case errors.Is(err, run.ErrNotFound), errors.Is(err, run.ErrExecNotFound):
 		s.writeProblem(w, problem(http.StatusNotFound, err.Error()))
 	case errors.Is(err, run.ErrBadRequest):
 		s.writeProblem(w, problem(http.StatusBadRequest, err.Error()))
@@ -220,9 +224,14 @@ func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 	s.writeRun(w, http.StatusCreated, forked)
 }
 
+// capacityDiskTimeout bounds the storage probe of GET /v1/capacity: a
+// wedged docker or zfs command leaves the field out rather than holding
+// the answer.
+const capacityDiskTimeout = 5 * time.Second
+
 // handleCapacity reports what the box has and what its runs are entitled
 // to — the numbers a scheduler placing runs across daemons needs.
-func (s *Server) handleCapacity(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	load := s.Manager.Capacity()
 	runtimeName := s.Runtime
 	if runtimeName == "" {
@@ -254,6 +263,12 @@ func (s *Server) handleCapacity(w http.ResponseWriter, _ *http.Request) {
 		// Only from a driver with a warm pool configured; "allocated"
 		// above already counts its machines.
 		body["warmPool"] = map[string]any{"sizes": load.WarmPool}
+	}
+	diskCtx, cancel := context.WithTimeout(r.Context(), capacityDiskTimeout)
+	defer cancel()
+	if disk := s.Manager.Disk(diskCtx); disk != nil {
+		// Only when the driver can say: absent means unknown, never empty.
+		body["disk"] = disk
 	}
 	s.writeJSON(w, http.StatusOK, body)
 }
@@ -382,7 +397,15 @@ type execRequest struct {
 	// every exec, required only while the run holds an active lease.
 	Owner      string `json:"owner,omitempty"`
 	Generation uint64 `json:"generation,omitempty"`
+	// Recoverable detaches the command from this request: it keeps
+	// running when the stream drops, and its status and output can be
+	// fetched by the ID in the X-Exec-Id response header (execlog.go).
+	// Without it an exec is exactly what it always was.
+	Recoverable bool `json:"recoverable,omitempty"`
 }
+
+// ExecIDHeader carries a recoverable exec's ID on the stream's response.
+const ExecIDHeader = "X-Exec-Id"
 
 // leaseRequest is the body of all three lease endpoints. Generation is
 // the fencing token returned by acquire; ttlSec is required on acquire
@@ -546,6 +569,12 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, problem(http.StatusInternalServerError, "Streaming unsupported."))
 		return
 	}
+	if req.Recoverable {
+		if err := s.Manager.AdmitRecoverable(timeout); err != nil {
+			s.writeError(w, err)
+			return
+		}
+	}
 
 	// The lease fence decides before the stream starts: a refused exec
 	// is a 409 problem, not an SSE stream that dies mid-flight. The
@@ -556,19 +585,128 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
+	var record *run.ExecRecord
+	if req.Recoverable {
+		if record, err = s.Manager.RecordExec(current.ID); err != nil {
+			session.Abandon()
+			s.writeError(w, err)
+			return
+		}
+		w.Header().Set(ExecIDHeader, record.ID())
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 
-	stream := &sseWriter{w: w, flusher: flusher, encoding: req.OutputEncoding}
-	exitCode, timedOut, execErr := session.Exec(r.Context(), req.Cmd, cwd, req.Env, timeout,
-		stream.channel("stdout"), stream.channel("stderr"))
-	if execErr != nil {
-		_, _ = stream.channel("stderr").Write([]byte("sandbox: " + execErr.Error()))
-		exitCode = -1
+	stream := &sseWriter{w: w, flusher: flusher, encoding: req.OutputEncoding, record: record}
+	if record == nil {
+		exitCode, timedOut, execErr := session.Exec(r.Context(), req.Cmd, cwd, req.Env, timeout,
+			stream.channel("stdout"), stream.channel("stderr"))
+		if execErr != nil {
+			_, _ = stream.channel("stderr").Write([]byte("sandbox: " + execErr.Error()))
+			exitCode = -1
+		}
+		stream.finishOutput()
+		stream.frame("exit", fmt.Sprintf(`{"exitCode":%d,"timedOut":%t}`, exitCode, timedOut))
+		return
 	}
-	stream.finishOutput()
-	stream.frame("exit", fmt.Sprintf(`{"exitCode":%d,"timedOut":%t}`, exitCode, timedOut))
+
+	// Recoverable: the command runs detached from the request, so a
+	// dropped stream neither kills it nor loses its outcome. It is still
+	// bounded by its timeout, and ends with its run. The headers go out
+	// now: a command that prints nothing for an hour must not keep its
+	// X-Exec-Id from the client that whole time.
+	flusher.Flush()
+	type outcome struct {
+		code     int
+		timedOut bool
+	}
+	done := make(chan outcome, 1)
+	execCtx := record.Context(context.WithoutCancel(r.Context()))
+	go func() {
+		exitCode, timedOut, execErr := session.Exec(execCtx, req.Cmd, cwd, req.Env, timeout,
+			stream.channel("stdout"), stream.channel("stderr"))
+		if execErr != nil {
+			// Into the record too, at the offset the stream shows it.
+			_, _ = stream.channel("stderr").Write([]byte("sandbox: " + execErr.Error()))
+			exitCode = -1
+		}
+		record.Finish(exitCode, timedOut, execErr)
+		done <- outcome{exitCode, timedOut}
+	}()
+	select {
+	case result := <-done:
+		stream.finishOutput()
+		stream.frame("exit", fmt.Sprintf(`{"exitCode":%d,"timedOut":%t}`, result.code, result.timedOut))
+	case <-r.Context().Done():
+		// Nothing may write to the response once the handler returns.
+		stream.detach()
+		record.Detach()
+	}
+}
+
+// execOutputDefaultLimit is how many bytes an output read returns when
+// the caller does not say.
+const execOutputDefaultLimit = 64 << 10
+
+func (s *Server) handleExecList(w http.ResponseWriter, r *http.Request) {
+	execs, err := s.Manager.ListExecs(r.PathValue("id"))
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"execs": execs})
+}
+
+// handleExecCancel ends a running recoverable exec: 202 with its status,
+// which turns "cancelled" once the command has ended.
+func (s *Server) handleExecCancel(w http.ResponseWriter, r *http.Request) {
+	status, err := s.Manager.CancelExec(r.PathValue("id"), r.PathValue("execId"))
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusAccepted, map[string]any{"exec": status})
+}
+
+func (s *Server) handleExecStatus(w http.ResponseWriter, r *http.Request) {
+	status, err := s.Manager.ExecStatus(r.PathValue("id"), r.PathValue("execId"))
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"exec": status})
+}
+
+// handleExecOutput reads a recoverable exec's output: ?since=<offset> to
+// continue from where a stream or an earlier read stopped, or without it
+// the last ?limit bytes.
+func (s *Server) handleExecOutput(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	var since *int64
+	if raw := query.Get("since"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			s.writeProblem(w, problem(http.StatusBadRequest, fmt.Sprintf("since must be a byte offset, got %q", raw)))
+			return
+		}
+		since = &parsed
+	}
+	limit := execOutputDefaultLimit
+	if raw := query.Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			s.writeProblem(w, problem(http.StatusBadRequest, fmt.Sprintf("limit must be a positive byte count, got %q", raw)))
+			return
+		}
+		limit = parsed
+	}
+	output, err := s.Manager.ExecOutput(r.PathValue("id"), r.PathValue("execId"), since, limit)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"execId": r.PathValue("execId"), "output": output})
 }
 
 func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
@@ -641,6 +779,19 @@ type sseWriter struct {
 	err      error
 	encoding string
 	pending  map[string][]byte
+	// record, on a recoverable exec, gets every byte first, in the order
+	// the stream sends them, so a client counting what it received
+	// (base64 mode) knows the offset to resume from. A failed or
+	// detached stream then no longer fails the command's writes.
+	record *run.ExecRecord
+	// detached: the handler has returned; nothing more is written.
+	detached bool
+}
+
+func (s *sseWriter) detach() {
+	s.mu.Lock()
+	s.detached = true
+	s.mu.Unlock()
 }
 
 func (s *sseWriter) frame(event, data string) {
@@ -649,7 +800,7 @@ func (s *sseWriter) frame(event, data string) {
 	s.frameLocked(event, data)
 }
 func (s *sseWriter) frameLocked(event, data string) {
-	if s.err != nil {
+	if s.err != nil || s.detached {
 		return
 	}
 	if _, err := fmt.Fprintf(s.w, "event: %s\n", event); err != nil {
@@ -673,6 +824,12 @@ func (s *sseWriter) channel(event string) io.Writer {
 	return writerFunc(func(p []byte) (int, error) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		if s.record != nil {
+			s.record.Write(event, p)
+			if s.err != nil || s.detached {
+				return len(p), nil
+			}
+		}
 		if s.err != nil {
 			return 0, s.err
 		}
@@ -696,7 +853,7 @@ func (s *sseWriter) channel(event string) io.Writer {
 				s.frameLocked(event, strings.ToValidUTF8(string(bytes[:end]), "�"))
 			}
 		}
-		if s.err != nil {
+		if s.err != nil && s.record == nil {
 			return 0, s.err
 		}
 		return len(p), nil
@@ -751,6 +908,7 @@ var (
 // in-flight execs finish, then reap every run.
 func Serve(ctx context.Context, addr string, s *Server, reapInterval time.Duration) error {
 	s.Manager.StartReaper(ctx, reapInterval)
+	s.Manager.StartUsageSampler(ctx)
 	httpServer := &http.Server{Addr: addr, Handler: s.Handler()}
 
 	errCh := make(chan error, 1)

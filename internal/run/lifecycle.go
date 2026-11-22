@@ -151,6 +151,8 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool, pu
 	if err != nil {
 		return nil, err
 	}
+	// The last look at the container's counters before they go with it.
+	m.sampleRun(context.WithoutCancel(ctx), id, current.ContainerID, current.usageGen, false, usageStopTimeout)
 	// Detached from the request: a caller that gives up once the capture
 	// exists must not abort the removal half way. A cancelled removal is
 	// reported as failed although the runtime may still carry it out, and
@@ -172,6 +174,7 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool, pu
 	retainUntil := now.Add(m.StoppedRetention)
 	live.State = StateStopped
 	live.ContainerID = ""
+	foldUsageLocked(live)
 	live.CacheDir = ""
 	live.CachePath = ""
 	// The lease dies with the container; leaseGen stays, so a credential
@@ -566,6 +569,7 @@ func (m *Manager) destroyStopped(ctx context.Context, current *Run) error {
 	m.mu.Lock()
 	delete(m.runs, current.ID)
 	m.mu.Unlock()
+	m.execLog.dropRun(current.ID)
 	m.releaseImages([]string{current.snapshot, current.base})
 	m.persist()
 	m.log.Info("stopped run deleted", "id", current.ID, "snapshot", current.snapshot)

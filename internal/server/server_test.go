@@ -31,7 +31,10 @@ type fakeRuntime struct {
 	removedImages []string
 	files         map[string][]byte
 	execFunc      func(cmd string, stdout, stderr io.Writer) (int, bool)
-	execEnvs      []map[string]string
+	// execCtxFunc, when set, is used instead of execFunc and sees the
+	// exec's context: what the real runtimes kill the command by.
+	execCtxFunc func(ctx context.Context, cmd string, stdout, stderr io.Writer) (int, bool)
+	execEnvs    []map[string]string
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -45,10 +48,14 @@ func (f *fakeRuntime) Create(_ context.Context, spec run.CreateSpec) (string, er
 	return "ctr-" + spec.Name, nil
 }
 
-func (f *fakeRuntime) Exec(_ context.Context, _ string, cmd, _ string, env map[string]string, _ time.Duration, stdout, stderr io.Writer) (int, bool, error) {
+func (f *fakeRuntime) Exec(ctx context.Context, _ string, cmd, _ string, env map[string]string, _ time.Duration, stdout, stderr io.Writer) (int, bool, error) {
 	f.mu.Lock()
 	f.execEnvs = append(f.execEnvs, env)
 	f.mu.Unlock()
+	if f.execCtxFunc != nil {
+		code, timedOut := f.execCtxFunc(ctx, cmd, stdout, stderr)
+		return code, timedOut, nil
+	}
 	if f.execFunc != nil {
 		code, timedOut := f.execFunc(cmd, stdout, stderr)
 		return code, timedOut, nil
@@ -269,6 +276,10 @@ func TestAuthRequiredOnEverythingButHealth(t *testing.T) {
 		{"GET", "/v1/runs"},
 		{"DELETE", "/v1/runs/x"},
 		{"POST", "/v1/runs/x/exec"},
+		{"GET", "/v1/runs/x/execs"},
+		{"GET", "/v1/runs/x/execs/y"},
+		{"DELETE", "/v1/runs/x/execs/y"},
+		{"GET", "/v1/runs/x/execs/y/output"},
 		{"POST", "/v1/runs/x/snapshot"},
 		{"POST", "/v1/runs/x/stop"},
 		{"POST", "/v1/runs/x/resume"},

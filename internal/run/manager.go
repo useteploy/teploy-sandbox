@@ -181,6 +181,16 @@ type Run struct {
 	// runningSince is when the current stretch began (zero while stopped).
 	runningFor   time.Duration
 	runningSince time.Time
+	// usageCarry is the run's usage outside its current container, and
+	// usageLive the latest sample of usageLiveFor, the current one
+	// (usage.go). Guarded by Manager.mu.
+	usageCarry   usageTotals
+	usageLive    UsageSample
+	usageLiveFor string
+	// usageGen counts the run's containers (bumped at every stop): a
+	// sample started under one is dropped if it lands under the next,
+	// which a VM's reused name would not tell apart.
+	usageGen uint64
 }
 
 // RunUsage is what a run has consumed so far.
@@ -188,6 +198,16 @@ type RunUsage struct {
 	// RunningSec is the total time spent in StateRunning, accumulated
 	// across stop/resume and including the current stretch.
 	RunningSec int64 `json:"runningSec"`
+	// The sampled observations (usage.go): only with sampling on
+	// (--usage-interval), and each only once the driver has read it.
+	// CPUSeconds, RxBytes and TxBytes only grow for the run's life on
+	// this daemon; DiskBytes is the latest level; SampledAt is when the
+	// last sample was taken.
+	CPUSeconds *float64   `json:"cpuSeconds,omitempty"`
+	RxBytes    *int64     `json:"rxBytes,omitempty"`
+	TxBytes    *int64     `json:"txBytes,omitempty"`
+	DiskBytes  *int64     `json:"diskBytes,omitempty"`
+	SampledAt  *time.Time `json:"sampledAt,omitempty"`
 }
 
 // WarmState is the warm-cache view of a run: which repo's volume it
@@ -280,6 +300,13 @@ type Manager struct {
 	// reports durable each scrub reads and holds to their SHA-256 (the
 	// scrub that reads, ScrubRemote); zero reads nothing.
 	RemoteScrubReadBytes int64
+	// RecoverableMaxTimeout is the longest timeout a recoverable exec may
+	// ask for (DefaultRecoverableMaxTimeout unless serve says otherwise).
+	RecoverableMaxTimeout time.Duration
+	// UsageInterval paces the per-run usage sampler (usage.go); zero
+	// samples nothing.
+	UsageInterval time.Duration
+	usageRounds   atomic.Uint64
 	// Transfers is how many uploads and restores run at once
 	// (DefaultTransfers when zero); with more than one, uploads take at
 	// most all but one of them. Set before the first one.
@@ -343,10 +370,13 @@ type Manager struct {
 	transferOnce sync.Once
 	transfers    chan struct{}
 	uploads      chan struct{}
+
+	// execLog holds the recoverable execs (execlog.go): memory only.
+	execLog *execRegistry
 }
 
 func NewManager(runtime Runtime, log *slog.Logger) *Manager {
-	return &Manager{
+	m := &Manager{
 		runtime: runtime,
 		log:     log,
 		now:     time.Now,
@@ -363,7 +393,11 @@ func NewManager(runtime Runtime, log *slog.Logger) *Manager {
 		SandboxUser:      DefaultSandboxUser,
 		StoppedRetention: DefaultStoppedRetention,
 		SnapshotRetry:    DefaultSnapshotRetry,
+
+		RecoverableMaxTimeout: DefaultRecoverableMaxTimeout,
 	}
+	m.execLog = newExecRegistry(func() time.Time { return m.now() })
+	return m
 }
 
 // SetClock overrides time for tests.
@@ -754,6 +788,11 @@ func (m *Manager) viewLocked(run *Run) *Run {
 		}
 	}
 	view.Usage = RunUsage{RunningSec: int64(running / time.Second)}
+	if m.UsageInterval > 0 {
+		// With sampling off the usage JSON is what it always was, even
+		// for a stopped run that carries totals from a life with it on.
+		usageViewLocked(run, &view.Usage)
+	}
 	return &view
 }
 
@@ -873,6 +912,9 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 		}
 		return err
 	}
+	// After the manager's lock, never under it: the registry's sweep
+	// asks the manager about runs, so the two locks are never nested.
+	m.execLog.dropRun(id)
 	m.releaseWarm(current)
 	if len(current.images) > 0 || current.base != "" {
 		// The container is gone, so the snapshots it was created from can
@@ -1260,13 +1302,7 @@ func (m *Manager) Reap(ctx context.Context) int {
 			// Not published here: an upload must not hold up the
 			// deadlines of the runs behind this one. The upkeep
 			// started below does it.
-			_, err := m.stopIf(ctx, current.ID, func(live *Run) bool { return !live.ExpiresAt.After(now) }, false)
-			switch {
-			case errors.Is(err, errNotDue), errors.Is(err, ErrStopped):
-				// Stopped (and perhaps resumed) by a caller meanwhile.
-			case err != nil:
-				m.log.Error("reap stop failed; retrying next tick", "id", current.ID, "error", err)
-			default:
+			if m.reapStop(ctx, current.ID, now) {
 				reaped++
 			}
 		default:
@@ -1289,11 +1325,37 @@ func (m *Manager) Reap(ctx context.Context) int {
 	if m.Cache != nil {
 		m.Cache.Sweep(ctx)
 	}
+	m.execLog.sweep(func(runID string) bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		_, ok := m.runs[runID]
+		return ok
+	})
 	if m.stateDirty.Load() {
 		m.persist()
 	}
 	m.kickMaintenance()
 	return reaped
+}
+
+// reapStop is the reaper's stop of a run past its deadline that asked to
+// be stopped there. The reaper works from a copy; whether the run is
+// still due is decided on the live record, both before its recoverable
+// execs are cancelled and again with the stop's admission, so a run a
+// caller stopped and resumed meanwhile (a new deadline) loses nothing.
+func (m *Manager) reapStop(ctx context.Context, id string, now time.Time) bool {
+	due := func(live *Run) bool { return live.State == StateRunning && !live.ExpiresAt.After(now) }
+	m.cancelExecsForStop(ctx, id, due, "the run reached its deadline and is being stopped")
+	_, err := m.stopIf(ctx, id, due, false)
+	switch {
+	case errors.Is(err, errNotDue), errors.Is(err, ErrStopped):
+		// Stopped (and perhaps resumed) by a caller meanwhile.
+		return false
+	case err != nil:
+		m.log.Error("reap stop failed; retrying next tick", "id", id, "error", err)
+		return false
+	}
+	return true
 }
 
 func (m *Manager) releaseWarm(run *Run) {
@@ -1338,6 +1400,7 @@ func (m *Manager) Shutdown(ctx context.Context) {
 			// Every run is stopped before any is uploaded: a stop that
 			// did not happen loses the run, an upload that did not is
 			// made up for at the next start.
+			m.cancelExecsForStop(ctx, run.ID, nil, "the daemon is shutting down and is stopping the run")
 			if _, err := m.stopIf(ctx, run.ID, nil, false); err != nil {
 				m.log.Error("shutdown stop failed; the run's state is lost with its container", "id", run.ID, "error", err)
 			}

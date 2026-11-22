@@ -243,7 +243,6 @@ func TestTwoPhaseARotationInEveryOrder(t *testing.T) {
 	})
 }
 
-
 // Finding 5: a damaged chunk in a snapshot the chain builds on, which
 // this host has no copy of, used to take back the snapshot's own (good)
 // manifest before uploading it again. Now the new upload replaces it in

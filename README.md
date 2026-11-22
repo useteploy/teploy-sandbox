@@ -374,6 +374,25 @@ The layers are independent; each is checked by the live suite.
   control socket and signal another run's process; with its own UID,
   plain file permissions already refuse all three. No account has to be
   created. The daemon stays root and reaches each VM's sockets as root.
+- **Its memory is never merged with anyone's (KSM).** Kernel samepage
+  merging shares equal pages between every process on the host that
+  asked for it, and how long a write to a shared page takes tells the
+  writer that someone else had the same page: a side channel between
+  tenants, and between a tenant and the host. The hypervisor is started
+  with `--memory ...,mergeable=off` (its default, said out loud). That
+  alone is not enough: `prctl(PR_SET_MEMORY_MERGE)` (Linux 6.4) makes
+  every mapping of a process mergeable and is inherited across `fork`
+  and `execve` (measured on 6.12), so a daemon started with it (a
+  systemd unit with `MemoryKSM=yes`, or a parent that set it) would hand
+  it to every hypervisor. The jail helper clears it before it executes
+  the hypervisor (a kernel older than 6.4, or without KSM, has no such
+  flag and answers `EINVAL`, which is taken as cleared), and the
+  daemon's seccomp filter (below) refuses `PR_SET_MEMORY_MERGE` and
+  `madvise(MADV_MERGEABLE)`, so a hypervisor that was taken over cannot
+  ask again. `TestJailClearsTheMemoryMergeFlag` (root-only unit test)
+  and `TestVMConfinement` (live: the daemon runs with the flag set and
+  no mapping of the hypervisor may show `mg` in `/proc/PID/smaps`)
+  check it.
 - **Its own disk node.** The hypervisor is not given the volume's node
   under `/dev/zvol` (udev resets that node's ownership on every change
   event, and it is shared with the host's tools). It gets a private
@@ -401,7 +420,9 @@ The layers are independent; each is checked by the live suite.
   kernel's older asynchronous I/O for the disk); the mount calls old
   and new, `pivot_root`, `chroot`; `ptrace`, `process_vm_readv/writev`,
   `pidfd_getfd`, `kcmp`; `keyctl`, `add_key`, `request_key`; `bpf`,
-  `perf_event_open`, `userfaultfd`, `memfd_secret`; modules, `kexec`,
+  `perf_event_open`, `userfaultfd`, `memfd_secret`; `prctl` with
+  `PR_SET_MEMORY_MERGE` and `madvise` with `MADV_MERGEABLE` (KSM, above;
+  every other `prctl` and `madvise` is allowed); modules, `kexec`,
   file handles, and the calls only an administrator uses (swap, reboot,
   clocks, quotas, host name). A call made through another
   architecture's table (32-bit on x86-64, x32) kills the process. A

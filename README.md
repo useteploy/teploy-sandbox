@@ -394,7 +394,12 @@ The layers are independent; each is checked by the live suite.
   disk is opened (measured: under 20 MiB/s a guest wrote at 19.6 and
   read at 20.2 MiB/s against 349 and 580 without; under 500 operations
   per second it made 494 and 505 against 3946 and 5383). The limits are the daemon's, for every run; a create cannot
-  change them. They are for a VM that is alive: I/O the kernel holds
+  change them. A VM boots under them raised to at least the defaults,
+  and has them from the moment its guest's agent first answers: what an
+  image reads to boot is not the run's doing (a fresh clone of Ubuntu's
+  x86-64 cloud image reads about 465 MB), and a limit set low must not
+  make a VM that cannot boot within the boot timeout. A boot can
+  therefore use up to the default rate for at most that long. They are for a VM that is alive: I/O the kernel holds
   back for the limit cannot be taken back, a killed process does not
   end while it has any, and the guest chooses how much it queues, so a
   VM that was killed keeps its limits for 3 seconds and then has them

@@ -309,6 +309,74 @@ func TestABootedVMIsHeldToTheRunsDiskLimits(t *testing.T) {
 	}
 }
 
+// A snapshot whose boots keep failing (its agent never starts: the
+// tenant's disk decides that) is not booted again back to back, so the
+// raised boot limits cannot be made into a rate by looping resumes or
+// forks. The golden image, another snapshot and a success are unaffected.
+func TestASnapshotWhoseBootsKeepFailingIsBackedOff(t *testing.T) {
+	rig := newRig(t, nil)
+	rig.driver.BootTimeout = 100 * time.Millisecond
+	source, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken, err := rig.manager.Snapshot(bg, source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := rig.manager.Snapshot(bg, source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	starts := func() int {
+		rig.hypervisor.mu.Lock()
+		defer rig.hypervisor.mu.Unlock()
+		return len(rig.hypervisor.started)
+	}
+	fail := func() { rig.hypervisor.bootErr = errors.New("connection refused") }
+	// One failure is not held against it: the next starts at once.
+	fail()
+	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: broken}); err == nil {
+		t.Fatal("a boot whose agent never answered succeeded")
+	}
+	fail()
+	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: broken}); err == nil || errors.Is(err, run.ErrAtCapacity) {
+		t.Fatalf("the second boot after one failure: %v, want it tried and failed", err)
+	}
+	// Two in a row: the next is refused without starting anything.
+	before := starts()
+	_, err = rig.manager.Create(bg, run.CreateRequest{Image: broken})
+	if !errors.Is(err, run.ErrAtCapacity) || !strings.Contains(err.Error(), "the next may start in") {
+		t.Fatalf("a third boot right after two failures: %v", err)
+	}
+	if starts() != before {
+		t.Fatal("a backed-off boot started a hypervisor")
+	}
+	// Others boot.
+	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: other}); err != nil {
+		t.Fatalf("another snapshot: %v", err)
+	}
+	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage}); err != nil {
+		t.Fatalf("the golden image: %v", err)
+	}
+	// The wait doubles, is bounded, and a success clears it.
+	now := time.Now()
+	rig.driver.noteBoot(broken, false, now)
+	if wait := rig.driver.bootWait(broken, now); wait != 2*bootBackoffBase {
+		t.Fatalf("wait after three failures: %s, want %s", wait, 2*bootBackoffBase)
+	}
+	for range 20 {
+		rig.driver.noteBoot(broken, false, now)
+	}
+	if wait := rig.driver.bootWait(broken, now); wait != bootBackoffMax {
+		t.Fatalf("wait after many failures: %s, want %s", wait, bootBackoffMax)
+	}
+	rig.driver.noteBoot(broken, true, now)
+	if wait := rig.driver.bootWait(broken, now); wait != 0 {
+		t.Fatalf("wait after a success: %s", wait)
+	}
+}
+
 func TestAFailedRollbackIsTrackedAndRetried(t *testing.T) {
 	rig := newRig(t, nil)
 	rig.driver.BootTimeout = 100 * time.Millisecond

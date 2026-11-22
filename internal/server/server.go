@@ -885,6 +885,7 @@ var (
 // in-flight execs finish, then reap every run.
 func Serve(ctx context.Context, addr string, s *Server, reapInterval time.Duration) error {
 	s.Manager.StartReaper(ctx, reapInterval)
+	s.Manager.StartUsageSampler(ctx)
 	httpServer := &http.Server{Addr: addr, Handler: s.Handler()}
 
 	errCh := make(chan error, 1)

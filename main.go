@@ -141,6 +141,8 @@ func serve(args []string) error {
 		"vm driver: host memory (MemAvailable, MiB) the warm pool leaves free beyond a new VM's limit before it boots one; 0 is none")
 	vmBootTimeout := flags.Duration("vm-boot-timeout", envDuration("SBX_VM_BOOT_TIMEOUT", vm.DefaultBootTimeout),
 		"vm driver: how long a new VM may take to answer")
+	usageInterval := flags.Duration("usage-interval", envDuration("SBX_USAGE_INTERVAL", 0),
+		"how often each running run's CPU, network and disk usage is sampled into its usage field; 0 (default) samples nothing")
 	remote := addRemoteFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -417,6 +419,10 @@ func serve(args []string) error {
 		manager.SandboxUser = ""
 	}
 	manager.StoppedRetention = retention
+	if *usageInterval < 0 {
+		return errors.New("usage-interval must not be negative")
+	}
+	manager.UsageInterval = *usageInterval
 	if pool != nil {
 		manager.Egress = pool
 	}

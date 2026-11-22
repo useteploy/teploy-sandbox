@@ -181,6 +181,12 @@ type Run struct {
 	// runningSince is when the current stretch began (zero while stopped).
 	runningFor   time.Duration
 	runningSince time.Time
+	// usageCarry is the run's usage outside its current container, and
+	// usageLive the latest sample of usageLiveFor, the current one
+	// (usage.go). Guarded by Manager.mu.
+	usageCarry   usageTotals
+	usageLive    UsageSample
+	usageLiveFor string
 }
 
 // RunUsage is what a run has consumed so far.
@@ -188,6 +194,16 @@ type RunUsage struct {
 	// RunningSec is the total time spent in StateRunning, accumulated
 	// across stop/resume and including the current stretch.
 	RunningSec int64 `json:"runningSec"`
+	// The sampled observations (usage.go): only with sampling on
+	// (--usage-interval), and each only once the driver has read it.
+	// CPUSeconds, RxBytes and TxBytes only grow for the run's life on
+	// this daemon; DiskBytes is the latest level; SampledAt is when the
+	// last sample was taken.
+	CPUSeconds *float64   `json:"cpuSeconds,omitempty"`
+	RxBytes    *int64     `json:"rxBytes,omitempty"`
+	TxBytes    *int64     `json:"txBytes,omitempty"`
+	DiskBytes  *int64     `json:"diskBytes,omitempty"`
+	SampledAt  *time.Time `json:"sampledAt,omitempty"`
 }
 
 // WarmState is the warm-cache view of a run: which repo's volume it
@@ -276,6 +292,9 @@ type Manager struct {
 	// RemoteScrubInterval paces the check that what this daemon reports
 	// durable still is (ScrubRemote); negative turns it off.
 	RemoteScrubInterval time.Duration
+	// UsageInterval paces the per-run usage sampler (usage.go); zero
+	// samples nothing.
+	UsageInterval time.Duration
 	// Transfers is how many uploads and restores run at once
 	// (DefaultTransfers when zero); with more than one, uploads take at
 	// most all but one of them. Set before the first one.
@@ -747,6 +766,7 @@ func (m *Manager) viewLocked(run *Run) *Run {
 		}
 	}
 	view.Usage = RunUsage{RunningSec: int64(running / time.Second)}
+	usageViewLocked(run, &view.Usage)
 	return &view
 }
 

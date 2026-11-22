@@ -394,12 +394,21 @@ The layers are independent; each is checked by the live suite.
   disk is opened (measured: under 20 MiB/s a guest wrote at 19.6 and
   read at 20.2 MiB/s against 349 and 580 without; under 500 operations
   per second it made 494 and 505 against 3946 and 5383). The limits are the daemon's, for every run; a create cannot
-  change them. A VM boots under them raised to at least the defaults,
-  and has them from the moment its guest's agent first answers: what an
+  change them. A VM's writes are held to them from the start; its reads
+  are raised to at least the defaults while it boots, because what an
   image reads to boot is not the run's doing (a fresh clone of Ubuntu's
-  x86-64 cloud image reads about 465 MB), and a limit set low must not
-  make a VM that cannot boot within the boot timeout. A boot can
-  therefore use up to the default rate for at most that long. They are for a VM that is alive: I/O the kernel holds
+  x86-64 cloud image reads about 465 MB, and writes about 2 MB) and a
+  limit set low must not make a VM that cannot boot within the boot
+  timeout. The raised reads end when the guest's agent first answers or
+  when the VM has read 1 GiB (`BootReadBudget`), whichever is first. On
+  a resume or a fork the guest is the tenant's disk, so when its agent
+  answers is the tenant's choice: what bounds the window then is the
+  1 GiB, and repeating it is held back, per snapshot, once two boots of
+  it in a row did not come up (the next waits 10 s, doubling up to
+  5 min). A tenant with many snapshots can still boot each once at the
+  raised read rate; a read limit below the defaults is a hard bound on
+  the whole host only together with `--vm-max-runs`, which bounds how
+  many such boots run at once. They are for a VM that is alive: I/O the kernel holds
   back for the limit cannot be taken back, a killed process does not
   end while it has any, and the guest chooses how much it queues, so a
   VM that was killed keeps its limits for 3 seconds and then has them

@@ -2839,8 +2839,18 @@ The point was correctness and confinement on real x86-64.
   namespace and the host's forward chain drop `meta nfproto != ipv4`;
   the namespace and the host's end of the link have IPv6 disabled by
   sysctl; the guest setup turns IPv6 off on the device and tolerates a
-  kernel without it. With the README's kernel the IPv6 part is untested
-  live on x86-64; it last ran on arm64 with a kernel that had IPv6.
+  kernel without it. As first written this left the host's IPv6 drop
+  untested on x86-64, on the wrong belief (in the test's comment) that a
+  guest without an IPv6 stack cannot send IPv6: it can, by hand, through
+  an AF_PACKET socket. The review of this branch caught it. Both tests
+  now have guest a send raw IPv6 frames (to b's MAC, to all nodes, and
+  through the gateway) whatever its kernel, and check with captures in
+  guest b and on the host's end of a's link (each of which must see its
+  own control frame leave) that none arrives, and, with rules in place,
+  that the tap's ingress dropped them all. `SBX_VM_REQUIRE_IPV6=1` turns
+  "not applicable" for the checks through the guest's own IPv6 stack into
+  a failure. Those checks (link-local addresses, `ping -6`) still need a
+  guest kernel with IPv6; they last ran on arm64.
 - **C. A low disk limit made a VM that could not boot.** The run's
   `io.max` was set before boot. A fresh clone of the runbook's x86-64
   golden read about 465 MB before its agent answered (cgroup `io.stat`;
@@ -2855,26 +2865,43 @@ The point was correctness and confinement on real x86-64.
   network), but which of these reads what was not measured.
   *Decided as product behaviour, not a test patch:* an operator who sets
   a low `--vm-disk-mbps`/`--vm-disk-iops` must not get VMs that cannot
-  boot, and cannot size a limit by an image's boot. A VM now boots under
-  its limits raised to at least the defaults (256 MiB/s and 16000 IOPS
-  each way; a higher limit, or none, is unchanged), and the run's own
-  limits are written as soon as its agent first answers, before a create
-  returns or the warm pool counts the VM as ready. A VM that is being
-  killed is never given them (its limits are only lifted then, see
-  `DrainGrace`). Under 2 MiB/s a create now takes 3.4 to 3.7 s, under
-  10 MiB/s 3.7 to 3.8 s; the rate checks of `TestVMLimits` pass after
-  boot as before. The pool-on failure ("the warm pool did not fill")
-  went with it.
-  *The trade-off, the noisy-neighbour one:* every boot (create, resume,
-  fork, pool refill) gets up to the default rate until its agent answers,
-  whatever the operator configured, for at most the boot timeout (2 min
-  by default). A resume or fork boots a tenant's own disk, and a tenant
-  that controls its image's boot can delay the agent and use that rate
-  for those two minutes, once per create; how many creates run at once
-  is bounded only by `--vm-max-runs`, when it is set. The alternative, no limit at all until the
-  agent answers, was rejected for that reason; the alternative of
-  keeping the run's limit for the boot was rejected because it makes a
-  low limit unusable.
+  boot, and cannot size a limit by an image's boot. A VM now boots with
+  its read limits raised to at least the defaults (256 MiB/s and 16000
+  IOPS; a higher limit, or none, is unchanged) and its write limits the
+  run's own from the start: a boot of that image wrote about 2 MB (and
+  discarded about 230 MB, which the kernel's throttle counts as 512
+  bytes an operation; 42 writes and 68 discards before the agent
+  answered), so its writes need nothing raised. The run's own read
+  limits are written as soon as its agent first answers, or as soon as
+  its cgroup has read `BootReadBudget` (1 GiB, about twice that image's
+  boot; checked every 200 ms, so a boot can overshoot by about 50 MB),
+  whichever is first, before a create returns or the warm pool counts
+  the VM as ready. A VM that is being killed is never given them (its
+  limits are only lifted then, see `DrainGrace`). Under 2 MiB/s a
+  create now takes 3.4 to 3.7 s, under 10 MiB/s 3.7 to 3.8 s; the rate
+  checks of `TestVMLimits` pass after boot as before. The pool-on
+  failure ("the warm pool did not fill") went with it.
+  *The trade-off, the noisy-neighbour one,* as first written was too
+  wide, and an independent review of this branch said so: every boot
+  got the default rate for reads and writes until its agent answered,
+  for up to the boot timeout, and on a resume or fork (a tenant's own
+  disk) when the agent answers is the tenant's choice, so a tenant
+  could loop boots of a snapshot whose agent never starts and get that
+  rate for two minutes at a time, back to back. Now:
+  - only reads are raised, and at most 1 GiB of them per boot;
+  - the boots of one snapshot that failed twice in a row are held back:
+    the next is refused as at capacity, without starting anything, for
+    10 s, doubling with each further failure up to 5 min, and one boot
+    that comes up clears it (`TestASnapshotWhoseBootsKeepFailingIsBackedOff`);
+  - what is left: a tenant with many snapshots (a running run can take
+    as many as it likes) can boot each of them once, or twice, at the
+    raised read rate, up to 1 GiB each. How many boots run at once is
+    bounded only by `--vm-max-runs` (by default unbounded), so a read
+    limit below the defaults is a hard bound for the host only with
+    `--vm-max-runs` set; per-tenant accounting would close it and needs
+    a tenant identity the driver does not have.
+  The alternative of keeping the run's limit for the boot was rejected
+  because it makes a low limit unusable.
 - **E. Runbook step 10 could not be met.** `-test.run TestVM` selects the
   three off-host tests, which skip without an S3 service, and the step
   said no `--- SKIP`. *Fixed (docs):* step 10 leaves them out with

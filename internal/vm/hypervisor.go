@@ -67,6 +67,10 @@ type Machine interface {
 	// Diagnostics is what the VM left behind for a human: the end of its
 	// serial console and of the hypervisor's own output.
 	Diagnostics() string
+	// Booted is called once the guest's agent has first answered: the
+	// VM boots under its boot disk limits and is held to the run's own
+	// from here on. An error means the VM must not be used.
+	Booted() error
 }
 
 // MachineExit is how a VM process ended: killed by Signal, or, when
@@ -412,7 +416,12 @@ func (m *chMachine) AddNet(ctx context.Context, tap *os.File, mac string) error 
 	return nil
 }
 
+func (m *chMachine) Booted() error { return m.cell.booted() }
+
 func (m *chMachine) Kill(ctx context.Context) error {
+	// First: a limit set after this would hold back what the kill is
+	// waiting for.
+	m.cell.killing()
 	m.killOnce.Do(func() { _ = m.process.Kill() })
 	// A killed process does not end while the kernel holds back I/O it
 	// queued under its disk limit, and how much that is was the guest's

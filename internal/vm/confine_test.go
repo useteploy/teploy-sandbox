@@ -872,11 +872,36 @@ func TestCgroupBoundsWhatAVMDoesToItsDisk(t *testing.T) {
 	c.disk = diskLimits{BytesPerSecond: 64 << 20, IOPS: 2000}
 	ctx := context.Background()
 	config := MachineConfig{Name: runName(1), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
-	if _, err := c.enter(ctx, config, filepath.Join(root, "run", config.Name)); err != nil {
+	// It boots under the defaults, a floor its own limits are below...
+	cell, err := c.enter(ctx, config, filepath.Join(root, "run", config.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cgroupFile(t, c.cgroups.path(config.Name), "io.max"); got != "230:16 rbps=268435456 wbps=268435456 riops=16000 wiops=16000" {
+		t.Fatalf("io.max of a VM that is booting: %q", got)
+	}
+	// ...and is held to its own once its agent answers.
+	if err := cell.booted(); err != nil {
 		t.Fatal(err)
 	}
 	if got := cgroupFile(t, c.cgroups.path(config.Name), "io.max"); got != "230:16 rbps=67108864 wbps=67108864 riops=2000 wiops=2000" {
-		t.Fatalf("io.max of the VM's group: %q", got)
+		t.Fatalf("io.max of the VM's group once booted: %q", got)
+	}
+	// A VM that is being killed only ever has its limits lifted: one
+	// set now would hold back what its kill waits for.
+	cell.killing()
+	if err := cell.booted(); err == nil {
+		t.Fatal("a VM that is being killed was given its run's limits")
+	}
+	if err := c.cgroups.unthrottle(config.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := cell.booted(); err == nil {
+		t.Fatal("a VM that is being killed was given its run's limits")
+	}
+	// (The kernel lists a device only while it has a limit.)
+	if got := cgroupFile(t, c.cgroups.path(config.Name), "io.max"); got != "" {
+		t.Fatalf("io.max of a VM that is being killed, once lifted: %q", got)
 	}
 	// A limit that cannot be set fails the VM, like the others.
 	c.disk = diskLimits{IOPS: 10}
@@ -889,6 +914,42 @@ func TestCgroupBoundsWhatAVMDoesToItsDisk(t *testing.T) {
 	other := MachineConfig{Name: runName(2), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
 	if _, err := c.enter(ctx, other, filepath.Join(root, "run", other.Name)); err == nil || !strings.Contains(err.Error(), "io.max") {
 		t.Fatalf("a VM was confined without its disk limit: %v", err)
+	}
+}
+
+// A boot is held to the defaults at least, whatever the run's limits:
+// a low limit does not make a VM that cannot boot. A higher limit, and
+// none, are the boot's too.
+func TestABootIsNotHeldBelowTheDefaultDiskLimits(t *testing.T) {
+	defaults := diskLimits{BytesPerSecond: DefaultDiskMBPerSecond << 20, IOPS: DefaultDiskIOPS}
+	for _, each := range []struct{ run, boot diskLimits }{
+		{diskLimits{BytesPerSecond: 2 << 20}, diskLimits{BytesPerSecond: defaults.BytesPerSecond}},
+		{diskLimits{IOPS: 20}, diskLimits{IOPS: defaults.IOPS}},
+		{diskLimits{BytesPerSecond: 2 << 20, IOPS: 20}, defaults},
+		{defaults, defaults},
+		{diskLimits{BytesPerSecond: 1 << 30, IOPS: 50000}, diskLimits{BytesPerSecond: 1 << 30, IOPS: 50000}},
+		{diskLimits{BytesPerSecond: 1 << 30, IOPS: 20}, diskLimits{BytesPerSecond: 1 << 30, IOPS: defaults.IOPS}},
+		{diskLimits{}, diskLimits{}},
+		{diskLimits{BytesPerSecond: -1, IOPS: -1}, diskLimits{}},
+	} {
+		if got := each.run.forBoot(); got != each.boot {
+			t.Errorf("boot limits of a VM with %+v: %+v, want %+v", each.run, got, each.boot)
+		}
+	}
+	// A VM whose limits are its boot limits is not written to again.
+	root := t.TempDir()
+	c, _, _ := newTestConfinement(t, root)
+	c.disk = defaults
+	config := MachineConfig{Name: runName(1), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
+	cell, err := c.enter(context.Background(), config, filepath.Join(root, "run", config.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(c.cgroups.path(config.Name), "io.max")); err != nil {
+		t.Fatal(err)
+	}
+	if err := cell.booted(); err != nil {
+		t.Fatalf("a VM already under its run's limits: %v", err)
 	}
 }
 

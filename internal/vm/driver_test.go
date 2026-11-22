@@ -254,6 +254,11 @@ func TestBootFailuresRollBackCompletely(t *testing.T) {
 		"hypervisor does not start": func(h *fakeHypervisor) { h.startErr = errors.New("exec format error") },
 		"agent never answers":       func(h *fakeHypervisor) { h.bootErr = errors.New("connection refused") },
 		"hypervisor exits":          func(h *fakeHypervisor) { h.dieOnBoot = true },
+		// The run's own disk limits, set once the agent answers, could
+		// not be: a VM still under its boot limits is not a run's.
+		"run's disk limits not set": func(h *fakeHypervisor) {
+			h.onStart = func(m *fakeMachine) { m.bootedErr = errors.New("set io.max: no such device") }
+		},
 	} {
 		rig := newRig(t, nil)
 		rig.driver.BootTimeout = 300 * time.Millisecond
@@ -269,13 +274,38 @@ func TestBootFailuresRollBackCompletely(t *testing.T) {
 		if name == "hypervisor exits" && time.Since(start) > 250*time.Millisecond {
 			t.Errorf("a dead hypervisor was waited on for the whole boot timeout (%s)", time.Since(start))
 		}
-		if name != "hypervisor does not start" && !strings.Contains(err.Error(), "fake serial log") {
+		if name == "run's disk limits not set" && !strings.Contains(err.Error(), "io.max") {
+			t.Errorf("%s: the error does not say what failed: %v", name, err)
+		}
+		if name != "hypervisor does not start" && name != "run's disk limits not set" && !strings.Contains(err.Error(), "fake serial log") {
 			t.Errorf("%s: the error carries no diagnostics: %v", name, err)
 		}
 		assertPool(t, rig.zfs, pristine...)
 		if len(rig.hypervisor.running()) != 0 || len(rig.manager.List()) != 0 {
 			t.Fatalf("%s: left running=%v runs=%d", name, rig.hypervisor.running(), len(rig.manager.List()))
 		}
+	}
+}
+
+// A VM boots under its boot disk limits and is held to the run's own
+// once its agent has answered, before the create returns: what a run
+// does is always under the run's limits, and what its image does to
+// boot is not (diskLimits.forBoot).
+func TestABootedVMIsHeldToTheRunsDiskLimits(t *testing.T) {
+	rig := newRig(t, nil)
+	created, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine := rig.hypervisor.machine(containerName(created.ID))
+	machine.mu.Lock()
+	booted, afterAgent := machine.booted, machine.pingedBeforeBooted
+	machine.mu.Unlock()
+	if !booted {
+		t.Fatal("a create returned without holding its VM to the run's disk limits")
+	}
+	if !afterAgent {
+		t.Fatal("the run's disk limits were set before the guest's agent answered: the boot ran under them")
 	}
 }
 

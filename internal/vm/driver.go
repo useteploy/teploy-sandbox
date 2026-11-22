@@ -462,6 +462,8 @@ func (d *Driver) boot(ctx context.Context, name, ref string, cpus, memoryMB int)
 	if err == nil {
 		if err = d.waitReady(ctx, machine); err != nil {
 			err = fmt.Errorf("vm %s did not come up: %w", name, err)
+		} else if err = machine.Booted(); err != nil {
+			err = fmt.Errorf("vm %s: the run's disk limits: %w", name, err)
 		}
 	}
 	if err == nil {

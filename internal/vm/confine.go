@@ -139,9 +139,15 @@ type cell struct {
 	// dir is the VM's runtime dir, disk its private device node.
 	dir, disk string
 
+	// device is the number of the VM's disk, as io.max names it.
+	device uint64
+
 	mu       sync.Mutex
 	cgroup   *os.File
 	released bool
+	// dying is set once the VM's process is being killed: from then on
+	// its disk limits are only ever lifted (see DrainGrace), never set.
+	dying bool
 }
 
 // jailRoot is the mount point of the VM's jail.
@@ -202,8 +208,11 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 	if err = c.sys.chown(current.disk, uid, uid); err != nil {
 		return nil, err
 	}
+	current.device = dev
+	// The VM boots under its boot limits and gets the run's own once its
+	// agent answers (booted).
 	limits := limitsFor(config)
-	limits.Disk, limits.DiskDevice = c.disk, dev
+	limits.Disk, limits.DiskDevice = c.disk.forBoot(), dev
 	group, err := c.cgroups.create(ctx, config.Name, limits)
 	if err != nil {
 		return nil, fmt.Errorf("cgroup: %w", err)
@@ -272,6 +281,29 @@ func (c *cell) drain(stop <-chan struct{}) {
 	case <-grace.C:
 		_ = c.owner.cgroups.unthrottle(c.name)
 	}
+}
+
+// booted is for a VM whose guest agent answered: from here on it is held
+// to the run's own disk limits instead of its boot limits (see
+// diskLimits.forBoot). It fails for a VM that is being killed, and
+// when the limit cannot be set; either way the VM is not a run's.
+func (c *cell) booted() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dying || c.released {
+		return errors.New("the VM is being removed")
+	}
+	if c.owner.disk.forBoot() == c.owner.disk {
+		return nil
+	}
+	return c.owner.cgroups.limitDisk(c.name, c.owner.disk.ioMax(c.device))
+}
+
+// killing marks the VM as being killed, before its process is.
+func (c *cell) killing() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dying = true
 }
 
 func (c *cell) started() {
@@ -466,6 +498,29 @@ const (
 type diskLimits struct {
 	BytesPerSecond int64
 	IOPS           int64
+}
+
+// forBoot is what a VM with the limits l may do to its disk until its
+// guest agent first answers: l, but never less than the defaults. A
+// boot reads what the image needs, which the run did not choose and an
+// operator cannot size a limit by: a fresh clone of the README's x86-64
+// image read about 500 MB before its agent answered, which is four
+// minutes at 2 MiB/s and longer than the driver waits for a boot. So a
+// limit set low does not make a VM that cannot boot. The boot is
+// bounded all the same: by the defaults, which are what the daemon
+// holds every VM to when it is told nothing, and in time by the boot
+// timeout. A limit above the defaults, and no limit, stay as they are.
+func (l diskLimits) forBoot() diskLimits {
+	floor := func(limit, floor int64) int64 {
+		if limit <= 0 {
+			return 0
+		}
+		return max(limit, floor)
+	}
+	return diskLimits{
+		BytesPerSecond: floor(l.BytesPerSecond, DefaultDiskMBPerSecond<<20),
+		IOPS:           floor(l.IOPS, DefaultDiskIOPS),
+	}
 }
 
 // ioMax is the line that sets the limits for one device in a cgroup's
@@ -721,6 +776,18 @@ func (c *cgroups) remove(ctx context.Context, name string) error {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+// limitDisk sets one line of a VM's group's io.max: the run's limits on
+// its disk, once it has booted.
+func (c *cgroups) limitDisk(name, line string) error {
+	if line == "" {
+		return nil
+	}
+	if err := c.fs.write(filepath.Join(c.path(name), "io.max"), line); err != nil {
+		return fmt.Errorf("set io.max: %w", err)
+	}
+	return nil
 }
 
 // unthrottle lifts the disk limits of a VM's group, for every device it

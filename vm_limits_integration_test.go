@@ -437,9 +437,9 @@ func waitForReadsToSettle(t *testing.T, group string, quiet, limit time.Duration
 // six minutes, and every destroy in that time failed. A killed VM keeps
 // its limit for vm.DrainGrace and no longer.
 //
-// The VM boots under the default limits and has the 2 MiB/s from the
+// The VM boots reading under the default limits and has the 2 MiB/s from the
 // moment its agent answers: a fresh clone of the x86-64 image reads about
-// 500 MB to boot, which under 2 MiB/s did not finish within the driver's
+// 465 MB to boot, which under 2 MiB/s did not finish within the driver's
 // two minutes.
 func TestVMDestroyIsNotHeldByQueuedIO(t *testing.T) {
 	if os.Getuid() != 0 {

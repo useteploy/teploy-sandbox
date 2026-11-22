@@ -459,7 +459,11 @@ func preflight(ctx context.Context, config Config, zfs ZFS, host host) error {
 	} else if err := reachable(host.stat, path, 0o005); err != nil {
 		miss("a hypervisor binary that an unprivileged VM process can run (--vm-hypervisor / SBX_VM_HYPERVISOR): %v", err)
 	}
-	if info, err := host.stat(config.Kernel); err != nil || !info.Mode().IsRegular() {
+	if !filepath.IsAbs(config.Kernel) || filepath.Clean(config.Kernel) != config.Kernel {
+		// The jail binds it by this path, and refuses one that is not
+		// absolute and clean: say so now rather than at every create.
+		miss("a guest kernel image named by an absolute, clean path (--vm-kernel / SBX_VM_KERNEL), not %q", config.Kernel)
+	} else if info, err := host.stat(config.Kernel); err != nil || !info.Mode().IsRegular() {
 		miss("the guest kernel image %q (--vm-kernel / SBX_VM_KERNEL)", config.Kernel)
 	} else if err := reachable(host.stat, config.Kernel, 0o004); err != nil {
 		miss("a guest kernel image that an unprivileged VM process can read (--vm-kernel / SBX_VM_KERNEL): %v", err)

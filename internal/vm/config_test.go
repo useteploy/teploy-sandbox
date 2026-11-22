@@ -250,6 +250,19 @@ func TestPreflightReportsEverythingAtOnce(t *testing.T) {
 	}
 }
 
+// A kernel path the jail would refuse fails the daemon's start, not
+// every create.
+func TestPreflightRefusesAKernelPathThatIsNotAbsoluteAndClean(t *testing.T) {
+	for _, path := range []string{"boot/Image", "./Image", "/var/lib/../lib/Image", "/boot//Image", "/boot/Image/"} {
+		config := goodConfig()
+		config.Kernel = path
+		err := preflight(context.Background(), config, newFakeZFS(), goodHost())
+		if err == nil || !strings.Contains(err.Error(), "absolute, clean path") {
+			t.Errorf("kernel %q: %v", path, err)
+		}
+	}
+}
+
 func TestPreflightAKernelThatIsADirectoryIsMissing(t *testing.T) {
 	h := goodHost()
 	h.stat = func(string) (os.FileInfo, error) { return fileInfo{mode: fs.ModeDir | 0o755}, nil }

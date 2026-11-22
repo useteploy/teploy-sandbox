@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -212,6 +213,13 @@ func jailAdd(root string, each jailPath) error {
 	}
 	info, err := os.Stat(source)
 	if err != nil {
+		// The error names the path in the jail (the caller's message),
+		// not the host's: what the helper prints reaches the VM's
+		// diagnostics, and where the host keeps the file is not theirs.
+		var pathErr *fs.PathError
+		if each.Source != "" && errors.As(err, &pathErr) {
+			return fmt.Errorf("the file bound at %s: %w", each.Path, pathErr.Err)
+		}
 		return err
 	}
 	switch isDevice := info.Mode()&os.ModeDevice != 0; {

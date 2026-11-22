@@ -465,3 +465,18 @@ func TestJailCostPerStart(t *testing.T) {
 	t.Logf("timing: a process started and reaped, median of %d: %s without a jail, %s with one; the jail adds %s per start",
 		rounds, before.Round(10*time.Microsecond), jailed.Round(10*time.Microsecond), (jailed - before).Round(10*time.Microsecond))
 }
+
+// A file bound from elsewhere that is not there is reported by its path
+// in the jail: the helper's output reaches the VM's diagnostics, and the
+// host's path is not for them.
+func TestJailNamesAMissingKernelByItsPathInTheJail(t *testing.T) {
+	root := t.TempDir()
+	host := filepath.Join(t.TempDir(), "var", "lib", "teploy-sandbox", "vm", "vmlinux-x86_64")
+	err := jailAdd(root, jailPath{Path: JailKernel, Source: host, Kind: jailFile})
+	if err == nil {
+		t.Fatal("a missing kernel was bound")
+	}
+	if strings.Contains(err.Error(), host) || strings.Contains(err.Error(), "/var/lib") || !strings.Contains(err.Error(), JailKernel) {
+		t.Fatalf("the error for a missing kernel: %q, want it to name %s and not the host's path", err, JailKernel)
+	}
+}

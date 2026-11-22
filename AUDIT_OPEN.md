@@ -2945,7 +2945,10 @@ The point was correctness and confinement on real x86-64.
   look (every 2 s) can fall inside the create's 1.5 s claim grace,
   before the death at claim pauses the pool, and then boots a refill.
   Not caused by this branch (the boot path only gained one call after
-  the agent answers); not fixed here. Likewise
+  the agent answers). It failed again in the root-only unit run on the
+  laptop in the review round, so the test now holds the pool's refill
+  off while the claim waits (a create that boots its own VM still fails
+  it). Likewise
   `TestReleaseKeepsTheUIDUntilTheCgroupIsEmpty` failed once in CI's
   `verify` job ("device or resource busy" on the retried release) and
   passed in `vm-root` and on the pull request's run: its fake cgroups

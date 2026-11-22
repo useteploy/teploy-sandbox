@@ -122,7 +122,9 @@ elif kind == "arp":
 const sniffPy = `import socket, sys, time
 dev, marker, seconds, log = sys.argv[1], sys.argv[2].encode(), float(sys.argv[3]), sys.argv[4]
 control = b"control-" + marker[::-1]
-r = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x86DD)); r.bind((dev, 0)); r.settimeout(0.2)
+# ETH_P_ALL, not 0x86DD: only a socket for every protocol sees what
+# leaves the device, which the control needs. IPv6 is picked out here.
+r = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)); r.bind((dev, 0)); r.settimeout(0.2)
 w = socket.socket(socket.AF_PACKET, socket.SOCK_RAW); w.bind((dev, 0))
 own = bytes.fromhex(open("/sys/class/net/%s/address" % dev).read().strip().replace(":", ""))
 with open(log, "w") as f: f.write("ready\n")
@@ -132,6 +134,7 @@ end = time.time() + seconds
 while time.time() < end:
     try: frame = r.recv(65535)
     except socket.timeout: continue
+    if frame[12:14] != b"\x86\xdd": continue
     if control in frame: controls += 1
     elif marker in frame: seen += 1
 with open(log, "a") as f: f.write("control %d seen %d\n" % (controls, seen))

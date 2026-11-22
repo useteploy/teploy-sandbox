@@ -31,7 +31,11 @@ import (
 // Every path keeps the name it has on the host, so the command line, the
 // hypervisor's own Landlock rules and the daemon's view of the VM's
 // sockets (the socket directory is the host's, bound in) are the same
-// inside and outside.
+// inside and outside. The one exception is the guest kernel: it is
+// bound at JailKernel whatever its path on the host, and the hypervisor
+// is told that path. Where an operator keeps it (under /var/lib by
+// default) says something about the host's layout, and a jail holds
+// nothing of that.
 
 // jailArg0 is the name the daemon's binary is started under to act as
 // the jail helper.
@@ -52,11 +56,19 @@ const (
 	jailSymlink = "symlink"
 )
 
+// JailKernel is where a VM's jail holds the guest kernel image, and so
+// the path the hypervisor is told to boot (and its Landlock rules
+// allow), whatever --vm-kernel names on the host.
+const JailKernel = "/kernel"
+
 // jailPath is one thing that exists in a jail.
 type jailPath struct {
-	// Path is where it is, on the host and in the jail alike.
+	// Path is where it is in the jail, and on the host unless Source
+	// says otherwise.
 	Path string `json:"path"`
-	Kind string `json:"kind"`
+	// Source is where a file is on the host when that is not Path.
+	Source string `json:"source,omitempty"`
+	Kind   string `json:"kind"`
 	// Write leaves the mount writable and Exec leaves it executable;
 	// without them it is read-only and noexec. All are nosuid, and all
 	// but a device are nodev.
@@ -104,6 +116,9 @@ func (s jailSpec) validate() error {
 		if !filepath.IsAbs(each.Path) || filepath.Clean(each.Path) != each.Path || each.Path == "/" {
 			return fmt.Errorf("%q is not a path a jail can hold", each.Path)
 		}
+		if each.Source != "" && (each.Kind != jailFile || !filepath.IsAbs(each.Source) || filepath.Clean(each.Source) != each.Source) {
+			return fmt.Errorf("%s: %q is not a file of the host a jail can hold", each.Path, each.Source)
+		}
 		switch each.Kind {
 		case jailFile, jailDir, jailDevice:
 		case jailSymlink:
@@ -140,14 +155,14 @@ const (
 )
 
 // jailFor is the jail of one VM: the hypervisor's binary (and what it is
-// linked against, if anything), the kernel image, the VM's own disk
+// linked against, if anything), the kernel image (at JailKernel), the VM's own disk
 // node, /dev/kvm and /dev/urandom, and the directory its two sockets are
 // made in. A tap is a descriptor and needs no path: the daemon hands it
 // over the VM's API socket once the VM runs (AddNet).
 func jailFor(root string, uid uint32, groups []uint32, bin, kernel, disk, dir string, libraries []jailPath) jailSpec {
 	paths := []jailPath{
 		{Path: bin, Kind: jailFile, Exec: true},
-		{Path: kernel, Kind: jailFile},
+		{Path: JailKernel, Source: kernel, Kind: jailFile},
 		{Path: disk, Kind: jailDevice},
 		{Path: kvmDevice, Kind: jailDevice},
 		{Path: rngDevice, Kind: jailDevice},

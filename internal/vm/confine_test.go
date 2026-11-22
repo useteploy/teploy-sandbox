@@ -540,7 +540,7 @@ func TestEnterGivesAVMItsOwnUserDeviceAndCgroup(t *testing.T) {
 	// its own runtime dir, and is mounted beside the runtime dirs.
 	wantJail := jailSpec{Root: dir + jailRootSuffix, UID: 70000, GID: 70000, Groups: []uint32{993}, Paths: []jailPath{
 		{Path: "/opt/ch", Kind: jailFile, Exec: true},
-		{Path: "/boot/Image", Kind: jailFile},
+		{Path: JailKernel, Source: "/boot/Image", Kind: jailFile},
 		{Path: node, Kind: jailDevice},
 		{Path: "/dev/kvm", Kind: jailDevice},
 		{Path: "/dev/urandom", Kind: jailDevice},

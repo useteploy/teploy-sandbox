@@ -300,6 +300,9 @@ The layers are independent; each is checked by the live suite.
   mounts an empty tmpfs, binds into it exactly seven things (the
   hypervisor binary, the kernel image, the VM's disk node, `/dev/kvm`,
   `/dev/urandom`, and the directory the VM's two sockets are made in),
+  each at its host path except the kernel, which is always at `/kernel`
+  (and the hypervisor is told that path) so that where the host keeps
+  it says nothing about the host's layout,
   makes that the root with `pivot_root`, detaches the old root so that
   no path, descriptor or working directory leads back to the host's
   tree, drops to the VM's UID and executes the hypervisor in its place.

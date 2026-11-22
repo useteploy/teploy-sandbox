@@ -135,7 +135,8 @@ type Hypervisor interface {
 type CloudHypervisor struct {
 	// Bin is the cloud-hypervisor binary.
 	Bin string
-	// Kernel is the uncompressed kernel image every VM direct-boots.
+	// Kernel is the uncompressed kernel image every VM direct-boots, on
+	// the host. Each VM's jail holds it at JailKernel.
 	Kernel string
 	// Cmdline is the kernel command line.
 	Cmdline string
@@ -198,7 +199,10 @@ func (h *CloudHypervisor) machineDir(name string) string { return filepath.Join(
 // the warm pool. One way for both, so that a run cannot tell which it got.
 func (h *CloudHypervisor) machineArgs(config MachineConfig, dir string, cid uint32) []string {
 	return []string{
-		"--kernel", h.Kernel,
+		// The kernel as the jail holds it, not as the host does (see
+		// JailKernel): the hypervisor opens it from inside, and its
+		// Landlock rules are made from this path.
+		"--kernel", JailKernel,
 		"--cmdline", h.Cmdline,
 		// image_type=raw is mandatory: without it the hypervisor probes the
 		// image format, and it refuses to guess for a writable disk.

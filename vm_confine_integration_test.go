@@ -628,7 +628,7 @@ func inspectJail(t *testing.T, config vm.Config, machine confinedVM, kvmGroup ui
 	want := map[string]string{
 		"/":            "ro,nosuid,nodev,noexec",
 		hypervisor:     "ro,nosuid,nodev",
-		config.Kernel:  "ro,nosuid,nodev,noexec",
+		vm.JailKernel:  "ro,nosuid,nodev,noexec",
 		machine.node:   "ro,nosuid,noexec",
 		"/dev/kvm":     "ro,nosuid,noexec",
 		"/dev/urandom": "ro,nosuid,noexec",
@@ -681,7 +681,12 @@ func inspectJail(t *testing.T, config vm.Config, machine confinedVM, kvmGroup ui
 
 	// --- from inside, as the VM's user
 	other := filepath.Join(filepath.Dir(machine.runDir), "teploy-sbx-someone-else")
+	// The kernel is at vm.JailKernel; where the host keeps it (under
+	// /var by default) is not in the jail.
 	stats := []string{"/proc", "/sys", "/etc", "/etc/passwd", "/run/dbus", "/run/systemd", "/var", "/home", "/root", "/tmp", "/dev/net/tun", "/dev/vhost-net", "/dev/vhost-vsock", "/dev/udmabuf", "/dev/zvol", filepath.Dir(machine.zvol), other}
+	if config.Kernel != vm.JailKernel {
+		stats = append(stats, config.Kernel)
+	}
 	runBlocks, runInodes := filesystemUse(t, filepath.Dir(machine.runDir))
 	view := viewJail(t, machine.pid, machine.uid, machine.uid, kvmGroup, stats, []string{machine.node, "/dev/kvm", "/dev/urandom"}, machine.runDir)
 	// --- the socket directory takes what its own filesystem has and no

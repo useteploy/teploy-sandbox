@@ -206,7 +206,11 @@ func jailAdd(root string, each jailPath) error {
 	if each.Kind == jailSymlink {
 		return os.Symlink(each.Target, target)
 	}
-	info, err := os.Stat(each.Path)
+	source := each.Path
+	if each.Source != "" {
+		source = each.Source
+	}
+	info, err := os.Stat(source)
 	if err != nil {
 		return err
 	}
@@ -231,7 +235,7 @@ func jailAdd(root string, each jailPath) error {
 	}
 	// Not recursive: what is mounted below a directory on the host does
 	// not come along.
-	if err := syscall.Mount(each.Path, target, "", syscall.MS_BIND, ""); err != nil {
+	if err := syscall.Mount(source, target, "", syscall.MS_BIND, ""); err != nil {
 		return fmt.Errorf("bind: %w", err)
 	}
 	// A bind mount takes its flags from where it came from; they are set

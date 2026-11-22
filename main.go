@@ -61,7 +61,7 @@ Usage:
                        [--cache-root /var/lib/teploy-sandbox/cache] [--cache-max-gb 20]
                        [--state-dir /var/lib/teploy-sandbox/state] [--stopped-retention 336h]
                        [--driver docker|vm]
-                       [--vm-hypervisor cloud-hypervisor] [--vm-kernel /var/lib/teploy-sandbox/vm/Image]
+                       [--vm-hypervisor cloud-hypervisor] [--vm-kernel /var/lib/teploy-sandbox/vm/vmlinux-x86_64 (arm64: .../Image)]
                        [--vm-pool sbx] [--vm-golden sbx/golden-guestd@v1] [--vm-run-dir /run/teploy-sandbox/vm]
                        [--vm-uid-base 1879048192] [--vm-cgroup /sys/fs/cgroup/teploy-sandbox-vm]
                        [--vm-dev-dir /dev/teploy-sandbox]
@@ -102,7 +102,7 @@ func serve(args []string) error {
 	vmHypervisor := flags.String("vm-hypervisor", envOr("SBX_VM_HYPERVISOR", vm.DefaultHypervisor),
 		"vm driver: the cloud-hypervisor binary (a path, or a name on PATH)")
 	vmKernel := flags.String("vm-kernel", envOr("SBX_VM_KERNEL", vm.DefaultKernel),
-		"vm driver: the uncompressed guest kernel image every run direct-boots")
+		"vm driver: the uncompressed guest kernel image every run direct-boots (default: vmlinux-x86_64 on x86-64, Image on arm64, in /var/lib/teploy-sandbox/vm)")
 	vmCmdline := flags.String("vm-cmdline", envOr("SBX_VM_CMDLINE", vm.DefaultCmdline()),
 		"vm driver: the guest kernel command line")
 	vmPool := flags.String("vm-pool", envOr("SBX_VM_POOL", vm.DefaultPool),

@@ -20,7 +20,6 @@ import (
 // scripts/build-golden.sh produces when told nothing else.
 const (
 	DefaultHypervisor = "cloud-hypervisor"
-	DefaultKernel     = "/var/lib/teploy-sandbox/vm/Image"
 	DefaultPool       = "sbx"
 	DefaultGolden     = DefaultPool + "/golden-guestd@v1"
 	DefaultRunDir     = "/run/teploy-sandbox/vm"
@@ -35,6 +34,21 @@ const (
 	// a filesystem that allows device nodes, which /run is not.
 	DefaultDevDir = "/dev/teploy-sandbox"
 )
+
+// DefaultKernel is where the daemon looks for the guest kernel unless
+// told otherwise: the name Cloud Hypervisor's own kernel builds publish
+// for the host's architecture.
+var DefaultKernel = defaultKernelFor(runtime.GOARCH)
+
+// defaultKernelFor is DefaultKernel on the architecture goarch. x86-64
+// boots an ELF vmlinux, which the kernel builds call vmlinux-x86_64;
+// arm64 boots the Image of its build tree.
+func defaultKernelFor(goarch string) string {
+	if goarch == "amd64" {
+		return "/var/lib/teploy-sandbox/vm/vmlinux-x86_64"
+	}
+	return "/var/lib/teploy-sandbox/vm/Image"
+}
 
 // Config is everything the VM driver needs from the host.
 type Config struct {

@@ -103,9 +103,38 @@ if kind == "udp":
     ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 1, 0, 64, 17, 0, socket.inet_aton(sip), socket.inet_aton(dip))
     ip = ip[:10] + struct.pack("!H", csum(ip)) + ip[12:]
     s.send(mac(dmac) + mac(smac) + b"\x08\x00" + ip + udp)
+elif kind == "udp6":
+    smac, dmac, sip, dip, dport, payload = sys.argv[3:9]
+    data = payload.encode()
+    src, dst = socket.inet_pton(socket.AF_INET6, sip), socket.inet_pton(socket.AF_INET6, dip)
+    udp = struct.pack("!HHHH", 40000, int(dport), 8 + len(data), 0) + data
+    udp = udp[:6] + struct.pack("!H", csum(src + dst + struct.pack("!I3xB", len(udp), 17) + udp) or 0xffff) + udp[8:]
+    s.send(mac(dmac) + mac(smac) + b"\x86\xdd" + struct.pack("!IHBB", 0x60000000, len(udp), 17, 255) + src + dst + udp)
 elif kind == "arp":
     smac, dmac, op, sha, spa, tha, tpa = sys.argv[3:10]
     s.send(mac(dmac) + mac(smac) + b"\x08\x06" + struct.pack("!HHBBH", 1, 0x0800, 6, 4, int(op)) + mac(sha) + socket.inet_aton(spa) + mac(tha) + socket.inet_aton(tpa))
+`
+
+// sniffPy counts the IPv6 frames (ethertype 0x86DD) that carry a marker
+// on one device, with an AF_PACKET socket, which needs no IPv6 in the
+// kernel. Its control: a frame it sends out of the same device itself,
+// with another marker, which a working capture sees leave.
+const sniffPy = `import socket, sys, time
+dev, marker, seconds, log = sys.argv[1], sys.argv[2].encode(), float(sys.argv[3]), sys.argv[4]
+control = b"control-" + marker[::-1]
+r = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x86DD)); r.bind((dev, 0)); r.settimeout(0.2)
+w = socket.socket(socket.AF_PACKET, socket.SOCK_RAW); w.bind((dev, 0))
+own = bytes.fromhex(open("/sys/class/net/%s/address" % dev).read().strip().replace(":", ""))
+with open(log, "w") as f: f.write("ready\n")
+w.send(b"\x33\x33\x00\x00\x00\x01" + own + b"\x86\xdd" + bytes(40) + control)
+seen = controls = 0
+end = time.time() + seconds
+while time.time() < end:
+    try: frame = r.recv(65535)
+    except socket.timeout: continue
+    if control in frame: controls += 1
+    elif marker in frame: seen += 1
+with open(log, "a") as f: f.write("control %d seen %d\n" % (controls, seen))
 `
 
 func hostTry(name string, args ...string) (string, error) {
@@ -412,7 +441,7 @@ echo "$dev $(ip -4 -o addr show dev "$dev" | awk '{print $4}') $(cat /sys/class/
 // installTools puts the suite's scripts in a guest.
 func installTools(t *testing.T, manager *run.Manager, id string) {
 	t.Helper()
-	for name, content := range map[string]string{"frame.py": framePy, "listen.py": listenPy} {
+	for name, content := range map[string]string{"frame.py": framePy, "listen.py": listenPy, "sniff.py": sniffPy} {
 		if err := manager.WriteFile(context.Background(), id, run.LeaseCredential{}, run.WorkDir+"/"+name, strings.NewReader(content)); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
@@ -444,10 +473,13 @@ done; wait`, strings.Join(targets, " "), c.port, c.port)
 	return strings.TrimSpace(sh(t, manager, id, script).stdout)
 }
 
-// guestHasIPv6 reports whether the guest's kernel has IPv6 at all. The
-// kernel the README prescribes does not, and a guest without it cannot
-// send an IPv6 packet: the IPv6 checks are then not applicable, which
-// the tests say in their log rather than skip.
+// guestHasIPv6 reports whether the guest's kernel has an IPv6 stack. The
+// kernel the README prescribes does not, and then the checks that use the
+// guest's own IPv6 (link-local addresses, ping -6) are not applicable:
+// the tests say so in their log rather than skip, and fail instead with
+// SBX_VM_REQUIRE_IPV6=1. A guest without the stack can still put IPv6
+// frames on its link through an AF_PACKET socket: rawIPv6Closed sends
+// those either way.
 func guestHasIPv6(t *testing.T, manager *run.Manager, id string) bool {
 	t.Helper()
 	out := sh(t, manager, id, `if [ -d /proc/sys/net/ipv6 ]; then echo yes; else echo no; fi`)
@@ -455,10 +487,88 @@ func guestHasIPv6(t *testing.T, manager *run.Manager, id string) bool {
 	case "yes":
 		return true
 	case "no":
+		if os.Getenv("SBX_VM_REQUIRE_IPV6") == "1" {
+			t.Fatalf("guest %s has no IPv6 stack, and SBX_VM_REQUIRE_IPV6=1 asks for the checks that need one", id)
+		}
 		return false
 	}
 	t.Fatalf("whether guest %s has IPv6: %+v", id, out)
 	return false
+}
+
+// rawIPv6Closed has guest a put hand-made IPv6 frames on its link (to
+// b's MAC, to all nodes, and through the gateway), with an AF_PACKET
+// socket that needs no IPv6 in a's kernel, and checks that none reaches
+// guest b (a capture in b) or the host (a capture on the host's end of
+// a's link). With rules, the tap's ingress filter must also have dropped
+// them all.
+func rawIPv6Closed(t *testing.T, manager *run.Manager, when, a, b string, nicA, nicB guestNIC, rules bool) {
+	t.Helper()
+	marker := fmt.Sprintf("teploy-raw-v6-%d", time.Now().UnixNano())
+	const seconds = 15
+	started := sh(t, manager, b, fmt.Sprintf(`rm -f /work/sniff.log; (setsid python3 /work/sniff.py %s %s %d /work/sniff.log >/dev/null 2>&1 &)
+for i in $(seq 50); do grep -q ready /work/sniff.log 2>/dev/null && break; sleep 0.1; done; cat /work/sniff.log`, nicB.dev, marker, seconds))
+	if !strings.Contains(started.stdout, "ready") {
+		t.Fatalf("%s: the capture in guest b did not start: %+v", when, started)
+	}
+	dir := t.TempDir()
+	script, hostLog := filepath.Join(dir, "sniff.py"), filepath.Join(dir, "host.log")
+	if err := os.WriteFile(script, []byte(sniffPy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	capture := exec.Command("python3", script, nicA.link, marker, strconv.Itoa(seconds), hostLog)
+	var captureOut bytes.Buffer
+	capture.Stdout, capture.Stderr = &captureOut, &captureOut
+	if err := capture.Start(); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		if raw, _ := os.ReadFile(hostLog); strings.Contains(string(raw), "ready") {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = capture.Process.Kill()
+			t.Fatalf("%s: the capture on the host's %s did not start: %s", when, nicA.link, captureOut.String())
+		}
+	}
+	dropsBefore := 0
+	if rules {
+		dropsBefore = ingressDrops(t, nicA.ns)
+	}
+	const rounds, perRound = 3, 3
+	sent := sh(t, manager, a, fmt.Sprintf(`for i in $(seq %[6]d); do
+python3 /work/frame.py udp6 %[1]s %[2]s %[3]s fe80::a fe80::b 9000 %[5]s
+python3 /work/frame.py udp6 %[1]s %[2]s 33:33:00:00:00:01 fe80::a ff02::1 9000 %[5]s
+python3 /work/frame.py udp6 %[1]s %[2]s %[4]s fe80::a 2001:db8::1 9000 %[5]s
+done`, nicA.dev, nicA.mac, nicB.mac, nicA.gatewayMAC, marker, rounds))
+	if sent.code != 0 {
+		t.Fatalf("%s: guest a could not send raw IPv6 frames: %+v", when, sent)
+	}
+	if rules {
+		if dropped := ingressDrops(t, nicA.ns) - dropsBefore; dropped < rounds*perRound {
+			t.Fatalf("%s: the tap's ingress filter dropped %d frames, want at least the %d IPv6 frames guest a sent", when, dropped, rounds*perRound)
+		}
+	}
+	inB := sh(t, manager, b, fmt.Sprintf(`for i in $(seq %d); do grep -q seen /work/sniff.log && break; sleep 0.1; done; cat /work/sniff.log`, (seconds+10)*10))
+	_ = capture.Wait()
+	onHost, _ := os.ReadFile(hostLog)
+	for where, log := range map[string]string{"in guest b": inB.stdout, "on the host's " + nicA.link: string(onHost)} {
+		var controls, seen int
+		at := strings.Index(log, "control")
+		if at < 0 {
+			t.Fatalf("%s: the capture %s did not finish: %q %s", when, where, log, captureOut.String())
+		}
+		if _, err := fmt.Sscanf(log[at:], "control %d seen %d", &controls, &seen); err != nil {
+			t.Fatalf("%s: the capture %s: %q %s", when, where, log, captureOut.String())
+		}
+		if controls < 1 {
+			t.Fatalf("%s: control: the capture %s did not see its own frame leave; it shows nothing", when, where)
+		}
+		if seen != 0 {
+			t.Fatalf("%s: %d of guest a's raw IPv6 frames arrived %s", when, seen, where)
+		}
+	}
+	t.Logf("%s: %d raw IPv6 frames from guest a (no IPv6 stack needed): none in guest b, none on the host's %s", when, rounds*perRound, nicA.link)
 }
 
 // hostAddress is the address the host uses towards the internet.
@@ -620,15 +730,16 @@ func TestVMNetworkIsolation(t *testing.T) {
 
 	// --- 1: guest to guest, by every means a guest has
 	//
-	// The IPv6 part needs a guest kernel with IPv6. The kernel the README
-	// prescribes (Cloud Hypervisor's ch_defconfig) has none: such a guest
-	// cannot send IPv6 at all, so there is nothing of it to refuse, and
-	// the IPv4 and layer 2 checks run without it. The host side drops
-	// IPv6 from a guest that has it either way (the tap's ingress takes
-	// ARP and IPv4 only; the namespace's chains drop every other family).
+	// The checks through the guest's own IPv6 (link-local addresses,
+	// ping -6) need a guest kernel with an IPv6 stack, which the README's
+	// (Cloud Hypervisor's ch_defconfig) does not have. Such a guest can
+	// still send IPv6 frames, by hand through an AF_PACKET socket, and
+	// those are sent whatever the guest's kernel (rawIPv6Closed): the
+	// host's side, which takes ARP and IPv4 only at the tap and drops
+	// every other family in the namespace, is tested either way.
 	ipv6 := guestHasIPv6(t, manager, a) && guestHasIPv6(t, manager, b)
 	if !ipv6 {
-		t.Logf("not applicable: the guest kernel has no IPv6 (no /proc/sys/net/ipv6), so the guest-to-guest IPv6 checks do not run; the IPv4, ARP and layer 2 checks do")
+		t.Logf("not applicable: the guest kernel has no IPv6 stack (no /proc/sys/net/ipv6), so the checks through the guest's own IPv6 do not run; raw IPv6 frames, IPv4, ARP and layer 2 checks do")
 	}
 	isolation := func(when string) {
 		t.Helper()
@@ -696,6 +807,7 @@ echo 1 > /proc/sys/net/ipv6/conf/$dev/disable_ipv6
 			t.Fatalf("%s: the allowlist guest reached guest b: %s", when, out.stdout)
 		}
 		received := sh(t, manager, b, `sleep 1; grep -v -e ready -e "from `+nicB.addr+`" /work/recv.log; pkill -f '[l]isten.py'; [ ! -d /proc/sys/net/ipv6 ] || echo 1 > /proc/sys/net/ipv6/conf/`+nicB.dev+`/disable_ipv6; true`)
+		rawIPv6Closed(t, manager, when, a, b, nicA, nicB, true)
 		if strings.TrimSpace(received.stdout) != "" {
 			t.Fatalf("%s: guest b received something from another guest:\n%s", when, received.stdout)
 		}
@@ -1222,7 +1334,7 @@ func TestVMNetworkFailsClosed(t *testing.T) {
 	}
 
 	if !guestHasIPv6(t, manager, a) {
-		t.Logf("not applicable: the guest kernel has no IPv6 (no /proc/sys/net/ipv6), so the all-nodes IPv6 check does not run; the IPv4 and layer 2 checks do")
+		t.Logf("not applicable: the guest kernel has no IPv6 stack (no /proc/sys/net/ipv6), so the all-nodes check through the guest's own IPv6 does not run; raw IPv6 frames, IPv4 and layer 2 checks do")
 	}
 	// closed is everything that must hold with no rules, checked while
 	// they are away.
@@ -1263,6 +1375,7 @@ ip route del default; true`, nicC.gateway, nicC.dev, nicB.addr, nicD.addr, peerA
 			t.Fatalf("%s: allowlist guest c got out of its namespace:\n%s", when, out.stdout)
 		}
 		received := sh(t, manager, b, `sleep 1; grep -v -e ready -e "from `+nicB.addr+`" /work/recv.log; true`)
+		rawIPv6Closed(t, manager, when, a, b, nicA, nicB, false)
 		if strings.TrimSpace(received.stdout) != "" {
 			t.Fatalf("%s: guest b received something from another guest:\n%s", when, received.stdout)
 		}

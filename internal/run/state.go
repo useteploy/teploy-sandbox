@@ -78,7 +78,9 @@ type stateRun struct {
 	Snapshot    string            `json:"snapshot,omitempty"`
 	Images      []string          `json:"images,omitempty"`
 	RunningMs   int64             `json:"runningMs,omitempty"`
-	LeaseGen    uint64            `json:"leaseGen,omitempty"`
+	// Usage is the run's sampled usage totals (usage.go). Additive.
+	Usage    *usageTotals `json:"usage,omitempty"`
+	LeaseGen uint64       `json:"leaseGen,omitempty"`
 	// The off-host side (remote.go). Base is a snapshot ref like
 	// Snapshot; a running record carries it too, with the three below.
 	Remote     *RemoteState `json:"remote,omitempty"`
@@ -313,6 +315,7 @@ func (rec stateRun) stoppedRun(owns func(ref string) bool) (*Run, error) {
 		warmReq:     rec.Warm,
 		snapshot:    rec.Snapshot,
 		runningFor:  time.Duration(rec.RunningMs) * time.Millisecond,
+		usageCarry:  usageOf(rec.Usage),
 		Remote:      rec.Remote,
 		base:        rec.Base,
 		remoteGen:   rec.RemoteGen,
@@ -324,6 +327,11 @@ func (rec stateRun) stoppedRun(owns func(ref string) bool) (*Run, error) {
 // stoppedStateRun is a stopped run as the registry file holds it.
 func stoppedStateRun(run *Run) stateRun {
 	limits := run.limits
+	var usage *usageTotals
+	if !run.usageCarry.empty() {
+		carry := run.usageCarry
+		usage = &carry
+	}
 	return stateRun{
 		ID:          run.ID,
 		State:       StateStopped,
@@ -344,6 +352,7 @@ func stoppedStateRun(run *Run) stateRun {
 		WarmState:   run.Warm,
 		Snapshot:    run.snapshot,
 		RunningMs:   int64(run.runningFor / time.Millisecond),
+		Usage:       usage,
 		LeaseGen:    run.leaseGen,
 		Remote:      run.Remote,
 		Base:        run.base,
@@ -442,4 +451,11 @@ func writeStateFile(path string, file stateFile) (result error) {
 		_ = d.Close()
 	}
 	return nil
+}
+
+func usageOf(totals *usageTotals) usageTotals {
+	if totals == nil {
+		return usageTotals{}
+	}
+	return *totals
 }

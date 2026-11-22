@@ -141,6 +141,10 @@ func serve(args []string) error {
 		"vm driver: host memory (MemAvailable, MiB) the warm pool leaves free beyond a new VM's limit before it boots one; 0 is none")
 	vmBootTimeout := flags.Duration("vm-boot-timeout", envDuration("SBX_VM_BOOT_TIMEOUT", vm.DefaultBootTimeout),
 		"vm driver: how long a new VM may take to answer")
+	usageInterval := flags.Duration("usage-interval", envDuration("SBX_USAGE_INTERVAL", 0),
+		"how often each running run's CPU, network and disk usage is sampled into its usage field; 0 (default) samples nothing")
+	recoverableMax := flags.Duration("exec-recoverable-max-timeout", envDuration("SBX_EXEC_RECOVERABLE_MAX_TIMEOUT", run.DefaultRecoverableMaxTimeout),
+		"the longest timeoutSec a recoverable exec may ask for (each holds one of the daemon's 64 recoverable-exec slots until it ends); at most 24h")
 	remote := addRemoteFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -417,6 +421,14 @@ func serve(args []string) error {
 		manager.SandboxUser = ""
 	}
 	manager.StoppedRetention = retention
+	if err := checkUsageInterval(*usageInterval); err != nil {
+		return err
+	}
+	manager.UsageInterval = *usageInterval
+	if *recoverableMax <= 0 || *recoverableMax > run.MaxTTL {
+		return fmt.Errorf("exec-recoverable-max-timeout: must be more than 0 and at most %s, got %s", run.MaxTTL, *recoverableMax)
+	}
+	manager.RecoverableMaxTimeout = *recoverableMax
 	if pool != nil {
 		manager.Egress = pool
 	}
@@ -565,4 +577,13 @@ func probeWritableDir(dir string) error {
 	name := probe.Name()
 	probe.Close()
 	return os.Remove(name)
+}
+
+// checkUsageInterval refuses a usage interval that is negative or, when
+// on, under a second: each round runs docker or zfs commands per run.
+func checkUsageInterval(interval time.Duration) error {
+	if interval < 0 || (interval > 0 && interval < time.Second) {
+		return fmt.Errorf("usage-interval: must be 0 (off) or at least 1s, got %s", interval)
+	}
+	return nil
 }

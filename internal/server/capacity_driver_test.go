@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -89,5 +91,39 @@ func TestAtCapacityIsServiceUnavailable(t *testing.T) {
 	srv.writeError(recorder, fmt.Errorf("%w: this daemon runs at most 2 VMs at once", run.ErrAtCapacity))
 	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), "at-capacity") {
 		t.Fatalf("%d %s", recorder.Code, recorder.Body)
+	}
+}
+
+// diskRuntime is a runtime that reports its storage, as both drivers do.
+type diskRuntime struct {
+	*fakeRuntime
+	usage *run.DiskUsage
+	err   error
+}
+
+func (d diskRuntime) Disk(context.Context) (*run.DiskUsage, error) { return d.usage, d.err }
+
+func TestCapacityReportsDisk(t *testing.T) {
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	serve := func(rt run.Runtime) map[string]any {
+		srv := Server{Token: "test-token", Log: quiet, ServerName: "box", Manager: run.NewManager(rt, quiet)}
+		ts := httptest.NewServer(srv.Handler())
+		defer ts.Close()
+		return call(t, ts, "GET", "/v1/capacity", "", http.StatusOK)
+	}
+	body := serve(diskRuntime{fakeRuntime: newFakeRuntime(), usage: &run.DiskUsage{Kind: "zfs-pool", Name: "tank", UsedBytes: 3, FreeBytes: 7}})
+	disk, ok := body["disk"].(map[string]any)
+	if !ok || disk["kind"] != "zfs-pool" || disk["name"] != "tank" || disk["usedBytes"] != 3.0 || disk["freeBytes"] != 7.0 {
+		t.Fatalf("disk: %v", body["disk"])
+	}
+	// Unknown is absent, never zero: a failed probe, or a runtime that
+	// cannot say.
+	for name, rt := range map[string]run.Runtime{
+		"probe failed": diskRuntime{fakeRuntime: newFakeRuntime(), err: errors.New("zfs: no pool")},
+		"no reporter":  newFakeRuntime(),
+	} {
+		if body := serve(rt); body["disk"] != nil {
+			t.Fatalf("%s: disk %v", name, body["disk"])
+		}
 	}
 }

@@ -2791,6 +2791,295 @@ The seven items of the previous entry, and:
 11. **Four stops uploading and a resume that has to fetch**, with the
     default four transfers: the resume does not wait for the uploads.
 
+## 2026-11-21 — VM driver: first run on real x86-64 hardware
+
+The README's runbook ("Validating on a fresh x86-64 host") was followed
+for the first time, on bare metal: a 4-core Pentium Silver N5000 laptop,
+3.7 GB (about 2.6 GB available beside its owner's desktop session),
+eMMC, the pool a 30 GB sparse file on it. Debian 13 with Linux 6.12 and
+ZFS 2.3.9 (not the runbook's Ubuntu 24.04, 6.8 and 2.2), Cloud
+Hypervisor v54.1 (static), guest kernel `vmlinux-x86_64` of
+`ch-release-v7.2.8-20261009`, base image Ubuntu noble's cloud image.
+**The host is far below the runbook's 16 GB and has no disk of its own
+for the pool: no figure below is representative of a production host.**
+The point was correctness and confinement on real x86-64.
+
+### First run (main at `eeb0d54`)
+
+- `install-host.sh`: host ready; every check passed (seccomp filter for
+  x86_64, Landlock, cgroup v2 controllers, tbf, connlimit, static
+  hypervisor).
+- Root-only unit tests: all pass, none skipped.
+- Live suite, pool off and on: 6 pass, 9 fail, 3 skip each. Nothing
+  failed in a way that let a guest or hypervisor reach anything it should
+  not; the failures were the four defects below, plus the warm-pool
+  tests, which need more memory than the host has.
+- Seccomp kills: none (`type=1326` absent from the kernel log). The
+  runbook's `grep -E 'type=1326|seccomp'` matched seven
+  `__seccomp_filter` stack frames inside the intended memcg OOM reports
+  of `TestVMCgroupLimitIsEnforced`: false positives.
+
+### Defects found, and what was done
+
+- **A. `/var` was in every hypervisor's jail.** The jail bound the
+  kernel at its host path, and the default (and documented) kernel path
+  is under `/var/lib`; `TestVMConfinement` and four other tests fail on
+  `/var inside the jail`. The arm64 runs had the kernel elsewhere.
+  *Fixed:* the jail always holds the kernel at `/kernel` (`vm.JailKernel`)
+  and the hypervisor is told that path, so its Landlock rules (made from
+  its command line) follow; the host path can be anything, and existing
+  installs need no change. The confinement test is as strict as before
+  and also requires the kernel's host path to be absent from the jail.
+  Moving the documented location out of `/var` was the alternative; it
+  would have left the jail revealing wherever an operator does keep it.
+  Also: `vm.DefaultKernel` is now the architecture's own name
+  (`/var/lib/teploy-sandbox/vm/vmlinux-x86_64` on amd64, `.../Image` on
+  arm64), so `SBX_VM_KERNEL` is no longer needed on x86-64.
+- **B. `TestVMNetworkIsolation` needed guest IPv6.** The runbook's guest
+  kernel has no IPv6 (`CONFIG_IPV6` unset in `ch_defconfig`, x86 and
+  arm64 alike) and the test's control stopped when guest b had no IPv6
+  link-local address, so its guest-to-guest, guest-to-host and ARP
+  checks never ran on x86-64. *Fixed (test):* the IPv4, ARP and layer 2
+  checks run regardless; the IPv6 ones run when the guest has IPv6 and
+  are logged as not applicable when it does not (not a skip).
+  `TestVMNetworkFailsClosed`'s one IPv6 line is guarded the same way.
+  Checked by reading that nothing depends on guest IPv6 and that a guest
+  that has it is still refused: the tap's netdev ingress chain accepts
+  only the VM's ARP request for the gateway and IPv4 from its own
+  address and drops everything else; both inet chains of the run's
+  namespace and the host's forward chain drop `meta nfproto != ipv4`;
+  the namespace and the host's end of the link have IPv6 disabled by
+  sysctl; the guest setup turns IPv6 off on the device and tolerates a
+  kernel without it. As first written this left the host's IPv6 drop
+  untested on x86-64, on the wrong belief (in the test's comment) that a
+  guest without an IPv6 stack cannot send IPv6: it can, by hand, through
+  an AF_PACKET socket. The review of this branch caught it. Both tests
+  now have guest a send raw IPv6 frames (to b's MAC, to all nodes, and
+  through the gateway) whatever its kernel, and check with captures in
+  guest b and on the host's end of a's link (each of which must see its
+  own control frame leave) that none arrives, and, with rules in place,
+  that the tap's ingress dropped them all. `SBX_VM_REQUIRE_IPV6=1` turns
+  "not applicable" for the checks through the guest's own IPv6 stack into
+  a failure. Those checks (link-local addresses, `ping -6`) still need a
+  guest kernel with IPv6; they last ran on arm64.
+- **C. A low disk limit made a VM that could not boot.** The run's
+  `io.max` was set before boot. A fresh clone of the runbook's x86-64
+  golden read about 465 MB before its agent answered (cgroup `io.stat`;
+  about 490 MB within the first 20 s), so under the suite's 2 MiB/s
+  (`TestVMDestroyIsNotHeldByQueuedIO`) the boot took longer than the
+  driver's two minutes, and under 10 MiB/s a create took 46 s. The arm64
+  image read about 100 MiB to boot (entry of 2026-11-16 on the seccomp filter and limits), which fits in
+  two minutes at 2 MiB/s: that is why it passed there. Why the x86-64
+  image reads five times more was not established; it is a never-booted
+  clone each time (`snapd.seeded` 34 s, `ldconfig`,
+  `systemd-networkd-wait-online` waits its full 2 min on a run with no
+  network), but which of these reads what was not measured.
+  *Decided as product behaviour, not a test patch:* an operator who sets
+  a low `--vm-disk-mbps`/`--vm-disk-iops` must not get VMs that cannot
+  boot, and cannot size a limit by an image's boot. A VM now boots with
+  its read limits raised to at least the defaults (256 MiB/s and 16000
+  IOPS; a higher limit, or none, is unchanged) and its write limits the
+  run's own from the start: a boot of that image wrote about 2 MB (and
+  discarded about 230 MB, which the kernel's throttle counts as 512
+  bytes an operation; 42 writes and 68 discards before the agent
+  answered), so its writes need nothing raised. The run's own read
+  limits are written as soon as its agent first answers, or as soon as
+  its cgroup has read `BootReadBudget` (1 GiB, about twice that image's
+  boot; checked every 200 ms, so a boot can overshoot by about 50 MB),
+  whichever is first, before a create returns or the warm pool counts
+  the VM as ready. A VM that is being killed is never given them (its
+  limits are only lifted then, see `DrainGrace`). Under 2 MiB/s a
+  create now takes 3.4 to 3.7 s, under 10 MiB/s 3.7 to 3.8 s; the rate
+  checks of `TestVMLimits` pass after boot as before. The pool-on
+  failure ("the warm pool did not fill") went with it.
+  *The trade-off, the noisy-neighbour one,* as first written was too
+  wide, and an independent review of this branch said so: every boot
+  got the default rate for reads and writes until its agent answered,
+  for up to the boot timeout, and on a resume or fork (a tenant's own
+  disk) when the agent answers is the tenant's choice, so a tenant
+  could loop boots of a snapshot whose agent never starts and get that
+  rate for two minutes at a time, back to back. Now:
+  - only reads are raised, and at most 1 GiB of them per boot;
+  - the boots of one snapshot that did not come up are held back by
+    what they read at the raised rate: summed since the snapshot's last
+    boot that came up, each 1 GiB of it makes the next boot of that
+    snapshot wait (refused as at capacity, without starting anything),
+    10 s, doubling up to 5 min; one boot that comes up, by anyone,
+    clears it (`TestASnapshotWhoseBootsKeepFailingIsBackedOff`). A
+    second review found that the first version counted failed boots,
+    so cancelled ones (callers that went away, client timeouts under
+    load) locked every user of a shared snapshot out for minutes; a
+    boot cancelled after a few MB now costs about that. What remains of
+    sharing: once a snapshot's failed boots have read 1 GiB, everyone
+    who boots it waits with the one who caused it;
+  - a boot whose reads cannot be counted (its io.stat cannot be read or
+    does not list its disk, 50 times in a row at 200 ms) gets the run's
+    limits, with one warning in the log
+    (`TestABootThatCannotBeCountedGetsTheRunsLimits`). So a VM whose
+    first disk read takes more than 10 s (an overloaded host) loses its
+    raised boot reads and boots under the run's limits: the safe
+    direction, noted by the final review, not changed;
+  - **what is left, plainly:** a read limit below the defaults applies to
+    a run after its boot. It does not cap what a caller who can create
+    runs freely can read: every boot, including a create that succeeds
+    and is destroyed again, reads at up to the default rate until its
+    agent answers (about 465 MB for the README's image), so a
+    create/destroy loop reads at the default rate for each VM booting at
+    once, and a tenant with many snapshots can boot each at the raised
+    rate up to 1 GiB. How many boot at once is bounded only by
+    `--vm-max-runs` (by default unbounded).
+  - **Follow-up, not done:** a host-wide budget for boosted boots (a cap
+    on the raised-rate reads, or on the boots holding raised limits, at
+    any one time, for the whole daemon), which would bound this without
+    `--vm-max-runs`; per-tenant accounting would need a tenant identity
+    the driver does not have.
+  The alternative of keeping the run's limit for the boot was rejected
+  because it makes a low limit unusable.
+- **E. Runbook step 10 could not be met.** `-test.run TestVM` selects the
+  three off-host tests, which skip without an S3 service, and the step
+  said no `--- SKIP`. *Fixed (docs):* step 10 leaves them out with
+  `-test.skip`, and a new step 10b runs them against versitygw 1.11 on
+  loopback (the service the earlier live runs used; the commands were
+  checked against the release on a workstation, not run on the x86-64
+  host). Also corrected: the seccomp check reads `type=1326` only; the
+  daemon and suite need no `SBX_VM_KERNEL`; small hosts' warm-pool
+  failures and the "skipping the 2048/4096 MiB guest" lines are expected
+  and say why; a Debian aside; the guest's interface name is `ens5` on
+  x86-64 (`enp0s5` on arm64), which nothing depends on.
+
+### Found on the re-run, and left open
+
+- **A guest that floods its own disk stalls its own reads here.** With
+  the fix for C, `TestVMDestroyIsNotHeldByQueuedIO` booted, but on this
+  host (Linux 6.12, ZFS 2.3.9) the hypervisor's one disk-queue thread
+  sleeps in `io_submit` (state D) once the 48 throttled writers queue,
+  so the guest's reads, which have their own budget in `io.max`, wait
+  behind the writes, and the guest's agent stops answering execs until
+  the writes drain. AIO is in use (`fs.aio-nr` 128 per VM). On arm64
+  (6.8, ZFS 2.2) the same guest kept answering. It only harms the guest
+  that does it: the destroy is still held only for `DrainGrace` (3.4 s,
+  four runs). The test now waits for the guest's first-boot reads to
+  settle (about 16 s at 2 MiB/s), accepts an exec that times out once
+  the writers run, checks that the writes reached the host, and keeps
+  its destroy assertions; that a run under a low limit can freeze itself
+  with writes is recorded here, not fixed. Which of the kernel, ZFS 2.3's
+  zvol or blk-throttle makes the submission block was not established.
+- **The golden image could boot lighter.** Masking snapd's seeding and
+  `systemd-networkd-wait-online` in the base (README step 7) would cut
+  every create's boot I/O and the 2-minute "starting" state; not done,
+  because it changes what the runbook's image is and the figures
+  against the arm64 runs.
+
+- **Two unit tests that can flake, each seen once in CI on this branch.**
+  `TestAPoolVMNotSeenGoneInTimeIsNotReplaced` failed once ("2 VMs
+  booted, want only the pool's one") in both CI jobs of one push and
+  passed on the re-run, on the pull request's run and 80 times locally
+  (with and without `-race`). By reading: the pool's periodic refill
+  look (every 2 s) can fall inside the create's 1.5 s claim grace,
+  before the death at claim pauses the pool, and then boots a refill.
+  Not caused by this branch (the boot path only gained one call after
+  the agent answers). It failed again in the root-only unit run on the
+  laptop in the review round, so the test now holds the pool's refill
+  off while the claim waits (a create that boots its own VM still fails
+  it). Likewise
+  `TestReleaseKeepsTheUIDUntilTheCgroupIsEmpty` failed once in CI's
+  `verify` job ("device or resource busy" on the retried release) and
+  passed in `vm-root` and on the pull request's run: its fake cgroups
+  give a removal 200 ms, which a loaded runner can spend before the
+  first retry. Neither failed in 8 local runs of the whole package
+  (`-cpu 1,2`). It failed once more in CI on main (PR #6's push run).
+  Fixed in the code, not the test: a removal whose time ran out gave up
+  right after the kill that had just emptied the group, without looking
+  again; it now tries the removal once more before it reports the group
+  busy (`TestARemovalLooksOnceMoreAfterItsLastKill`, with no time at
+  all, fails without it). On a real host this only spares an error when
+  the last kill's processes are reaped in that moment.
+
+### Re-run on the branch (kernel at its default `/var` path, no `SBX_VM_KERNEL`)
+
+- Root-only unit tests: all pass (245), no skip, the four named tests
+  pass.
+- Pool off and pool on (`SBX_VM_WARM=1x512=1`): `TestVMHostIsPrepared`,
+  `TestVMLifecycle`, `TestVMConfinement`, `TestVMMemoryStaysInsideItsCgroup`,
+  `TestVMCgroupLimitIsEnforced`, `TestVMLimits`, `TestVMNetworkIsolation`
+  (IPv6 part logged not applicable), `TestVMNetworkTiers`,
+  `TestVMNetworkFailsClosed` pass in both.
+  `TestVMDestroyIsNotHeldByQueuedIO` passed with the pool on and failed
+  with it off in the suite (the guest queued too little: see above);
+  with the test change it passed three times alone with the pool off
+  and once with it on. Not re-run: the whole suite after that last test
+  change (it touches that one test only).
+- No `type=1326` in the kernel log over all of it; the two OOM kills
+  are `CONSTRAINT_MEMCG`, the ones `TestVMCgroupLimitIsEnforced` causes.
+- Figures, not representative (3.7 GB laptop, eMMC file pool): cold
+  create to agent ready 4.7 / 4.9 s (pool off / on), resume 4.2 / 4.4 s,
+  fork 4.2 / 4.3 s, stop 0.46 / 0.56 s, destroy 0.23 / 0.27 s. 512 MiB
+  guest: cgroup limit 584 MiB, peak 516 MiB (guest + 4.0 MiB),
+  hypervisor VmHWM about 530 MB, pids.peak 11 of 136. Network setup:
+  open runs host side 160 to 250 ms, guest side 0.2 to 1.2 s; allowlist
+  host side 50 to 100 ms. Default-size VMs that fit, from the first run:
+  1, and 1 by the cgroup limits.
+
+### Review round (same day): what changed, and the live re-run
+
+An independent security review of the branch asked for: reads only and
+a read budget for the boot limits, and a back-off of failing snapshot
+boots (entry C above); raw IPv6 frames from a guest without an IPv6
+stack, and `SBX_VM_REQUIRE_IPV6` (entry B above); a kernel path that is
+not absolute and clean refused at start; the jail helper's error naming
+`/kernel` and not the host's path; usage text and figures made
+consistent. Each with a unit test that fails without it, except the
+live-test changes. Re-run on the laptop with the final code (logs kept
+with the run's other files):
+
+- Root-only unit tests: all pass (249), none skipped (the first attempt
+  of this round hit the pool test's flake above, now fixed).
+- `TestVMCgroupLimitIsEnforced`, `TestVMLimits`,
+  `TestVMDestroyIsNotHeldByQueuedIO`: pass, pool off and on (create under
+  2 MiB/s 4.1 s; destroy 3.4 and 3.7 s).
+- `TestVMNetworkIsolation`, `TestVMNetworkFailsClosed`: pass, pool off
+  and on; in each, 9 raw IPv6 frames per check (guest to guest, after
+  the rules were restored, with every table flushed, with every table
+  deleted) reached neither guest b nor the host's end of a's link, and
+  with rules the tap's ingress counted them dropped. The first attempt
+  failed on the test's own capture (a socket for 0x86DD alone does not
+  see frames leaving, so its control failed); it captures every
+  protocol now. With `SBX_VM_REQUIRE_IPV6=1` the test fails, as meant,
+  on this guest kernel.
+- No `type=1326` in the kernel log.
+- Not run live: the read budget ending a boot whose agent never answers,
+  and the back-off (unit tests only; the suite has no guest that will
+  not start its agent).
+
+### Second review round (same day)
+
+A second review asked for: the back-off charged by raised-rate bytes
+read, not by failures (entry C); the docs to say plainly that a read
+limit below the defaults applies after boot and is no cap on a caller
+who can create runs freely, with a host-wide budget for raised boots
+recorded as a follow-up (entry C); the raw IPv6 check to fail when
+sending outlasted its captures, and guest a's own capture to see its
+frames leave (entry B); the boot watch to fail closed when it cannot
+count (entry C). Unit tests for each fail without the change. Re-run
+on the laptop, pool off: root-only unit tests all pass (254), none
+skipped; `TestVMLimits`, `TestVMDestroyIsNotHeldByQueuedIO`,
+`TestVMNetworkIsolation`, `TestVMNetworkFailsClosed` pass; no
+`type=1326`. Not run live: the back-off and the fail-closed watch (no
+guest in the suite fails its boot after reading, or hides its io.stat).
+
+### Still needs a host of the runbook's size (16 GB, a disk for the pool)
+
+- `TestVMWarmPool` and `TestVMWarmPoolRaces` in the suite (here the pool
+  never reaches its target: the headroom gate needs more free memory than
+  the host has; `TestVMWarmPoolRaces` passed alone in the first run), and
+  so the `WARM`/`COLD` lines and pool-on start figures.
+- The 2048 and 4096 MiB guests of `TestVMMemoryStaysInsideItsCgroup`.
+- Density, and the go/no-go against the plan's phase-1 numbers (start
+  from the pool, default-size VMs per host): nothing here speaks to it.
+- The off-host tests (step 10b) on x86-64, and the whole suite green
+  pool off and pool on in one run each. The x86-64 and bare-metal items
+  stay open.
+
 ## 2026-11-21 — off-host storage: the two-phase delete (A4), the scrub that reads, upload backoff, and `drop`
 
 Closes, under the assumptions stated below, the three items the third

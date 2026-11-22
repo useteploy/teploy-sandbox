@@ -888,6 +888,10 @@ func TestAPoolVMNotSeenGoneInTimeIsNotReplaced(t *testing.T) {
 	pool := rig.driver.warmPool()
 	pool.mu.Lock()
 	pool.retryBase = time.Minute
+	// No refill while the claim waits: the pool's periodic look (every
+	// 2 s from its start) would otherwise boot one inside the claim's
+	// grace on a slow machine, and that boot is not the create's.
+	pool.retryAt = time.Now().Add(time.Hour)
 	pool.mu.Unlock()
 	dead := rig.warmVMs(1, 512)[0]
 	machine := rig.hypervisor.machine(dead)

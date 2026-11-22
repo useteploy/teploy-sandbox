@@ -638,6 +638,12 @@ type fakeMachine struct {
 	execFunc func(cmd, cwd string, env map[string]string, timeout time.Duration, stdout, stderr io.Writer) (int, bool, error)
 	// setupFunc answers the guest setup script; nil succeeds.
 	setupFunc func(script string, stderr io.Writer) (int, bool, error)
+	// booted records that the driver called Booted, and pinged whether
+	// the agent had answered by then; bootedErr is what Booted answers.
+	booted, pingedBeforeBooted bool
+	bootedErr                  error
+	// bootRead is what BootRead answers.
+	bootRead int64
 }
 
 func (m *fakeMachine) Agent() Agent            { return (*fakeAgent)(m) }
@@ -732,6 +738,19 @@ func (m *fakeMachine) AddNet(_ context.Context, tap *os.File, mac string) error 
 	m.netMAC, m.netTap = mac, statErr == nil
 	m.events = append(m.events, "add-net")
 	return nil
+}
+
+func (m *fakeMachine) Booted() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.booted, m.pingedBeforeBooted = true, m.up
+	return m.bootedErr
+}
+
+func (m *fakeMachine) BootRead() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.bootRead
 }
 
 func (m *fakeMachine) Kill(ctx context.Context) error {

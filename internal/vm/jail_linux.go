@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -206,8 +207,19 @@ func jailAdd(root string, each jailPath) error {
 	if each.Kind == jailSymlink {
 		return os.Symlink(each.Target, target)
 	}
-	info, err := os.Stat(each.Path)
+	source := each.Path
+	if each.Source != "" {
+		source = each.Source
+	}
+	info, err := os.Stat(source)
 	if err != nil {
+		// The error names the path in the jail (the caller's message),
+		// not the host's: what the helper prints reaches the VM's
+		// diagnostics, and where the host keeps the file is not theirs.
+		var pathErr *fs.PathError
+		if each.Source != "" && errors.As(err, &pathErr) {
+			return fmt.Errorf("the file bound at %s: %w", each.Path, pathErr.Err)
+		}
 		return err
 	}
 	switch isDevice := info.Mode()&os.ModeDevice != 0; {
@@ -231,7 +243,7 @@ func jailAdd(root string, each jailPath) error {
 	}
 	// Not recursive: what is mounted below a directory on the host does
 	// not come along.
-	if err := syscall.Mount(each.Path, target, "", syscall.MS_BIND, ""); err != nil {
+	if err := syscall.Mount(source, target, "", syscall.MS_BIND, ""); err != nil {
 		return fmt.Errorf("bind: %w", err)
 	}
 	// A bind mount takes its flags from where it came from; they are set

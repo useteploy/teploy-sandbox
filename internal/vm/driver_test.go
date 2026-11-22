@@ -254,6 +254,11 @@ func TestBootFailuresRollBackCompletely(t *testing.T) {
 		"hypervisor does not start": func(h *fakeHypervisor) { h.startErr = errors.New("exec format error") },
 		"agent never answers":       func(h *fakeHypervisor) { h.bootErr = errors.New("connection refused") },
 		"hypervisor exits":          func(h *fakeHypervisor) { h.dieOnBoot = true },
+		// The run's own disk limits, set once the agent answers, could
+		// not be: a VM still under its boot limits is not a run's.
+		"run's disk limits not set": func(h *fakeHypervisor) {
+			h.onStart = func(m *fakeMachine) { m.bootedErr = errors.New("set io.max: no such device") }
+		},
 	} {
 		rig := newRig(t, nil)
 		rig.driver.BootTimeout = 300 * time.Millisecond
@@ -269,13 +274,132 @@ func TestBootFailuresRollBackCompletely(t *testing.T) {
 		if name == "hypervisor exits" && time.Since(start) > 250*time.Millisecond {
 			t.Errorf("a dead hypervisor was waited on for the whole boot timeout (%s)", time.Since(start))
 		}
-		if name != "hypervisor does not start" && !strings.Contains(err.Error(), "fake serial log") {
+		if name == "run's disk limits not set" && !strings.Contains(err.Error(), "io.max") {
+			t.Errorf("%s: the error does not say what failed: %v", name, err)
+		}
+		if name != "hypervisor does not start" && name != "run's disk limits not set" && !strings.Contains(err.Error(), "fake serial log") {
 			t.Errorf("%s: the error carries no diagnostics: %v", name, err)
 		}
 		assertPool(t, rig.zfs, pristine...)
 		if len(rig.hypervisor.running()) != 0 || len(rig.manager.List()) != 0 {
 			t.Fatalf("%s: left running=%v runs=%d", name, rig.hypervisor.running(), len(rig.manager.List()))
 		}
+	}
+}
+
+// A VM boots under its boot disk limits and is held to the run's own
+// once its agent has answered, before the create returns: what a run
+// does is always under the run's limits, and what its image does to
+// boot is not (diskLimits.forBoot).
+func TestABootedVMIsHeldToTheRunsDiskLimits(t *testing.T) {
+	rig := newRig(t, nil)
+	created, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine := rig.hypervisor.machine(containerName(created.ID))
+	machine.mu.Lock()
+	booted, afterAgent := machine.booted, machine.pingedBeforeBooted
+	machine.mu.Unlock()
+	if !booted {
+		t.Fatal("a create returned without holding its VM to the run's disk limits")
+	}
+	if !afterAgent {
+		t.Fatal("the run's disk limits were set before the guest's agent answered: the boot ran under them")
+	}
+}
+
+// A snapshot whose boots keep failing after reading (its agent never
+// starts: the tenant's disk decides that) is not booted again back to
+// back, so the raised boot limits cannot be made into a rate by looping
+// resumes or forks. What is charged is what those boots read at the
+// raised rate: boots that were cancelled or failed early, having read
+// little, cost about nothing, however many there are, and do not lock
+// out the others who boot the same snapshot. The golden image, another
+// snapshot and a success are unaffected.
+func TestASnapshotWhoseBootsKeepFailingIsBackedOff(t *testing.T) {
+	rig := newRig(t, nil)
+	rig.driver.BootTimeout = 100 * time.Millisecond
+	source, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken, err := rig.manager.Snapshot(bg, source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := rig.manager.Snapshot(bg, source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	starts := func() int {
+		rig.hypervisor.mu.Lock()
+		defer rig.hypervisor.mu.Unlock()
+		return len(rig.hypervisor.started)
+	}
+	failReading := func(read int64) {
+		rig.hypervisor.bootErr = errors.New("connection refused")
+		rig.hypervisor.onStart = func(m *fakeMachine) { m.bootRead = read }
+	}
+	// Twenty boots that fail having read 4 MiB each (callers that went
+	// away, say): 80 MiB in all, far below the budget. None is refused.
+	for i := range 20 {
+		failReading(4 << 20)
+		if _, err := rig.manager.Create(bg, run.CreateRequest{Image: broken}); err == nil || errors.Is(err, run.ErrAtCapacity) {
+			t.Fatalf("boot %d after cheap failures: %v, want it tried and failed", i, err)
+		}
+	}
+	// Failed boots that read the budget between them: the next is refused
+	// without starting anything.
+	failReading(BootReadBudget / 2)
+	_, _ = rig.manager.Create(bg, run.CreateRequest{Image: broken})
+	failReading(BootReadBudget / 2)
+	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: broken}); err == nil || errors.Is(err, run.ErrAtCapacity) {
+		t.Fatalf("the boot that reached the budget: %v, want it tried and failed", err)
+	}
+	rig.hypervisor.onStart = nil
+	before := starts()
+	_, err = rig.manager.Create(bg, run.CreateRequest{Image: broken})
+	if !errors.Is(err, run.ErrAtCapacity) || !strings.Contains(err.Error(), "the next may start in") {
+		t.Fatalf("a boot right after failed boots read the budget: %v", err)
+	}
+	if starts() != before {
+		t.Fatal("a backed-off boot started a hypervisor")
+	}
+	// Others boot.
+	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: other}); err != nil {
+		t.Fatalf("another snapshot: %v", err)
+	}
+	if _, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage}); err != nil {
+		t.Fatalf("the golden image: %v", err)
+	}
+	// The wait doubles per budget read, is bounded, and a success clears it.
+	now := time.Now()
+	rig.driver.noteBoot(broken, false, BootReadBudget, now)
+	if wait := rig.driver.bootWait(broken, now); wait != 2*bootBackoffBase {
+		t.Fatalf("wait after a second budget: %s, want %s", wait, 2*bootBackoffBase)
+	}
+	rig.driver.noteBoot(broken, false, 1<<20, now)
+	if wait := rig.driver.bootWait(broken, now); wait != 2*bootBackoffBase {
+		t.Fatalf("a cheap failure changed the wait: %s", wait)
+	}
+	for range 20 {
+		rig.driver.noteBoot(broken, false, BootReadBudget, now)
+	}
+	if wait := rig.driver.bootWait(broken, now); wait != bootBackoffMax {
+		t.Fatalf("wait after many budgets: %s, want %s", wait, bootBackoffMax)
+	}
+	rig.driver.noteBoot(broken, true, 0, now)
+	if wait := rig.driver.bootWait(broken, now); wait != 0 {
+		t.Fatalf("wait after a success: %s", wait)
+	}
+	// What a snapshot's failed boots read is forgotten once it has not
+	// failed for a long while.
+	rig.driver.noteBoot(broken, false, BootReadBudget-1, now)
+	rig.driver.noteBoot(other, false, 1, now.Add(2*bootBackoffMax))
+	rig.driver.noteBoot(broken, false, 1, now.Add(2*bootBackoffMax))
+	if wait := rig.driver.bootWait(broken, now.Add(2*bootBackoffMax)); wait != 0 {
+		t.Fatalf("an old failed boot was still counted: wait %s", wait)
 	}
 }
 

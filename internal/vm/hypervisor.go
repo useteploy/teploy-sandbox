@@ -67,6 +67,14 @@ type Machine interface {
 	// Diagnostics is what the VM left behind for a human: the end of its
 	// serial console and of the hypervisor's own output.
 	Diagnostics() string
+	// Booted is called once the guest's agent has first answered: the
+	// VM boots under its boot disk limits and is held to the run's own
+	// from here on. An error means the VM must not be used.
+	Booted() error
+	// BootRead is how much the VM has read from its disk under its boot
+	// limits (diskLimits.forBoot): what a failed boot cost at the raised
+	// rate. It is for the driver to call before the VM is killed.
+	BootRead() int64
 }
 
 // MachineExit is how a VM process ended: killed by Signal, or, when
@@ -135,7 +143,8 @@ type Hypervisor interface {
 type CloudHypervisor struct {
 	// Bin is the cloud-hypervisor binary.
 	Bin string
-	// Kernel is the uncompressed kernel image every VM direct-boots.
+	// Kernel is the uncompressed kernel image every VM direct-boots, on
+	// the host. Each VM's jail holds it at JailKernel.
 	Kernel string
 	// Cmdline is the kernel command line.
 	Cmdline string
@@ -198,7 +207,10 @@ func (h *CloudHypervisor) machineDir(name string) string { return filepath.Join(
 // the warm pool. One way for both, so that a run cannot tell which it got.
 func (h *CloudHypervisor) machineArgs(config MachineConfig, dir string, cid uint32) []string {
 	return []string{
-		"--kernel", h.Kernel,
+		// The kernel as the jail holds it, not as the host does (see
+		// JailKernel): the hypervisor opens it from inside, and its
+		// Landlock rules are made from this path.
+		"--kernel", JailKernel,
 		"--cmdline", h.Cmdline,
 		// image_type=raw is mandatory: without it the hypervisor probes the
 		// image format, and it refuses to guess for a writable disk.
@@ -278,6 +290,7 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("start hypervisor: %w", err), confined.release(cleanupCtx))
 	}
+	go confined.watchBoot()
 	machine := &chMachine{
 		dir:     dir,
 		cell:    confined,
@@ -408,7 +421,13 @@ func (m *chMachine) AddNet(ctx context.Context, tap *os.File, mac string) error 
 	return nil
 }
 
+func (m *chMachine) Booted() error   { return m.cell.booted() }
+func (m *chMachine) BootRead() int64 { return m.cell.raisedRead() }
+
 func (m *chMachine) Kill(ctx context.Context) error {
+	// First: a limit set after this would hold back what the kill is
+	// waiting for.
+	m.cell.killing()
 	m.killOnce.Do(func() { _ = m.process.Kill() })
 	// A killed process does not end while the kernel holds back I/O it
 	// queued under its disk limit, and how much that is was the guest's

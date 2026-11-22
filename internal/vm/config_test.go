@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"net/netip"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -249,6 +250,19 @@ func TestPreflightReportsEverythingAtOnce(t *testing.T) {
 	}
 }
 
+// A kernel path the jail would refuse fails the daemon's start, not
+// every create.
+func TestPreflightRefusesAKernelPathThatIsNotAbsoluteAndClean(t *testing.T) {
+	for _, path := range []string{"boot/Image", "./Image", "/var/lib/../lib/Image", "/boot//Image", "/boot/Image/"} {
+		config := goodConfig()
+		config.Kernel = path
+		err := preflight(context.Background(), config, newFakeZFS(), goodHost())
+		if err == nil || !strings.Contains(err.Error(), "absolute, clean path") {
+			t.Errorf("kernel %q: %v", path, err)
+		}
+	}
+}
+
 func TestPreflightAKernelThatIsADirectoryIsMissing(t *testing.T) {
 	h := goodHost()
 	h.stat = func(string) (os.FileInfo, error) { return fileInfo{mode: fs.ModeDir | 0o755}, nil }
@@ -267,6 +281,23 @@ func TestDefaultsAreConsistent(t *testing.T) {
 	config := Config{RunDir: DefaultRunDir, Owner: testOwner}
 	if dir := config.ownerDir(); dir != DefaultRunDir+"/"+testOwner[:16] {
 		t.Fatalf("owner dir: %q", dir)
+	}
+}
+
+// The default kernel is the file the host's architecture boots, under
+// the name Cloud Hypervisor's kernel builds publish it as: an x86-64
+// host that followed the README needs no --vm-kernel.
+func TestTheDefaultKernelIsTheArchitecturesOwn(t *testing.T) {
+	for goarch, want := range map[string]string{
+		"amd64": "/var/lib/teploy-sandbox/vm/vmlinux-x86_64",
+		"arm64": "/var/lib/teploy-sandbox/vm/Image",
+	} {
+		if got := defaultKernelFor(goarch); got != want {
+			t.Errorf("default kernel on %s: %q, want %q", goarch, got, want)
+		}
+	}
+	if DefaultKernel != defaultKernelFor(runtime.GOARCH) {
+		t.Errorf("DefaultKernel %q is not this architecture's (%s)", DefaultKernel, runtime.GOARCH)
 	}
 }
 

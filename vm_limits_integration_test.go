@@ -401,6 +401,33 @@ func TestVMLimits(t *testing.T) {
 	}
 }
 
+// waitForReadsToSettle waits until a VM's cgroup has read nothing from
+// its disk for quiet, and at most limit.
+func waitForReadsToSettle(t *testing.T, group string, quiet, limit time.Duration) {
+	t.Helper()
+	read := func() int64 {
+		match := regexp.MustCompile(`rbytes=(\d+)`).FindStringSubmatch(cgroupValue(t, group, "io.stat"))
+		if match == nil {
+			return 0
+		}
+		n, _ := strconv.ParseInt(match[1], 10, 64)
+		return n
+	}
+	began, last := time.Now(), read()
+	since := began
+	for time.Since(since) < quiet {
+		if time.Since(began) > limit {
+			t.Logf("the guest was still reading from its disk after %s (%d bytes so far)", limit, last)
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+		if now := read(); now != last {
+			last, since = now, time.Now()
+		}
+	}
+	t.Logf("the guest's reads settled after %s, at %d bytes read since it was created", time.Since(began).Round(100*time.Millisecond), last)
+}
+
 // TestVMDestroyIsNotHeldByQueuedIO is a guest that makes its own removal
 // wait. A read or write the kernel holds back for io.max cannot be taken
 // back, and a killed process does not end while it has one; the guest
@@ -409,6 +436,11 @@ func TestVMLimits(t *testing.T) {
 // once, the hypervisor of this guest stayed after its kill for more than
 // six minutes, and every destroy in that time failed. A killed VM keeps
 // its limit for vm.DrainGrace and no longer.
+//
+// The VM boots reading under the default limits and has the 2 MiB/s from the
+// moment its agent answers: a fresh clone of the x86-64 image reads about
+// 465 MB to boot, which under 2 MiB/s did not finish within the driver's
+// two minutes.
 func TestVMDestroyIsNotHeldByQueuedIO(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Fatal("the vm suite needs root (zfs, /dev/kvm)")
@@ -419,10 +451,12 @@ func TestVMDestroyIsNotHeldByQueuedIO(t *testing.T) {
 	const capMB = 2
 	config.DiskMBPerSecond, config.DiskIOPS = capMB, -1
 	manager, _, _, _ := newVMManager(t, config, t.TempDir())
+	began := time.Now()
 	created, err := manager.Create(ctx, run.CreateRequest{Image: vm.GoldenImage, Limits: &run.Limits{MemoryMB: 1024, CPUs: 2}})
 	if err != nil {
-		t.Fatalf("create: %v", err)
+		t.Fatalf("create under a disk limit of %d MiB/s: %v", capMB, err)
 	}
+	t.Logf("create under a disk limit of %d MiB/s took %s", capMB, time.Since(began).Round(100*time.Millisecond))
 	id := created.ID
 	destroyed, group := false, ""
 	defer func() {
@@ -442,25 +476,59 @@ func TestVMDestroyIsNotHeldByQueuedIO(t *testing.T) {
 	}()
 	machine := inspectVM(t, config, manager, id, 2, 1024)
 	group = machine.cgroup
+	// The run's own limit, already: the boot's ended with the create.
+	if limit := cgroupValue(t, machine.cgroup, "io.max"); !strings.Contains(limit, fmt.Sprintf("rbps=%d wbps=%d", capMB<<20, capMB<<20)) {
+		t.Fatalf("io.max of a VM whose create returned: %q, want the run's %d MiB/s", limit, capMB)
+	}
+	// A fresh clone of the README's x86-64 image still reads for a while
+	// after its agent answers (its first-boot services: about 25 MB more,
+	// against about 465 MB before), now at 2 MiB/s. The writers' own
+	// reads (binaries, the filesystem's metadata) would wait behind that
+	// and they would queue too little to show anything. So the guest is
+	// let finish reading first.
+	waitForReadsToSettle(t, machine.cgroup, 5*time.Second, 3*time.Minute)
 	// As root in the guest: let one request carry as much as the device
 	// takes, then start more direct writes than the limit passes in
 	// minutes. The writes are left running.
 	const writers, eachMB = 48, 64
 	// (Everything the script runs after the writers is read from the
 	// disk before them: behind that queue nothing else is.)
+	//
+	// The guest may not answer once they run: on the x86-64 host
+	// (Linux 6.12, ZFS 2.3) the hypervisor's one disk thread sleeps in
+	// io_submit behind the throttled writes, so the guest's reads wait
+	// too and the exec cannot finish. That is the guest stalling its own
+	// disk, and not what is tested here; what is, is that the writes
+	// reached the host and that the destroy is not held by them.
+	written := func() int64 {
+		match := regexp.MustCompile(`wbytes=(\d+)`).FindStringSubmatch(cgroupValue(t, machine.cgroup, "io.stat"))
+		if match == nil {
+			return 0
+		}
+		n, _ := strconv.ParseInt(match[1], 10, 64)
+		return n
+	}
+	before := written()
 	started := vmRun(t, manager, id, fmt.Sprintf(`for q in /sys/block/vd*/queue; do echo 1048576 > $q/max_sectors_kb; done
 sleep 0.1
 for i in $(seq 1 %d); do (dd if=/dev/zero of=/work/q$i bs=16M count=%d oflag=direct >/dev/null 2>&1 &); done
-sleep 4; echo started`, writers, eachMB/16), "", nil, time.Minute)
-	if started.code != 0 || strings.TrimSpace(started.stdout) != "started" {
+sleep 4; echo started`, writers, eachMB/16), "", nil, 30*time.Second)
+	switch {
+	case started.code == 0 && strings.TrimSpace(started.stdout) == "started":
+	case started.timedOut:
+		t.Logf("the guest did not answer once its writers ran (it stalled its own disk); going on")
+	default:
 		t.Fatalf("the guest's writers: exit %d %q %q", started.code, started.stdout, started.stderr)
+	}
+	if after := written(); after-before < 4*capMB<<20 {
+		t.Fatalf("the guest's writers wrote %d bytes to the host's device, want at least what %d MiB/s passes in 4 s", after-before, capMB)
 	}
 	limit := cgroupValue(t, machine.cgroup, "io.max")
 	if !strings.Contains(limit, fmt.Sprintf("wbps=%d", capMB<<20)) {
 		t.Fatalf("io.max of a VM that is alive, with writes queued: %q", limit)
 	}
 	stat := cgroupValue(t, machine.cgroup, "io.stat")
-	began := time.Now()
+	began = time.Now()
 	err = manager.Destroy(ctx, id)
 	took := time.Since(began)
 	destroyed = err == nil

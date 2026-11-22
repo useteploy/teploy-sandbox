@@ -48,6 +48,8 @@ type jailReport struct {
 	// with, and what a read of the stray one gave.
 	Open  []int
 	Stray string
+	// Kernel is what reading JailKernel gave.
+	Kernel string
 }
 
 // strayDescriptor is where the tests put a descriptor that nothing
@@ -82,6 +84,11 @@ func init() {
 		n, _ := syscall.Read(fd, buf)
 		report.Stray = string(buf[:max(n, 0)])
 		_ = syscall.Close(fd)
+	}
+	if raw, err := os.ReadFile(JailKernel); err == nil {
+		report.Kernel = string(raw)
+	} else {
+		report.Kernel = "!" + err.Error()
 	}
 	report.Groups, _ = os.Getgroups()
 	report.Hostname, _ = os.Hostname()
@@ -193,7 +200,14 @@ func TestJailHoldsNothingOfTheHost(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(other, "secret"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	kernel := filepath.Join(base, "Image")
+	// The kernel in a directory of its own, as the host keeps it
+	// (/var/lib/teploy-sandbox/vm by default): the jail has it at
+	// JailKernel, and that directory is not in the jail.
+	kernelDir := filepath.Join(base, "var", "lib", "kernels")
+	if err := os.MkdirAll(kernelDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	kernel := filepath.Join(kernelDir, "vmlinux")
 	if err := os.WriteFile(kernel, []byte("kernel"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -262,6 +276,9 @@ func TestJailHoldsNothingOfTheHost(t *testing.T) {
 	if report.Status != "" {
 		t.Errorf("the jail has a /proc")
 	}
+	if report.Kernel != "kernel" {
+		t.Errorf("the kernel in the jail at %s: %q, want the host's file", JailKernel, report.Kernel)
+	}
 	// The one file it was handed, and nothing else that was open in the
 	// process that started it.
 	if !slices.Equal(report.Open, []int{standardDescriptors}) {
@@ -277,6 +294,9 @@ func TestJailHoldsNothingOfTheHost(t *testing.T) {
 		for path := each.Path; path != "/"; path = filepath.Dir(path) {
 			want[path] = true
 		}
+	}
+	if want[filepath.Join(base, "var")] {
+		t.Fatalf("the spec names the kernel's host directory: %+v", spec.Paths)
 	}
 	var got []string
 	for _, line := range report.Tree {
@@ -444,4 +464,19 @@ func TestJailCostPerStart(t *testing.T) {
 	})
 	t.Logf("timing: a process started and reaped, median of %d: %s without a jail, %s with one; the jail adds %s per start",
 		rounds, before.Round(10*time.Microsecond), jailed.Round(10*time.Microsecond), (jailed - before).Round(10*time.Microsecond))
+}
+
+// A file bound from elsewhere that is not there is reported by its path
+// in the jail: the helper's output reaches the VM's diagnostics, and the
+// host's path is not for them.
+func TestJailNamesAMissingKernelByItsPathInTheJail(t *testing.T) {
+	root := t.TempDir()
+	host := filepath.Join(t.TempDir(), "var", "lib", "teploy-sandbox", "vm", "vmlinux-x86_64")
+	err := jailAdd(root, jailPath{Path: JailKernel, Source: host, Kind: jailFile})
+	if err == nil {
+		t.Fatal("a missing kernel was bound")
+	}
+	if strings.Contains(err.Error(), host) || strings.Contains(err.Error(), "/var/lib") || !strings.Contains(err.Error(), JailKernel) {
+		t.Fatalf("the error for a missing kernel: %q, want it to name %s and not the host's path", err, JailKernel)
+	}
 }

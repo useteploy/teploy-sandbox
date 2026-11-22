@@ -20,7 +20,6 @@ import (
 // scripts/build-golden.sh produces when told nothing else.
 const (
 	DefaultHypervisor = "cloud-hypervisor"
-	DefaultKernel     = "/var/lib/teploy-sandbox/vm/Image"
 	DefaultPool       = "sbx"
 	DefaultGolden     = DefaultPool + "/golden-guestd@v1"
 	DefaultRunDir     = "/run/teploy-sandbox/vm"
@@ -35,6 +34,21 @@ const (
 	// a filesystem that allows device nodes, which /run is not.
 	DefaultDevDir = "/dev/teploy-sandbox"
 )
+
+// DefaultKernel is where the daemon looks for the guest kernel unless
+// told otherwise: the name Cloud Hypervisor's own kernel builds publish
+// for the host's architecture.
+var DefaultKernel = defaultKernelFor(runtime.GOARCH)
+
+// defaultKernelFor is DefaultKernel on the architecture goarch. x86-64
+// boots an ELF vmlinux, which the kernel builds call vmlinux-x86_64;
+// arm64 boots the Image of its build tree.
+func defaultKernelFor(goarch string) string {
+	if goarch == "amd64" {
+		return "/var/lib/teploy-sandbox/vm/vmlinux-x86_64"
+	}
+	return "/var/lib/teploy-sandbox/vm/Image"
+}
 
 // Config is everything the VM driver needs from the host.
 type Config struct {
@@ -445,7 +459,11 @@ func preflight(ctx context.Context, config Config, zfs ZFS, host host) error {
 	} else if err := reachable(host.stat, path, 0o005); err != nil {
 		miss("a hypervisor binary that an unprivileged VM process can run (--vm-hypervisor / SBX_VM_HYPERVISOR): %v", err)
 	}
-	if info, err := host.stat(config.Kernel); err != nil || !info.Mode().IsRegular() {
+	if !filepath.IsAbs(config.Kernel) || filepath.Clean(config.Kernel) != config.Kernel {
+		// The jail binds it by this path, and refuses one that is not
+		// absolute and clean: say so now rather than at every create.
+		miss("a guest kernel image named by an absolute, clean path (--vm-kernel / SBX_VM_KERNEL), not %q", config.Kernel)
+	} else if info, err := host.stat(config.Kernel); err != nil || !info.Mode().IsRegular() {
 		miss("the guest kernel image %q (--vm-kernel / SBX_VM_KERNEL)", config.Kernel)
 	} else if err := reachable(host.stat, config.Kernel, 0o004); err != nil {
 		miss("a guest kernel image that an unprivileged VM process can read (--vm-kernel / SBX_VM_KERNEL): %v", err)
@@ -678,6 +696,7 @@ func New(ctx context.Context, config Config, log *slog.Logger) (*Driver, error) 
 		libraries: libraries,
 		disk:      config.diskLimits(),
 		sys:       realConfineSys(),
+		log:       log,
 	}
 	plan, err := networkPlan(config, realHost(), func(string, ...any) {})
 	if err != nil {

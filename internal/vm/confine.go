@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -65,7 +66,14 @@ type confinement struct {
 	libraries []jailPath
 	// disk is what every VM may read from and write to its disk.
 	disk diskLimits
-	sys  confineSys
+	// bootReadBudget and bootPoll are BootReadBudget and bootPoll unless
+	// a test says otherwise.
+	bootReadBudget int64
+	bootPoll       time.Duration
+	bootMisses     int
+	// log is for what a VM's confinement cannot do; nil logs nothing.
+	log *slog.Logger
+	sys confineSys
 }
 
 // confineSys is the host as confinement uses it; tests replace it.
@@ -139,9 +147,25 @@ type cell struct {
 	// dir is the VM's runtime dir, disk its private device node.
 	dir, disk string
 
+	// device is the number of the VM's disk, as io.max names it.
+	device uint64
+
 	mu       sync.Mutex
 	cgroup   *os.File
 	released bool
+	// dying is set once the VM's process is being killed: from then on
+	// its disk limits are only ever lifted (see DrainGrace), never set.
+	dying bool
+	// boosted: the VM still has its boot limits (diskLimits.forBoot),
+	// not the run's.
+	boosted bool
+	// bootDone is closed when the boot limits end, for whatever reason;
+	// it stops watchBoot.
+	bootDone chan struct{}
+	bootOnce sync.Once
+	// read is what the VM has read from its disk under its boot limits,
+	// as last seen.
+	read int64
 }
 
 // jailRoot is the mount point of the VM's jail.
@@ -155,7 +179,7 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 	if err != nil {
 		return nil, err
 	}
-	current := &cell{owner: c, name: config.Name, uid: uid, dir: dir, disk: filepath.Join(c.devDir, config.Name)}
+	current := &cell{owner: c, name: config.Name, uid: uid, dir: dir, disk: filepath.Join(c.devDir, config.Name), bootDone: make(chan struct{})}
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, current.release(ctx))
@@ -202,8 +226,12 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 	if err = c.sys.chown(current.disk, uid, uid); err != nil {
 		return nil, err
 	}
+	current.device = dev
+	// The VM boots under its boot limits and gets the run's own once its
+	// agent answers (booted) or its boot has read its budget (watchBoot).
 	limits := limitsFor(config)
-	limits.Disk, limits.DiskDevice = c.disk, dev
+	limits.DiskRead, limits.Disk, limits.DiskDevice = c.disk.forBoot(), c.disk, dev
+	current.boosted = c.disk.forBoot() != c.disk
 	group, err := c.cgroups.create(ctx, config.Name, limits)
 	if err != nil {
 		return nil, fmt.Errorf("cgroup: %w", err)
@@ -274,6 +302,144 @@ func (c *cell) drain(stop <-chan struct{}) {
 	}
 }
 
+// booted is for a VM whose guest agent answered: from here on it is held
+// to the run's own disk limits instead of its boot limits (see
+// diskLimits.forBoot). It fails for a VM that is being killed, and
+// when the limit cannot be set; either way the VM is not a run's.
+func (c *cell) booted() error {
+	defer c.endBoot()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dying || c.released {
+		return errors.New("the VM is being removed")
+	}
+	return c.unboostLocked()
+}
+
+// unboostLocked replaces the boot limits with the run's, once.
+func (c *cell) unboostLocked() error {
+	if !c.boosted {
+		return nil
+	}
+	if err := c.owner.cgroups.limitDisk(c.name, c.owner.disk.ioMax(c.device)); err != nil {
+		return err
+	}
+	c.boosted = false
+	return nil
+}
+
+func (c *cell) endBoot() { c.bootOnce.Do(func() { close(c.bootDone) }) }
+
+// BootReadBudget is how much a VM may read from its disk under its boot
+// limits (diskLimits.forBoot): when its cgroup has read this much and
+// its agent has still not answered, it has the run's own limits from
+// then on, for the rest of its boot. A boot of the README's x86-64 image
+// read about 465 MB before its agent answered; this is twice that. The
+// end of the boot window is the guest's to choose on a resume or a fork
+// (it boots a tenant's disk, and the tenant decides when its agent
+// starts): the budget is what bounds the window then, not the boot
+// timeout.
+const BootReadBudget = 1 << 30
+
+// bootPoll is how often watchBoot reads a booting VM's io.stat. At the
+// default read rate that lets a boot overshoot its budget by about 50 MB.
+const bootPoll = 200 * time.Millisecond
+
+// bootMisses is how many reads of a booting VM's io.stat in a row may
+// fail, or not list its disk, before watchBoot gives up counting and
+// gives it the run's limits: what cannot be counted is not left raised.
+// A guest reads its root filesystem well within a second of starting;
+// this is 10 s at bootPoll.
+const bootMisses = 50
+
+// watchBoot gives a booting VM the run's own disk limits once its cgroup
+// has read the boot budget, if its agent has not answered first. It
+// returns when the boot limits have ended, whichever way.
+func (c *cell) watchBoot() {
+	budget, poll := c.owner.bootReadBudget, c.owner.bootPoll
+	if budget <= 0 {
+		budget = BootReadBudget
+	}
+	if poll <= 0 {
+		poll = bootPoll
+	}
+	c.mu.Lock()
+	raised := c.boosted
+	c.mu.Unlock()
+	if !raised {
+		// Nothing raised, nothing to end or to count.
+		c.endBoot()
+		return
+	}
+	missLimit := c.owner.bootMisses
+	if missLimit <= 0 {
+		missLimit = bootMisses
+	}
+	tick := time.NewTicker(poll)
+	defer tick.Stop()
+	misses := 0
+	for {
+		select {
+		case <-c.bootDone:
+			return
+		case <-tick.C:
+		}
+		read, found, err := c.owner.cgroups.readBytes(c.name, c.device)
+		if err != nil || !found {
+			misses++
+			if misses == 1 && c.owner.log != nil {
+				c.owner.log.Warn("vm boot: cannot count what the VM reads from its disk; it gets the run's disk limits if this goes on", "name", c.name, "error", err)
+			}
+			if misses < missLimit {
+				continue
+			}
+		} else {
+			misses = 0
+			c.mu.Lock()
+			c.read = max(c.read, read)
+			c.mu.Unlock()
+			if read < budget {
+				continue
+			}
+		}
+		c.mu.Lock()
+		done := c.dying || c.released
+		if !done {
+			// A write that fails is tried again on the next tick, and
+			// booted tries it too.
+			done = c.unboostLocked() == nil
+		}
+		c.mu.Unlock()
+		if done {
+			c.endBoot()
+			return
+		}
+	}
+}
+
+// raisedRead is what the VM has read from its disk under its boot
+// limits: read now while it still has them, and as last seen once it
+// has not. A VM whose limits were never raised read nothing at a raised
+// rate.
+func (c *cell) raisedRead() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.boosted && !c.released {
+		if read, found, err := c.owner.cgroups.readBytes(c.name, c.device); err == nil && found {
+			c.read = max(c.read, read)
+		}
+	}
+	return c.read
+}
+
+// killing marks the VM as being killed, before its process is.
+func (c *cell) killing() {
+	defer c.endBoot()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dying = true
+}
+
 func (c *cell) started() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -290,6 +456,7 @@ func (c *cell) started() {
 // A failed release can be repeated.
 func (c *cell) release(ctx context.Context) error {
 	c.started()
+	c.endBoot()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.released {
@@ -447,10 +614,10 @@ type cgroupLimits struct {
 	Pids        int
 	// CPUs is the CPU time the whole process may use, in CPUs.
 	CPUs int
-	// Disk is what the process may read from and write to the block
-	// device with the number DiskDevice.
-	Disk       diskLimits
-	DiskDevice uint64
+	// Disk is what the process may write to the block device with the
+	// number DiskDevice, and DiskRead what it may read from it.
+	Disk, DiskRead diskLimits
+	DiskDevice     uint64
 }
 
 // Defaults for what one VM may do to its disk, in each direction. They
@@ -468,6 +635,31 @@ type diskLimits struct {
 	IOPS           int64
 }
 
+// forBoot is what a VM with the limits l may read from its disk while it
+// boots: l, but never less than the defaults. Its writes are held to l
+// from the start. A boot reads what the image needs, which the run did
+// not choose and an operator cannot size a limit by: a fresh clone of
+// the README's x86-64 image read about 465 MB before its agent
+// answered, which is four minutes at 2 MiB/s and longer than the driver
+// waits for a boot. It wrote about 2 MB (and discarded about 230 MB,
+// which the kernel's throttle counts as 512 bytes an operation), so its
+// writes need nothing raised. So a limit set low does not make a VM
+// that cannot boot. The raised reads end when the agent first answers
+// or when the VM has read BootReadBudget, whichever is first. A limit
+// above the defaults, and no limit, stay as they are.
+func (l diskLimits) forBoot() diskLimits {
+	floor := func(limit, floor int64) int64 {
+		if limit <= 0 {
+			return 0
+		}
+		return max(limit, floor)
+	}
+	return diskLimits{
+		BytesPerSecond: floor(l.BytesPerSecond, DefaultDiskMBPerSecond<<20),
+		IOPS:           floor(l.IOPS, DefaultDiskIOPS),
+	}
+}
+
 // ioMax is the line that sets the limits for one device in a cgroup's
 // io.max, or "" when there is nothing to limit.
 //
@@ -476,8 +668,13 @@ type diskLimits struct {
 // for its guest is charged to the hypervisor's cgroup as it is
 // submitted. The hypervisor has a rate limiter of its own, which is not
 // used: it would be the hypervisor limiting itself.
-func (l diskLimits) ioMax(device uint64) string {
-	if l.BytesPerSecond <= 0 && l.IOPS <= 0 {
+func (l diskLimits) ioMax(device uint64) string { return ioMaxLine(l, l, device) }
+
+// ioMaxLine is the io.max line for reads under read and writes under
+// write, or "" when there is nothing to limit.
+func ioMaxLine(read, write diskLimits, device uint64) string {
+	none := func(l diskLimits) bool { return l.BytesPerSecond <= 0 && l.IOPS <= 0 }
+	if none(read) && none(write) {
 		return ""
 	}
 	value := func(limit int64) string {
@@ -486,12 +683,17 @@ func (l diskLimits) ioMax(device uint64) string {
 		}
 		return strconv.FormatInt(limit, 10)
 	}
-	// A device number as Linux packs it: twelve bits of major above
-	// eight of minor, and the rest of each above those.
+	return fmt.Sprintf("%s rbps=%s wbps=%s riops=%s wiops=%s", deviceKey(device),
+		value(read.BytesPerSecond), value(write.BytesPerSecond), value(read.IOPS), value(write.IOPS))
+}
+
+// deviceKey is a device number as io.max and io.stat name it,
+// "MAJOR:MINOR". Linux packs twelve bits of major above eight of minor,
+// and the rest of each above those.
+func deviceKey(device uint64) string {
 	major := (device>>8)&0xfff | (device>>32)&^uint64(0xfff)
 	minor := device&0xff | (device>>12)&^uint64(0xff)
-	bps, iops := value(l.BytesPerSecond), value(l.IOPS)
-	return fmt.Sprintf("%d:%d rbps=%s wbps=%s riops=%s wiops=%s", major, minor, bps, bps, iops, iops)
+	return fmt.Sprintf("%d:%d", major, minor)
 }
 
 // MemoryLimitMB is the host memory limit of a VM with a guest of the
@@ -675,7 +877,7 @@ func (c *cgroups) create(ctx context.Context, name string, limits cgroupLimits) 
 		{file: "pids.max", value: strconv.Itoa(limits.Pids)},
 		{file: "cpu.max", value: fmt.Sprintf("%d %d", limits.CPUs*cpuPeriodUsec, cpuPeriodUsec)},
 	}
-	if line := limits.Disk.ioMax(limits.DiskDevice); line != "" {
+	if line := ioMaxLine(limits.DiskRead, limits.Disk, limits.DiskDevice); line != "" {
 		settings = append(settings, struct {
 			file, value string
 			optional    bool
@@ -713,6 +915,12 @@ func (c *cgroups) remove(ctx context.Context, name string) error {
 			_ = c.unthrottle(name)
 		}
 		if time.Now().After(deadline) {
+			// Once more after the last kill: the time may have run out
+			// while what the kill ended was being reaped, and a group
+			// that is empty by now is removed, not reported.
+			if last := c.fs.rmdir(dir); last == nil || os.IsNotExist(last) {
+				return nil
+			}
 			return fmt.Errorf("cgroup %s: %w", dir, err)
 		}
 		select {
@@ -721,6 +929,42 @@ func (c *cgroups) remove(ctx context.Context, name string) error {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+// limitDisk sets one line of a VM's group's io.max: the run's limits on
+// its disk, once it has booted.
+func (c *cgroups) limitDisk(name, line string) error {
+	if line == "" {
+		return nil
+	}
+	if err := c.fs.write(filepath.Join(c.path(name), "io.max"), line); err != nil {
+		return fmt.Errorf("set io.max: %w", err)
+	}
+	return nil
+}
+
+// readBytes is how much a VM's group has read from the device, from its
+// io.stat. found is false while the device is not listed (it has done no
+// I/O yet, or the file is not what was expected).
+func (c *cgroups) readBytes(name string, device uint64) (read int64, found bool, err error) {
+	stat, err := c.fs.read(filepath.Join(c.path(name), "io.stat"))
+	if err != nil {
+		return 0, false, err
+	}
+	key := deviceKey(device)
+	for _, line := range strings.Split(stat, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != key {
+			continue
+		}
+		for _, field := range fields[1:] {
+			if value, ok := strings.CutPrefix(field, "rbytes="); ok {
+				read, err := strconv.ParseInt(value, 10, 64)
+				return read, err == nil, err
+			}
+		}
+	}
+	return 0, false, nil
 }
 
 // unthrottle lifts the disk limits of a VM's group, for every device it

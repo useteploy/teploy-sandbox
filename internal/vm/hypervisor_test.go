@@ -33,10 +33,12 @@ func shortDir(t *testing.T) string {
 }
 
 func TestMachineArgsAreTheProvenCommandLine(t *testing.T) {
-	h := &CloudHypervisor{Bin: "/opt/ch", Kernel: "/boot/Image", Cmdline: "root=/dev/vda1 rw console=ttyAMA0 quiet", RunDir: "/run/sbx/abc"}
+	h := &CloudHypervisor{Bin: "/opt/ch", Kernel: "/var/lib/teploy-sandbox/vm/Image", Cmdline: "root=/dev/vda1 rw console=ttyAMA0 quiet", RunDir: "/run/sbx/abc"}
 	got := h.machineArgs(MachineConfig{Name: "teploy-sbx-x", Disk: "/dev/zvol/tank/teploy-sbx-x", CPUs: 2, MemoryMB: 2048}, "/run/sbx/abc/teploy-sbx-x", 7)
 	want := []string{
-		"--kernel", "/boot/Image",
+		// The kernel where the jail holds it: the host's path is not
+		// named to the hypervisor, and does not exist in its jail.
+		"--kernel", JailKernel,
 		"--cmdline", "root=/dev/vda1 rw console=ttyAMA0 quiet",
 		"--disk", "path=/dev/zvol/tank/teploy-sbx-x,image_type=raw,direct=on",
 		"--cpus", "boot=2",

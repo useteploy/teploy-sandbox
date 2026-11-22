@@ -24,6 +24,13 @@ func TestJailSpecRefusesRootAndPathsThatAreNotItsOwn(t *testing.T) {
 		"the whole tree":    func(s *jailSpec) { s.Paths[0].Path = "/" },
 		"an unknown kind":   func(s *jailSpec) { s.Paths[0].Kind = "everything" },
 		"a link to nowhere": func(s *jailSpec) { s.Paths[0] = jailPath{Path: "/lib", Kind: jailSymlink} },
+		// A file bound from elsewhere names a file of the host, and only
+		// a file: a directory or device moved to a new name in the jail
+		// is not something the jail needs.
+		"a relative source":          func(s *jailSpec) { s.Paths[1].Source = "boot/Image" },
+		"a source with ..":           func(s *jailSpec) { s.Paths[1].Source = "/boot/../etc/shadow" },
+		"a directory from elsewhere": func(s *jailSpec) { s.Paths[5].Source = "/home" },
+		"a device from elsewhere":    func(s *jailSpec) { s.Paths[2].Source = "/dev/sda" },
 		// Fewer than its standard three: a spec that does not say what
 		// the program is given would let everything through.
 		"no descriptors": func(s *jailSpec) { s.Descriptors = 0 },
@@ -66,6 +73,24 @@ func TestJailArgsKeepTheHypervisorsCommandLine(t *testing.T) {
 // can be mounted.
 func TestJailForHoldsOnlyWhatAVMNeeds(t *testing.T) {
 	spec := jailFor("/run/sbx/abc/vm.jail", 70000, nil, "/opt/ch", "/boot/Image", "/dev/sbx/abc/vm", "/run/sbx/abc/vm", nil)
+	// The kernel is at JailKernel, bound from wherever the host keeps
+	// it: its host path (here /boot, by default /var/lib) is not in the
+	// jail.
+	kernels := 0
+	for _, each := range spec.Paths {
+		if each.Source != "" && (each.Path != JailKernel || each.Source != "/boot/Image" || each.Kind != jailFile || each.Write || each.Exec) {
+			t.Errorf("a path bound from elsewhere that is not the kernel, read-only, at %s: %+v", JailKernel, each)
+		}
+		if each.Path == JailKernel {
+			kernels++
+		}
+		if each.Path == "/boot" || strings.HasPrefix(each.Path, "/boot/") {
+			t.Errorf("the jail holds the kernel's host path: %+v", each)
+		}
+	}
+	if kernels != 1 {
+		t.Errorf("%d kernels at %s, want 1", kernels, JailKernel)
+	}
 	var writable, executable, devices []string
 	for _, each := range spec.Paths {
 		if each.Write {

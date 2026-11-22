@@ -642,6 +642,8 @@ type fakeMachine struct {
 	// the agent had answered by then; bootedErr is what Booted answers.
 	booted, pingedBeforeBooted bool
 	bootedErr                  error
+	// bootRead is what BootRead answers.
+	bootRead int64
 }
 
 func (m *fakeMachine) Agent() Agent            { return (*fakeAgent)(m) }
@@ -743,6 +745,12 @@ func (m *fakeMachine) Booted() error {
 	defer m.mu.Unlock()
 	m.booted, m.pingedBeforeBooted = true, m.up
 	return m.bootedErr
+}
+
+func (m *fakeMachine) BootRead() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.bootRead
 }
 
 func (m *fakeMachine) Kill(ctx context.Context) error {

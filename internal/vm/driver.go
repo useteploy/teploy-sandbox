@@ -77,24 +77,37 @@ type Driver struct {
 	// creating counts creates under way, for MaxRuns.
 	creating int
 	pool     *warmPool
-	// failedBoots is, per snapshot, the boots from it in a row that
-	// started and did not come up, and when the next may start.
+	// failedBoots is, per snapshot, what its boots that started and did
+	// not come up read under the raised boot limits since its last boot
+	// that did, and when the next may start.
 	failedBoots map[string]bootBackoff
 }
 
 // bootBackoff is a snapshot whose last boots failed.
 type bootBackoff struct {
-	failures int
-	until    time.Time
+	// read is the raised-rate bytes of its failed boots not yet charged
+	// as a strike; strikes the BootReadBudgets charged.
+	read    int64
+	strikes int
+	until   time.Time
+	// last is when the last failed boot was noted.
+	last time.Time
 }
 
-// Backing off the boots of one snapshot that keep failing. A boot of a
-// snapshot (a resume or a fork) runs the tenant's own disk, and the
-// tenant decides whether its agent ever starts; each attempt reads under
-// the raised boot limits (diskLimits.forBoot, up to BootReadBudget).
-// Repeating attempts back to back is how that would be made a rate: the
-// second failure in a row waits bootBackoffBase, and each further one
-// twice as long, up to bootBackoffMax. One success clears it.
+// Backing off the boots of one snapshot whose boots keep failing after
+// reading. A boot of a snapshot (a resume or a fork) runs the tenant's
+// own disk, and the tenant decides whether its agent ever starts; each
+// attempt reads under the raised boot limits (diskLimits.forBoot, up to
+// BootReadBudget). Repeating attempts back to back is how that would be
+// made a rate. What is charged is what the back-off protects: the bytes
+// failed boots read at the raised rate. A boot that was cancelled (the
+// caller went away) or failed early read little and costs about
+// nothing. Each BootReadBudget of them, summed over the snapshot's
+// failed boots since its last boot that came up, is a strike: the next
+// boot waits bootBackoffBase, doubling with each further strike up to
+// bootBackoffMax. One boot that comes up, by anyone, clears it. The
+// snapshot is the unit, so every caller that boots a shared snapshot
+// waits with the one whose boots failed.
 const (
 	bootBackoffBase = 10 * time.Second
 	bootBackoffMax  = 5 * time.Minute
@@ -110,8 +123,9 @@ func (d *Driver) bootWait(ref string, now time.Time) time.Duration {
 	return 0
 }
 
-// noteBoot records how a boot from ref that started ended.
-func (d *Driver) noteBoot(ref string, ok bool, now time.Time) {
+// noteBoot records how a boot from ref that started ended, and what it
+// read under the raised boot limits.
+func (d *Driver) noteBoot(ref string, ok bool, read int64, now time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if ok {
@@ -121,17 +135,20 @@ func (d *Driver) noteBoot(ref string, ok bool, now time.Time) {
 	if d.failedBoots == nil {
 		d.failedBoots = map[string]bootBackoff{}
 	}
-	// Entries whose wait is long over are of no use.
+	// A snapshot that has not failed for a long while, and does not
+	// have to wait, starts again from nothing.
 	for other, failed := range d.failedBoots {
-		if now.Sub(failed.until) > bootBackoffMax {
+		if now.Sub(failed.last) > bootBackoffMax && !now.Before(failed.until) {
 			delete(d.failedBoots, other)
 		}
 	}
 	failed := d.failedBoots[ref]
-	failed.failures++
-	failed.until = now
-	if failed.failures > 1 {
-		failed.until = now.Add(min(bootBackoffBase<<min(failed.failures-2, 10), bootBackoffMax))
+	failed.last = now
+	failed.read += max(read, 0)
+	if failed.read >= BootReadBudget {
+		failed.read = 0
+		failed.strikes++
+		failed.until = now.Add(min(bootBackoffBase<<min(failed.strikes-1, 10), bootBackoffMax))
 	}
 	d.failedBoots[ref] = failed
 }
@@ -514,7 +531,7 @@ func (d *Driver) track(name string, current *instance) {
 func (d *Driver) boot(ctx context.Context, name, ref string, cpus, memoryMB int) (machine Machine, leftover bool, err error) {
 	if ref != "" {
 		if wait := d.bootWait(ref, time.Now()); wait > 0 {
-			return nil, false, fmt.Errorf("%w: the last boots of %s did not come up; the next may start in %s", run.ErrAtCapacity, ref, wait.Round(time.Second))
+			return nil, false, fmt.Errorf("%w: boots of %s that did not come up have read %d MiB or more under the raised boot limits; the next may start in %s", run.ErrAtCapacity, ref, BootReadBudget>>20, wait.Round(time.Second))
 		}
 	}
 	device, err := d.volumes.CreateRun(ctx, name, ref)
@@ -529,7 +546,11 @@ func (d *Driver) boot(ctx context.Context, name, ref string, cpus, memoryMB int)
 			err = fmt.Errorf("vm %s: the run's disk limits: %w", name, err)
 		}
 		if ref != "" {
-			d.noteBoot(ref, err == nil, time.Now())
+			var read int64
+			if err != nil {
+				read = machine.BootRead()
+			}
+			d.noteBoot(ref, err == nil, read, time.Now())
 		}
 	}
 	if err == nil {

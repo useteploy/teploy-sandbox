@@ -71,6 +71,10 @@ type Machine interface {
 	// VM boots under its boot disk limits and is held to the run's own
 	// from here on. An error means the VM must not be used.
 	Booted() error
+	// BootRead is how much the VM has read from its disk under its boot
+	// limits (diskLimits.forBoot): what a failed boot cost at the raised
+	// rate. It is for the driver to call before the VM is killed.
+	BootRead() int64
 }
 
 // MachineExit is how a VM process ended: killed by Signal, or, when
@@ -417,7 +421,8 @@ func (m *chMachine) AddNet(ctx context.Context, tap *os.File, mac string) error 
 	return nil
 }
 
-func (m *chMachine) Booted() error { return m.cell.booted() }
+func (m *chMachine) Booted() error   { return m.cell.booted() }
+func (m *chMachine) BootRead() int64 { return m.cell.raisedRead() }
 
 func (m *chMachine) Kill(ctx context.Context) error {
 	// First: a limit set after this would hold back what the kill is

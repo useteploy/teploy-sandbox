@@ -696,6 +696,7 @@ func New(ctx context.Context, config Config, log *slog.Logger) (*Driver, error) 
 		libraries: libraries,
 		disk:      config.diskLimits(),
 		sys:       realConfineSys(),
+		log:       log,
 	}
 	plan, err := networkPlan(config, realHost(), func(string, ...any) {})
 	if err != nil {

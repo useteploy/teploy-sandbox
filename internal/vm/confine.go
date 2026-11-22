@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -69,7 +70,10 @@ type confinement struct {
 	// a test says otherwise.
 	bootReadBudget int64
 	bootPoll       time.Duration
-	sys            confineSys
+	bootMisses     int
+	// log is for what a VM's confinement cannot do; nil logs nothing.
+	log *slog.Logger
+	sys confineSys
 }
 
 // confineSys is the host as confinement uses it; tests replace it.
@@ -159,6 +163,9 @@ type cell struct {
 	// it stops watchBoot.
 	bootDone chan struct{}
 	bootOnce sync.Once
+	// read is what the VM has read from its disk under its boot limits,
+	// as last seen.
+	read int64
 }
 
 // jailRoot is the mount point of the VM's jail.
@@ -338,6 +345,13 @@ const BootReadBudget = 1 << 30
 // default read rate that lets a boot overshoot its budget by about 50 MB.
 const bootPoll = 200 * time.Millisecond
 
+// bootMisses is how many reads of a booting VM's io.stat in a row may
+// fail, or not list its disk, before watchBoot gives up counting and
+// gives it the run's limits: what cannot be counted is not left raised.
+// A guest reads its root filesystem well within a second of starting;
+// this is 10 s at bootPoll.
+const bootMisses = 50
+
 // watchBoot gives a booting VM the run's own disk limits once its cgroup
 // has read the boot budget, if its agent has not answered first. It
 // returns when the boot limits have ended, whichever way.
@@ -349,17 +363,44 @@ func (c *cell) watchBoot() {
 	if poll <= 0 {
 		poll = bootPoll
 	}
+	c.mu.Lock()
+	raised := c.boosted
+	c.mu.Unlock()
+	if !raised {
+		// Nothing raised, nothing to end or to count.
+		c.endBoot()
+		return
+	}
+	missLimit := c.owner.bootMisses
+	if missLimit <= 0 {
+		missLimit = bootMisses
+	}
 	tick := time.NewTicker(poll)
 	defer tick.Stop()
+	misses := 0
 	for {
 		select {
 		case <-c.bootDone:
 			return
 		case <-tick.C:
 		}
-		read, err := c.owner.cgroups.readBytes(c.name, c.device)
-		if err != nil || read < budget {
-			continue
+		read, found, err := c.owner.cgroups.readBytes(c.name, c.device)
+		if err != nil || !found {
+			misses++
+			if misses == 1 && c.owner.log != nil {
+				c.owner.log.Warn("vm boot: cannot count what the VM reads from its disk; it gets the run's disk limits if this goes on", "name", c.name, "error", err)
+			}
+			if misses < missLimit {
+				continue
+			}
+		} else {
+			misses = 0
+			c.mu.Lock()
+			c.read = max(c.read, read)
+			c.mu.Unlock()
+			if read < budget {
+				continue
+			}
 		}
 		c.mu.Lock()
 		done := c.dying || c.released
@@ -374,6 +415,21 @@ func (c *cell) watchBoot() {
 			return
 		}
 	}
+}
+
+// raisedRead is what the VM has read from its disk under its boot
+// limits: read now while it still has them, and as last seen once it
+// has not. A VM whose limits were never raised read nothing at a raised
+// rate.
+func (c *cell) raisedRead() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.boosted && !c.released {
+		if read, found, err := c.owner.cgroups.readBytes(c.name, c.device); err == nil && found {
+			c.read = max(c.read, read)
+		}
+	}
+	return c.read
 }
 
 // killing marks the VM as being killed, before its process is.
@@ -888,11 +944,12 @@ func (c *cgroups) limitDisk(name, line string) error {
 }
 
 // readBytes is how much a VM's group has read from the device, from its
-// io.stat; 0 while it has read nothing (the device is not listed yet).
-func (c *cgroups) readBytes(name string, device uint64) (int64, error) {
+// io.stat. found is false while the device is not listed (it has done no
+// I/O yet, or the file is not what was expected).
+func (c *cgroups) readBytes(name string, device uint64) (read int64, found bool, err error) {
 	stat, err := c.fs.read(filepath.Join(c.path(name), "io.stat"))
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	key := deviceKey(device)
 	for _, line := range strings.Split(stat, "\n") {
@@ -902,11 +959,12 @@ func (c *cgroups) readBytes(name string, device uint64) (int64, error) {
 		}
 		for _, field := range fields[1:] {
 			if value, ok := strings.CutPrefix(field, "rbytes="); ok {
-				return strconv.ParseInt(value, 10, 64)
+				read, err := strconv.ParseInt(value, 10, 64)
+				return read, err == nil, err
 			}
 		}
 	}
-	return 0, nil
+	return 0, false, nil
 }
 
 // unthrottle lifts the disk limits of a VM's group, for every device it

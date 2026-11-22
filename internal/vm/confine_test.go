@@ -1082,6 +1082,58 @@ func TestABootThatReadsItsBudgetGetsTheRunsLimits(t *testing.T) {
 	}
 }
 
+// What cannot be counted is not left raised: a boot whose io.stat
+// cannot be read, or does not list its disk, for bootMisses reads in a
+// row gets the run's limits. And what a boot read under its raised
+// limits is what BootRead reports, for the driver's back-off.
+func TestABootThatCannotBeCountedGetsTheRunsLimits(t *testing.T) {
+	root := t.TempDir()
+	c, _, _ := newTestConfinement(t, root)
+	c.disk = diskLimits{BytesPerSecond: 2 << 20, IOPS: 100}
+	c.bootReadBudget, c.bootPoll, c.bootMisses = 1<<30, 5*time.Millisecond, 4
+	run := "230:16 rbps=2097152 wbps=2097152 riops=100 wiops=100"
+	for i, stat := range []string{"", "8:0 rbytes=99999999999 wbytes=0\n"} {
+		config := MachineConfig{Name: runName(i + 1), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
+		cell, err := c.enter(context.Background(), config, filepath.Join(root, "run", config.Name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		group := c.cgroups.path(config.Name)
+		if stat != "" {
+			must(t, os.WriteFile(filepath.Join(group, "io.stat"), []byte(stat), 0o644))
+		}
+		watched := make(chan struct{})
+		go func() { defer close(watched); cell.watchBoot() }()
+		select {
+		case <-watched:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("io.stat %q: the watch did not give up", stat)
+		}
+		if got := cgroupFile(t, group, "io.max"); got != run {
+			t.Errorf("io.stat %q: io.max %q, want the run's %q", stat, got, run)
+		}
+	}
+
+	config := MachineConfig{Name: runName(3), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
+	cell, err := c.enter(context.Background(), config, filepath.Join(root, "run", config.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cell.raisedRead(); got != 0 {
+		t.Fatalf("read before any I/O: %d", got)
+	}
+	must(t, os.WriteFile(filepath.Join(c.cgroups.path(config.Name), "io.stat"), []byte("230:16 rbytes=5242880 wbytes=0\n"), 0o644))
+	if got := cell.raisedRead(); got != 5<<20 {
+		t.Fatalf("read under the raised limits: %d, want 5 MiB", got)
+	}
+	// Once the run's limits are on, more reads are not raised-rate ones.
+	must(t, cell.booted())
+	must(t, os.WriteFile(filepath.Join(c.cgroups.path(config.Name), "io.stat"), []byte("230:16 rbytes=999999999 wbytes=0\n"), 0o644))
+	if got := cell.raisedRead(); got != 5<<20 {
+		t.Fatalf("read once booted: %d, want the 5 MiB of the boot", got)
+	}
+}
+
 // A process that was killed does not end while the kernel holds back
 // I/O it queued under io.max, and a guest chooses how much it queues: a
 // VM could keep its own removal waiting for as long as its queue takes

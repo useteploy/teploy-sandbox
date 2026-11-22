@@ -509,7 +509,8 @@ func TestRotationRewrapsWithoutMovingAnything(t *testing.T) {
 	chunk := func() []string {
 		var out []string
 		for _, key := range bucket.Keys("fleet/v1/snap/" + snapB + "/") {
-			if !strings.HasSuffix(key, "/manifest") {
+			// Chunks: not the manifest, and not the pins a pass leaves.
+			if !strings.HasSuffix(key, "/manifest") && !strings.Contains(key, "/pin/") {
 				out = append(out, key)
 			}
 		}

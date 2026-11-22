@@ -480,8 +480,12 @@ func TestABaseCollectedUnderAnUploadThatBuildsOnIt(t *testing.T) {
 		if err != nil {
 			t.Fatalf("upload: %v", err)
 		}
-		if collected != 1 {
-			t.Fatalf("the test did not provoke the race: the collection deleted %d snapshots", collected)
+		// Since the third fix round ensureBase pins the base before it
+		// reads it, so the collection under the stream finds the base
+		// pinned and leaves it (it deleted it before the two-phase
+		// delete). Either way the stop must restore.
+		if collected > 1 {
+			t.Fatalf("the collection deleted %d snapshots", collected)
 		}
 		if _, err := service.Advance(bg, run.RemoteRecord{Run: runR, Generation: 1, State: RecordStopped, Snapshot: "snap:" + snapT, Key: uploaded.Key}); err != nil {
 			t.Fatal(err)
@@ -915,7 +919,9 @@ func TestOnlyAnUnusableParentFallsBackToAFullSend(t *testing.T) {
 	t.Run("storage fails", func(t *testing.T) {
 		memory, host, service := arrange(t)
 		memory.SetFail(func(op, key string) error {
-			if op == "put" {
+			// Pins (two-phase delete) still land: the outage is met by
+			// the stream, not by the check of the parent before it.
+			if op == "put" && !strings.Contains(key, "/pin/") {
 				return errors.New("storage is down")
 			}
 			return nil
@@ -1341,7 +1347,11 @@ func TestACollectionTakesOnlyTheUploadItDecidedOn(t *testing.T) {
 		}
 	})
 	stats, err := collector.Collect(bg, grace)
-	if err != nil || stats.Snapshots != 1 || !uploaded {
+	// Since the two-phase delete (2026-11-21) the listing in question is
+	// the one after the condemnation, and the upload's own check pinned
+	// the base: the round decides to put the old manifest back, which
+	// the fresh one standing refuses. Either way the fresh upload stays.
+	if err != nil || stats.Snapshots+stats.Restored != 1 || !uploaded {
 		t.Fatalf("the test did not provoke the race: %+v, %v, uploaded %v", stats, err, uploaded)
 	}
 	restores(t, uploader, snapT, host.data[snapT])

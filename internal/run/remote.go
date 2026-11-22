@@ -69,6 +69,40 @@ type RemoteState struct {
 	DurableAt   *time.Time `json:"durableAt,omitempty"`
 	// Error is why the last publish failed.
 	Error string `json:"error,omitempty"`
+	// Damage is the chunk a read found not to be the chunk that was
+	// uploaded, when that is why the run is not durable. It is kept in
+	// the registry so that a restart does not forget it: remote storage
+	// would otherwise find the snapshot whole by sizes and call the run
+	// durable again (and eviction could then drop the only whole copy).
+	Damage *RemoteDamage `json:"damage,omitempty"`
+}
+
+// RemoteDamage names one damaged chunk: the snapshot, the upload attempt
+// whose chunk it is, and its index.
+type RemoteDamage struct {
+	Snapshot string `json:"snapshot"`
+	Attempt  string `json:"attempt"`
+	Chunk    int    `json:"chunk"`
+}
+
+// DamageError is an error that says a snapshot is not whole because a
+// chunk was read and found damaged, and which one.
+type DamageError struct {
+	Damage RemoteDamage
+	Err    error
+}
+
+func (e *DamageError) Error() string { return e.Err.Error() }
+func (e *DamageError) Unwrap() error { return e.Err }
+
+// damageOf is the damaged chunk an error names, nil when it names none.
+func damageOf(err error) *RemoteDamage {
+	var damaged *DamageError
+	if errors.As(err, &damaged) {
+		d := damaged.Damage
+		return &d
+	}
+	return nil
 }
 
 var (
@@ -86,6 +120,12 @@ var (
 	// ErrNotCallerSnapshot: the snapshot is a run's stop, which goes
 	// with its run and is not a caller's to delete or boot by ID.
 	ErrNotCallerSnapshot = errors.New("snapshot belongs to a run")
+	// ErrRemoteListing: remote storage's listing did not show what was
+	// just written (a chunk that a request by name finds). Not a verdict
+	// on the snapshot, and not storage being unreachable either: a
+	// service whose listings are behind its writes, which every upload
+	// will meet again.
+	ErrRemoteListing = errors.New("remote storage's listing does not show what was written")
 )
 
 // RemoteRecord is one generation of a run's remote record.
@@ -224,6 +264,33 @@ type OffHost interface {
 	// Pressure is whether local storage is short enough that copies
 	// which are safe in remote storage should go.
 	Pressure(ctx context.Context) (bool, error)
+	// ScrubContent reads up to budget bytes of the chunks of the given
+	// snapshots and of everything they build on, going on from where
+	// the last call stopped, and holds each chunk to the SHA-256 its
+	// manifest records. Damaged lists the refs whose chain holds a chunk
+	// a read has found damaged (now or before): Verify reports those not
+	// whole from then on.
+	ScrubContent(ctx context.Context, refs []string, budget int64) (ContentScrub, error)
+	// RememberDamage tells remote storage again what a read found before
+	// this daemon restarted (RemoteState.Damage), until a read finds the
+	// chunk whole or the snapshot is uploaded again.
+	RememberDamage(damage RemoteDamage)
+	// RecheckDamage reads a remembered damaged chunk again: whole is
+	// true when it now reads as uploaded, or the snapshot has been
+	// uploaded again since (its manifest names another attempt).
+	RecheckDamage(ctx context.Context, damage RemoteDamage) (whole bool, err error)
+}
+
+// ContentScrub is what one round of the scrub that reads found.
+type ContentScrub struct {
+	// ReadBytes is what was fetched; Snapshots how many snapshots were
+	// read through in this round; Complete whether every snapshot asked
+	// about has now been read through since the pass began (the next
+	// round begins a new pass).
+	ReadBytes int64
+	Snapshots int
+	Complete  bool
+	Damaged   []string
 }
 
 // RemoteSnapshot is one caller snapshot in the bucket. Membership is

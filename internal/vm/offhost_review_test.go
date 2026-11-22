@@ -764,7 +764,8 @@ func TestTheScrubFindsWhatIsNoLongerWhole(t *testing.T) {
 		created := a.startRun(t, payload(t, 400))
 		stopped := a.stop(t, created.ID)
 		lose(bucket, stopped.Remote.Snapshot)
-		objects := len(bucket.Keys(""))
+		// What is there now; checks add pins, which are not the point.
+		objects := bucket.Keys("")
 		if stats := a.manager.ScrubRemote(bg); stats.NotWhole != 1 {
 			t.Fatalf("scrub: %+v", stats)
 		}
@@ -773,8 +774,10 @@ func TestTheScrubFindsWhatIsNoLongerWhole(t *testing.T) {
 		if got.Remote.State != run.RemoteFailed || got.Remote.Local || !strings.Contains(got.Remote.Error, "not whole") {
 			t.Fatalf("a run lost from the bucket is reported %+v", *got.Remote)
 		}
-		if len(bucket.Keys("")) != objects {
-			t.Fatal("the upkeep deleted from the bucket what a scrub found damaged")
+		for _, key := range objects {
+			if bucket.Raw(key) == nil && !strings.Contains(key, "/pin/") {
+				t.Fatalf("the upkeep deleted from the bucket what a scrub found damaged: %s", key)
+			}
 		}
 		if _, err := a.manager.Resume(bg, created.ID, 0); err == nil {
 			t.Fatal("a run with a chunk gone resumed")

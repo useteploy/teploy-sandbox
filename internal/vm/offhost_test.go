@@ -314,7 +314,8 @@ func TestADamagedRestoreLeavesNothing(t *testing.T) {
 	snapshotKeys := func(bucket *offhosttest.Memory, base bool) []string {
 		var keys []string
 		for _, key := range bucket.Keys("fleet/v1/snap/") {
-			if strings.Contains(key, "/snap/base-") == base && !strings.HasSuffix(key, "/manifest") {
+			// Chunks only: not manifests, and not the pins checks leave.
+			if strings.Contains(key, "/snap/base-") == base && !strings.HasSuffix(key, "/manifest") && !strings.Contains(key, "/pin/") {
 				keys = append(keys, key)
 			}
 		}
@@ -1113,7 +1114,7 @@ func TestMasterKeysRotateWithoutTheOldOne(t *testing.T) {
 	}
 	var chunksBefore []string
 	for _, key := range bucket.Keys("fleet/v1/snap/") {
-		if !strings.HasSuffix(key, "/manifest") {
+		if !strings.HasSuffix(key, "/manifest") && !strings.Contains(key, "/pin/") { // chunks; not the pins checks leave
 			chunksBefore = append(chunksBefore, key)
 		}
 	}
@@ -1132,7 +1133,7 @@ func TestMasterKeysRotateWithoutTheOldOne(t *testing.T) {
 	// The chunks did not move; only the manifest envelopes changed.
 	var chunksAfter []string
 	for _, key := range bucket.Keys("fleet/v1/snap/") {
-		if !strings.HasSuffix(key, "/manifest") {
+		if !strings.HasSuffix(key, "/manifest") && !strings.Contains(key, "/pin/") { // chunks; not the pins checks leave
 			chunksAfter = append(chunksAfter, key)
 		}
 	}

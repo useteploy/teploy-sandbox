@@ -76,7 +76,7 @@ Usage:
                         [--remote-chunk-mb 16] [--remote-parallel 4] [--remote-transfers 4] [--remote-max-chain 8]
                         [--remote-local keep|drop] [--remote-pool-reserve 15] [--remote-snapshot-retry 12h]
                         [--remote-sync-interval 1m] [--remote-gc-interval 1h] [--remote-gc-grace 24h]
-                        [--remote-scrub-interval 6h] [--remote-unfenced]]
+                        [--remote-scrub-interval 6h] [--remote-scrub-read-mb 256] [--remote-unfenced]]
   teploy-sandbox version`, "DEFAULT_KERNEL", vm.DefaultKernel))
 }
 
@@ -448,6 +448,7 @@ func serve(args []string) error {
 		if *remote.scrubInterval == 0 {
 			manager.RemoteScrubInterval = -1
 		}
+		manager.RemoteScrubReadBytes = int64(*remote.scrubReadMB) << 20
 	}
 	if *cacheRoot != "" {
 		manager.Cache = run.NewCacheStore(*cacheRoot, int64(*cacheMaxGB*(1<<30)))

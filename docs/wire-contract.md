@@ -133,7 +133,7 @@ resumed on another daemon from remote storage starts at zero there, as
 | `runs` | `{running, stopped, stoppedRemote?}`; `stoppedRemote` only with remote storage |
 | `allocated` | `{cpus, memoryMb}`: the limits of running runs (and of the warm pool), not measured use |
 | `warmPool` | Only with a VM warm pool: `{sizes: [{cpus, memoryMb, target, ready, booting}]}` |
-| `disk` | Optional: `{kind, name, usedBytes, freeBytes}`. `kind` `zfs-pool` (VM driver; `name` is the pool) or `docker-data-dir` (Docker; `name` is the data root's path, read from the filesystem it is on). `freeBytes` is what can still be written. Absent when the probe fails or takes over 5 s |
+| `disk` | Optional: `{kind, name, usedBytes, freeBytes}`. `kind` `zfs-pool` (VM driver; `name` is the pool) or `docker-data-dir` (Docker; `name` is the data root's path from `docker info`, statfs'd on the daemon's own filesystem: right only for a daemon on the Docker host, wrong or absent against a remote Docker or a Docker VM). `freeBytes` is what can still be written. Absent when the probe fails or takes over 5 s |
 
 ### Runs
 

@@ -314,6 +314,13 @@ func (e *ExecRecord) Finish(code int, timedOut bool, err error) {
 	e.done = true
 	e.finished = e.registry.now()
 	e.exitCode, e.timedOut = code, timedOut
+	if e.cancelled && err == nil && code >= 0 {
+		// The command ended by itself (an exit code of its own) before
+		// the cancel reached it: that is its outcome, not a cancel. A
+		// cancelled command comes back as -1 (the docker CLI killed) or
+		// a context error (the guest agent's connection closed).
+		e.cancelled = false
+	}
 	if err != nil {
 		e.exitCode = -1
 		e.errText = err.Error()
@@ -641,7 +648,19 @@ var execDrainWait = 10 * time.Second
 // would otherwise hold the run busy, and an onExpire "stop" run whose
 // stop is refused at shutdown loses its state. A stop a caller asks for
 // still answers 409 busy, as it always has.
-func (m *Manager) cancelExecsForStop(ctx context.Context, runID, reason string) {
+//
+// due, when given, is checked on the live record first: nothing is
+// cancelled for a run that is no longer due.
+func (m *Manager) cancelExecsForStop(ctx context.Context, runID string, due func(*Run) bool, reason string) {
+	if due != nil {
+		m.mu.Lock()
+		current, ok := m.runs[runID]
+		stillDue := ok && due(current)
+		m.mu.Unlock()
+		if !stillDue {
+			return
+		}
+	}
 	running := m.execLog.running(runID)
 	for _, record := range running {
 		record.Cancel(reason)

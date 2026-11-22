@@ -25,6 +25,8 @@ type samplingRT struct {
 	hold     chan struct{}
 	inFlight int
 	peak     int
+	// onSample, when set, runs once, at the start of the next sample.
+	onSample func()
 }
 
 func (s *samplingRT) set(cpuUsec, rx, tx, disk int64) {
@@ -34,6 +36,13 @@ func (s *samplingRT) set(cpuUsec, rx, tx, disk int64) {
 }
 
 func (s *samplingRT) SampleUsage(_ context.Context, _ string, withDisk bool) (UsageSample, error) {
+	s.mu.Lock()
+	hook := s.onSample
+	s.onSample = nil
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	s.mu.Lock()
 	s.samples++
 	s.disks = append(s.disks, withDisk)
@@ -311,5 +320,35 @@ func TestUsageFieldsHiddenWithSamplingOff(t *testing.T) {
 	got, _ := off.Get(created.ID)
 	if raw, _ := json.Marshal(got.Usage); string(raw) != `{"runningSec":0}` {
 		t.Fatalf("usage with sampling off: %s", raw)
+	}
+}
+
+// Regression (second review of PR #6): a VM keeps its name across stop
+// and resume, so a sample started under the old VM and landing under the
+// new one passed the container check and counted the old VM's numbers
+// again. A per-run generation drops it.
+func TestAStaleSampleDoesNotLandOnTheNextContainer(t *testing.T) {
+	ctx := context.Background()
+	rt := &samplingRT{fakeRT: &fakeRT{}}
+	m := NewManager(rt, testLogger())
+	m.UsageInterval = time.Minute
+	created, _ := m.Create(ctx, CreateRequest{Image: "x"})
+	rt.onSample = func() {
+		// While this round's sample is under way: stop (its own sample
+		// sees 2 s), resume, and the stale sample then reports 99 s.
+		rt.set(2_000_000, 10, 10, 1)
+		if _, err := m.Stop(ctx, created.ID); err != nil {
+			t.Error(err)
+		}
+		if _, err := m.Resume(ctx, created.ID, 0); err != nil {
+			t.Error(err)
+		}
+		rt.set(99_000_000, 990, 990, 1)
+	}
+	m.SampleUsage(ctx)
+	got, _ := m.Get(created.ID)
+	if got.Usage.CPUSeconds == nil || *got.Usage.CPUSeconds != 2 || *got.Usage.RxBytes != 10 {
+		raw, _ := json.Marshal(got.Usage)
+		t.Fatalf("a stale sample landed on the resumed container: %s", raw)
 	}
 }

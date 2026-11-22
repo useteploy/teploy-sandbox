@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
+	"time"
 )
 
 func fakeDocker(t *testing.T, script string) *DockerRuntime {
@@ -82,4 +84,61 @@ echo "`+root+`"
 	if n := len(raw) / 2; n != 2 {
 		t.Fatalf("docker info ran %d times, want 2 (the failure, then once)", n)
 	}
+}
+
+// Regression (second review of PR #6): the data-root lookup held its lock
+// across `docker info`, so with a wedged Docker a capacity call queued
+// behind whoever held it, however short its own deadline. Each caller now
+// waits only as long as its own context, and one command is shared.
+func TestDockerDiskDoesNotQueueBehindAWedgedDocker(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	docker := fakeDocker(t, `echo x >> "`+calls+`"
+exec sleep 5
+`)
+	// A caller with a long deadline gets there first.
+	first := make(chan struct{})
+	go func() {
+		defer close(first)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_, _ = docker.Disk(ctx)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(calls); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("docker info never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	const callers = 4
+	var wg sync.WaitGroup
+	took := make(chan time.Duration, callers)
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			start := time.Now()
+			if _, err := docker.Disk(ctx); err == nil {
+				t.Error("a wedged docker answered")
+			}
+			took <- time.Since(start)
+		}()
+	}
+	wg.Wait()
+	close(took)
+	for d := range took {
+		if d > time.Second {
+			t.Fatalf("a caller with a 200ms deadline waited %s behind another", d)
+		}
+	}
+	raw, _ := os.ReadFile(calls)
+	if n := len(raw) / 2; n != 1 {
+		t.Fatalf("docker info ran %d times, want 1 shared", n)
+	}
+	<-first
 }

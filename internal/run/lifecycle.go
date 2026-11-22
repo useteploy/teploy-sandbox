@@ -151,12 +151,12 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool, pu
 	if err != nil {
 		return nil, err
 	}
+	// The last look at the container's counters before they go with it.
+	m.sampleRun(context.WithoutCancel(ctx), id, current.ContainerID, current.usageGen, false, usageStopTimeout)
 	// Detached from the request: a caller that gives up once the capture
 	// exists must not abort the removal half way. A cancelled removal is
 	// reported as failed although the runtime may still carry it out, and
 	// the capture — then the only copy of the run — would be thrown away.
-	// The last look at the container's counters before they go with it.
-	m.sampleRun(context.WithoutCancel(ctx), id, current.ContainerID, false, usageStopTimeout)
 	attempt, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	err = m.runtime.Remove(attempt, current.ContainerID)
 	cancel()

@@ -187,6 +187,10 @@ type Run struct {
 	usageCarry   usageTotals
 	usageLive    UsageSample
 	usageLiveFor string
+	// usageGen counts the run's containers (bumped at every stop): a
+	// sample started under one is dropped if it lands under the next,
+	// which a VM's reused name would not tell apart.
+	usageGen uint64
 }
 
 // RunUsage is what a run has consumed so far.
@@ -1286,14 +1290,7 @@ func (m *Manager) Reap(ctx context.Context) int {
 			// Not published here: an upload must not hold up the
 			// deadlines of the runs behind this one. The upkeep
 			// started below does it.
-			m.cancelExecsForStop(ctx, current.ID, "the run reached its deadline and is being stopped")
-			_, err := m.stopIf(ctx, current.ID, func(live *Run) bool { return !live.ExpiresAt.After(now) }, false)
-			switch {
-			case errors.Is(err, errNotDue), errors.Is(err, ErrStopped):
-				// Stopped (and perhaps resumed) by a caller meanwhile.
-			case err != nil:
-				m.log.Error("reap stop failed; retrying next tick", "id", current.ID, "error", err)
-			default:
+			if m.reapStop(ctx, current.ID, now) {
 				reaped++
 			}
 		default:
@@ -1327,6 +1324,26 @@ func (m *Manager) Reap(ctx context.Context) int {
 	}
 	m.kickMaintenance()
 	return reaped
+}
+
+// reapStop is the reaper's stop of a run past its deadline that asked to
+// be stopped there. The reaper works from a copy; whether the run is
+// still due is decided on the live record, both before its recoverable
+// execs are cancelled and again with the stop's admission, so a run a
+// caller stopped and resumed meanwhile (a new deadline) loses nothing.
+func (m *Manager) reapStop(ctx context.Context, id string, now time.Time) bool {
+	due := func(live *Run) bool { return live.State == StateRunning && !live.ExpiresAt.After(now) }
+	m.cancelExecsForStop(ctx, id, due, "the run reached its deadline and is being stopped")
+	_, err := m.stopIf(ctx, id, due, false)
+	switch {
+	case errors.Is(err, errNotDue), errors.Is(err, ErrStopped):
+		// Stopped (and perhaps resumed) by a caller meanwhile.
+		return false
+	case err != nil:
+		m.log.Error("reap stop failed; retrying next tick", "id", id, "error", err)
+		return false
+	}
+	return true
 }
 
 func (m *Manager) releaseWarm(run *Run) {
@@ -1371,7 +1388,7 @@ func (m *Manager) Shutdown(ctx context.Context) {
 			// Every run is stopped before any is uploaded: a stop that
 			// did not happen loses the run, an upload that did not is
 			// made up for at the next start.
-			m.cancelExecsForStop(ctx, run.ID, "the daemon is shutting down and is stopping the run")
+			m.cancelExecsForStop(ctx, run.ID, nil, "the daemon is shutting down and is stopping the run")
 			if _, err := m.stopIf(ctx, run.ID, nil, false); err != nil {
 				m.log.Error("shutdown stop failed; the run's state is lost with its container", "id", run.ID, "error", err)
 			}

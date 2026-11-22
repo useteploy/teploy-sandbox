@@ -119,6 +119,7 @@ func foldUsageLocked(run *Run) {
 	run.usageCarry.TxBytes = addCounter(run.usageCarry.TxBytes, run.usageLive.TxBytes)
 	run.usageLive = UsageSample{}
 	run.usageLiveFor = ""
+	run.usageGen++
 }
 
 // usageSampler is the driver's sampler when sampling is on.
@@ -159,17 +160,18 @@ func (m *Manager) SampleUsage(ctx context.Context) {
 		}
 		slots <- struct{}{}
 		wg.Add(1)
-		go func(id, containerID string) {
+		go func(id, containerID string, gen uint64) {
 			defer func() { <-slots; wg.Done() }()
-			m.sampleRun(ctx, id, containerID, withDisk, usageSampleTimeout)
-		}(current.ID, current.ContainerID)
+			m.sampleRun(ctx, id, containerID, gen, withDisk, usageSampleTimeout)
+		}(current.ID, current.ContainerID, current.usageGen)
 	}
 	wg.Wait()
 }
 
 // sampleRun samples one container and records it on the run, if the run
-// still has that container.
-func (m *Manager) sampleRun(ctx context.Context, id, containerID string, withDisk bool, timeout time.Duration) {
+// still has that container: the same ID and the same generation (gen,
+// read with the ID), since a VM keeps its name across stop and resume.
+func (m *Manager) sampleRun(ctx context.Context, id, containerID string, gen uint64, withDisk bool, timeout time.Duration) {
 	sampler, ok := m.usageSampler()
 	if !ok {
 		return
@@ -184,7 +186,7 @@ func (m *Manager) sampleRun(ctx context.Context, id, containerID string, withDis
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	current, ok := m.runs[id]
-	if !ok || current.ContainerID != containerID {
+	if !ok || current.ContainerID != containerID || current.usageGen != gen {
 		return
 	}
 	if current.usageLiveFor != containerID {

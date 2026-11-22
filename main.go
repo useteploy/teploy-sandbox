@@ -421,8 +421,8 @@ func serve(args []string) error {
 		manager.SandboxUser = ""
 	}
 	manager.StoppedRetention = retention
-	if *usageInterval < 0 {
-		return errors.New("usage-interval must not be negative")
+	if err := checkUsageInterval(*usageInterval); err != nil {
+		return err
 	}
 	manager.UsageInterval = *usageInterval
 	if *recoverableMax <= 0 || *recoverableMax > run.MaxTTL {
@@ -577,4 +577,13 @@ func probeWritableDir(dir string) error {
 	name := probe.Name()
 	probe.Close()
 	return os.Remove(name)
+}
+
+// checkUsageInterval refuses a usage interval that is negative or, when
+// on, under a second: each round runs docker or zfs commands per run.
+func checkUsageInterval(interval time.Duration) error {
+	if interval < 0 || (interval > 0 && interval < time.Second) {
+		return fmt.Errorf("usage-interval: must be 0 (off) or at least 1s, got %s", interval)
+	}
+	return nil
 }

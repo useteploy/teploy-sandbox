@@ -2896,3 +2896,24 @@ items; each fix has a test that fails without it (shown locally):
 - statfs uses f_frsize on Linux (no test: the two are equal on the
   filesystems at hand); cgroup paths with `..` are not followed; usage
   fields are hidden with sampling off.
+
+### Second review fixes (2026-11-21)
+
+- The Docker data-root lookup no longer holds its lock across `docker
+  info`: one command at a time, on its own 30 s deadline, shared by every
+  caller, each of which waits only as long as its own context. Test: a
+  fake docker that blocks; a 200 ms caller behind a 3 s one returns in
+  time and the command runs once.
+- The reaper re-checks, on the live record, that a run is still due
+  before cancelling its execs (it decides from a copy): a run stopped and
+  resumed during a slow tick keeps its execs. Test.
+- A cancel that lands after the command ended by itself (an exit code of
+  its own, no error) no longer reports `cancelled`; the exit code stands.
+  Test.
+- Usage samples carry the run's container generation (bumped at every
+  stop): a VM keeps its name across stop and resume, so a sample started
+  under the old VM could land on the new one. Test.
+- `--usage-interval` must be 0 or at least 1s. Test.
+- `disk` for Docker is a statfs of the data root's path on the daemon's
+  own filesystem: wrong or absent against a remote Docker or a Docker VM
+  (Docker Desktop, colima). Documented, not changed.

@@ -174,8 +174,9 @@ type DockerRuntime struct {
 
 	// rootDir is Docker's data root once Disk has asked for it: it does
 	// not change under a running Docker, and GET /v1/capacity is polled.
-	rootMu  sync.Mutex
-	rootDir string
+	rootMu     sync.Mutex
+	rootDir    string
+	rootLookup *rootLookup
 }
 
 func (d *DockerRuntime) bin() string {

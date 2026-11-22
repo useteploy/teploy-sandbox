@@ -33,15 +33,9 @@ type DiskUsage struct {
 // it is only right for a daemon on the Docker host itself (as serve runs);
 // a path this process cannot see is an error and the field is left out.
 func (d *DockerRuntime) Disk(ctx context.Context) (*DiskUsage, error) {
-	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, d.bin(), "info", "--format", "{{.DockerRootDir}}")
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("docker info: %s", strings.TrimSpace(stderr.String()))
-	}
-	root := strings.TrimSpace(stdout.String())
-	if !filepath.IsAbs(root) {
-		return nil, fmt.Errorf("docker info: data root %q is not a path", root)
+	root, err := d.dataRoot(ctx)
+	if err != nil {
+		return nil, err
 	}
 	used, free, err := statfsUsage(root)
 	if err != nil {
@@ -62,4 +56,26 @@ func (m *Manager) Disk(ctx context.Context) *DiskUsage {
 		return nil
 	}
 	return usage
+}
+
+// dataRoot asks docker for its data root once; a failure is not
+// remembered, so a Docker that comes up later is found.
+func (d *DockerRuntime) dataRoot(ctx context.Context) (string, error) {
+	d.rootMu.Lock()
+	defer d.rootMu.Unlock()
+	if d.rootDir != "" {
+		return d.rootDir, nil
+	}
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, d.bin(), "info", "--format", "{{.DockerRootDir}}")
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("docker info: %s", strings.TrimSpace(stderr.String()))
+	}
+	root := strings.TrimSpace(stdout.String())
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("docker info: data root %q is not a path", root)
+	}
+	d.rootDir = root
+	return root, nil
 }

@@ -143,6 +143,8 @@ func serve(args []string) error {
 		"vm driver: how long a new VM may take to answer")
 	usageInterval := flags.Duration("usage-interval", envDuration("SBX_USAGE_INTERVAL", 0),
 		"how often each running run's CPU, network and disk usage is sampled into its usage field; 0 (default) samples nothing")
+	recoverableMax := flags.Duration("exec-recoverable-max-timeout", envDuration("SBX_EXEC_RECOVERABLE_MAX_TIMEOUT", run.DefaultRecoverableMaxTimeout),
+		"the longest timeoutSec a recoverable exec may ask for (each holds one of the daemon's 64 recoverable-exec slots until it ends); at most 24h")
 	remote := addRemoteFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -423,6 +425,10 @@ func serve(args []string) error {
 		return errors.New("usage-interval must not be negative")
 	}
 	manager.UsageInterval = *usageInterval
+	if *recoverableMax <= 0 || *recoverableMax > run.MaxTTL {
+		return fmt.Errorf("exec-recoverable-max-timeout: must be more than 0 and at most %s, got %s", run.MaxTTL, *recoverableMax)
+	}
+	manager.RecoverableMaxTimeout = *recoverableMax
 	if pool != nil {
 		manager.Egress = pool
 	}

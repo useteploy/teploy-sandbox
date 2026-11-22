@@ -83,7 +83,7 @@ func parseLinkStats(out []byte) (rx, tx int64, err error) {
 // network bytes from its tap, and its volume's ZFS `used` (the bytes the
 // clone holds of its own, beyond what it shares with the image it was
 // cloned from). A part that cannot be read is left out.
-func (d *Driver) SampleUsage(ctx context.Context, containerID string) (run.UsageSample, error) {
+func (d *Driver) SampleUsage(ctx context.Context, containerID string, withDisk bool) (run.UsageSample, error) {
 	current, err := d.instance(containerID)
 	if err != nil {
 		return run.UsageSample{}, err
@@ -102,6 +102,9 @@ func (d *Driver) SampleUsage(ctx context.Context, containerID string) (run.Usage
 		if rx, tx, err := counter.Counters(ctx, current.network); err == nil {
 			sample.RxBytes, sample.TxBytes = &rx, &tx
 		}
+	}
+	if !withDisk {
+		return sample, nil
 	}
 	if used, err := d.volumes.zfs.Property(ctx, d.volumes.runVolume(containerID), "used"); err == nil {
 		if bytes, err := strconv.ParseInt(used, 10, 64); err == nil && bytes >= 0 {

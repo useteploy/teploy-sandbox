@@ -19,7 +19,7 @@ stability promise — is [docs/wire-contract.md](docs/wire-contract.md).
 |---|---|
 | `POST /v1/runs` | `{image, env?, ttlSec?, network?, egressAllow?, limits?, warm?, user?, labels?, onExpire?}` → the run: `{id, server, state, expiresAt, user, onExpire, usage, labels?, warm?}` — network `none` (default), `allowlist` or `open` (see Egress); defaults 1 CPU / 1 GB / 256 pids, never the `teploy` app network; `user` `default` (absent) or `root` (see Run user); `warm: {repo, path?}` gives the run a private volume for the repo (below) |
 | `POST /v1/runs/{id}/exec` | `{cmd, cwd?, timeoutSec?, env?, owner?, generation?, outputEncoding?, recoverable?}` (`env`: name → value, set in the command's environment; POSIX names, no NUL, ≤64 vars / 64 KiB, else 400; values reach the container through a private (0600, removed after) `--env-file`, never argv and never the docker CLI's own environment; so no line breaks) → SSE: `stdout`/`stderr` chunks, then `exit` `{exitCode, timedOut}`; while the run holds a lease, only the holder's `owner`+`generation` may exec (409 otherwise); `recoverable: true` answers with `X-Exec-Id` and keeps the command running if the stream drops (see Recoverable execs) |
-| `GET /v1/runs/{id}/execs`, `GET /v1/runs/{id}/execs/{execId}`, `GET /v1/runs/{id}/execs/{execId}/output?since=&limit=` | A recoverable exec's status (`running`/`exited`/`timedOut`/`failed`, `exitCode`, `signal?`, `detached`) and its output from an offset or the tail (see Recoverable execs) |
+| `GET /v1/runs/{id}/execs`, `GET /v1/runs/{id}/execs/{execId}`, `GET /v1/runs/{id}/execs/{execId}/output?since=&limit=`, `DELETE /v1/runs/{id}/execs/{execId}` | A recoverable exec's status (`running`/`exited`/`timedOut`/`cancelled`/`failed`, `exitCode`, `signal?`, `detached`), its output from an offset or the tail, and cancelling it (202) (see Recoverable execs) |
 | `PUT/GET /v1/runs/{id}/files/{path}` | Confined to `/work`; traversal rejected. PUT takes the lease credential as `?owner=&generation=` query and is fenced like exec; GET is open, lease or not |
 | `DELETE /v1/runs/{id}` | Destroy now (the reaper enforces TTLs regardless, default 30 min); on a stopped run, deletes the record and its snapshot |
 | `POST /v1/runs/{id}/stop` | Capture the filesystem, remove the container, keep the run → the run, `state: "stopped"` (see Persistent runs) |
@@ -103,7 +103,9 @@ behind a fork, which goes with the child.
 
 `serve --usage-interval` / `SBX_USAGE_INTERVAL` (a Go duration; default
 0, which samples nothing and leaves `usage` as `{runningSec}`) samples
-every running run on that interval, and once more when it stops:
+every running run on that interval (at most four at a time), and once
+more, without disk and within 3 s, when it stops. `diskBytes` is read on
+the first round and every tenth after it:
 
 | Field | Docker driver | VM driver |
 |---|---|---|
@@ -1218,15 +1220,25 @@ can come back for the outcome and the rest of the output by the ID in
 the `X-Exec-Id` response header (or find it in `GET /v1/runs/{id}/execs`).
 
 - The record holds the status and the last 1 MiB of output, stdout and
-  stderr in the order the stream sent them, each byte at an offset. With
-  `outputEncoding: "base64"` the number of bytes a client decoded is the
+  stderr in the order the stream sent them, each byte at an offset. A
+  client that wants to resume must use `outputEncoding: "base64"` (text
+  mode has no offset guarantee); the number of bytes it decoded is the
   offset to resume from: `GET …/execs/{execId}/output?since=<that>`
   returns exactly the rest (base64 `data` per chunk, `next` to continue,
   `done` at the end, `truncated` if the bytes had already left the 1 MiB
   window). Without `since` it is the last `limit` bytes (default 64 KiB).
-- Bounds: 16 records per run, 64 per daemon; finished records make room
+- Bounds: 8 records per run, 64 per daemon; finished records make room
   oldest first, running ones never, so a recoverable exec with every slot
-  running is a 503. A finished record is kept 15 minutes; a run's records
+  running is a 503. `timeoutSec` is at most
+  `--exec-recoverable-max-timeout` / `SBX_EXEC_RECOVERABLE_MAX_TIMEOUT`
+  (default `1h`, at most `24h`; more is a 400), because a running exec
+  holds its slot until it ends.
+- `DELETE /v1/runs/{id}/execs/{execId}` cancels one (202, idempotent).
+  The VM guest kills the command; under Docker the record and the run
+  are released at once but the in-container process runs on to its own
+  timeout. Before an expiry or shutdown stop the daemon cancels the run's
+  recoverable execs itself and waits up to 10 s, so a detached exec does
+  not cost an `onExpire: "stop"` run its state. A finished record is kept 15 minutes; a run's records
   go when the run is destroyed. The command is still bounded by its
   `timeoutSec` and still ends with its run.
 - **Daemon restart loses every record** (they are memory only), and

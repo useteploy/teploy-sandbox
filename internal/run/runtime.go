@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -170,6 +171,11 @@ type DockerRuntime struct {
 	Bin         string
 	Owner       string
 	CleanupRoot string
+
+	// rootDir is Docker's data root once Disk has asked for it: it does
+	// not change under a running Docker, and GET /v1/capacity is polled.
+	rootMu  sync.Mutex
+	rootDir string
 }
 
 func (d *DockerRuntime) bin() string {

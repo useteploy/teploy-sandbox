@@ -156,7 +156,7 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool, pu
 	// reported as failed although the runtime may still carry it out, and
 	// the capture — then the only copy of the run — would be thrown away.
 	// The last look at the container's counters before they go with it.
-	m.sampleRun(context.WithoutCancel(ctx), id, current.ContainerID)
+	m.sampleRun(context.WithoutCancel(ctx), id, current.ContainerID, false, usageStopTimeout)
 	attempt, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	err = m.runtime.Remove(attempt, current.ContainerID)
 	cancel()

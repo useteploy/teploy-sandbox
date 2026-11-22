@@ -1,6 +1,7 @@
 package run
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -32,9 +33,19 @@ const (
 	// evicted oldest first to make room; a running one never is, so a
 	// recoverable exec beyond either bound with every slot running is
 	// refused (ErrAtCapacity). Worst case memory is ExecRecordsTotal *
-	// ExecOutputBytes * 9/8, about 72 MiB.
-	ExecRecordsPerRun = 16
+	// ExecOutputBytes * 9/8, about 72 MiB. One run can hold at most an
+	// eighth of the daemon's slots, so a single run cannot starve the
+	// others (a caller with many runs can; the daemon has one token and
+	// no notion of callers, so that bound is the control plane's).
+	ExecRecordsPerRun = 8
 	ExecRecordsTotal  = 64
+	// DefaultRecoverableMaxTimeout is the longest timeoutSec a
+	// recoverable exec may ask for (serve --exec-recoverable-max-timeout).
+	// A running recoverable exec holds a slot until it ends, so this is
+	// how long a slot can be held: an hour covers builds and test suites,
+	// and an operator whose jobs run longer raises it, up to MaxTTL (no
+	// run lives longer than that, so neither can its exec).
+	DefaultRecoverableMaxTimeout = time.Hour
 	// ExecRetention is how long a finished record is kept.
 	ExecRetention = 15 * time.Minute
 	// ExecOutputMaxChunks bounds the chunks one output read returns: a
@@ -49,6 +60,9 @@ const (
 	ExecRunning  = "running"
 	ExecExited   = "exited"
 	ExecTimedOut = "timedOut"
+	// ExecCancelled is a command ended by DELETE on its record, or by the
+	// daemon before an expiry or shutdown stop of its run.
+	ExecCancelled = "cancelled"
 	// ExecFailed is a command the sandbox could not run to the end: the
 	// run was stopped or destroyed under it, the runtime failed. Its exit
 	// code is -1, as on the stream.
@@ -240,6 +254,43 @@ type ExecRecord struct {
 	timedOut bool
 	errText  string
 	detached bool
+	// cancel ends the command's context (Context); cancelled says it was
+	// used, and why.
+	cancel       context.CancelFunc
+	cancelled    bool
+	cancelReason string
+}
+
+// Context is the context the command runs under: parent, ended early by
+// Cancel. Call once, before the command starts.
+func (e *ExecRecord) Context(parent context.Context) context.Context {
+	ctx, cancel := context.WithCancel(parent)
+	e.mu.Lock()
+	e.cancel = cancel
+	already := e.cancelled
+	e.mu.Unlock()
+	if already {
+		cancel()
+	}
+	return ctx
+}
+
+// Cancel ends a running command; it reports whether it was still
+// running. The runtime returns soon after, and Finish records how it
+// ended.
+func (e *ExecRecord) Cancel(reason string) bool {
+	e.mu.Lock()
+	if e.done || e.cancelled {
+		e.mu.Unlock()
+		return false
+	}
+	e.cancelled, e.cancelReason = true, reason
+	cancel := e.cancel
+	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return true
 }
 
 // ID is the exec's ID, the one the caller looks it up by.
@@ -300,6 +351,9 @@ func (e *ExecRecord) status() ExecStatus {
 		status.TimedOut = e.timedOut
 		status.Error = e.errText
 		switch {
+		case e.cancelled:
+			status.State = ExecCancelled
+			status.Error = e.cancelReason
 		case e.errText != "":
 			status.State = ExecFailed
 		case e.timedOut:
@@ -421,13 +475,24 @@ func (g *execRegistry) sweepLocked() {
 }
 
 // sweep drops expired records, and every record of a run keep says is
-// gone.
+// gone. keep is called with no registry lock held: it may take the
+// manager's lock, and the manager calls into the registry (dropRun) only
+// after releasing its own, so the two are never held in opposite orders.
 func (g *execRegistry) sweep(keep func(runID string) bool) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.sweepLocked()
+	runs := map[string]bool{}
+	for _, record := range g.records {
+		runs[record.runID] = true
+	}
+	g.mu.Unlock()
+	for runID := range runs {
+		runs[runID] = keep(runID)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	for id, record := range g.records {
-		if !keep(record.runID) {
+		if kept, seen := runs[record.runID]; seen && !kept {
 			delete(g.records, id)
 		}
 	}
@@ -462,6 +527,19 @@ func (g *execRegistry) list(runID string) []ExecStatus {
 	return statuses
 }
 
+// running is every record of a run whose command has not ended.
+func (g *execRegistry) running(runID string) []*ExecRecord {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var records []*ExecRecord
+	for _, record := range g.records {
+		if _, done := record.finishedAt(); !done && record.runID == runID {
+			records = append(records, record)
+		}
+	}
+	return records
+}
+
 func (g *execRegistry) dropRun(runID string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -477,6 +555,15 @@ func (g *execRegistry) count() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return len(g.records)
+}
+
+// AdmitRecoverable checks a recoverable exec's timeout against
+// RecoverableMaxTimeout before anything is reserved.
+func (m *Manager) AdmitRecoverable(timeout time.Duration) error {
+	if timeout > m.RecoverableMaxTimeout {
+		return fmt.Errorf("%w: a recoverable exec's timeoutSec may be at most %d on this daemon", ErrBadRequest, int(m.RecoverableMaxTimeout/time.Second))
+	}
+	return nil
 }
 
 // RecordExec makes the record of a recoverable exec on a run; the caller
@@ -527,4 +614,50 @@ func (m *Manager) ListExecs(runID string) ([]ExecStatus, error) {
 		return nil, err
 	}
 	return m.execLog.list(runID), nil
+}
+
+// CancelExec ends a running recoverable exec and returns its status as it
+// stands (the command may take a moment to end; poll the status). An exec
+// that already ended is left as it is: cancelling is idempotent.
+func (m *Manager) CancelExec(runID, execID string) (ExecStatus, error) {
+	if _, err := m.Get(runID); err != nil {
+		return ExecStatus{}, err
+	}
+	record, err := m.execLog.get(runID, execID)
+	if err != nil {
+		return ExecStatus{}, err
+	}
+	record.Cancel("cancelled by request")
+	return record.status(), nil
+}
+
+// execDrainWait bounds how long a stop the daemon makes on its own waits
+// for a run's cancelled execs to give their in-flight slot back.
+var execDrainWait = 10 * time.Second
+
+// cancelExecsForStop ends a run's running recoverable execs before a stop
+// the daemon makes on its own (expiry, shutdown) and waits, at most
+// execDrainWait, until nothing is in flight on the run. A detached exec
+// would otherwise hold the run busy, and an onExpire "stop" run whose
+// stop is refused at shutdown loses its state. A stop a caller asks for
+// still answers 409 busy, as it always has.
+func (m *Manager) cancelExecsForStop(ctx context.Context, runID, reason string) {
+	running := m.execLog.running(runID)
+	for _, record := range running {
+		record.Cancel(reason)
+	}
+	if len(running) == 0 {
+		return
+	}
+	deadline := time.Now().Add(execDrainWait)
+	for {
+		m.mu.Lock()
+		current, ok := m.runs[runID]
+		idle := !ok || current.execs == 0
+		m.mu.Unlock()
+		if idle || time.Now().After(deadline) || ctx.Err() != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

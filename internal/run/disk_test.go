@@ -55,3 +55,31 @@ echo "`+root+`"
 		t.Fatalf("fake runtime: %+v", got)
 	}
 }
+
+// GET /v1/capacity is polled: docker is asked for its data root once, and
+// every later call is only a statfs. A failed ask is not remembered.
+func TestDockerDiskAsksForTheDataRootOnce(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("statfs is read on linux and darwin")
+	}
+	root, calls := t.TempDir(), filepath.Join(t.TempDir(), "calls")
+	docker := fakeDocker(t, `echo x >> "`+calls+`"
+[ -f "`+calls+`.fail" ] && { rm "`+calls+`.fail"; exit 1; }
+echo "`+root+`"
+`)
+	if err := os.WriteFile(calls+".fail", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := docker.Disk(context.Background()); err == nil {
+		t.Fatal("the failing ask succeeded")
+	}
+	for range 3 {
+		if _, err := docker.Disk(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, _ := os.ReadFile(calls)
+	if n := len(raw) / 2; n != 2 {
+		t.Fatalf("docker info ran %d times, want 2 (the failure, then once)", n)
+	}
+}

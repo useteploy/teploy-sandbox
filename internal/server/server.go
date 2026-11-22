@@ -79,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/runs/{id}/exec", s.auth(s.handleExec))
 	mux.Handle("GET /v1/runs/{id}/execs", s.auth(s.handleExecList))
 	mux.Handle("GET /v1/runs/{id}/execs/{execId}", s.auth(s.handleExecStatus))
+	mux.Handle("DELETE /v1/runs/{id}/execs/{execId}", s.auth(s.handleExecCancel))
 	mux.Handle("GET /v1/runs/{id}/execs/{execId}/output", s.auth(s.handleExecOutput))
 	mux.Handle("POST /v1/runs/{id}/snapshot", s.auth(s.handleSnapshot))
 	mux.Handle("POST /v1/runs/{id}/stop", s.auth(s.handleStop))
@@ -567,6 +568,12 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, problem(http.StatusInternalServerError, "Streaming unsupported."))
 		return
 	}
+	if req.Recoverable {
+		if err := s.Manager.AdmitRecoverable(timeout); err != nil {
+			s.writeError(w, err)
+			return
+		}
+	}
 
 	// The lease fence decides before the stream starts: a refused exec
 	// is a 409 problem, not an SSE stream that dies mid-flight. The
@@ -605,14 +612,18 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 
 	// Recoverable: the command runs detached from the request, so a
 	// dropped stream neither kills it nor loses its outcome. It is still
-	// bounded by its timeout, and ends with its run.
+	// bounded by its timeout, and ends with its run. The headers go out
+	// now: a command that prints nothing for an hour must not keep its
+	// X-Exec-Id from the client that whole time.
+	flusher.Flush()
 	type outcome struct {
 		code     int
 		timedOut bool
 	}
 	done := make(chan outcome, 1)
+	execCtx := record.Context(context.WithoutCancel(r.Context()))
 	go func() {
-		exitCode, timedOut, execErr := session.Exec(context.WithoutCancel(r.Context()), req.Cmd, cwd, req.Env, timeout,
+		exitCode, timedOut, execErr := session.Exec(execCtx, req.Cmd, cwd, req.Env, timeout,
 			stream.channel("stdout"), stream.channel("stderr"))
 		if execErr != nil {
 			// Into the record too, at the offset the stream shows it.
@@ -644,6 +655,17 @@ func (s *Server) handleExecList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"execs": execs})
+}
+
+// handleExecCancel ends a running recoverable exec: 202 with its status,
+// which turns "cancelled" once the command has ended.
+func (s *Server) handleExecCancel(w http.ResponseWriter, r *http.Request) {
+	status, err := s.Manager.CancelExec(r.PathValue("id"), r.PathValue("execId"))
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusAccepted, map[string]any{"exec": status})
 }
 
 func (s *Server) handleExecStatus(w http.ResponseWriter, r *http.Request) {

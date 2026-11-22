@@ -3,6 +3,7 @@ package run
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,13 @@ type samplingRT struct {
 	mu      sync.Mutex
 	next    UsageSample
 	samples int
+	// disks records withDisk of every sample, in order.
+	disks []bool
+	// hold, when set, blocks every sample until it is closed; inFlight
+	// and peak count samples under way.
+	hold     chan struct{}
+	inFlight int
+	peak     int
 }
 
 func (s *samplingRT) set(cpuUsec, rx, tx, disk int64) {
@@ -25,11 +33,25 @@ func (s *samplingRT) set(cpuUsec, rx, tx, disk int64) {
 	s.next = UsageSample{CPUUsec: &cpuUsec, RxBytes: &rx, TxBytes: &tx, DiskBytes: &disk}
 }
 
-func (s *samplingRT) SampleUsage(context.Context, string) (UsageSample, error) {
+func (s *samplingRT) SampleUsage(_ context.Context, _ string, withDisk bool) (UsageSample, error) {
+	s.mu.Lock()
+	s.samples++
+	s.disks = append(s.disks, withDisk)
+	s.inFlight++
+	s.peak = max(s.peak, s.inFlight)
+	hold := s.hold
+	s.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.samples++
-	return s.next, nil
+	s.inFlight--
+	sample := s.next
+	if !withDisk {
+		sample.DiskBytes = nil
+	}
+	return sample, nil
 }
 
 func wantUsage(t *testing.T, what string, got RunUsage, cpuSeconds float64, rx, tx, disk int64) {
@@ -89,17 +111,17 @@ func TestUsageIsMonotonicAcrossStopAndResume(t *testing.T) {
 	got, _ := m.Get(created.ID)
 	wantUsage(t, "first sample", got.Usage, 2, 100, 50, 1000)
 
-	rt.set(1_000_000, 90, 40, 800) // went back: kept at the high mark; disk is a level
-	m.SampleUsage(ctx)
+	rt.set(1_000_000, 90, 40, 800) // went back: kept at the high mark
+	m.SampleUsage(ctx)             // not a disk round: disk stays as sampled
 	got, _ = m.Get(created.ID)
-	wantUsage(t, "a counter that went back", got.Usage, 2, 100, 50, 800)
+	wantUsage(t, "a counter that went back", got.Usage, 2, 100, 50, 1000)
 
-	rt.set(3_000_000, 150, 70, 900) // what the stop's own sample sees
+	rt.set(3_000_000, 150, 70, 900) // what the stop's own sample sees (no disk)
 	if _, err := m.Stop(ctx, created.ID); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = m.Get(created.ID)
-	wantUsage(t, "stopped", got.Usage, 3, 150, 70, 900)
+	wantUsage(t, "stopped", got.Usage, 3, 150, 70, 1000)
 
 	// A restart: the stopped run comes back with its totals.
 	m = NewManager(rt, testLogger())
@@ -108,15 +130,15 @@ func TestUsageIsMonotonicAcrossStopAndResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ = m.Get(created.ID)
-	wantUsage(t, "after a restart", got.Usage, 3, 150, 70, 900)
+	wantUsage(t, "after a restart", got.Usage, 3, 150, 70, 1000)
 
 	if _, err := m.Resume(ctx, created.ID, 0); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = m.Get(created.ID)
-	wantUsage(t, "resumed, not sampled yet", got.Usage, 3, 150, 70, 900)
+	wantUsage(t, "resumed, not sampled yet", got.Usage, 3, 150, 70, 1000)
 	rt.set(500_000, 10, 5, 950) // the new container counts from zero
-	m.SampleUsage(ctx)
+	m.SampleUsage(ctx)          // the new manager's first round: with disk
 	got, _ = m.Get(created.ID)
 	wantUsage(t, "resumed", got.Usage, 3.5, 160, 75, 950)
 
@@ -175,7 +197,7 @@ func TestDockerSampleUsage(t *testing.T) {
 	docker := fakeDocker(t, `[ "$1 $2 $3" = "container inspect --size" ] || exit 9
 echo "`+fullID+` 4242 4096"
 `)
-	sample, err := docker.SampleUsage(context.Background(), "teploy-sbx-x")
+	sample, err := docker.SampleUsage(context.Background(), "teploy-sbx-x", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,15 +209,107 @@ echo "`+fullID+` 4242 4096"
 	// A pid in another cgroup (reused, or a daemon in its own pid
 	// namespace): only docker's own answer is used.
 	other := fakeDocker(t, `echo "`+fullID+` 77 10"`+"\n")
-	sample, err = other.SampleUsage(context.Background(), "teploy-sbx-x")
+	sample, err = other.SampleUsage(context.Background(), "teploy-sbx-x", true)
 	if err != nil || sample.CPUUsec != nil || sample.RxBytes != nil || sample.DiskBytes == nil || *sample.DiskBytes != 10 {
 		t.Fatalf("foreign pid: %+v %v", sample, err)
 	}
+	// A cgroup path that climbs out of the tree is not followed, even with
+	// the container's ID in it.
+	write(filepath.Join(procRoot, "88", "cgroup"), "0::/../../docker-"+fullID+".scope\n")
+	write(filepath.Join(procRoot, "88", "net", "dev"), "h\nh\n  eth0: 9 0 0 0 0 0 0 0 9 0 0 0 0 0 0 0\n")
+	climbing := fakeDocker(t, `echo "`+fullID+` 88 10"`+"\n")
+	if sample, err := climbing.SampleUsage(context.Background(), "teploy-sbx-x", true); err != nil || sample.CPUUsec != nil || sample.RxBytes != nil {
+		t.Fatalf("a climbing cgroup path: %+v %v", sample, err)
+	}
+	// Without disk, docker is not asked for the layer's size.
+	if sample, err := fakeDocker(t, `[ "$3" = "--size" ] && exit 9
+echo "`+fullID+` 4242 0"`+"\n").SampleUsage(context.Background(), "teploy-sbx-x", false); err != nil || sample.DiskBytes != nil || sample.CPUUsec == nil {
+		t.Fatalf("without disk: %+v %v", sample, err)
+	}
 	// A stopped container (pid 0) and a failing docker.
-	if sample, err := fakeDocker(t, `echo "`+fullID+` 0 10"`+"\n").SampleUsage(context.Background(), "x"); err != nil || sample.CPUUsec != nil {
+	if sample, err := fakeDocker(t, `echo "`+fullID+` 0 10"`+"\n").SampleUsage(context.Background(), "x", true); err != nil || sample.CPUUsec != nil {
 		t.Fatalf("pid 0: %+v %v", sample, err)
 	}
-	if _, err := fakeDocker(t, "exit 1\n").SampleUsage(context.Background(), "x"); err == nil {
+	if _, err := fakeDocker(t, "exit 1\n").SampleUsage(context.Background(), "x", true); err == nil {
 		t.Fatal("a failing docker sampled")
+	}
+}
+
+// Disk is the expensive part: it is sampled on the first round and every
+// usageDiskEvery-th after it, never at a stop; CPU and network every
+// round. Runs are sampled in parallel, at most usageParallel at a time.
+func TestUsageSamplingCadenceAndParallelism(t *testing.T) {
+	ctx := context.Background()
+	rt := &samplingRT{fakeRT: &fakeRT{}}
+	rt.set(1, 2, 3, 4)
+	m := NewManager(rt, testLogger())
+	m.UsageInterval = time.Minute
+	created, _ := m.Create(ctx, CreateRequest{Image: "x"})
+	for range usageDiskEvery + 1 {
+		m.SampleUsage(ctx)
+	}
+	if _, err := m.Stop(ctx, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	want := make([]bool, usageDiskEvery+2)
+	want[0], want[usageDiskEvery] = true, true
+	if fmt.Sprint(rt.disks) != fmt.Sprint(want) {
+		t.Fatalf("disk asked %v, want %v", rt.disks, want)
+	}
+
+	rt = &samplingRT{fakeRT: &fakeRT{}, hold: make(chan struct{})}
+	m = NewManager(rt, testLogger())
+	m.UsageInterval = time.Minute
+	for range 3 * usageParallel {
+		if _, err := m.Create(ctx, CreateRequest{Image: "x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan struct{})
+	go func() { m.SampleUsage(ctx); close(done) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		rt.mu.Lock()
+		inFlight := rt.inFlight
+		rt.mu.Unlock()
+		if inFlight == usageParallel {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d samples under way, want %d", inFlight, usageParallel)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(rt.hold)
+	<-done
+	if rt.peak != usageParallel || rt.samples != 3*usageParallel {
+		t.Fatalf("peak %d samples %d", rt.peak, rt.samples)
+	}
+}
+
+// With sampling off the observations are not shown, even when a stopped
+// run carries totals from a daemon life that had it on.
+func TestUsageFieldsHiddenWithSamplingOff(t *testing.T) {
+	ctx := context.Background()
+	stateDir := t.TempDir()
+	rt := &samplingRT{fakeRT: &fakeRT{}}
+	rt.set(1_000_000, 2, 3, 4)
+	m := NewManager(rt, testLogger())
+	m.UsageInterval = time.Minute
+	if _, err := m.LoadState(ctx, stateDir); err != nil {
+		t.Fatal(err)
+	}
+	created, _ := m.Create(ctx, CreateRequest{Image: "x", OnExpire: OnExpireStop})
+	m.SampleUsage(ctx)
+	if _, err := m.Stop(ctx, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	off := NewManager(rt, testLogger())
+	if _, err := off.LoadState(ctx, stateDir); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := off.Get(created.ID)
+	if raw, _ := json.Marshal(got.Usage); string(raw) != `{"runningSec":0}` {
+		t.Fatalf("usage with sampling off: %s", raw)
 	}
 }

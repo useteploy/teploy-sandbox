@@ -292,9 +292,13 @@ type Manager struct {
 	// RemoteScrubInterval paces the check that what this daemon reports
 	// durable still is (ScrubRemote); negative turns it off.
 	RemoteScrubInterval time.Duration
+	// RecoverableMaxTimeout is the longest timeout a recoverable exec may
+	// ask for (DefaultRecoverableMaxTimeout unless serve says otherwise).
+	RecoverableMaxTimeout time.Duration
 	// UsageInterval paces the per-run usage sampler (usage.go); zero
 	// samples nothing.
 	UsageInterval time.Duration
+	usageRounds   atomic.Uint64
 	// Transfers is how many uploads and restores run at once
 	// (DefaultTransfers when zero); with more than one, uploads take at
 	// most all but one of them. Set before the first one.
@@ -373,6 +377,8 @@ func NewManager(runtime Runtime, log *slog.Logger) *Manager {
 		SandboxUser:      DefaultSandboxUser,
 		StoppedRetention: DefaultStoppedRetention,
 		SnapshotRetry:    DefaultSnapshotRetry,
+
+		RecoverableMaxTimeout: DefaultRecoverableMaxTimeout,
 	}
 	m.execLog = newExecRegistry(func() time.Time { return m.now() })
 	return m
@@ -766,7 +772,11 @@ func (m *Manager) viewLocked(run *Run) *Run {
 		}
 	}
 	view.Usage = RunUsage{RunningSec: int64(running / time.Second)}
-	usageViewLocked(run, &view.Usage)
+	if m.UsageInterval > 0 {
+		// With sampling off the usage JSON is what it always was, even
+		// for a stopped run that carries totals from a life with it on.
+		usageViewLocked(run, &view.Usage)
+	}
 	return &view
 }
 
@@ -872,7 +882,6 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 	m.mu.Lock()
 	if err == nil {
 		delete(m.runs, id)
-		m.execLog.dropRun(id)
 	} else {
 		current.removing = false
 		if owed {
@@ -887,6 +896,9 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 		}
 		return err
 	}
+	// After the manager's lock, never under it: the registry's sweep
+	// asks the manager about runs, so the two locks are never nested.
+	m.execLog.dropRun(id)
 	m.releaseWarm(current)
 	if len(current.images) > 0 || current.base != "" {
 		// The container is gone, so the snapshots it was created from can
@@ -1274,6 +1286,7 @@ func (m *Manager) Reap(ctx context.Context) int {
 			// Not published here: an upload must not hold up the
 			// deadlines of the runs behind this one. The upkeep
 			// started below does it.
+			m.cancelExecsForStop(ctx, current.ID, "the run reached its deadline and is being stopped")
 			_, err := m.stopIf(ctx, current.ID, func(live *Run) bool { return !live.ExpiresAt.After(now) }, false)
 			switch {
 			case errors.Is(err, errNotDue), errors.Is(err, ErrStopped):
@@ -1358,6 +1371,7 @@ func (m *Manager) Shutdown(ctx context.Context) {
 			// Every run is stopped before any is uploaded: a stop that
 			// did not happen loses the run, an upload that did not is
 			// made up for at the next start.
+			m.cancelExecsForStop(ctx, run.ID, "the daemon is shutting down and is stopping the run")
 			if _, err := m.stopIf(ctx, run.ID, nil, false); err != nil {
 				m.log.Error("shutdown stop failed; the run's state is lost with its container", "id", run.ID, "error", err)
 			}

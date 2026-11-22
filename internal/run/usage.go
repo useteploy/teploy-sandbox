@@ -9,8 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,9 +38,11 @@ import (
 
 // UsageSampler is implemented by a driver that can read what a run's
 // container or VM has used so far. Optional, like the other hooks. A nil
-// field is one the driver could not read.
+// field is one the driver could not read. withDisk asks for DiskBytes
+// too: it is the expensive part (Docker walks the writable layer), so it
+// is asked for on a slower cadence.
 type UsageSampler interface {
-	SampleUsage(ctx context.Context, containerID string) (UsageSample, error)
+	SampleUsage(ctx context.Context, containerID string, withDisk bool) (UsageSample, error)
 }
 
 // UsageSample is what a container has used since it started. RxBytes is
@@ -126,31 +130,52 @@ func (m *Manager) usageSampler() (UsageSampler, bool) {
 	return sampler, ok
 }
 
-// usageSampleTimeout bounds one run's sample.
-const usageSampleTimeout = 10 * time.Second
+const (
+	// usageSampleTimeout bounds one run's sample on the ticker, and
+	// usageStopTimeout the one a stop takes (without disk) before it
+	// removes the container: a stop must not wait long for a gauge.
+	usageSampleTimeout = 10 * time.Second
+	usageStopTimeout   = 3 * time.Second
+	// usageDiskEvery: disk is sampled on the first round and every
+	// usageDiskEvery-th after it.
+	usageDiskEvery = 10
+	// usageParallel bounds the runs sampled at once.
+	usageParallel = 4
+)
 
-// SampleUsage samples every running run once. Called by the sampler's
-// ticker and exposed for tests; a no-op with sampling off.
+// SampleUsage samples every running run once, at most usageParallel at a
+// time. Called by the sampler's ticker and exposed for tests; a no-op with
+// sampling off.
 func (m *Manager) SampleUsage(ctx context.Context) {
 	if _, ok := m.usageSampler(); !ok {
 		return
 	}
+	withDisk := (m.usageRounds.Add(1)-1)%usageDiskEvery == 0
+	slots := make(chan struct{}, usageParallel)
+	var wg sync.WaitGroup
 	for _, current := range m.List() {
-		if current.State == StateRunning && current.ContainerID != "" {
-			m.sampleRun(ctx, current.ID, current.ContainerID)
+		if current.State != StateRunning || current.ContainerID == "" {
+			continue
 		}
+		slots <- struct{}{}
+		wg.Add(1)
+		go func(id, containerID string) {
+			defer func() { <-slots; wg.Done() }()
+			m.sampleRun(ctx, id, containerID, withDisk, usageSampleTimeout)
+		}(current.ID, current.ContainerID)
 	}
+	wg.Wait()
 }
 
 // sampleRun samples one container and records it on the run, if the run
 // still has that container.
-func (m *Manager) sampleRun(ctx context.Context, id, containerID string) {
+func (m *Manager) sampleRun(ctx context.Context, id, containerID string, withDisk bool, timeout time.Duration) {
 	sampler, ok := m.usageSampler()
 	if !ok {
 		return
 	}
-	attempt, cancel := context.WithTimeout(ctx, usageSampleTimeout)
-	sample, err := sampler.SampleUsage(attempt, containerID)
+	attempt, cancel := context.WithTimeout(ctx, timeout)
+	sample, err := sampler.SampleUsage(attempt, containerID, withDisk)
 	cancel()
 	if err != nil {
 		m.log.Debug("usage sample failed", "id", id, "error", err)
@@ -262,9 +287,13 @@ var (
 // cgroup named after the container's full ID before anything is read
 // from it: a daemon that cannot see the host's process table (one in a
 // container of its own) reads nothing rather than another process.
-func (d *DockerRuntime) SampleUsage(ctx context.Context, containerID string) (UsageSample, error) {
+func (d *DockerRuntime) SampleUsage(ctx context.Context, containerID string, withDisk bool) (UsageSample, error) {
 	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, d.bin(), "container", "inspect", "--size", "--format", "{{.Id}} {{.State.Pid}} {{.SizeRw}}", containerID)
+	args := []string{"container", "inspect", "--format", "{{.Id}} {{.State.Pid}} 0"}
+	if withDisk {
+		args = []string{"container", "inspect", "--size", "--format", "{{.Id}} {{.State.Pid}} {{.SizeRw}}"}
+	}
+	cmd := exec.CommandContext(ctx, d.bin(), append(args, containerID)...)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
 		return UsageSample{}, fmt.Errorf("docker inspect: %s", strings.TrimSpace(stderr.String()))
@@ -274,7 +303,7 @@ func (d *DockerRuntime) SampleUsage(ctx context.Context, containerID string) (Us
 		return UsageSample{}, fmt.Errorf("docker inspect: unexpected output %q", strings.TrimSpace(stdout.String()))
 	}
 	var sample UsageSample
-	if size, err := strconv.ParseInt(fields[2], 10, 64); err == nil && size >= 0 {
+	if size, err := strconv.ParseInt(fields[2], 10, 64); withDisk && err == nil && size >= 0 {
 		sample.DiskBytes = &size
 	}
 	fullID := fields[0]
@@ -288,7 +317,9 @@ func (d *DockerRuntime) SampleUsage(ctx context.Context, containerID string) (Us
 		return sample, nil
 	}
 	group, err := cgroupV2Path(membership)
-	if err != nil || !strings.Contains(group, fullID) {
+	// A path that climbs out of the cgroup tree is never followed, even
+	// with the container's ID in it.
+	if err != nil || !strings.Contains(group, fullID) || slices.Contains(strings.Split(group, "/"), "..") {
 		return sample, nil
 	}
 	if stat, err := os.ReadFile(filepath.Join(cgroupRoot, group, "cpu.stat")); err == nil {

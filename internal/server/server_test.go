@@ -278,6 +278,7 @@ func TestAuthRequiredOnEverythingButHealth(t *testing.T) {
 		{"POST", "/v1/runs/x/exec"},
 		{"GET", "/v1/runs/x/execs"},
 		{"GET", "/v1/runs/x/execs/y"},
+		{"DELETE", "/v1/runs/x/execs/y"},
 		{"GET", "/v1/runs/x/execs/y/output"},
 		{"POST", "/v1/runs/x/snapshot"},
 		{"POST", "/v1/runs/x/stop"},

@@ -378,3 +378,90 @@ func TestRecoverableExecOutputIsBounded(t *testing.T) {
 		t.Fatalf("tail: %v", chunks)
 	}
 }
+
+// DELETE on an exec record ends the command; it is idempotent.
+func TestCancelARecoverableExec(t *testing.T) {
+	ts, rt, _ := newTestServer(t)
+	started := make(chan struct{}, 1)
+	rt.execCtxFunc = func(ctx context.Context, _ string, stdout, _ io.Writer) (int, bool) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return -1, false
+	}
+	id := createRun(t, ts)
+	ctx, drop := context.WithCancel(context.Background())
+	resp := startExec(t, ctx, ts, id, `{"cmd":"sleep 1d","recoverable":true,"timeoutSec":3600}`)
+	execID := resp.Header.Get(ExecIDHeader)
+	<-started
+	drop()
+	resp.Body.Close()
+	eventually(t, "the daemon to see the stream drop", func() bool { return execStatus(t, ts, id, execID)["detached"] == true })
+
+	call(t, ts, "DELETE", "/v1/runs/"+id+"/execs/"+execID, "", http.StatusAccepted)
+	status := waitFinished(t, ts, id, execID)
+	if status["state"] != run.ExecCancelled || status["exitCode"] != -1.0 || status["error"] == nil {
+		t.Fatalf("cancelled: %v", status)
+	}
+	again := call(t, ts, "DELETE", "/v1/runs/"+id+"/execs/"+execID, "", http.StatusAccepted)["exec"].(map[string]any)
+	if again["state"] != run.ExecCancelled {
+		t.Fatalf("a second cancel changed it: %v", again)
+	}
+	call(t, ts, "DELETE", "/v1/runs/"+id+"/execs/01ARZ3NDEKTSV4RRFFQ69G5FAV", "", http.StatusNotFound)
+	// The run is free again.
+	call(t, ts, "POST", "/v1/runs/"+id+"/stop", "", http.StatusOK)
+}
+
+// A run whose recoverable-exec slots are all running gets a 503 for one
+// more, and the refused exec gives its in-flight reservation back
+// (session.Abandon): once the others end, the run is idle again. Other
+// runs are not starved meanwhile.
+func TestRecoverableExecSlotsFullIs503(t *testing.T) {
+	ts, rt, _ := newTestServer(t)
+	release := make(chan struct{})
+	rt.execCtxFunc = func(ctx context.Context, _ string, stdout, _ io.Writer) (int, bool) {
+		<-release
+		return 0, false
+	}
+	full := createRun(t, ts)
+	var execIDs []string
+	for range run.ExecRecordsPerRun {
+		resp := startExec(t, context.Background(), ts, full, `{"cmd":"x","recoverable":true}`)
+		execIDs = append(execIDs, resp.Header.Get(ExecIDHeader))
+		defer resp.Body.Close()
+	}
+	refused := request(t, ts, "POST", "/v1/runs/"+full+"/exec", "test-token", `{"cmd":"x","recoverable":true}`)
+	if body := decodeBody(t, refused); refused.StatusCode != http.StatusServiceUnavailable || !strings.HasSuffix(body["type"].(string), "/at-capacity") {
+		t.Fatalf("one more recoverable exec: %d %v", refused.StatusCode, body)
+	}
+	other := createRun(t, ts)
+	resp := startExec(t, context.Background(), ts, other, `{"cmd":"x","recoverable":true}`)
+	defer resp.Body.Close()
+
+	close(release)
+	for _, execID := range execIDs {
+		waitFinished(t, ts, full, execID)
+	}
+	eventually(t, "the run to be idle", func() bool {
+		resp := request(t, ts, "POST", "/v1/runs/"+full+"/lease", "test-token", `{"owner":"human","ttlSec":60}`)
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+}
+
+// A recoverable exec's timeout is capped (it holds a slot until it ends);
+// a plain exec's is not, as before. The refusal reserves nothing.
+func TestRecoverableExecTimeoutIsCapped(t *testing.T) {
+	ts, _, manager := newTestServer(t)
+	id := createRun(t, ts)
+	max := int(manager.RecoverableMaxTimeout / time.Second)
+	call(t, ts, "POST", "/v1/runs/"+id+"/exec", fmt.Sprintf(`{"cmd":"x","recoverable":true,"timeoutSec":%d}`, max+1), http.StatusBadRequest)
+	for _, body := range []string{
+		fmt.Sprintf(`{"cmd":"x","recoverable":true,"timeoutSec":%d}`, max),
+		fmt.Sprintf(`{"cmd":"x","timeoutSec":%d}`, max+1),
+	} {
+		resp := startExec(t, context.Background(), ts, id, body)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	call(t, ts, "POST", "/v1/runs/"+id+"/lease", `{"owner":"human","ttlSec":60}`, http.StatusOK)
+}

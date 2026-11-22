@@ -75,7 +75,7 @@ func TestDriverSampleUsage(t *testing.T) {
 	rig.zfs.datasets[rig.volume(created.ID)].props["used"] = "65536"
 	rig.zfs.mu.Unlock()
 
-	sample, err := rig.driver.SampleUsage(bg, name)
+	sample, err := rig.driver.SampleUsage(bg, name, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestDriverSampleUsage(t *testing.T) {
 	if got.Usage.CPUSeconds == nil || *got.Usage.CPUSeconds != 2.5 || *got.Usage.RxBytes != 1500 || *got.Usage.DiskBytes != 65536 {
 		t.Fatalf("usage: %+v", got.Usage)
 	}
-	if _, err := rig.driver.SampleUsage(bg, "teploy-sbx-nothing"); err == nil {
+	if _, err := rig.driver.SampleUsage(bg, "teploy-sbx-nothing", true); err == nil {
 		t.Fatal("a VM that does not exist was sampled")
 	}
 }

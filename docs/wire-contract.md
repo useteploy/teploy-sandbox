@@ -103,6 +103,8 @@ Returned by create, stop, resume and fork, and in `GET /v1/runs`.
 
 The optional fields appear only when the daemon samples usage
 (`--usage-interval`, off by default) and the driver could read them.
+`diskBytes` is sampled on the first round and every tenth after it (it
+is the expensive read), not at a stop; the rest every round.
 They are observations, not a billing ledger: usage after the last sample
 and before the container went is not in them (a stop takes one last
 sample first; a destroy or a crash does not). The counters only grow for
@@ -195,17 +197,24 @@ With `"recoverable": true`:
 - The command no longer depends on the request: closing the stream (or
   losing the connection, or the client restarting) leaves it running to
   its end or its timeout.
+- The response headers (with `X-Exec-Id`) are sent at once, before the
+  command has printed anything.
+- `timeoutSec` may be at most the daemon's
+  `--exec-recoverable-max-timeout` (default 3600); more is a 400. Plain
+  execs have no such cap.
 - Offsets: every output byte, stdout and stderr together in the order
-  the stream sends them, has an offset counting from 0. In `base64` mode
-  the number of decoded bytes a client has received is exactly the
-  offset to resume from. In text mode it is exact unless the output had
-  invalid UTF-8 or the stream broke inside a multi-byte character, so
-  use `base64` when resuming matters.
+  the stream sends them, has an offset counting from 0. **A client that
+  wants to resume must ask for `outputEncoding: "base64"`**: then the
+  number of decoded bytes it has received is exactly the offset to
+  resume from. In text mode there is no offset guarantee (bytes are
+  held back across split UTF-8 characters and invalid bytes are
+  replaced); a text-mode client can only re-read from a tail or from 0.
 
 | Route | Success | Body |
 |---|---|---|
 | `GET /v1/runs/{id}/execs` | 200 | `{execs: [status…]}`, oldest first: the way back for a client that lost an ID |
 | `GET /v1/runs/{id}/execs/{execId}` | 200 | `{exec: status}` |
+| `DELETE /v1/runs/{id}/execs/{execId}` | 202 | `{exec: status}`: ends a running command. Idempotent: on one that already ended it changes nothing. The status turns `cancelled` once the runtime has returned; poll it |
 | `GET /v1/runs/{id}/execs/{execId}/output?since=&limit=` | 200 | `{execId, output}` |
 
 The status object:
@@ -213,13 +222,13 @@ The status object:
 | Field | Meaning |
 |---|---|
 | `id`, `runId` | |
-| `state` | `running`, `exited`, `timedOut` or `failed` (the sandbox could not run it to the end: the run was stopped or destroyed under it, the runtime failed) |
+| `state` | `running`, `exited`, `timedOut`, `cancelled` (by DELETE, or by the daemon before an expiry or shutdown stop of the run) or `failed` (the sandbox could not run it to the end: the run was stopped or destroyed under it, the runtime failed) |
 | `startedAt` | |
 | `finishedAt`, `expiresAt` | Once finished; the record goes at `expiresAt` |
 | `exitCode` | `null` while running, as on the `exit` frame after |
 | `timedOut` | |
 | `signal` | Optional: n when `exitCode` is 128+n and the exec did not time out. Inferred: a command that itself exits 137 looks the same |
-| `error` | Optional, on `failed` |
+| `error` | Optional, on `failed` and `cancelled`: why |
 | `detached` | The stream that started it went away before it ended |
 | `output` | `{start, end, capBytes}`: offsets still held are `[start, end)`; `end` is every byte written so far |
 
@@ -240,9 +249,20 @@ Output reads:
 Limits and lifetime (constants, not configurable in this release):
 
 - Output: the last 1 MiB per exec (`capBytes`); older bytes are dropped.
-- Records: 16 per run and 64 per daemon. A finished record makes room for
+- Records: 8 per run and 64 per daemon, so one run can hold at most an
+  eighth of the daemon's slots. A finished record makes room for
   a new one, oldest first; running ones are never evicted, so a
   recoverable exec beyond either bound with every slot running is a 503.
+- Cancelling: under the VM driver the guest kills the command's process
+  group. Under the Docker driver the `docker exec` client is killed and
+  the record and the run are released at once, but the process inside
+  the container runs on until its own `timeoutSec` (Docker has no way to
+  signal an exec's process from outside) or until the run stops.
+- Before a stop the daemon makes on its own (a run's `onExpire: "stop"`
+  deadline, or a graceful shutdown) it cancels the run's running
+  recoverable execs and waits up to 10 s for them, so a detached exec
+  cannot keep the run from being stopped and lose its state. A stop a
+  caller asks for still answers 409 `busy` while an exec runs.
 - A finished record is kept 15 minutes. Every record of a run goes when
   the run is destroyed (status lookups for it then answer 404 for the
   run). A stop keeps them.

@@ -2794,20 +2794,38 @@ Additive daemon asks: `recoverable` execs with `X-Exec-Id` and
   every running command (running runs do not survive a restart); the
   lookup answers 404 with that reason at once. A control plane that sees
   that 404 for an exec it started knows only "outcome unknown".
-- Output is the last 1 MiB per exec (plus 128 KiB of stream bits), 16
+- Output is the last 1 MiB per exec (plus 128 KiB of stream bits), 8
   records per run, 64 per daemon: about 72 MiB worst case. Running
   records are never evicted, so a 65th concurrent recoverable exec (or
-  17th on one run) is a 503. Finished records live 15 minutes. All
-  constants, not flags.
-- There is no way to kill a recoverable exec early: it is bounded by
-  `timeoutSec` (default 120, no maximum, as for every exec) and by its
-  run. A recoverable exec still counts as in flight, so it blocks stop,
-  snapshot, fork and lease takeover until it ends, exactly as a
-  connected exec did.
+  9th on one run) is a 503. One run holds at most an eighth of the
+  slots; a caller with eight or more runs can still take them all (the
+  daemon has one token and no notion of callers: that bound belongs to
+  the control plane). Finished records live 15 minutes. All constants,
+  not flags.
+- A recoverable exec's `timeoutSec` is capped at
+  `--exec-recoverable-max-timeout` (default 1h, at most 24h): a running
+  one holds a slot until it ends, and an hour covers builds and suites.
+  It can be cancelled (`DELETE …/execs/{execId}`). Under Docker that
+  kills only the `docker exec` client: the record and the run's
+  in-flight slot are released, but the in-container process runs on to
+  its own timeout or the run's stop (not fixed: Docker cannot signal an
+  exec's process from outside without tracking its pid in the
+  container).
+- A recoverable exec counts as in flight like any exec, so a caller's
+  stop, snapshot, fork or lease takeover is 409 `busy` while it runs.
+  Unlike a connected exec, a detached one has no client to end it, so
+  (fixed after review) a stop the daemon makes itself (expiry with
+  `onExpire: "stop"`, graceful shutdown) first cancels the run's
+  recoverable execs and waits up to 10 s; before that fix such a stop
+  was refused and a shutdown lost the run's state. Plain execs still
+  block those stops as on `main`.
 - Text-mode resume offsets are exact only when the output is valid UTF-8
   and the stream did not break inside a character; base64 mode is exact.
 - `signal` is inferred from exit code 128+n; a command that exits 137
   itself reads as SIGKILL.
+- Usage sampling runs at most four runs at a time; disk is read on the
+  first round and every tenth (it is the expensive read), not at a stop,
+  whose sample has a 3 s budget.
 - Usage numbers are observations, not a ledger: usage after the last
   sample is lost on destroy, expiry-destroy and crash (a stop takes a
   final sample). Counters reset to zero for a fork and for a run resumed
@@ -2854,3 +2872,27 @@ direction.
 - Not run live: `vm_usage_integration_test.go` (`TestVMRecoverableExecs`,
   `TestVMUsage`), Docker CPU/network/disk on a Linux Docker host, and
   anything under gVisor.
+
+### Review fixes (2026-11-21, same day)
+
+An independent review of PR #6 found one blocker and several smaller
+items; each fix has a test that fails without it (shown locally):
+
+- Lock-order deadlock (blocker): destroy dropped a run's exec records
+  under the manager lock while the reaper's sweep held the registry lock
+  and asked the manager about runs. The drop now happens after the
+  manager lock is released, and the sweep releases the registry lock
+  before asking. Regression: the reviewer's repro,
+  `TestExecSweepAndDestroyDoNotDeadlock`. Every other registry call site
+  takes the manager lock (if at all) only before or after, never around.
+- Detached execs and daemon-made stops, cancel endpoint, timeout cap,
+  per-run share (above). HTTP test of the 503 path and of the refused
+  exec giving back its in-flight reservation.
+- Found while testing the cancel endpoint: the recoverable path did not
+  flush its headers, so a command that printed nothing held back
+  `X-Exec-Id` until its first output. It is flushed at once now (the
+  plain path is untouched).
+- Docker's data root is asked for once and cached; capacity is a statfs.
+- statfs uses f_frsize on Linux (no test: the two are equal on the
+  filesystems at hand); cgroup paths with `..` are not followed; usage
+  fields are hidden with sampling off.

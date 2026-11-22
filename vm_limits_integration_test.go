@@ -409,6 +409,11 @@ func TestVMLimits(t *testing.T) {
 // once, the hypervisor of this guest stayed after its kill for more than
 // six minutes, and every destroy in that time failed. A killed VM keeps
 // its limit for vm.DrainGrace and no longer.
+//
+// The VM boots under the default limits and has the 2 MiB/s from the
+// moment its agent answers: a fresh clone of the x86-64 image reads about
+// 500 MB to boot, which under 2 MiB/s did not finish within the driver's
+// two minutes.
 func TestVMDestroyIsNotHeldByQueuedIO(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Fatal("the vm suite needs root (zfs, /dev/kvm)")
@@ -419,10 +424,12 @@ func TestVMDestroyIsNotHeldByQueuedIO(t *testing.T) {
 	const capMB = 2
 	config.DiskMBPerSecond, config.DiskIOPS = capMB, -1
 	manager, _, _, _ := newVMManager(t, config, t.TempDir())
+	began := time.Now()
 	created, err := manager.Create(ctx, run.CreateRequest{Image: vm.GoldenImage, Limits: &run.Limits{MemoryMB: 1024, CPUs: 2}})
 	if err != nil {
-		t.Fatalf("create: %v", err)
+		t.Fatalf("create under a disk limit of %d MiB/s: %v", capMB, err)
 	}
+	t.Logf("create under a disk limit of %d MiB/s took %s", capMB, time.Since(began).Round(100*time.Millisecond))
 	id := created.ID
 	destroyed, group := false, ""
 	defer func() {
@@ -442,6 +449,10 @@ func TestVMDestroyIsNotHeldByQueuedIO(t *testing.T) {
 	}()
 	machine := inspectVM(t, config, manager, id, 2, 1024)
 	group = machine.cgroup
+	// The run's own limit, already: the boot's ended with the create.
+	if limit := cgroupValue(t, machine.cgroup, "io.max"); !strings.Contains(limit, fmt.Sprintf("rbps=%d wbps=%d", capMB<<20, capMB<<20)) {
+		t.Fatalf("io.max of a VM whose create returned: %q, want the run's %d MiB/s", limit, capMB)
+	}
 	// As root in the guest: let one request carry as much as the device
 	// takes, then start more direct writes than the limit passes in
 	// minutes. The writes are left running.
@@ -460,7 +471,7 @@ sleep 4; echo started`, writers, eachMB/16), "", nil, time.Minute)
 		t.Fatalf("io.max of a VM that is alive, with writes queued: %q", limit)
 	}
 	stat := cgroupValue(t, machine.cgroup, "io.stat")
-	began := time.Now()
+	began = time.Now()
 	err = manager.Destroy(ctx, id)
 	took := time.Since(began)
 	destroyed = err == nil

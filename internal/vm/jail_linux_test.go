@@ -65,6 +65,9 @@ func init() {
 	case "seccomp":
 		probeSeccomp()
 		os.Exit(0)
+	case "ksm":
+		probeKSM()
+		os.Exit(0)
 	case "fill":
 		probeFill(os.Getenv(jailProbeEnv + "_DIR"))
 		os.Exit(0)

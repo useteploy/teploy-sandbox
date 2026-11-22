@@ -39,6 +39,15 @@ import (
 //   - the mount calls, other processes' memory, kernel keyrings, bpf,
 //     perf events, userfaultfd, modules, kexec, file handles, and the
 //     calls that only an administrator has a use for.
+//   - the two ways to make memory mergeable by KSM: prctl with
+//     PR_SET_MEMORY_MERGE (every mapping of the process) and madvise
+//     with MADV_MERGEABLE (one range). KSM merges equal pages across
+//     every process on the host that asked for it, and how long a write
+//     to a merged page takes tells whoever wrote it that someone else
+//     had the same page. The hypervisor is started with mergeable=off
+//     and the jail helper clears the inherited flag; this keeps a
+//     hypervisor that was taken over from asking again. prctl and
+//     madvise are otherwise allowed: the hypervisor uses both.
 //
 // A denied call fails with EPERM and the process lives: the list is
 // there to take the calls away, and a thread that asks for one out of
@@ -105,6 +114,16 @@ const cloneNamespaceFlags = 0x00020000 | // CLONE_NEWNS
 
 const afUnix = 1
 
+// The KSM requests the filter refuses: prctl's option (its first
+// argument) and madvise's advice (its third). Both are an int, so the
+// low 32 bits the filter reads are the whole value, as the kernel reads
+// it.
+const (
+	prSetMemoryMergeOption = 67 // PR_SET_MEMORY_MERGE
+	madvMergeable          = 12 // MADV_MERGEABLE
+	seccompDataArg2        = seccompDataArg0 + 2*8
+)
+
 // seccompArch is one architecture's system call table, as far as the
 // filter names calls.
 type seccompArch struct {
@@ -114,7 +133,7 @@ type seccompArch struct {
 	// x32 says the architecture has a second table behind x32Bit.
 	x32 bool
 	// The calls that are judged by an argument.
-	clone, clone3, socket, socketpair uint32
+	clone, clone3, socket, socketpair, prctl, madvise uint32
 	// denied is every call that is refused outright, by name.
 	denied map[string]uint32
 }
@@ -148,7 +167,7 @@ var sharedDenied = map[string]uint32{
 var seccompArches = map[string]seccompArch{
 	"amd64": {
 		audit: 0xc000003e, x32: true,
-		clone: 56, clone3: 435, socket: 41, socketpair: 53,
+		clone: 56, clone3: 435, socket: 41, socketpair: 53, prctl: 157, madvise: 28,
 		denied: map[string]uint32{
 			"ptrace": 101, "syslog": 103, "uselib": 134, "personality": 135,
 			"vhangup": 153, "modify_ldt": 154, "pivot_root": 155, "_sysctl": 156,
@@ -166,7 +185,7 @@ var seccompArches = map[string]seccompArch{
 	},
 	"arm64": {
 		audit: 0xc00000b7,
-		clone: 220, clone3: 435, socket: 198, socketpair: 199,
+		clone: 220, clone3: 435, socket: 198, socketpair: 199, prctl: 167, madvise: 233,
 		denied: map[string]uint32{
 			"lookup_dcookie": 18, "umount2": 39, "mount": 40, "pivot_root": 41,
 			"nfsservctl": 42, "chroot": 51, "vhangup": 58, "quotactl": 60,
@@ -201,8 +220,7 @@ const bpfMaxJump = 255
 // seccompProgram is the filter for one architecture.
 //
 // It reads top to bottom: the architecture, then the call's number
-// against each refused call, then the calls judged by their first
-// argument. Every answer is one of four return instructions at the end.
+// against each refused call, then the calls judged by an argument. Every answer is one of four return instructions at the end.
 func seccompProgram(goarch string) ([]bpfInsn, error) {
 	arch, ok := seccompArches[goarch]
 	if !ok {
@@ -230,6 +248,8 @@ func seccompProgram(goarch string) ([]bpfInsn, error) {
 	emit(bpfJeq, arch.socket, "socket", "")
 	emit(bpfJeq, arch.socketpair, "socket", "")
 	emit(bpfJeq, arch.clone3, "enosys", "")
+	emit(bpfJeq, arch.prctl, "prctl", "")
+	emit(bpfJeq, arch.madvise, "madvise", "")
 	denied := arch.deniedCalls()
 	numbers := make([]uint32, 0, len(denied))
 	for _, nr := range denied {
@@ -251,6 +271,14 @@ func seccompProgram(goarch string) ([]bpfInsn, error) {
 	label("socket")
 	emit(bpfLdAbsW, seccompDataArg0, "", "")
 	emit(bpfJeq, afUnix, "allow", "eperm")
+	// prctl: refused for PR_SET_MEMORY_MERGE, whichever way it is set.
+	label("prctl")
+	emit(bpfLdAbsW, seccompDataArg0, "", "")
+	emit(bpfJeq, prSetMemoryMergeOption, "eperm", "allow")
+	// madvise: refused for MADV_MERGEABLE.
+	label("madvise")
+	emit(bpfLdAbsW, seccompDataArg2, "", "")
+	emit(bpfJeq, madvMergeable, "eperm", "allow")
 	label("allow")
 	emit(bpfRet, seccompAllow, "", "")
 	label("eperm")

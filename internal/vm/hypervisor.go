@@ -221,7 +221,9 @@ func (h *CloudHypervisor) machineArgs(config MachineConfig, dir string, cid uint
 		// its limit, at the guest's expense and for nothing.
 		"--disk", "path=" + config.Disk + ",image_type=raw,direct=on",
 		"--cpus", fmt.Sprintf("boot=%d", config.CPUs),
-		"--memory", fmt.Sprintf("size=%dM", config.MemoryMB),
+		// mergeable=off is the hypervisor's default, said out loud: the
+		// guest's RAM is never advised to KSM (see the jail helper).
+		"--memory", fmt.Sprintf("size=%dM,mergeable=off", config.MemoryMB),
 		"--vsock", fmt.Sprintf("cid=%d,socket=%s", cid, filepath.Join(dir, vsockSocketName)),
 		// A zero-sized balloon that only reports free pages: memory the
 		// guest stops using goes back to the host. No policy sits on top.

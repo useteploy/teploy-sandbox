@@ -933,43 +933,96 @@ sleep 1`, nicA.dev, nicA.gatewayMAC, peerAddr, peerUDP, nicA.mac, nicA.addr, nic
 	// everything above still holds. Twice: every table deleted (what a
 	// "flush ruleset" does, on the host and in each run's namespace), and
 	// every table left in place with nothing in it.
-	rulesOf := func() string {
+	//
+	// The daemon's watcher looks every two seconds and may put a ruleset
+	// back between the damage and the test's look at it. So each ruleset
+	// is looked at right after its own damage, and counts as damaged when
+	// it lists differently then, or when the daemon has said since the
+	// damage began that it found that one changed and put it back (it
+	// says so before it writes, so a listing that is already back always
+	// comes after the word). A damage that did nothing gives neither.
+	type ruleset struct {
+		name, ns string // ns is "" for the host's table
+	}
+	targets := []ruleset{{name: "the host's table"}}
+	for _, nic := range []guestNIC{nicA, nicB, nicC} {
+		targets = append(targets, ruleset{name: "the namespace " + nic.ns, ns: nic.ns})
+	}
+	listOf := func(r ruleset) string {
 		// A table that is not there lists as an error, which is as
 		// different from the rules as written as anything.
-		listing, _ := hostTry("nft", "-s", "list", "table", "inet", names.table)
-		for _, nic := range []guestNIC{nicA, nicB, nicC} {
-			rules, _ := tryNS(nic.ns, "nft", "-s", "list", "ruleset")
-			listing += "\n" + rules
+		if r.ns == "" {
+			listing, _ := hostTry("nft", "-s", "list", "table", "inet", names.table)
+			return listing
 		}
-		return listing
+		rules, _ := tryNS(r.ns, "nft", "-s", "list", "ruleset")
+		return rules
+	}
+	rulesOf := func() string {
+		var listing []string
+		for _, r := range targets {
+			listing = append(listing, listOf(r))
+		}
+		return strings.Join(listing, "\n")
+	}
+	// restoresOf is how many times the daemon has said it put r back.
+	restoresOf := func(r ruleset) int {
+		count := 0
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if r.ns == "" {
+				if strings.Contains(line, "the vm firewall table was removed by something else") || strings.Contains(line, "the vm firewall table was changed by something else") {
+					count++
+				}
+			} else if strings.Contains(line, "a run's ruleset was removed or changed by something else") && strings.Contains(line, "namespace="+r.ns+" ") {
+				count++
+			}
+		}
+		return count
 	}
 	intact := rulesOf()
+	intactOf := map[ruleset]string{}
+	for _, r := range targets {
+		intactOf[r] = listOf(r)
+	}
 	for _, want := range []string{nicA.addr, nicB.addr, `"` + nicA.link + `"`, "tcp dport " + proxyPort + " accept", "hook ingress device \"" + nicC.tap + "\"", "tcp dport 25", "169.254.0.0/16"} {
 		if !strings.Contains(intact, want) {
 			t.Fatalf("the rules as written lack %q:\n%s", want, intact)
 		}
 	}
-	for how, damage := range map[string]func(){
-		"deleted": func() {
-			hostRun(t, "nft", "delete", "table", "inet", names.table)
-			for _, nic := range []guestNIC{nicA, nicB, nicC} {
-				inNS(t, nic.ns, "nft", "flush", "ruleset")
-			}
-		},
-		"emptied": func() {
-			hostRun(t, "nft", "flush", "table", "inet", names.table)
-			hostRun(t, "nft", "flush", "set", "inet", names.table, "open")
-			for _, nic := range []guestNIC{nicA, nicB, nicC} {
-				inNS(t, nic.ns, "nft", "flush", "table", "inet", runTable)
-				inNS(t, nic.ns, "nft", "flush", "table", "netdev", runTable)
-			}
-		},
-	} {
-		damage()
-		if rulesOf() == intact {
-			t.Fatalf("rules %s by hand are unchanged; nothing was tested", how)
-		}
+	for _, how := range []string{"deleted", "emptied"} {
+		damage := map[string]func(r ruleset){
+			"deleted": func(r ruleset) {
+				if r.ns == "" {
+					hostRun(t, "nft", "delete", "table", "inet", names.table)
+				} else {
+					inNS(t, r.ns, "nft", "flush", "ruleset")
+				}
+			},
+			"emptied": func(r ruleset) {
+				if r.ns == "" {
+					hostRun(t, "nft", "flush", "table", "inet", names.table)
+					hostRun(t, "nft", "flush", "set", "inet", names.table, "open")
+				} else {
+					inNS(t, r.ns, "nft", "flush", "table", "inet", runTable)
+					inNS(t, r.ns, "nft", "flush", "table", "netdev", runTable)
+				}
+			},
+		}[how]
 		removed := time.Now()
+		var seen, early []string
+		for _, r := range targets {
+			before := restoresOf(r)
+			damage(r)
+			switch {
+			case listOf(r) != intactOf[r]:
+				seen = append(seen, r.name)
+			case restoresOf(r) > before:
+				early = append(early, r.name)
+			default:
+				t.Fatalf("%s %s by hand lists as it did, and the daemon put nothing back; nothing was tested", r.name, how)
+			}
+		}
+		t.Logf("rules %s by hand: seen damaged %v; already put back by the daemon when looked at %v", how, seen, early)
 		for rulesOf() != intact {
 			if time.Since(removed) > 20*time.Second {
 				t.Fatalf("the daemon did not put back the rules that were %s:\n%s\nwant:\n%s", how, rulesOf(), intact)

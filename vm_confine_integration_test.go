@@ -333,8 +333,70 @@ func inspectVM(t *testing.T, config vm.Config, manager *run.Manager, id string, 
 	if entries, err := os.ReadDir(machine.runDir + ".jail"); err != nil || len(entries) != 0 {
 		t.Errorf("the jail's mount point on the host: %v %v, want an empty directory", entries, err)
 	}
+	// --- KSM: no mapping of the hypervisor, the guest's RAM above all,
+	// is mergeable ("mg" in its VmFlags). TestVMConfinement starts its
+	// daemon with PR_SET_MEMORY_MERGE set, which would otherwise be
+	// inherited and make every one of them so.
+	if merged := mergeableMappings(t, machine.pid); len(merged) != 0 {
+		t.Errorf("%d mappings of the hypervisor are mergeable by KSM, the first: %s", len(merged), merged[0])
+	}
 	inspectJail(t, config, machine, uint32(kvm.Sys().(*syscall.Stat_t).Gid))
 	return machine
+}
+
+// mergeableMappings is every mapping of a process that KSM may merge:
+// those with "mg" (VM_MERGEABLE) among the VmFlags of /proc/PID/smaps,
+// by their header line.
+func mergeableMappings(t *testing.T, pid int) []string {
+	t.Helper()
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/smaps", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var merged []string
+	header := ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if fields[0] == "VmFlags:" {
+			if slices.Contains(fields[1:], "mg") {
+				merged = append(merged, header)
+			}
+		} else if !strings.HasSuffix(fields[0], ":") {
+			header = line
+		}
+	}
+	return merged
+}
+
+// prSetMemoryMerge is PR_SET_MEMORY_MERGE (Linux 6.4).
+const prSetMemoryMerge = 67
+
+// mergeableDaemon makes this test process a daemon started with
+// PR_SET_MEMORY_MERGE set (what a systemd unit's MemoryKSM=yes does),
+// until the test ends. It shows the flag works here: this process's own
+// mappings become mergeable.
+func mergeableDaemon(t *testing.T) {
+	t.Helper()
+	if _, _, errno := syscall.RawSyscall6(syscall.SYS_PRCTL, prSetMemoryMerge, 1, 0, 0, 0, 0); errno != 0 {
+		if errno == syscall.EINVAL {
+			t.Log("note: this kernel has no PR_SET_MEMORY_MERGE (Linux 6.4 or newer, with CONFIG_KSM); the KSM checks below prove little here")
+			return
+		}
+		t.Fatalf("set PR_SET_MEMORY_MERGE on the test process: %v", errno)
+	}
+	t.Cleanup(func() {
+		if _, _, errno := syscall.RawSyscall6(syscall.SYS_PRCTL, prSetMemoryMerge, 0, 0, 0, 0, 0); errno != 0 {
+			t.Errorf("clear PR_SET_MEMORY_MERGE on the test process: %v", errno)
+		}
+	})
+	if merged := mergeableMappings(t, os.Getpid()); len(merged) == 0 {
+		t.Fatal("PR_SET_MEMORY_MERGE is set on the test process and none of its mappings is mergeable: the hypervisor's check would prove nothing")
+	} else {
+		t.Logf("the test process runs with PR_SET_MEMORY_MERGE set: %d of its mappings are mergeable", len(merged))
+	}
 }
 
 // hostSockets are services of the host that anyone on it may connect to,
@@ -818,6 +880,9 @@ func TestVMConfinement(t *testing.T) {
 	}
 	config := vmTestConfig(t)
 	ctx := context.Background()
+	// Before the daemon starts, so that its warm pool VMs are started
+	// under the flag too.
+	mergeableDaemon(t)
 	manager, driver, _, _ := newVMManager(t, config, t.TempDir())
 	baseline := poolListing(t, config.Pool)
 	linksBefore := labelLinks(t)

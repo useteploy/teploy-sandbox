@@ -151,7 +151,21 @@ func (m *Manager) SampleUsage(ctx context.Context) {
 	if _, ok := m.usageSampler(); !ok {
 		return
 	}
-	withDisk := (m.usageRounds.Add(1)-1)%usageDiskEvery == 0
+	m.sampleAll(ctx, (m.usageRounds.Add(1)-1)%usageDiskEvery == 0)
+}
+
+// SampleUsageWithDisk is one round of SampleUsage that reads disk as well,
+// whatever round the ticker is on, and does not count as one of its
+// rounds. For tests, which otherwise cannot tell which round reads disk.
+func (m *Manager) SampleUsageWithDisk(ctx context.Context) {
+	if _, ok := m.usageSampler(); !ok {
+		return
+	}
+	m.sampleAll(ctx, true)
+}
+
+// sampleAll samples every running run once, with or without disk.
+func (m *Manager) sampleAll(ctx context.Context, withDisk bool) {
 	slots := make(chan struct{}, usageParallel)
 	var wg sync.WaitGroup
 	for _, current := range m.List() {

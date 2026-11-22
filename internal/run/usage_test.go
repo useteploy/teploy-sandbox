@@ -266,6 +266,32 @@ func TestUsageSamplingCadenceAndParallelism(t *testing.T) {
 		t.Fatalf("disk asked %v, want %v", rt.disks, want)
 	}
 
+	// SampleUsageWithDisk reads disk on a round that would not, and does
+	// not move the cadence: the ticker's next disk round is where it was.
+	rt = &samplingRT{fakeRT: &fakeRT{}}
+	rt.set(1, 2, 3, 4)
+	m = NewManager(rt, testLogger())
+	m.UsageInterval = time.Minute
+	if _, err := m.Create(ctx, CreateRequest{Image: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	m.SampleUsage(ctx)
+	m.SampleUsageWithDisk(ctx)
+	for range usageDiskEvery {
+		m.SampleUsage(ctx)
+	}
+	want = make([]bool, usageDiskEvery+2)
+	want[0], want[1], want[usageDiskEvery+1] = true, true, true
+	if fmt.Sprint(rt.disks) != fmt.Sprint(want) {
+		t.Fatalf("with a forced disk round, disk asked %v, want %v", rt.disks, want)
+	}
+	// With sampling off it is a no-op, as SampleUsage is.
+	off := NewManager(rt, testLogger())
+	off.SampleUsageWithDisk(ctx)
+	if len(rt.disks) != len(want) {
+		t.Fatalf("sampled with sampling off: %v", rt.disks)
+	}
+
 	rt = &samplingRT{fakeRT: &fakeRT{}, hold: make(chan struct{})}
 	m = NewManager(rt, testLogger())
 	m.UsageInterval = time.Minute

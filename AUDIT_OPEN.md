@@ -2954,7 +2954,13 @@ The point was correctness and confinement on real x86-64.
   passed in `vm-root` and on the pull request's run: its fake cgroups
   give a removal 200 ms, which a loaded runner can spend before the
   first retry. Neither failed in 8 local runs of the whole package
-  (`-cpu 1,2`).
+  (`-cpu 1,2`). It failed once more in CI on main (PR #6's push run).
+  Fixed in the code, not the test: a removal whose time ran out gave up
+  right after the kill that had just emptied the group, without looking
+  again; it now tries the removal once more before it reports the group
+  busy (`TestARemovalLooksOnceMoreAfterItsLastKill`, with no time at
+  all, fails without it). On a real host this only spares an error when
+  the last kill's processes are reaped in that moment.
 
 ### Re-run on the branch (kernel at its default `/var` path, no `SBX_VM_KERNEL`)
 

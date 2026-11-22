@@ -859,6 +859,12 @@ func (c *cgroups) remove(ctx context.Context, name string) error {
 			_ = c.unthrottle(name)
 		}
 		if time.Now().After(deadline) {
+			// Once more after the last kill: the time may have run out
+			// while what the kill ended was being reaped, and a group
+			// that is empty by now is removed, not reported.
+			if last := c.fs.rmdir(dir); last == nil || os.IsNotExist(last) {
+				return nil
+			}
 			return fmt.Errorf("cgroup %s: %w", dir, err)
 		}
 		select {

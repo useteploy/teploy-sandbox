@@ -640,6 +640,30 @@ func TestReleaseKeepsTheUIDUntilTheCgroupIsEmpty(t *testing.T) {
 	}
 }
 
+// A removal whose time runs out right after its kill ended what was in
+// the group still removes the group: it looks once more before it gives
+// up. (TestReleaseKeepsTheUIDUntilTheCgroupIsEmpty failed on a loaded CI
+// runner because the 200 ms it gives a removal had passed by the first
+// kill.)
+func TestARemovalLooksOnceMoreAfterItsLastKill(t *testing.T) {
+	groups, tree := newFakeCgroups(t, "cpu io memory pids")
+	must(t, groups.prepare())
+	dir, err := groups.create(context.Background(), runName(1), cgroupLimits{MemoryBytes: 1 << 30, Pids: 10, CPUs: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree.mu.Lock()
+	tree.procs[dir] = []int{77}
+	tree.mu.Unlock()
+	groups.removeTimeout = 0
+	if err := groups.remove(context.Background(), runName(1)); err != nil {
+		t.Fatalf("a group its kill emptied was not removed: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("the group is still there: %v", err)
+	}
+}
+
 func TestEnterRollsBackWhatItAllocated(t *testing.T) {
 	for _, op := range []string{"mountSockets", "deviceNumber", "mknod", "chown"} {
 		root := t.TempDir()

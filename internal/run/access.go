@@ -32,9 +32,10 @@ import (
 // A run that moves loses its grants: any resume that is not this daemon
 // continuing its own state (a run adopted from remote storage — stopped on
 // another daemon, taken over, or brought back from its last stop after a
-// restart lost it) sets epoch = max(epoch, accessEpoch from the caller,
-// now). With remote storage a revoke writes the new epoch to the run's
-// remote record before it answers, and fails loudly when it cannot.
+// restart lost it) sets epoch = max(epoch+1, accessEpoch+1, now)
+// (moveAccessLocked). With remote storage a revoke writes the new epoch to
+// the run's remote record before it answers, and fails loudly when it
+// cannot.
 
 // Port visibility and protocol values.
 const (

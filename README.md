@@ -23,11 +23,12 @@ stability promise — is [docs/wire-contract.md](docs/wire-contract.md).
 | `PUT/GET /v1/runs/{id}/files/{path}` | Confined to `/work`; traversal rejected. PUT takes the lease credential as `?owner=&generation=` query and is fenced like exec; GET is open, lease or not |
 | `DELETE /v1/runs/{id}` | Destroy now (the reaper enforces TTLs regardless, default 30 min); on a stopped run, deletes the record and its snapshot |
 | `POST /v1/runs/{id}/stop` | Capture the filesystem, remove the container, keep the run → the run, `state: "stopped"` (see Persistent runs) |
-| `POST /v1/runs/{id}/resume` | `{ttlSec?, takeover?}` → the same run, same `id`, `state: "running"`, new deadline (`takeover`: see Off-host storage) |
+| `POST /v1/runs/{id}/resume` | `{ttlSec?, takeover?, accessEpoch?}` → the same run, same `id`, `state: "running"`, new deadline (`takeover`: see Off-host storage) |
 | `POST /v1/runs/{id}/fork` | `{ttlSec?, labels?, onExpire?}` → 201, a new run started from this one's filesystem and settings, with `forkedFrom` |
 | `GET /v1/capacity` | `{server, driver, runtime, cpus, memoryMb, runs: {running, stopped}, allocated: {cpus, memoryMb}, warmPool?, disk?}` — the host's size and the sum of running runs' limits (and of the VM driver's warm pool, when it has one); `disk: {kind, name, usedBytes, freeBytes}` is the ZFS pool (`zfs-pool`) or Docker's data root filesystem (`docker-data-dir`), absent when unknown. The Docker figure is a statfs of the data root's path (from `docker info`) on the daemon's own filesystem: only right for a daemon on the Docker host itself (as `serve` runs). Against a remote Docker, or a Docker VM such as Docker Desktop or colima, that path is the local one or missing, and the number is wrong or absent |
 | `GET /v1/remote/snapshots` | Only with remote storage: the caller snapshots in the bucket → `{snapshots: [{id, run?, createdAt, storedBytes}]}` — membership is the durability probe for a snapshot whose upload failed and is retried |
 | `POST /v1/remote/sync`, `POST /v1/remote/collect`, `POST /v1/remote/rotate`, `POST /v1/remote/scrub` | Only with remote storage (400 without): look for runs stopped on other daemons now → `{remote, changed}`; garbage-collect the bucket now → 204; re-wrap the bucket's keys under the current master → `{manifestsRewrapped, recordsRewrapped, …, previousKeyNeeded, previousKeyNeededFor: [...]}`; check now that every stopped run this daemon reports durable is whole in the bucket, and read the next `--remote-scrub-read-mb` of their chunks → `{checked, notWhole, unreachable, contentReadBytes, contentSnapshots, damaged}` |
+| `PUT/DELETE /v1/runs/{id}/ports/{port}`, `POST /v1/runs/{id}/access/revoke`, `GET/PUT /v1/access/config` | Only with access on (`--access-addr`): publish a port (`{visibility: "public"\|"private", protocol?: "http"\|"h2c"}`, at most 16 public) or drop it; revoke every access grant of the run and close its streams → the run with its new `access.epoch`; the access configuration `{audience, issuerKeys, edgeDenylist}` (see Access) |
 | `GET /v1/runs`, `GET /health` | List; `{status, version}` |
 
 Run IDs are ULIDs and every response carries a `server` field — nothing
@@ -1463,6 +1464,104 @@ takeover indefinitely.
 
 Clients: `SandboxExecutor` in `@neutron-build/agents` (the pinned wire
 contract); a Go client package follows with the Phase B agent product.
+
+## Access: published ports and SSH (experimental, off by default)
+
+The daemon side of SSH into a run and of published HTTPS ports. The
+internet-facing part, an **edge** that terminates TLS and SSH and opens
+streams to daemons, is a separate program and not in this release; this
+release is what it talks to. The wire contract is in
+[docs/wire-contract.md](docs/wire-contract.md#access).
+
+Nothing of it exists unless the daemon is started with `--access-addr`.
+
+```
+teploy-sandbox serve --driver vm --vm-max-runs 22 \
+  --access-addr OVERLAY_ADDRESS:7448 \
+  --access-tls-cert /etc/teploy-sandbox/access.crt --access-tls-key /etc/teploy-sandbox/access.key \
+  --access-client-ca /etc/teploy-sandbox/edge-client-ca.pem
+```
+
+- **A separate listener.** Its own address (a private overlay address,
+  never public), its own server and routes: no control route is on it and
+  the control token means nothing there. TCP is always mutual TLS 1.3:
+  the client certificate is verified during the handshake, before any
+  HTTP is read, against `--access-client-ca`, and must name one edge as
+  `URI:teploy-edge://<name>` that is not on the denylist. Use **two CAs**:
+  one that signs only edge client certificates, one that signs only
+  daemon server certificates; the daemon refuses to start when the edge
+  CA also signed its own certificate. On a single host,
+  `--access-addr unix:/run/teploy-sandbox/access.sock` (Linux) is a 0660
+  socket that admits a peer by uid (`--access-unix-uid`) or gid
+  (`--access-unix-gid`, also the socket's group).
+- **Grants.** An edge forwards a signed grant (`Teploy-Grant`) with every
+  stream, and the daemon verifies it itself: the issuer's signature
+  (keys from `PUT /v1/access/config` or `--access-config FILE`, which
+  SIGHUP rereads), the audience, the run, the scope for the port, and
+  that its `ep` is at least the run's access epoch. A stream without a
+  grant is allowed only to a port the run published as public. A granted
+  stream is closed when its grant expires, however busy it is.
+- **Revoking.** `POST /v1/runs/{id}/access/revoke` raises the run's
+  access epoch, which ends every grant issued before and closes every
+  open stream of the run. With remote storage the new epoch is written to
+  the run's remote record before the answer (502 if it cannot be, with
+  the epoch raised and the streams closed anyway). A run that moves to
+  another daemon (a resume from remote storage, a takeover, a run brought
+  back from its last stop after a restart) resumes with its grants
+  revoked: they are minted again after a move. Residual: a state
+  directory rolled back on the same host restores the old epoch, and
+  with it the old grants until they expire.
+- **How bytes reach the guest.** Under the VM driver a stream is a new
+  vsock connection to the guest agent, which dials `127.0.0.1:<port>`
+  (then `::1`) inside the guest. No route, tap, firewall rule or
+  connection-tracking entry is created or changed, and a run on the
+  `none` tier gets one without a network device. The guest sees the
+  connection come from `127.0.0.1`, so a service that trusts loopback
+  (an admin panel, a debugger port, a notebook without a token) is
+  reachable by whoever holds a grant for that port, and by everyone once
+  it is public. The golden image needs this release's `teploy-guestd`
+  (guest protocol 2); an older agent answers `guest-agent`, and its runs
+  have no access until the image is rebuilt. Under the Docker driver
+  streams are not built yet (501).
+- **Not air-gapped.** Inbound access never opens an outbound path, but a
+  run with any access path is not isolated from the world: whoever holds
+  a grant (or anyone, for a public port) can move data in and out, and a
+  client that holds a stream open and relays can give a `none` or
+  `allowlist` run reach to anything that client can reach. The egress
+  tier does not bind what a grant holder relays.
+- **Bounds.** Per run: 64 streams, at most 16 without a grant, 4 of the
+  64 kept for shells so a run's owner can get in while its public port is
+  flooded; per daemon `--access-streams-max` (default `--vm-max-runs` ×
+  64; required without a run limit). Each stream can make the daemon hold
+  up to 320 KiB (a 256 KiB HTTP/2 window and two 32 KiB copy buffers);
+  the daemon refuses to start when the stream cap times that exceeds
+  `--access-memory-mb` (default a tenth of the host's memory), and warns
+  when its open file limit is short by `streams + 64`. One connection
+  serves one run, so a guest that stops reading stalls only its own run;
+  each edge may hold `--access-edge-conns` connections. Access streams do
+  not cross the run's tap, so the daemon shapes them itself: per run,
+  granted streams together at `--access-mbit` (default `--vm-net-mbit`),
+  anonymous ones together at `--access-anon-mbit` (20), and all of them
+  at `--access-total-mbit` (2000). Their bytes are in the run's usage as
+  `accessRxBytes`/`accessTxBytes` (and the `Anon` pair for public ports).
+- **Docker hosts on an overlay** (for when Docker streams land; the
+  `open` tier reaches everything the host can route, overlay included):
+  drop forwarded traffic from the Docker bridges to the overlay interface
+  and container traffic to the access listener, for example with an
+  nftables table of your own:
+
+  ```
+  table inet teploy_access_guard {
+    chain forward { type filter hook forward priority filter - 10;
+      iifname "docker0" oifname "wg0" drop
+      iifname "br-*" oifname "wg0" drop }
+    chain input { type filter hook input priority filter - 10;
+      iifname { "docker0", "br-*" } tcp dport 7448 drop }
+  }
+  ```
+
+  (interface names are examples: use your bridges and overlay device).
+  This is not tested in this release.
 
 ## Egress
 

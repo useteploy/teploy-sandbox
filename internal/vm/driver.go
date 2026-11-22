@@ -94,6 +94,7 @@ var (
 	_ run.Runtime        = (*Driver)(nil)
 	_ run.SnapshotNamer  = (*Driver)(nil)
 	_ run.CreateAdmitter = (*Driver)(nil)
+	_ run.DiskReporter   = (*Driver)(nil)
 )
 
 // NewDriver assembles a driver from its parts.
@@ -878,4 +879,16 @@ func (d *Driver) Close(ctx context.Context) error {
 		return err
 	}
 	return errors.Join(err, d.network.Close(ctx))
+}
+
+// Disk reports the ZFS pool the driver's volumes and snapshots are in:
+// the pool's own used and available bytes, of which run volumes are a
+// part (GET /v1/capacity's `disk`).
+func (d *Driver) Disk(ctx context.Context) (*run.DiskUsage, error) {
+	pool, _, _ := strings.Cut(d.volumes.root, "/")
+	available, used, err := d.volumes.zfs.Space(ctx, pool)
+	if err != nil {
+		return nil, err
+	}
+	return &run.DiskUsage{Kind: "zfs-pool", Name: pool, UsedBytes: used, FreeBytes: available}, nil
 }

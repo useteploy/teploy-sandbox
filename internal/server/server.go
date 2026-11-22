@@ -223,9 +223,14 @@ func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 	s.writeRun(w, http.StatusCreated, forked)
 }
 
+// capacityDiskTimeout bounds the storage probe of GET /v1/capacity: a
+// wedged docker or zfs command leaves the field out rather than holding
+// the answer.
+const capacityDiskTimeout = 5 * time.Second
+
 // handleCapacity reports what the box has and what its runs are entitled
 // to — the numbers a scheduler placing runs across daemons needs.
-func (s *Server) handleCapacity(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	load := s.Manager.Capacity()
 	runtimeName := s.Runtime
 	if runtimeName == "" {
@@ -257,6 +262,12 @@ func (s *Server) handleCapacity(w http.ResponseWriter, _ *http.Request) {
 		// Only from a driver with a warm pool configured; "allocated"
 		// above already counts its machines.
 		body["warmPool"] = map[string]any{"sizes": load.WarmPool}
+	}
+	diskCtx, cancel := context.WithTimeout(r.Context(), capacityDiskTimeout)
+	defer cancel()
+	if disk := s.Manager.Disk(diskCtx); disk != nil {
+		// Only when the driver can say: absent means unknown, never empty.
+		body["disk"] = disk
 	}
 	s.writeJSON(w, http.StatusOK, body)
 }

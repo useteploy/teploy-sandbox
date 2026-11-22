@@ -444,6 +444,23 @@ done; wait`, strings.Join(targets, " "), c.port, c.port)
 	return strings.TrimSpace(sh(t, manager, id, script).stdout)
 }
 
+// guestHasIPv6 reports whether the guest's kernel has IPv6 at all. The
+// kernel the README prescribes does not, and a guest without it cannot
+// send an IPv6 packet: the IPv6 checks are then not applicable, which
+// the tests say in their log rather than skip.
+func guestHasIPv6(t *testing.T, manager *run.Manager, id string) bool {
+	t.Helper()
+	out := sh(t, manager, id, `if [ -d /proc/sys/net/ipv6 ]; then echo yes; else echo no; fi`)
+	switch strings.TrimSpace(out.stdout) {
+	case "yes":
+		return true
+	case "no":
+		return false
+	}
+	t.Fatalf("whether guest %s has IPv6: %+v", id, out)
+	return false
+}
+
 // hostAddress is the address the host uses towards the internet.
 func hostAddress(t *testing.T) string {
 	t.Helper()
@@ -602,16 +619,34 @@ func TestVMNetworkIsolation(t *testing.T) {
 	}
 
 	// --- 1: guest to guest, by every means a guest has
+	//
+	// The IPv6 part needs a guest kernel with IPv6. The kernel the README
+	// prescribes (Cloud Hypervisor's ch_defconfig) has none: such a guest
+	// cannot send IPv6 at all, so there is nothing of it to refuse, and
+	// the IPv4 and layer 2 checks run without it. The host side drops
+	// IPv6 from a guest that has it either way (the tap's ingress takes
+	// ARP and IPv4 only; the namespace's chains drop every other family).
+	ipv6 := guestHasIPv6(t, manager, a) && guestHasIPv6(t, manager, b)
+	if !ipv6 {
+		t.Logf("not applicable: the guest kernel has no IPv6 (no /proc/sys/net/ipv6), so the guest-to-guest IPv6 checks do not run; the IPv4, ARP and layer 2 checks do")
+	}
 	isolation := func(when string) {
 		t.Helper()
-		// The target listens on TCP and UDP, has IPv6 up, and can reach
-		// its own listener: only the path from another guest is missing.
-		listening := sh(t, manager, b, `rm -f /work/recv.log; (setsid python3 /work/listen.py /work/recv.log 9000 >/dev/null 2>&1 &)
+		// The target listens on TCP and UDP, has IPv6 up (where its
+		// kernel has IPv6), and can reach its own listener: only the
+		// path from another guest is missing.
+		control := `rm -f /work/recv.log; (setsid python3 /work/listen.py /work/recv.log 9000 >/dev/null 2>&1 &)
 for i in $(seq 50); do grep -q ready /work/recv.log 2>/dev/null && break; sleep 0.1; done
-echo 0 > /proc/sys/net/ipv6/conf/`+nicB.dev+`/disable_ipv6; sleep 3
-nc -z -w 2 `+nicB.addr+` 9000 && ip -6 -o addr show dev `+nicB.dev+` scope link | awk '{print $4}' | cut -d/ -f1`)
+`
+		if ipv6 {
+			control += `echo 0 > /proc/sys/net/ipv6/conf/` + nicB.dev + `/disable_ipv6; sleep 3
+nc -z -w 2 ` + nicB.addr + ` 9000 && ip -6 -o addr show dev ` + nicB.dev + ` scope link | awk '{print $4}' | cut -d/ -f1`
+		} else {
+			control += `nc -z -w 2 ` + nicB.addr + ` 9000`
+		}
+		listening := sh(t, manager, b, control)
 		linkLocal := strings.TrimSpace(listening.stdout)
-		if listening.code != 0 || !strings.HasPrefix(linkLocal, "fe80:") {
+		if listening.code != 0 || (ipv6 && !strings.HasPrefix(linkLocal, "fe80:")) {
 			t.Fatalf("%s: control: guest b's listener or link-local address: %d %q %q", when, listening.code, listening.stdout, listening.stderr)
 		}
 		attack := fmt.Sprintf(`b=%[1]s; bmac=%[2]s; dev=%[3]s; me=%[4]s; mymac=%[5]s; gw=%[6]s; gwmac=%[7]s
@@ -634,18 +669,23 @@ ip addr add $b/32 dev $dev
 (curl -s --interface $b --connect-timeout 3 --max-time 4 http://%[8]s:%[9]d/hello.txt >/dev/null 2>&1 && echo "OPEN as the other guest's address")
 (nc -z -w 3 -s $b $b 9000 >/dev/null 2>&1 && echo "OPEN tcp from the other guest's address")
 ip addr del $b/32 dev $dev
+`, nicB.addr, nicB.mac, nicA.dev, nicA.addr, nicA.mac, nicA.gateway, nicA.gatewayMAC, peerAddr, peerHTTP)
+		if ipv6 {
+			attack += fmt.Sprintf(`dev=%[1]s
 # IPv6: link-local needs no configuration from anyone
 echo 0 > /proc/sys/net/ipv6/conf/$dev/disable_ipv6; sleep 3
 own=$(ip -6 -o addr show dev $dev scope link | awk '{print $4}' | cut -d/ -f1)
 [ -n "$own" ] || echo "no link-local address of my own: nothing was tested"
-(ping -6 -c 2 -W 2 %[10]s%%$dev >/dev/null 2>&1 && echo "OPEN icmp6 link-local") &
-(nc -6 -z -w 3 %[10]s%%$dev 9000 >/dev/null 2>&1 && echo "OPEN tcp6 link-local") &
+(ping -6 -c 2 -W 2 %[2]s%%$dev >/dev/null 2>&1 && echo "OPEN icmp6 link-local") &
+(nc -6 -z -w 3 %[2]s%%$dev 9000 >/dev/null 2>&1 && echo "OPEN tcp6 link-local") &
 # all nodes and all routers: a guest hears its own echo and nobody else's
 (ping -6 -c 2 -W 2 ff02::1%%$dev 2>/dev/null | grep "bytes from" | grep -v "from $own" | sed 's/^/ANSWER all-nodes: /') &
 (ping -6 -c 2 -W 2 ff02::2%%$dev 2>/dev/null | grep "bytes from" | grep -v "from $own" | sed 's/^/ANSWER all-routers: /') &
 wait
 echo 1 > /proc/sys/net/ipv6/conf/$dev/disable_ipv6
-true`, nicB.addr, nicB.mac, nicA.dev, nicA.addr, nicA.mac, nicA.gateway, nicA.gatewayMAC, peerAddr, peerHTTP, linkLocal)
+`, nicA.dev, linkLocal)
+		}
+		attack += "true"
 		out := sh(t, manager, a, attack)
 		if got := strings.TrimSpace(out.stdout); got != "" {
 			t.Fatalf("%s: guest a reached guest b, or something answered on IPv6:\n%s\n%s", when, got, out.stderr)
@@ -655,7 +695,7 @@ true`, nicB.addr, nicB.mac, nicA.dev, nicA.addr, nicA.mac, nicA.gateway, nicA.ga
 		if strings.TrimSpace(out.stdout) != "" {
 			t.Fatalf("%s: the allowlist guest reached guest b: %s", when, out.stdout)
 		}
-		received := sh(t, manager, b, `sleep 1; grep -v -e ready -e "from `+nicB.addr+`" /work/recv.log; pkill -f '[l]isten.py'; echo 1 > /proc/sys/net/ipv6/conf/`+nicB.dev+`/disable_ipv6; true`)
+		received := sh(t, manager, b, `sleep 1; grep -v -e ready -e "from `+nicB.addr+`" /work/recv.log; pkill -f '[l]isten.py'; [ ! -d /proc/sys/net/ipv6 ] || echo 1 > /proc/sys/net/ipv6/conf/`+nicB.dev+`/disable_ipv6; true`)
 		if strings.TrimSpace(received.stdout) != "" {
 			t.Fatalf("%s: guest b received something from another guest:\n%s", when, received.stdout)
 		}
@@ -1181,6 +1221,9 @@ func TestVMNetworkFailsClosed(t *testing.T) {
 		t.Fatalf("stop the driver's upkeep: %v", err)
 	}
 
+	if !guestHasIPv6(t, manager, a) {
+		t.Logf("not applicable: the guest kernel has no IPv6 (no /proc/sys/net/ipv6), so the all-nodes IPv6 check does not run; the IPv4 and layer 2 checks do")
+	}
 	// closed is everything that must hold with no rules, checked while
 	// they are away.
 	closed := func(when string, controls bool) {
@@ -1201,9 +1244,11 @@ ip addr add $b/32 dev $dev
 (nc -z -w 3 -s $b $b 9000 >/dev/null 2>&1 && echo "OPEN tcp from the other guest's address")
 (curl -s --interface $b --connect-timeout 3 --max-time 4 http://%[8]s:%[10]d/hello.txt >/dev/null 2>&1 && echo "OPEN as the other guest's address")
 ip addr del $b/32 dev $dev
+if [ -d /proc/sys/net/ipv6 ]; then
 echo 0 > /proc/sys/net/ipv6/conf/$dev/disable_ipv6; sleep 3
 (ping -6 -c 2 -W 2 ff02::1%%$dev 2>/dev/null | grep "bytes from" | grep -v "from $(ip -6 -o addr show dev $dev scope link | awk '{print $4}' | cut -d/ -f1)" | sed 's/^/ANSWER all-nodes: /')
 echo 1 > /proc/sys/net/ipv6/conf/$dev/disable_ipv6
+fi
 true`, nicB.addr, nicB.mac, nicA.dev, nicA.addr, nicA.mac, nicA.gatewayMAC, hostAddr, peerAddr, peerUDP, peerHTTP)
 		if out := sh(t, manager, a, attack); strings.TrimSpace(out.stdout) != "" {
 			t.Fatalf("%s: open guest a reached open guest b, or sent as it:\n%s\n%s", when, out.stdout, out.stderr)

@@ -2981,6 +2981,37 @@ The point was correctness and confinement on real x86-64.
   host side 50 to 100 ms. Default-size VMs that fit, from the first run:
   1, and 1 by the cgroup limits.
 
+### Review round (same day): what changed, and the live re-run
+
+An independent security review of the branch asked for: reads only and
+a read budget for the boot limits, and a back-off of failing snapshot
+boots (entry C above); raw IPv6 frames from a guest without an IPv6
+stack, and `SBX_VM_REQUIRE_IPV6` (entry B above); a kernel path that is
+not absolute and clean refused at start; the jail helper's error naming
+`/kernel` and not the host's path; usage text and figures made
+consistent. Each with a unit test that fails without it, except the
+live-test changes. Re-run on the laptop with the final code (logs kept
+with the run's other files):
+
+- Root-only unit tests: all pass (249), none skipped (the first attempt
+  of this round hit the pool test's flake above, now fixed).
+- `TestVMCgroupLimitIsEnforced`, `TestVMLimits`,
+  `TestVMDestroyIsNotHeldByQueuedIO`: pass, pool off and on (create under
+  2 MiB/s 4.1 s; destroy 3.4 and 3.7 s).
+- `TestVMNetworkIsolation`, `TestVMNetworkFailsClosed`: pass, pool off
+  and on; in each, 9 raw IPv6 frames per check (guest to guest, after
+  the rules were restored, with every table flushed, with every table
+  deleted) reached neither guest b nor the host's end of a's link, and
+  with rules the tap's ingress counted them dropped. The first attempt
+  failed on the test's own capture (a socket for 0x86DD alone does not
+  see frames leaving, so its control failed); it captures every
+  protocol now. With `SBX_VM_REQUIRE_IPV6=1` the test fails, as meant,
+  on this guest kernel.
+- No `type=1326` in the kernel log.
+- Not run live: the read budget ending a boot whose agent never answers,
+  and the back-off (unit tests only; the suite has no guest that will
+  not start its agent).
+
 ### Still needs a host of the runbook's size (16 GB, a disk for the pool)
 
 - `TestVMWarmPool` and `TestVMWarmPoolRaces` in the suite (here the pool

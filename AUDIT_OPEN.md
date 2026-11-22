@@ -2889,17 +2889,36 @@ The point was correctness and confinement on real x86-64.
   could loop boots of a snapshot whose agent never starts and get that
   rate for two minutes at a time, back to back. Now:
   - only reads are raised, and at most 1 GiB of them per boot;
-  - the boots of one snapshot that failed twice in a row are held back:
-    the next is refused as at capacity, without starting anything, for
-    10 s, doubling with each further failure up to 5 min, and one boot
-    that comes up clears it (`TestASnapshotWhoseBootsKeepFailingIsBackedOff`);
-  - what is left: a tenant with many snapshots (a running run can take
-    as many as it likes) can boot each of them once, or twice, at the
-    raised read rate, up to 1 GiB each. How many boots run at once is
-    bounded only by `--vm-max-runs` (by default unbounded), so a read
-    limit below the defaults is a hard bound for the host only with
-    `--vm-max-runs` set; per-tenant accounting would close it and needs
-    a tenant identity the driver does not have.
+  - the boots of one snapshot that did not come up are held back by
+    what they read at the raised rate: summed since the snapshot's last
+    boot that came up, each 1 GiB of it makes the next boot of that
+    snapshot wait (refused as at capacity, without starting anything),
+    10 s, doubling up to 5 min; one boot that comes up, by anyone,
+    clears it (`TestASnapshotWhoseBootsKeepFailingIsBackedOff`). A
+    second review found that the first version counted failed boots,
+    so cancelled ones (callers that went away, client timeouts under
+    load) locked every user of a shared snapshot out for minutes; a
+    boot cancelled after a few MB now costs about that. What remains of
+    sharing: once a snapshot's failed boots have read 1 GiB, everyone
+    who boots it waits with the one who caused it;
+  - a boot whose reads cannot be counted (its io.stat cannot be read or
+    does not list its disk, 50 times in a row at 200 ms) gets the run's
+    limits, with one warning in the log
+    (`TestABootThatCannotBeCountedGetsTheRunsLimits`);
+  - **what is left, plainly:** a read limit below the defaults applies to
+    a run after its boot. It does not cap what a caller who can create
+    runs freely can read: every boot, including a create that succeeds
+    and is destroyed again, reads at up to the default rate until its
+    agent answers (about 465 MB for the README's image), so a
+    create/destroy loop reads at the default rate for each VM booting at
+    once, and a tenant with many snapshots can boot each at the raised
+    rate up to 1 GiB. How many boot at once is bounded only by
+    `--vm-max-runs` (by default unbounded).
+  - **Follow-up, not done:** a host-wide budget for boosted boots (a cap
+    on the raised-rate reads, or on the boots holding raised limits, at
+    any one time, for the whole daemon), which would bound this without
+    `--vm-max-runs`; per-tenant accounting would need a tenant identity
+    the driver does not have.
   The alternative of keeping the run's limit for the boot was rejected
   because it makes a low limit unusable.
 - **E. Runbook step 10 could not be met.** `-test.run TestVM` selects the

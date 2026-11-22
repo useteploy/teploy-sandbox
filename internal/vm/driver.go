@@ -108,6 +108,13 @@ type bootBackoff struct {
 // bootBackoffMax. One boot that comes up, by anyone, clears it. The
 // snapshot is the unit, so every caller that boots a shared snapshot
 // waits with the one whose boots failed.
+//
+// This does not make a read limit below the defaults a cap on a caller
+// who can create runs freely: every boot that comes up read at up to the
+// default rate until its agent answered, so a create/destroy loop reads
+// at that rate for each VM booting at once, which only --vm-max-runs
+// bounds. A host-wide budget for raised boots is a follow-up (see
+// AUDIT_OPEN.md).
 const (
 	bootBackoffBase = 10 * time.Second
 	bootBackoffMax  = 5 * time.Minute

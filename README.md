@@ -438,15 +438,22 @@ The layers are independent; each is checked by the live suite.
   x86-64 cloud image reads about 465 MB, and writes about 2 MB) and a
   limit set low must not make a VM that cannot boot within the boot
   timeout. The raised reads end when the guest's agent first answers or
-  when the VM has read 1 GiB (`BootReadBudget`), whichever is first. On
-  a resume or a fork the guest is the tenant's disk, so when its agent
-  answers is the tenant's choice: what bounds the window then is the
-  1 GiB, and repeating it is held back, per snapshot, once two boots of
-  it in a row did not come up (the next waits 10 s, doubling up to
-  5 min). A tenant with many snapshots can still boot each once at the
-  raised read rate; a read limit below the defaults is a hard bound on
-  the whole host only together with `--vm-max-runs`, which bounds how
-  many such boots run at once. They are for a VM that is alive: I/O the kernel holds
+  when the VM has read 1 GiB (`BootReadBudget`), whichever is first.
+  **So a read limit below the defaults applies to a run once it has
+  booted; it does not cap what a caller who can create runs freely can
+  read.** Every boot, including a create that succeeds and is destroyed
+  again, reads at up to the default rate until its agent answers: a
+  create/destroy loop reads at the default rate for each VM booting at
+  once, and how many boot at once is unbounded unless `--vm-max-runs` is
+  set. On a resume or a fork the guest is the tenant's disk, so when its
+  agent answers is the tenant's choice: what bounds that boot is the
+  1 GiB, and what boots of one snapshot that did not come up read at the
+  raised rate is summed: for each 1 GiB of it the next boot of that
+  snapshot waits (10 s, doubling up to 5 min), and one boot that comes up
+  clears it. A boot cancelled early (its caller went away) costs about
+  what it read, so a few of those lock nobody out; but the snapshot is
+  the unit, so everyone who boots a shared snapshot waits once its
+  failed boots have read that much. They are for a VM that is alive: I/O the kernel holds
   back for the limit cannot be taken back, a killed process does not
   end while it has any, and the guest chooses how much it queues, so a
   VM that was killed keeps its limits for 3 seconds and then has them

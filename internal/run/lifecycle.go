@@ -566,6 +566,7 @@ func (m *Manager) destroyStopped(ctx context.Context, current *Run) error {
 	m.mu.Lock()
 	delete(m.runs, current.ID)
 	m.mu.Unlock()
+	m.execLog.dropRun(current.ID)
 	m.releaseImages([]string{current.snapshot, current.base})
 	m.persist()
 	m.log.Info("stopped run deleted", "id", current.ID, "snapshot", current.snapshot)

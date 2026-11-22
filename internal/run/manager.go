@@ -331,10 +331,13 @@ type Manager struct {
 	transferOnce sync.Once
 	transfers    chan struct{}
 	uploads      chan struct{}
+
+	// execLog holds the recoverable execs (execlog.go): memory only.
+	execLog *execRegistry
 }
 
 func NewManager(runtime Runtime, log *slog.Logger) *Manager {
-	return &Manager{
+	m := &Manager{
 		runtime: runtime,
 		log:     log,
 		now:     time.Now,
@@ -352,6 +355,8 @@ func NewManager(runtime Runtime, log *slog.Logger) *Manager {
 		StoppedRetention: DefaultStoppedRetention,
 		SnapshotRetry:    DefaultSnapshotRetry,
 	}
+	m.execLog = newExecRegistry(func() time.Time { return m.now() })
+	return m
 }
 
 // SetClock overrides time for tests.
@@ -847,6 +852,7 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 	m.mu.Lock()
 	if err == nil {
 		delete(m.runs, id)
+		m.execLog.dropRun(id)
 	} else {
 		current.removing = false
 		if owed {
@@ -1277,6 +1283,12 @@ func (m *Manager) Reap(ctx context.Context) int {
 	if m.Cache != nil {
 		m.Cache.Sweep(ctx)
 	}
+	m.execLog.sweep(func(runID string) bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		_, ok := m.runs[runID]
+		return ok
+	})
 	if m.stateDirty.Load() {
 		m.persist()
 	}

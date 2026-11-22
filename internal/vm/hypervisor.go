@@ -286,6 +286,7 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("start hypervisor: %w", err), confined.release(cleanupCtx))
 	}
+	go confined.watchBoot()
 	machine := &chMachine{
 		dir:     dir,
 		cell:    confined,

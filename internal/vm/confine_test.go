@@ -872,12 +872,13 @@ func TestCgroupBoundsWhatAVMDoesToItsDisk(t *testing.T) {
 	c.disk = diskLimits{BytesPerSecond: 64 << 20, IOPS: 2000}
 	ctx := context.Background()
 	config := MachineConfig{Name: runName(1), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
-	// It boots under the defaults, a floor its own limits are below...
+	// It boots reading under the defaults, a floor its own limits are
+	// below, and writing under its own from the start...
 	cell, err := c.enter(ctx, config, filepath.Join(root, "run", config.Name))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cgroupFile(t, c.cgroups.path(config.Name), "io.max"); got != "230:16 rbps=268435456 wbps=268435456 riops=16000 wiops=16000" {
+	if got := cgroupFile(t, c.cgroups.path(config.Name), "io.max"); got != "230:16 rbps=268435456 wbps=67108864 riops=16000 wiops=2000" {
 		t.Fatalf("io.max of a VM that is booting: %q", got)
 	}
 	// ...and is held to its own once its agent answers.
@@ -917,9 +918,10 @@ func TestCgroupBoundsWhatAVMDoesToItsDisk(t *testing.T) {
 	}
 }
 
-// A boot is held to the defaults at least, whatever the run's limits:
+// A boot reads under the defaults at least, whatever the run's limits:
 // a low limit does not make a VM that cannot boot. A higher limit, and
-// none, are the boot's too.
+// none, are the boot's too. (Its writes are the run's from the start:
+// TestCgroupBoundsWhatAVMDoesToItsDisk.)
 func TestABootIsNotHeldBelowTheDefaultDiskLimits(t *testing.T) {
 	defaults := diskLimits{BytesPerSecond: DefaultDiskMBPerSecond << 20, IOPS: DefaultDiskIOPS}
 	for _, each := range []struct{ run, boot diskLimits }{
@@ -953,6 +955,109 @@ func TestABootIsNotHeldBelowTheDefaultDiskLimits(t *testing.T) {
 	}
 }
 
+// A boot whose agent does not answer (a resume or fork of a tenant's
+// disk, whose boot the tenant controls) reads under the raised limits
+// only until it has read its budget; then it has the run's own, without
+// waiting for the agent or the boot timeout.
+func TestABootThatReadsItsBudgetGetsTheRunsLimits(t *testing.T) {
+	root := t.TempDir()
+	c, _, _ := newTestConfinement(t, root)
+	c.disk = diskLimits{BytesPerSecond: 2 << 20, IOPS: 100}
+	c.bootReadBudget, c.bootPoll = 1<<20, 5*time.Millisecond
+	config := MachineConfig{Name: runName(1), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
+	cell, err := c.enter(context.Background(), config, filepath.Join(root, "run", config.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := c.cgroups.path(config.Name)
+	boot, run := "230:16 rbps=268435456 wbps=2097152 riops=16000 wiops=100", "230:16 rbps=2097152 wbps=2097152 riops=100 wiops=100"
+	stat := func(read int64) {
+		t.Helper()
+		// Another device's reads are not this disk's.
+		line := fmt.Sprintf("8:0 rbytes=%d wbytes=0 rios=1 wios=0 dbytes=0 dios=0\n230:16 rbytes=%d wbytes=4096 rios=9 wios=1 dbytes=0 dios=0\n", 1<<40, read)
+		if err := os.WriteFile(filepath.Join(group, "io.stat"), []byte(line), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stat(1<<20 - 1)
+	watched := make(chan struct{})
+	go func() { defer close(watched); cell.watchBoot() }()
+	time.Sleep(50 * time.Millisecond)
+	if got := cgroupFile(t, group, "io.max"); got != boot {
+		t.Fatalf("io.max of a boot below its budget: %q, want %q", got, boot)
+	}
+	stat(1 << 20)
+	select {
+	case <-watched:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the watch did not end when the boot read its budget")
+	}
+	if got := cgroupFile(t, group, "io.max"); got != run {
+		t.Fatalf("io.max of a boot past its budget: %q, want the run's %q", got, run)
+	}
+	// The agent answering later changes nothing.
+	if err := cell.booted(); err != nil {
+		t.Fatal(err)
+	}
+	if got := cgroupFile(t, group, "io.max"); got != run {
+		t.Fatalf("io.max once booted: %q", got)
+	}
+
+	// A VM found to be dying when its budget is read is left with what
+	// it has: its limits are only ever lifted from then on.
+	dying := MachineConfig{Name: runName(3), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
+	dyingCell, err := c.enter(context.Background(), dying, filepath.Join(root, "run", dying.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(c.cgroups.path(dying.Name), "io.stat"), []byte("230:16 rbytes=999999999 wbytes=0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dyingCell.mu.Lock()
+	dyingCell.dying = true
+	dyingCell.mu.Unlock()
+	dyingCell.watchBoot()
+	if got := cgroupFile(t, c.cgroups.path(dying.Name), "io.max"); got != boot {
+		t.Errorf("a dying VM's io.max after its budget: %q, want it left at %q", got, boot)
+	}
+	must(t, dyingCell.release(context.Background()))
+
+	// The agent first: the watch ends with it, and a VM that is being
+	// killed is never given the run's limits by the watch.
+	for _, end := range []string{"booted", "killing"} {
+		other := MachineConfig{Name: runName(2), Disk: "/dev/x", CPUs: 1, MemoryMB: 512}
+		cell, err := c.enter(context.Background(), other, filepath.Join(root, "run", other.Name+end))
+		if err != nil {
+			t.Fatal(err)
+		}
+		watched := make(chan struct{})
+		go func() { defer close(watched); cell.watchBoot() }()
+		if end == "booted" {
+			must(t, cell.booted())
+		} else {
+			cell.killing()
+		}
+		select {
+		case <-watched:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the watch did not end", end)
+		}
+		want := run
+		if end == "killing" {
+			want = boot
+			group := c.cgroups.path(other.Name)
+			if err := os.WriteFile(filepath.Join(group, "io.stat"), []byte("230:16 rbytes=999999999 wbytes=0\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cell.watchBoot() // returns at once: the boot has ended
+		}
+		if got := cgroupFile(t, c.cgroups.path(other.Name), "io.max"); got != want {
+			t.Errorf("%s: io.max %q, want %q", end, got, want)
+		}
+		must(t, cell.release(context.Background()))
+	}
+}
+
 // A process that was killed does not end while the kernel holds back
 // I/O it queued under io.max, and a guest chooses how much it queues: a
 // VM could keep its own removal waiting for as long as its queue takes
@@ -966,7 +1071,7 @@ func TestAKilledGroupIsNotHeldByItsDiskLimit(t *testing.T) {
 	ctx := context.Background()
 	config := MachineConfig{Name: runName(1), CPUs: 1, MemoryMB: 512}
 	limits := limitsFor(config)
-	limits.Disk, limits.DiskDevice = diskLimits{BytesPerSecond: 2 << 20}, 230<<8|32
+	limits.Disk, limits.DiskRead, limits.DiskDevice = diskLimits{BytesPerSecond: 2 << 20}, diskLimits{BytesPerSecond: 2 << 20}, 230<<8|32
 	queued := func() string {
 		t.Helper()
 		dir, err := c.create(ctx, config.Name, limits)

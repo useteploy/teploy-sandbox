@@ -246,6 +246,16 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 			stats.ManifestsSkipped++
 			continue
 		}
+		// And no collection condemned it meanwhile: one that read the
+		// manifest before this write keeps those bytes to put back, and
+		// its copy is the only trace of it.
+		if _, err := s.objects.Get(ctx, s.condemnedKey(id), maxSmallObject); err == nil {
+			s.log.Warn("a manifest this pass rewrote is being condemned; run the rotation again", "snapshot", id)
+			stats.ManifestsSkipped++
+			continue
+		} else if !errors.Is(err, s3.ErrNotFound) {
+			return stats, fmt.Errorf("rotate: condemned copy of %s: %w", id, err)
+		}
 		stats.Manifests++
 	}
 	return stats, nil

@@ -480,8 +480,12 @@ func TestABaseCollectedUnderAnUploadThatBuildsOnIt(t *testing.T) {
 		if err != nil {
 			t.Fatalf("upload: %v", err)
 		}
-		if collected != 1 {
-			t.Fatalf("the test did not provoke the race: the collection deleted %d snapshots", collected)
+		// Since the third fix round ensureBase pins the base before it
+		// reads it, so the collection under the stream finds the base
+		// pinned and leaves it (it deleted it before the two-phase
+		// delete). Either way the stop must restore.
+		if collected > 1 {
+			t.Fatalf("the collection deleted %d snapshots", collected)
 		}
 		if _, err := service.Advance(bg, run.RemoteRecord{Run: runR, Generation: 1, State: RecordStopped, Snapshot: "snap:" + snapT, Key: uploaded.Key}); err != nil {
 			t.Fatal(err)

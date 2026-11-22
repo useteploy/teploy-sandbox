@@ -130,7 +130,10 @@ func TestAnOldRoundLeavesStaleCopiesToTheNext(t *testing.T) {
 }
 
 // Finding 7: a condemnation another collection is deciding about, of a
-// snapshot a record names, is put back at once.
+// snapshot a record names, is put back early — but (third fix round)
+// only once this daemon has watched the copy for half a grace, when the
+// collection that wrote it is past its own bound. Not at first sight:
+// that undid a live collection (TestR7bImmediatePutBackUnderALiveCollector).
 func TestACondemnedSnapshotThatIsReferredToIsPutBackAtOnce(t *testing.T) {
 	w := newA4World(t)
 	w.stop(t, PurposeStop) // snapT, named by its run's record
@@ -140,8 +143,13 @@ func TestACondemnedSnapshotThatIsReferredToIsPutBackAtOnce(t *testing.T) {
 	}
 	w.memory.Remove(w.collector.manifestKey(snapT))
 	stats, err := w.second.Collect(bg, twoPhaseGrace)
+	if err != nil || stats.Restored != 0 {
+		t.Fatalf("a condemnation of a referenced snapshot at first sight: %+v, %v", stats, err)
+	}
+	w.advance(13 * time.Hour)
+	stats, err = w.second.Collect(bg, twoPhaseGrace)
 	if err != nil || stats.Restored != 1 {
-		t.Fatalf("a young condemnation of a referenced snapshot: %+v, %v", stats, err)
+		t.Fatalf("half a grace later: %+v, %v", stats, err)
 	}
 	restores(t, w.uploader, snapT, w.host.data[snapT])
 }

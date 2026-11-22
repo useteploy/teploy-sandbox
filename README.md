@@ -844,7 +844,10 @@ the same: the resume fails, the run stays stopped, and it is reported
 run in the registry file (`remote.damage`), so a restart does not
 forget it and call the run durable again by sizes; it goes when the
 snapshot is uploaded again or a read finds the chunk whole. Another
-daemon finds the damage by its own scrub or restore. Where the scrub's
+daemon finds the damage by its own scrub or restore. Each scrub also
+reads again the one damaged chunk each failed run remembers, and forgets
+it if it reads whole now (or the snapshot was uploaded again since):
+the run is then published, verified and durable again. Where the scrub's
 pass is is not kept: each pass begins at a random snapshot, and a
 daemon's first scrub is due at a random point in its first interval, so
 a daemon restarted often still scrubs everything in time.
@@ -980,11 +983,17 @@ decision — asked again before each snapshot's chunks are deleted, by the
 monotonic and the wall clock both (a suspended machine's monotonic clock
 stands still; a wall clock that went back counts as the grace passed).
 A condemnation that another collection is deciding about keeps what it
-builds on, and is put back at once if a record or a staying manifest
-refers to it; one left for longer than the grace (its collection died)
-is put back if it is whole, finished if its chunks are already in
-pieces — but only if the copy is still the one that was watched, and
-only by a round that is itself younger than half the grace. A caller's
+builds on, and is put back once it has been watched for half the grace
+if a record or a staying manifest refers to it (by then its collection
+is past its own bound and deletes nothing more); one left for longer
+than the grace (its collection died) is put back if it is whole,
+finished if its chunks are already in pieces — but only if the copy is
+still the one that was watched (same size and, to the second, the same
+time), and only by a round that is itself younger than half the grace.
+The collection that condemned a snapshot looks again, before deleting
+its chunks, that its copy still stands and no manifest has come back;
+and it condemns at most 256 snapshots a round, so that a round always
+decides inside half the grace. A caller's
 delete of its own snapshot is the one delete that does not go through
 this: nothing is ever built on a caller's snapshot, and a restore from
 it in flight fails as a whole. Pins and stray copies are deleted once watched for the grace.

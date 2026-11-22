@@ -2909,10 +2909,13 @@ anything that checks: pin, then read), C2 another daemon's collection.
 | 11 | C2 meets a condemnation C left (C died) | Watched for the grace: put back if whole, finished if in pieces; before that, kept | `TestTwoPhaseACrashedCondemnationIsFinishedOrUndone` |
 | 11a | *Fix round.* C is alive after all: it has put the copy back and condemned it again since C2's listing | C2 acts only on the very copy it watched (HEAD: same time and size), so it leaves it | `TestAStaleTakeoverDoesNotUndoALiveCollection` |
 | 11b | *Fix round.* C2's own round is already half a grace old when it reaches the stale copies | It leaves them to the next round | `TestAnOldRoundLeavesStaleCopiesToTheNext` |
-| 11c | *Fix round.* C2 meets C's undecided condemnation of a snapshot a record (or a staying manifest) refers to | Put back at once, not a grace later | `TestACondemnedSnapshotThatIsReferredToIsPutBackAtOnce` |
+| 11c | *Fix round.* C2 meets C's undecided condemnation of a snapshot a record (or a staying manifest) refers to | *Third fix round:* put back once C2 has watched the copy for **half** a grace (C is then past its own bound), not at once — at once undid a live C: U's ensureBase (then unpinned) let C condemn and list the base, U wrote its manifest, C2 put the base back, U verified and was durable, C deleted the base | `TestACondemnedSnapshotThatIsReferredToIsPutBackAtOnce`, `TestR7bImmediatePutBackUnderALiveCollector` |
+| 11d | *Third fix round.* C, between its decision and a snapshot's chunk delete, finds its copy gone (another collection took it) or a manifest back (an upload sent the snapshot again) | Deletes nothing of it; a manifest standing again is left standing (the put-back is refused) | `TestTheOwnerLeavesACondemnationItNoLongerHolds`, `TestTwoPhaseAnUploadThatPinsAfterTheListingBuildsOnNothingCondemned` |
 | 7a | *Fix round.* C's machine is suspended: its monotonic clock stands still while the wall clock moves on (or the wall clock steps back) | Either clock at half the grace, or a wall clock that went back, counts as stalled | `TestAStallIsMeasuredByEitherClock` |
 | 12 | A rotation pass reads and rewrites a manifest while C condemns it | The pass pins first: rows 1–4 apply to it as to an upload | `TestTwoPhaseARotationPassIsSeenByACondemnation` |
+| 12b | *Third fix round.* A rotation pass's rewrite lands in C's gap between steps 3 and 4 (C read the old bytes, the pass writes, C deletes the rewrite and puts the old bytes back on the pass's pin) | The pass, after its final re-read, also looks for a condemned copy: any copy counts as skipped, so `previousKeyNeeded` | `TestR7bRotationInTheCondemnGap` |
 | 12a | *Fix round.* The pass pins between C's delete and listing; or meets a condemned copy under the old master; or finds the manifest condemned between its listing and its read; or has its write replaced by C's put-back of the old bytes | The pass walks condemned copies too, and counts each of these as skipped, so it answers `previousKeyNeeded: true` ("run again") instead of letting the old master be retired while a manifest under it can still come back (which would stop every collection and `ensureBase` fleet-wide) | `TestTwoPhaseARotationInEveryOrder` (four orders) |
+| 13b | *Third fix round.* A repair's replace-in-one-write (`Manifest.replaces`: read the standing manifest, then an unconditional PUT) of a snapshot C has read (step 1) and not yet deleted (step 4) | **Not covered**, beside row 13: C deletes the fresh manifest and, on the repair's pin, puts back the damaged one; the repair's check after the write may have passed in between. As narrow as row 13 (the repair's PUT, pin and read inside one round trip of C). The portable follow-up for both rows: `Verify` GETs the condemned key after reading a manifest and treats a copy as "being condemned, not whole" | none (residual) |
 | 13 | A re-upload of a snapshot that is not whole (U retracts the old manifest, writes a new one, pins, checks) entirely between C's steps 3 and 4 | **Not covered**: C deletes the fresh manifest and puts back the old one (not whole) on U's pin; what U built on it is lost. Four sequential requests of U inside one round trip of C, and only for a snapshot already not whole | none (residual) |
 | 14 | A daemon of an older version collects | A4's window as before 2026-11-21 | none (deployment rule, README) |
 
@@ -3317,3 +3320,37 @@ items; each fix has a test that fails without it (shown locally):
 - `disk` for Docker is a statfs of the data root's path on the daemon's
   own filesystem: wrong or absent against a remote Docker or a Docker VM
   (Docker Desktop, colima). Documented, not changed.
+
+### Third fix round, after the second independent review (same day)
+
+A second reviewer recommended merging after fixes. The branch was first
+brought up to date with `main` (PR #6, exec recovery and usage; the only
+conflicts were the appended sections of this file and `Manager`'s
+fields, both kept). Their three reproductions are adopted as regression
+tests (`review2_test.go`, `TestR7b*`); each failed on the commit they
+reviewed. **Nothing here has run live.**
+
+| | Finding | Fix | Test (fails without the fix) |
+|---|---|---|---|
+| 1 (blocker) | The first fix round's "put back at once" (finding 7) undid a **live** collection's condemnation with no time between them (row 11c) | Another collection acts early on an undecided condemnation only after watching the copy itself for half a grace. The owner looks again before each snapshot's chunk delete that its copy still stands (HEAD) and that no manifest is back (HEAD); otherwise it deletes nothing of it. `ensureBase` pins the base before it reads it | `TestR7bImmediatePutBackUnderALiveCollector` (fails with all three out), `TestACondemnedSnapshotThatIsReferredToIsPutBackAtOnce` (half-grace rule), `TestTheOwnerLeavesACondemnationItNoLongerHolds` (copy re-check), `TestTwoPhaseAnUploadThatPinsAfterTheListingBuildsOnNothingCondemned` (manifest re-check), `TestEnsureBasePinsTheBaseFirst` |
+| 2 | The stale side compared a listing's time (milliseconds) with a HEAD's Last-Modified (whole seconds): never equal on real services, so crashed condemnations were never put back or finished | `sameTime` compares to the second (with the size). The in-memory bucket now answers HEAD in whole seconds and listings in milliseconds, as real services do, so every stale-side test meets the difference | `TestR7bHeadTimeIsWholeSeconds`, and the stale-side tests of the earlier rounds (four fail with an exact comparison) |
+| 3 | A rotation's rewrite inside C's gap between re-read and delete was reported done while the old bytes came back | After its final re-read the pass looks for a condemned copy; any copy is skipped (`previousKeyNeeded`). Row 13b documents the same gap for a repair's replace, with the portable follow-up | `TestR7bRotationInTheCondemnGap` |
+| 4 | A failed run's remembered damage, with no local copy, was never read again (the scrub reads durable runs only), so a wrong read or a repair elsewhere left it failed for good | Each scrub that reads re-reads the one remembered chunk of every failed run (`RecheckDamage`); whole, or the snapshot uploaded again since: forgotten, and the upkeep publishes and verifies it | `TestARememberedDamageIsReadAgain` (across a restart) |
+| a | `ensureBase`'s damaged-base replacement, and the 412 path that meets a standing damaged manifest, replaced without keeping the previous bytes: a replacement then found not whole left no manifest | Both keep `previous` (`ensureBase` tells the upload what it replaces, which is what matters on a service without conditional writes) | `TestADamagedReplacementThatIsNotWholePutsThePreviousBack` (two paths) |
+| b | Setting a run `pending` (the give-back's first step; the sync meeting this daemon's own newer record) dropped its remembered damage | Carried | `TestPendingKeepsTheDamage` (both paths) |
+| c | A leftover copy beside a manifest, on a service with unreadable times, was kept for good and blocked rotation | A copy beside a manifest goes on this daemon's own watch alone: deleting it is safe whatever its collection does (it keeps the bytes it would put back, takes the missing copy for a listing that is behind, and — by blocker 1 — deletes no chunks of a snapshot whose copy no longer stands). The rotation then finishes | `TestALeftoverCopyGoesWithoutTheServicesTime` |
+| d | Condemning every due snapshot before listing any: with thousands due and a 1h grace, every round put them all back | At most `CondemnBatch` (256) per round; the rest wait | `TestACollectionCondemnsABatch` |
+| e | The replace path (read, then unconditional PUT) between two repairing daemons | Documented as harmless: both write whole manifests of the same snapshot (same guid, same stream), either standing is correct; a repair whose check fails puts its previous bytes back only while what stands is still its own (`takeBack`). `If-Match` would make it exact on services that have it; not used, for the reason of A3 | none (documentation) |
+
+Changed earlier tests, and why: the A4 test's first order no longer
+expects its collection to delete the base (the base is pinned by
+`ensureBase` now, so it is not due); row 2's test accepts the owner
+leaving the base when the upload has sent it again; finding 7's test
+now expects nothing at first sight and the put-back half a grace later.
+
+New things a review of this round should look at: the owner's re-check
+is two HEADs per condemned snapshot, which narrows rather than closes
+the moment between the check and the chunk delete (row 8's residual); a
+copy rewritten within the same second with the same size is taken for
+the one watched (a later round then acts on it); and `RecheckDamage`
+reads one chunk per failed run per scrub, outside the read budget.

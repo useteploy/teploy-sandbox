@@ -840,7 +840,11 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		live := m.runs[id]
 		live.remoteGen = latest.Generation
 		live.remoteHeld = latest.State == RecordRunning || latest.State == RecordForked
-		setRemoteLocked(live, RemoteState{State: RemotePending, Local: hasLocal})
+		var damage *RemoteDamage
+		if live.Remote != nil {
+			damage = live.Remote.Damage
+		}
+		setRemoteLocked(live, RemoteState{State: RemotePending, Local: hasLocal, Damage: damage})
 		m.mu.Unlock()
 		m.persist()
 		return nil
@@ -1048,7 +1052,11 @@ func (m *Manager) unclaimHeld(ctx context.Context, id string) {
 	}
 	snapshot, key, generation := live.snapshot, live.remoteKey, live.remoteGen
 	payload := m.remotePayloadLocked(live)
-	setRemoteLocked(live, RemoteState{State: RemotePending, Local: local})
+	var damage *RemoteDamage
+	if live.Remote != nil {
+		damage = live.Remote.Damage
+	}
+	setRemoteLocked(live, RemoteState{State: RemotePending, Local: local, Damage: damage})
 	m.mu.Unlock()
 	if !uploaded {
 		// The resume's own context is what just ran out (or whose caller
@@ -1486,6 +1494,9 @@ type ScrubStats struct {
 	ContentReadBytes int64 `json:"contentReadBytes"`
 	ContentSnapshots int   `json:"contentSnapshots"`
 	Damaged          int   `json:"damaged"`
+	// Rechecked is how many failed runs' remembered damaged chunks read
+	// whole on a second look and were forgotten.
+	Rechecked int `json:"rechecked"`
 }
 
 // ScrubRemote asks remote storage again about every stopped run this
@@ -1592,6 +1603,51 @@ func (m *Manager) scrubContent(ctx context.Context, stats *ScrubStats) {
 				stats.Damaged++
 			}
 		}
+	}
+	m.recheckDamage(ctx, stats)
+}
+
+// recheckDamage reads again the one damaged chunk each failed run
+// remembers (RemoteState.Damage). Such a run is not among the durable
+// runs the scrub reads, and without a copy on this host nothing else
+// would ever look at it again: a damage that was a wrong read, or that
+// another daemon has repaired since, would keep it failed for good. A
+// chunk that reads whole now (or a snapshot uploaded again since) is
+// forgotten, and the upkeep's next publish verifies the run and calls it
+// durable again.
+func (m *Manager) recheckDamage(ctx context.Context, stats *ScrubStats) {
+	type target struct {
+		id     string
+		damage RemoteDamage
+	}
+	var targets []target
+	m.mu.Lock()
+	for id, current := range m.runs {
+		if current.State == StateStopped && current.Remote != nil && current.Remote.State != RemoteDurable && current.Remote.Damage != nil {
+			targets = append(targets, target{id, *current.Remote.Damage})
+		}
+	}
+	m.mu.Unlock()
+	sort.Slice(targets, func(i, j int) bool { return targets[i].id < targets[j].id })
+	changed := false
+	for _, current := range targets {
+		whole, err := m.OffHost.RecheckDamage(ctx, current.damage)
+		if err != nil || !whole {
+			continue
+		}
+		m.mu.Lock()
+		if live, ok := m.runs[current.id]; ok && live.Remote != nil && live.Remote.Damage != nil && *live.Remote.Damage == current.damage {
+			state := *live.Remote
+			state.Damage = nil
+			live.Remote = &state
+			changed = true
+			stats.Rechecked++
+		}
+		m.mu.Unlock()
+		m.log.Info("a chunk found damaged before reads whole now; the run is published again", "id", current.id, "snapshot", current.damage.Snapshot, "chunk", current.damage.Chunk)
+	}
+	if changed {
+		m.persist()
 	}
 }
 

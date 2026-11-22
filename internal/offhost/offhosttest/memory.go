@@ -98,7 +98,10 @@ func (m *Memory) Head(_ context.Context, key string) (s3.Object, error) {
 	if !ok {
 		return s3.Object{}, &s3.Error{Status: 404, Code: "NoSuchKey"}
 	}
-	return s3.Object{Key: key, Size: int64(len(object.data)), LastModified: object.modified}, nil
+	// An HTTP date: whole seconds, where a listing has milliseconds
+	// (what real services answer, and what a comparison of the two must
+	// survive).
+	return s3.Object{Key: key, Size: int64(len(object.data)), LastModified: object.modified.Truncate(time.Second)}, nil
 }
 
 func (m *Memory) Delete(_ context.Context, key string) error {
@@ -121,7 +124,7 @@ func (m *Memory) ListAll(_ context.Context, prefix string) ([]s3.Object, error) 
 	var listed []s3.Object
 	for key, object := range m.objects {
 		if strings.HasPrefix(key, prefix) {
-			listed = append(listed, s3.Object{Key: key, Size: int64(len(object.data)), LastModified: object.modified})
+			listed = append(listed, s3.Object{Key: key, Size: int64(len(object.data)), LastModified: object.modified.Truncate(time.Millisecond)})
 		}
 	}
 	sort.Slice(listed, func(i, j int) bool { return listed[i].Key < listed[j].Key })

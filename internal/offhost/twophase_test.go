@@ -169,7 +169,11 @@ func TestTwoPhaseAnUploadThatPinsAfterTheListingBuildsOnNothingCondemned(t *test
 		t.Fatal(err)
 	}
 	stats, err := w.collector.Collect(bg, twoPhaseGrace)
-	if err != nil || stats.Snapshots != 1 || stats.Restored != 0 {
+	// The upload, finding no base, sent a fresh one; the owner, about to
+	// delete the old one's chunks, finds a manifest standing again and
+	// leaves the snapshot (third fix round). The old attempt's chunks are
+	// garbage that ages.
+	if err != nil || stats.Snapshots+stats.Restored != 1 {
 		t.Fatalf("collect: %+v, %v", stats, err)
 	}
 	after, _, err := w.collector.Manifest(bg, baseB)

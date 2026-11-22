@@ -33,7 +33,7 @@ func TestRemoteScrubAnswersWhatItRead(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"checked", "notWhole", "unreachable", "contentSnapshots", "damaged"} {
+	for _, field := range []string{"checked", "notWhole", "unreachable", "contentSnapshots", "damaged", "rechecked"} {
 		if _, ok := answer[field]; !ok {
 			t.Errorf("no %q in %v", field, answer)
 		}

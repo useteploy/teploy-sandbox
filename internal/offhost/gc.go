@@ -48,6 +48,10 @@ type CollectStats struct {
 	Condemned, Restored, Markers int
 }
 
+// DefaultCondemnBatch is how many due snapshots one collection condemns
+// at most (Store.CondemnBatch).
+const DefaultCondemnBatch = 256
+
 // MaxChainLimit is the most incremental streams that may follow one
 // another, on any daemon: the one bound every walk of a chain (upload,
 // restore, verification, collection) goes by. A chain is at most a base
@@ -350,7 +354,7 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 		summary  *summary
 		manifest *Manifest
 		// stale: this daemon has watched it stand for the grace.
-		stale bool
+		stale, halfAged bool
 		// modified is the copy's time as listed: it is acted on only if
 		// it is still that very copy.
 		modified time.Time
@@ -388,13 +392,26 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 		if entry.manifest != nil {
 			// The manifest is there: a condemnation that never got to
 			// deleting it, or a restore that never got to deleting
-			// this. Garbage, once it has stood for the grace.
-			if aged {
+			// this. Garbage, once it has stood for the grace by this
+			// daemon's own watch — the service's time is not needed:
+			// deleting a copy beside a manifest is safe whatever the
+			// copy's collection is doing (it keeps the bytes it would
+			// put back, its listing then shows the copy gone, which it
+			// takes for a listing that is behind, and it deletes no
+			// chunks of a snapshot whose copy no longer stands). On a
+			// service whose times cannot be read this is what lets a
+			// crash's leftover go, and a rotation finish.
+			if old(seen.first) {
 				leftovers = append(leftovers, id)
 			}
 			continue
 		}
-		condemnations[id] = &condemnation{raw: raw, manifest: manifest, stale: aged, modified: modified,
+		// halfAged: this daemon has watched it for half the grace, so the
+		// collection that wrote it is past its own bound (condemn, step
+		// 3) and puts back, rather than deletes, anything it has not yet
+		// deleted. Only then may another collection act on it early.
+		halfAged := !now.Before(seen.first.Add(grace/2)) && !modified.IsZero()
+		condemnations[id] = &condemnation{raw: raw, manifest: manifest, stale: aged, halfAged: halfAged, modified: modified,
 			summary: &summary{parent: manifest.Parent, purpose: manifest.Purpose, attempt: manifest.Attempt,
 				chunks: len(manifest.Chunks), stored: manifest.StoredBytes}}
 		stats.Condemned++
@@ -620,7 +637,7 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	// not due): it is put back at once, not a grace later.
 	var stale []string
 	for id, condemned := range condemnations {
-		if condemned.stale || needed[id] {
+		if condemned.stale || (needed[id] && condemned.halfAged) {
 			stale = append(stale, id)
 		}
 	}
@@ -642,7 +659,7 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 		if err != nil {
 			return stats, fmt.Errorf("collect: condemned copy of %s: %w", id, err)
 		}
-		if !current.LastModified.Equal(condemned.modified) || current.Size != int64(len(condemned.raw)) {
+		if !sameTime(current.LastModified, condemned.modified) || current.Size != int64(len(condemned.raw)) {
 			continue
 		}
 		if !condemned.stale {
@@ -766,6 +783,17 @@ func (s *Store) condemn(ctx context.Context, due map[string]bool, manifests, cha
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	// Every snapshot condemned is listed before any is deleted, and the
+	// round must decide within half the grace: a round that condemned
+	// thousands would put them all back, every round, for good. The rest
+	// wait for the next round.
+	batch := s.CondemnBatch
+	if batch <= 0 {
+		batch = DefaultCondemnBatch
+	}
+	if len(ids) > batch {
+		ids = ids[:batch]
+	}
 	condemned := map[string][]byte{}
 	keep := map[string]bool{}
 	finished := false
@@ -889,6 +917,28 @@ func (s *Store) condemn(ctx context.Context, due map[string]bool, manifests, cha
 			stats.Restored++
 			continue
 		}
+		// Still this round's condemnation? Another collection that
+		// finished or put it back has removed the copy; an upload that
+		// found no manifest has written a fresh one. Either way the
+		// chunks are not this round's to delete.
+		if _, err := s.objects.Head(ctx, s.condemnedKey(id)); errors.Is(err, s3.ErrNotFound) {
+			s.log.Warn("a condemned snapshot's copy is gone before its chunks were deleted; left to whoever took it", "snapshot", id)
+			delete(condemned, id)
+			continue
+		} else if err != nil {
+			return err
+		}
+		if _, err := s.objects.Head(ctx, s.manifestKey(id)); err == nil {
+			s.log.Warn("a condemned snapshot has a manifest again; it is left standing", "snapshot", id)
+			if err := s.restoreCondemned(ctx, id, raw); err != nil {
+				return err
+			}
+			delete(condemned, id)
+			stats.Restored++
+			continue
+		} else if !errors.Is(err, s3.ErrNotFound) {
+			return err
+		}
 		// From here a failure leaves the copy and chunks in pieces,
 		// which a later round finishes; it is not put back.
 		delete(condemned, id)
@@ -908,6 +958,14 @@ func (s *Store) condemn(ctx context.Context, due map[string]bool, manifests, cha
 	}
 	finished = true
 	return nil
+}
+
+// sameTime compares a HEAD's Last-Modified with a listing's: HTTP dates
+// are whole seconds, listings often carry milliseconds. Two writes of
+// the same size within one second are not told apart; the cost is a
+// put-back acted on by a later round.
+func sameTime(head, listed time.Time) bool {
+	return head.Truncate(time.Second).Equal(listed.Truncate(time.Second))
 }
 
 // stalled reports whether half the grace or more has passed since since,

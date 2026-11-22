@@ -168,6 +168,9 @@ type Store struct {
 	// outlives every copy's retention there is no such daemon: one that
 	// was away for longer comes back to copies its own reaper removes.
 	Tombstones time.Duration
+	// CondemnBatch bounds how many due snapshots one collection condemns
+	// (DefaultCondemnBatch when zero).
+	CondemnBatch int
 	// conditional is whether the service honours conditional writes
 	// (Probe).
 	conditional bool
@@ -792,10 +795,16 @@ func (s *Store) writeManifest(ctx, parent context.Context, manifest *Manifest, s
 			// damaged. This upload is whole: it replaces that manifest
 			// in one write, so the snapshot never stops existing on the
 			// way (a read can be wrong, and the old chunks stay until a
-			// collection ages them).
+			// collection ages them). What it replaces is kept, to be put
+			// back if this one turns out not whole (takeBack).
+			previous, err := s.objects.Get(ctx, s.manifestKey(manifest.ID), maxSmallObject)
+			if err != nil {
+				return nil, fmt.Errorf("read the manifest of %s before replacing it: %w", manifest.ID, err)
+			}
 			if err := s.objects.Put(ctx, s.manifestKey(manifest.ID), sealed, s3.PutOptions{ContentType: "application/json"}); err != nil {
 				return nil, fmt.Errorf("replace the manifest of %s, which names a damaged chunk: %w", manifest.ID, err)
 			}
+			manifest.previous = previous
 			s.log.Warn("a snapshot with a damaged chunk was uploaded again from this host's copy", "snapshot", manifest.ID, "replaced", existing.Attempt)
 			return manifest, nil
 		}

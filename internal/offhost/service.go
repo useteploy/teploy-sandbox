@@ -237,6 +237,34 @@ func (s *Service) remoteError(err error) error {
 	return err
 }
 
+// RecheckDamage reads a remembered damaged chunk again (readChunk, which
+// forgets the damage when it reads whole).
+func (s *Service) RecheckDamage(ctx context.Context, damage run.RemoteDamage) (bool, error) {
+	if !validID(damage.Snapshot) {
+		return false, nil
+	}
+	manifest, _, err := s.store.Manifest(ctx, damage.Snapshot)
+	if errors.Is(err, ErrNoSnapshot) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if manifest.Attempt != damage.Attempt {
+		return true, nil
+	}
+	if damage.Chunk < 0 || damage.Chunk >= len(manifest.Chunks) {
+		return false, nil
+	}
+	if _, err := s.store.readChunk(ctx, manifest, damage.Chunk); err != nil {
+		if errors.Is(err, ErrCorrupt) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // RememberDamage is a damaged chunk this daemon found before a restart.
 func (s *Service) RememberDamage(damage run.RemoteDamage) {
 	if validID(damage.Snapshot) && validAttempt(damage.Attempt) && damage.Chunk >= 0 {
@@ -460,14 +488,22 @@ func (s *Service) ensureBase(ctx context.Context, base string) (string, error) {
 		return "", err
 	}
 	defer s.basing.unlock()
+	// Pinned before it is read, like every check: a collection that
+	// condemns the base after this read puts it back.
+	if err := s.store.Pin(ctx, base); err != nil {
+		return "", err
+	}
+	replaces := ""
 	existing, _, err := s.store.Manifest(ctx, base)
 	switch {
 	case err == nil:
 		checkErr := s.store.checkChunks(ctx, existing)
 		if _, damaged := s.store.badOf(existing); checkErr == nil && damaged {
 			// Every chunk there, one read and found damaged: uploaded
-			// again, and the new manifest replaces this one in one write.
+			// again, and the new manifest replaces this one in one write
+			// (and comes back if the new one is not whole).
 			s.log.Error("the base image in remote storage has a damaged chunk; uploading it again", "base", base)
+			replaces = existing.Attempt
 			break
 		}
 		if checkErr == nil {
@@ -488,7 +524,7 @@ func (s *Service) ensureBase(ctx context.Context, base string) (string, error) {
 		return "", err
 	}
 	start := time.Now()
-	uploaded, err := s.stream(ctx, Manifest{ID: base, Purpose: PurposeBase, GUID: guid}, key)
+	uploaded, err := s.stream(ctx, Manifest{ID: base, Purpose: PurposeBase, GUID: guid, replaces: replaces}, key)
 	if err != nil {
 		return "", err
 	}

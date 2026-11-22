@@ -275,6 +275,10 @@ type OffHost interface {
 	// this daemon restarted (RemoteState.Damage), until a read finds the
 	// chunk whole or the snapshot is uploaded again.
 	RememberDamage(damage RemoteDamage)
+	// RecheckDamage reads a remembered damaged chunk again: whole is
+	// true when it now reads as uploaded, or the snapshot has been
+	// uploaded again since (its manifest names another attempt).
+	RecheckDamage(ctx context.Context, damage RemoteDamage) (whole bool, err error)
 }
 
 // ContentScrub is what one round of the scrub that reads found.

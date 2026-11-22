@@ -303,3 +303,88 @@ func TestAGiveBackThatCannotCheckDoesNotSayDurable(t *testing.T) {
 		t.Fatalf("once storage answers again: %+v", *got.Remote)
 	}
 }
+
+// Third fix round, finding 4: a failed run's remembered damaged chunk is
+// read again by the scrub, and forgotten when it reads whole (a wrong
+// read, or a chunk put right since): the run is then published and
+// durable again, even with no copy on this host and across a restart.
+func TestARememberedDamageIsReadAgain(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	drop := func(_ *offhost.Config, m *run.Manager) { m.LocalCache = run.LocalDrop }
+	a := newHost(t, bucket, "host-a", nil, reading(1<<20), drop)
+	created := a.startRun(t, payload(t, 500))
+	stopped := a.stop(t, created.ID)
+	manifest, _, _ := a.store.Manifest(bg, stopped.Remote.Snapshot)
+	key := "fleet/v1/snap/" + stopped.Remote.Snapshot + "/" + manifest.Attempt + "/" + leftPad(1)
+	good := bucket.Raw(key)
+	rotChunk(t, a, stopped.Remote.Snapshot, 1)
+	if stats := a.manager.ScrubRemote(bg); stats.Damaged != 1 {
+		t.Fatalf("scrub: %+v", stats)
+	}
+	bucket.SetRaw(key, good) // it reads whole again
+	restarted := newHost(t, bucket, "host-a", a, reading(1<<20), drop)
+	stats := restarted.manager.ScrubRemote(bg)
+	if stats.Rechecked != 1 {
+		t.Fatalf("the scrub after the chunk mended: %+v", stats)
+	}
+	restarted.manager.Maintain(bg)
+	if got := restarted.get(t, created.ID); got.Remote.State != run.RemoteDurable || got.Remote.Damage != nil {
+		t.Fatalf("after the damage read whole: %+v", *got.Remote)
+	}
+}
+
+// Third fix round, nit b: setting a run pending does not forget its
+// damaged chunk — not in the give-back of a resume that could not reach
+// storage, and not when the sync finds the newest record this daemon's
+// own.
+func TestPendingKeepsTheDamage(t *testing.T) {
+	setup := func(t *testing.T) (*remoteHost, *offhosttest.Faulty, string, *run.Run) {
+		memory := offhosttest.NewMemory()
+		flaky := offhosttest.NewFaulty(memory)
+		drop := func(_ *offhost.Config, m *run.Manager) { m.LocalCache = run.LocalDrop }
+		a := newHostObjs(t, memory, flaky, "host-a", nil, nil, reading(1<<20), drop)
+		created := a.startRun(t, payload(t, 500))
+		stopped := a.stop(t, created.ID)
+		rotChunk(t, a, stopped.Remote.Snapshot, 1)
+		if stats := a.manager.ScrubRemote(bg); stats.Damaged != 1 {
+			t.Fatalf("scrub: %+v", stats)
+		}
+		return a, flaky, stopped.Remote.Snapshot, created
+	}
+	t.Run("a give-back that cannot reach storage", func(t *testing.T) {
+		a, flaky, _, created := setup(t)
+		flaky.Set(func(f *offhosttest.Faulty) {
+			f.GetErr = func(key string) error {
+				if strings.Contains(key, "/snap/") {
+					return &s3.Error{Status: 503, Code: "SlowDown"}
+				}
+				return nil
+			}
+		})
+		if _, err := a.manager.Resume(bg, created.ID, 0); err == nil {
+			t.Fatal("resumed")
+		}
+		if got := a.get(t, created.ID); got.Remote.Damage == nil {
+			t.Fatalf("the damage was forgotten: %+v", *got.Remote)
+		}
+	})
+	t.Run("the sync meets this daemon's own newer record", func(t *testing.T) {
+		a, _, _, created := setup(t)
+		got := a.get(t, created.ID)
+		latest, err := a.service.Latest(bg, created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A claim of this daemon's that its registry never noted (a crash
+		// between the write and the note).
+		claim := latest
+		claim.Generation, claim.State = latest.Generation+1, run.RecordRunning
+		if _, err := a.service.Advance(bg, claim); err != nil {
+			t.Fatal(err)
+		}
+		a.sync(t)
+		if got = a.get(t, created.ID); got.Remote.Damage == nil || got.Remote.State == run.RemoteDurable {
+			t.Fatalf("after the sync: %+v", *got.Remote)
+		}
+	})
+}

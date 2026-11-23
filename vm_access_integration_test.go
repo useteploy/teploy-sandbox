@@ -7,6 +7,8 @@
 package main
 
 import (
+	"regexp"
+
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -143,14 +145,21 @@ func startGuestServer(t *testing.T, manager *run.Manager, id, name, script strin
 }
 
 // hostNetState is what an access stream must not change on the host.
+// Packet and byte counters are stripped: they count every packet the
+// host routes (its own DNS forwarder's chains included), and their
+// drift says nothing about the shape of the state.
 func hostNetState(t *testing.T) string {
 	t.Helper()
 	ruleset, _ := hostTry("nft", "list", "ruleset")
+	ruleset = counters.ReplaceAllString(ruleset, "")
 	routes, _ := hostTry("ip", "route")
 	routes6, _ := hostTry("ip", "-6", "route")
 	links, _ := hostTry("ip", "-o", "link")
 	return strings.Join([]string{ruleset, routes, routes6, links}, "\n---\n")
 }
+
+// counters matches nftables' counter statements, with or without bytes.
+var counters = regexp.MustCompile(`counter packets \d+( bytes \d+)?`)
 
 // A published port of a run on the "none" tier is reachable through the
 // access listener: the guest sees the stream come from 127.0.0.1, the

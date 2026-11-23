@@ -42,7 +42,7 @@ func TestMachineArgsAreTheProvenCommandLine(t *testing.T) {
 		"--cmdline", "root=/dev/vda1 rw console=ttyAMA0 quiet",
 		"--disk", "path=/dev/zvol/tank/teploy-sbx-x,image_type=raw,direct=on",
 		"--cpus", "boot=2",
-		"--memory", "size=2048M",
+		"--memory", "size=2048M,mergeable=off",
 		"--vsock", "cid=7,socket=/run/sbx/abc/teploy-sbx-x/vsock.sock",
 		"--balloon", "size=0,free_page_reporting=on,deflate_on_oom=on",
 		"--rng", "src=/dev/urandom",

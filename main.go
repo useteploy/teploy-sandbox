@@ -264,6 +264,7 @@ func serve(args []string) error {
 		}
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	clearMemoryMerge(log)
 	token, err := server.LoadOrMintToken(*tokenFile)
 	if err != nil {
 		return fmt.Errorf("token: %w", err)

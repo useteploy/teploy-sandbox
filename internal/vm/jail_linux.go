@@ -71,6 +71,10 @@ const (
 
 	prSetNoNewPrivs = 38
 	prCapBSetDrop   = 24
+	// prSetMemoryMerge is PR_SET_MEMORY_MERGE (Linux 6.4): with 1 every
+	// mapping of the process is mergeable by KSM, with 0 none is that
+	// was not advised one by one.
+	prSetMemoryMerge = 67
 	// lastCapability is beyond the highest capability any kernel has.
 	lastCapability = 63
 
@@ -150,6 +154,20 @@ func enterJail(args, env []string) error {
 	// from raising it again.
 	if err := step("turn core dumps off", syscall.Setrlimit(syscall.RLIMIT_CORE, &syscall.Rlimit{Cur: 1, Max: 1})); err != nil {
 		return err
+	}
+	// Not mergeable by KSM. PR_SET_MEMORY_MERGE is a flag of the
+	// process's memory that is kept across fork and execve, so a daemon
+	// started with it (a systemd unit with MemoryKSM=yes, or anything
+	// its parent set) would hand it to every hypervisor, and the guest's
+	// RAM would be merged with the rest of the host's mergeable memory:
+	// a timing side channel between tenants, and between a tenant and
+	// the host. Cleared here, before the execve, it is not passed on.
+	// EINVAL is a kernel older than 6.4 or one without KSM, where there
+	// is no such flag to clear. The hypervisor is started with
+	// mergeable=off, and the filter below refuses both ways of turning
+	// merging back on.
+	if _, _, errno := syscall.RawSyscall6(syscall.SYS_PRCTL, prSetMemoryMerge, 0, 0, 0, 0, 0); errno != 0 && errno != syscall.EINVAL {
+		return fmt.Errorf("make the hypervisor's memory unmergeable (PR_SET_MEMORY_MERGE): %w", errno)
 	}
 	// Nothing to regain: the bounding set is emptied while still root.
 	for capability := uintptr(0); capability <= lastCapability; capability++ {

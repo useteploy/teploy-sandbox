@@ -3664,6 +3664,147 @@ and failed on the commit they reviewed. **Nothing here has run live.**
     within one second (`sameTime`), or every stale condemnation and
     leftover copy is left for good.
 
+## 2026-11-21 (evening) — VM driver: first live run of main (`38ca4c0`) on x86-64, first off-host run against a real S3 service, and the fixes it called for
+
+**Host.** The same small bare-metal x86-64 laptop as the first x86-64 run
+(Pentium Silver N5000, 4 cores, 3.7 GB, eMMC, file-backed pool; Debian 13,
+kernel 6.12.117, ZFS 2.3.9, Cloud Hypervisor v54.1, guest kernel
+`ch-release-v7.2.8-20261009`). Far below the runbook's 16 GB: its density
+and throughput figures are not representative. Golden image reused (the
+guest agent is byte-identical between the commit it was built from and
+`38ca4c0` once built with `-trimpath -buildvcs=false`).
+
+### Results on main `38ca4c0` (unchanged)
+
+- Root-only unit tests: PASS (265, no SKIP).
+- Live suite, pool off: 15 PASS, 2 FAIL. Pool on (`1x512=1`): 14 PASS,
+  3 FAIL. No SKIP (TestVMMemoryStaysInsideItsCgroup logged that it skipped
+  its 2048 and 4096 MiB guests, as the README says for a host this size).
+  - TestVMWarmPool fails both times for memory (the documented small-host
+    failure: available memory fell to about 270 MiB). TestVMWarmPoolRaces
+    passed both times and alone.
+  - **TestVMUsage failed deterministically: a test defect.** Its busy
+    sample was usage round 1, which never reads disk (`usageDiskEvery =
+    10`), so DiskBytes could not grow. Its failure message printed
+    pointers instead of values.
+  - **TestVMNetworkIsolation (pool on) failed on a race in the test**: the
+    daemon's 2 s watcher restored the flushed rules before the test listed
+    them ("rules emptied by hand are unchanged; nothing was tested"). It
+    passed 3/3 alone.
+- Off-host against versitygw 1.11.0 (POSIX backend, loopback), pool off and
+  pool on: TestVMOffHost PASS, TestVMCallerSnapshots PASS,
+  **TestVMKeyRotation failed deterministically: a test defect** (the
+  rotation's pin, added by the two-phase delete, writes a `pin/` object
+  under the snapshot's prefix, which the test counted as "moved"). The
+  `internal/s3` live tests passed (36, run twice, including "1 won, 15
+  refused" for `If-None-Match: *` with 16 racing writers).
+  - TestVMOffHost logged "base image included: false" even when the
+    restore had fetched it, because it asked after the restore: it
+    under-reported one pool-on restore as 317 MiB at 4 MiB/s; the
+    daemon's own log line said 1184 MiB at 15 MiB/s.
+  - TestVMCallerSnapshots and TestVMKeyRotation left the received base
+    image (842 MiB each, a new name every run) on the standing pool, and
+    the off-host tests left the second daemon's empty cgroups.
+- **No seccomp kills**: `journalctl -k | grep type=1326` empty across the
+  whole session.
+- Off-host, live for the first time: encryption at rest (0 of 21 fetched
+  chunks hold the plaintext marker, none of the service's own files do,
+  a chunk does not compress, unsigned GET 403); an incremental stop after
+  4 MiB changed stored 7.4 to 7.6 MiB; fencing (two daemons resuming one
+  run: one running copy, one hypervisor, the loser gets `ErrRemoteConflict`;
+  each daemon won once, so both orders ran); loss of a host and byte-exact
+  resume and fork on the other; a flipped bit and a deleted chunk refused
+  with the pool left as it was and the run reported not whole; destroy
+  plus collect to an empty bucket (101 objects, about 1.19 GB, in 230 ms).
+
+### versitygw 1.11.0 behaviour, against what the code assumes
+
+All within the code's assumptions:
+
+- list-after-write is immediate (same process, same filesystem);
+- `If-None-Match: *` on an existing key gives 412 and leaves the object;
+  on a new key 200; other `If-None-Match` values give 501 (the code only
+  sends `*`; `Probe` would read a 501 as "no conditional writes");
+  `If-Match` on a missing key gives 404 where AWS gives 412 (not used);
+- Last-Modified: HEAD (RFC 1123) and listing (`...Z`, **no fraction**,
+  where AWS gives milliseconds) agree in 40 of 40 objects, and both are
+  the backend file's mtime **truncated** to the second, never rounded.
+  So `sameTime`'s window (truncate, then a second either way) is 2 to 3
+  seconds wide here; two writes of one size inside it are not told
+  apart, the documented cost;
+- ETag is the MD5 of a single PUT's body, the same in HEAD, PUT and
+  listing (the code does not use ETags);
+- missing key: GET 404 NoSuchKey, HEAD 404, DELETE **204**; missing bucket
+  404; `PUT` of an existing bucket 409 BucketAlreadyOwnedByYou (accepted);
+  bad signature 403 (the error body echoes the StringToSign and
+  CanonicalRequest, as AWS does); range past the end 416;
+- extra listing fields (`ChecksumAlgorithm`, `ChecksumType`) are ignored;
+- whole run: 1965×200, 700×204, 56×412, 53×404, 13×409, 3×403, 1×416,
+  1×501, no 5xx;
+- the POSIX backend leaves an empty lock file per object ever written in
+  `.vgwlocks/` and never removes them (harmless).
+
+### Figures (this host)
+
+Warm create to first exec, medians: 14 ms (none), 311 to 314 ms
+(allowlist), 406 to 417 ms (open). Cold create 4.7 to 4.9 s, resume 4.2 to
+4.4 s, fork 4.2 s, snapshot of a running run about 0.2 s. Off-host (bucket
+and pool on one eMMC): upload 40 to 51 MiB/s; restore 15 to 33 MiB/s, disk
+bound; rotation pass about 40 ms.
+
+### Fixed on this branch
+
+| | Defect | Fix | Test (fails without the fix) |
+|---|---|---|---|
+| 1 | TestVMUsage's busy sample never read disk | `run.Manager.SampleUsageWithDisk`: one round that reads disk and does not move the ticker's cadence; the test samples with it every time it compares disk, and prints the values | `TestUsageSamplingCadenceAndParallelism` (forced round on a non-disk round, cadence unchanged, no-op with sampling off); TestVMUsage live (failed on `38ca4c0`, see above) |
+| 2 | TestVMKeyRotation counted rotation's pin as moved | Compares the snapshot's own objects only: `pin/` and `condemned` left out (`snapshotObjects`, also used by TestVMOffHost) | TestVMKeyRotation live (failed on `38ca4c0`) |
+| 3 | TestVMOffHost asked whether the base image was here after the restore | Asks before; and now fails if the restore left none | TestVMOffHost live |
+| 4 | TestVMNetworkIsolation raced the 2 s watcher | Each ruleset is looked at right after its own damage, and counts as damaged when it lists differently then **or** when the daemon has logged since the damage began that it found that very ruleset changed (host table, or the run's namespace by name) and put it back. The daemon logs before it writes, so a listing already back always comes after the log line. A damage that did nothing gives neither and still fails; the wait for every ruleset to be back identical, and the checks after, are unchanged | Race, not reproducible on demand. Live: passed 3/3 pool on; the daemon never beat the look in these runs, so the "already put back" branch has not run live |
+| 5 | Received base images and empty cgroups left behind | The daemon that received the base reclaims it at teardown after destroying its runs; `standingPoolAsFound` fails the test at its end if the standing pool differs from its start, and destroys this test's base if left; the first daemon's cgroup tree is removed | TestVMKeyRotation and TestVMCallerSnapshots live: pool after each off-host run is `sbx`, `sbx/base@v1` and `sbx/golden-guestd@v1` only |
+| 6 | **KSM (security, existing gap).** `PR_SET_MEMORY_MERGE` (Linux 6.4) makes every mapping of a process mergeable and is inherited across fork and execve; a daemon started with it (systemd `MemoryKSM=yes`) would have made every guest's RAM mergeable host-wide, a cross-tenant timing side channel | The jail helper calls `prctl(PR_SET_MEMORY_MERGE, 0)` before the execve (`EINVAL` on a kernel without it is taken as cleared; any other error refuses the start). The hypervisor is started with `mergeable=off`. The daemon's seccomp filter refuses `prctl(PR_SET_MEMORY_MERGE)` (either value) and `madvise(MADV_MERGEABLE)` with `EPERM`, judged on the low 32 bits (both are an `int`); every other prctl and madvise is allowed | `TestJailClearsTheMemoryMergeFlag` (root-only: the test process sets the flag; a plain child inherits it, `1`, which is what makes the test mean something; the jailed one has `0` and both requests are refused). With the helper's clear removed it fails (`vm-unit-noclear`). `TestSeccompFilterOnBothArchitectures` (the argument checks, both architectures). `TestVMConfinement` live: the test runs as a daemon with the flag set (24 of its own mappings show `mg`), and no mapping of any hypervisor may show `mg` in `/proc/PID/smaps`; with the clear removed it fails with 92 mergeable mappings |
+
+Kernel semantics, checked against v6.12's sources (`kernel/sys.c`,
+`include/linux/sched/coredump.h`, `mm/ksm.c`): option 67, no capability
+check, arguments 3 to 5 must be 0; `MMF_VM_MERGE_ANY` is in
+`MMF_INIT_MASK`, so a new mm takes it from the parent's; clearing it
+unmerges and clears `VM_MERGEABLE` on the process's mappings. Inheritance
+across execve was not settled from the sources read and was **measured**:
+on 6.12 a child exec'd by a process with the flag set has it. v6.12's
+`/proc/PID/ksm_stat` has no field for the flag, hence `smaps` VmFlags in
+the live test. Cloud Hypervisor v54.1 calls `madvise(MADV_MERGEABLE)` only
+with `mergeable=on` and never calls `PR_SET_MEMORY_MERGE` (from its
+`memory_manager.rs`; its tail was not read). Landlock is not involved (no
+path); the prctl runs before the helper installs the filter.
+
+### Live, on the fixed branch (same host)
+
+- Root-only unit tests: PASS (266 PASS lines, no SKIP, no FAIL), including
+  `TestJailClearsTheMemoryMergeFlag`.
+- Pool off: TestVMUsage PASS (before: cpu 5.30 s, disk 827392; busy: cpu
+  7.36 s, tx 778, disk 69991424), TestVMConfinement PASS. Pool on: both
+  PASS.
+- TestVMNetworkIsolation, pool on: PASS 3/3; rules back after 0.8 to
+  1.4 s (deleted) and 2.0 to 2.1 s (emptied).
+- Off-host against versitygw 1.11.0, pool off and pool on: TestVMOffHost,
+  TestVMKeyRotation and TestVMCallerSnapshots PASS. Daemon-b won the
+  concurrent resume both times, so the cold resume on it fetched no base
+  image and is now reported so (317 MiB, base image included: false); the
+  "true" path did not occur.
+- `type=1326`: 0 lines. After the runs the pool holds only `sbx`,
+  `sbx/base@v1` and `sbx/golden-guestd@v1`; no off-host pool, cgroup,
+  hypervisor process, netns or nft table left.
+
+**Still open.** A whole green suite on a host with memory enough for the
+warm-pool tests; the 16 GB bare-metal figures (memory overhead of the 2048
+and 4096 MiB guests, VM density, warm and cold timings); off-host against
+a remote S3 service over a real network, and one that rounds Last-Modified
+or carries milliseconds (AWS S3, MinIO); `--remote-local drop`, still
+refused. `install-host.sh` does not warn about a unit with `MemoryKSM=yes`. The
+jail helper clears the flag for every hypervisor and the daemon clears
+its own at start (found by review: the daemon holds tenants' data in
+the clear while encrypting and decrypting it), so teploy's own
+processes are safe either way; the warning would still catch the case
+for every other process the operator runs under the same unit.
 ## 2026-11-21 — access, daemon side (phase 4, task 4a: A1–A4)
 
 What landed: the `accessgrant` package (grant format, strict verification,

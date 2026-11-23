@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -19,6 +20,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -190,10 +192,46 @@ func offHostPoolA(t *testing.T, configB vm.Config) vm.Config {
 	configA.UIDBase = vm.DefaultUIDBase + 2*vm.UIDCount
 	configA.Subnet = "10.213.0.0/16"
 	configA.Warm = vm.WarmConfig{}
+	// The first daemon's cgroups are its own tree; the driver leaves the
+	// tree when its last VM is gone, and the suite takes it away.
+	t.Cleanup(func() { removeCgroupTree(t, configA.Cgroup) })
 	if a, b := zfsCommand(t, "zfs", "get", "-Hp", "-o", "value", "guid", configA.Golden), zfsCommand(t, "zfs", "get", "-Hp", "-o", "value", "guid", configB.Golden); a == b {
 		t.Fatalf("the two golden images are the same snapshot (%s)", a)
 	}
 	return configA
+}
+
+// thisTestsBase is the name the standing pool gives the base image it
+// receives from the first daemon's golden image: named by that image's
+// guid, which is new on every run.
+func thisTestsBase(t *testing.T, configB, configA vm.Config) string {
+	t.Helper()
+	return configB.Pool + "/teploy-base-" + zfsCommand(t, "zfs", "get", "-Hp", "-o", "value", "guid", configA.Golden)
+}
+
+// standingPoolAsFound fails the test, once everything else of it has
+// ended, when the standing pool does not list what it did when this was
+// called: a base image received from the first daemon (842 MiB on the
+// suite's image) would otherwise stay on it, a new one on every run, until
+// some other test happened to sweep it. What is left of this test's base
+// image is destroyed then, so that one failed run does not leave it for
+// the next. Called after the pool's baseline is settled and before the
+// daemons start, so that it runs after their teardown.
+func standingPoolAsFound(t *testing.T, pool, base string) {
+	t.Helper()
+	baseline := poolListing(t, pool)
+	t.Cleanup(func() {
+		got := poolListing(t, pool)
+		if slices.Equal(got, baseline) {
+			return
+		}
+		t.Errorf("the standing pool is not as the test found it:\n%v\nwant\n%v", got, baseline)
+		if slices.Contains(got, base) {
+			if out, err := exec.Command("zfs", "destroy", "-r", base).CombinedOutput(); err != nil {
+				t.Logf("destroy %s: %v %s", base, err, out)
+			}
+		}
+	})
 }
 
 func TestVMOffHost(t *testing.T) {
@@ -262,7 +300,7 @@ func TestVMOffHost(t *testing.T) {
 	baselineB := poolListing(t, configB.Pool)
 
 	configA := offHostPoolA(t, configB)
-	thisBase := configB.Pool + "/teploy-base-" + zfsCommand(t, "zfs", "get", "-Hp", "-o", "value", "guid", configA.Golden)
+	thisBase := thisTestsBase(t, configB, configA)
 
 	a := startOffHostDaemon(t, "daemon-a", configA, objects, prefix, master, nil, nil)
 	aClosed := false
@@ -329,12 +367,7 @@ func TestVMOffHost(t *testing.T) {
 	snapshotID := stopped.Remote.Snapshot
 	// The snapshot's objects: its manifest and chunks, not the pins every
 	// check writes beside them (the two-phase delete, 2026-11-21).
-	var chunks []s3.Object
-	for _, object := range bucketKeys("v1/snap/" + snapshotID + "/") {
-		if !strings.Contains(object.Key, "/pin/") && !strings.HasSuffix(object.Key, "/condemned") {
-			chunks = append(chunks, object)
-		}
-	}
+	chunks := snapshotObjects(bucketKeys("v1/snap/" + snapshotID + "/"))
 	if len(chunks) < 3 {
 		t.Fatalf("the snapshot is %d objects", len(chunks))
 	}
@@ -470,11 +503,6 @@ func TestVMOffHost(t *testing.T) {
 		t.Fatalf("daemon-b's view of the lost host's run: %+v, %v", adopted, err)
 	}
 	ref, _ := b.service.Ref(adopted.Remote.Snapshot)
-	start = time.Now()
-	if err := b.service.Ensure(ctx, ref); err != nil {
-		t.Fatalf("restore: %v\n%s", err, b.logs.String())
-	}
-	restoreTook := time.Since(start)
 	// Whether the base image is fetched too depends on who won the race:
 	// the winner restored the raced run, base image and all, and a base
 	// image that was received stays.
@@ -484,7 +512,17 @@ func TestVMOffHost(t *testing.T) {
 	hasBase := func() bool {
 		return slices.Contains(poolListing(t, configB.Pool), thisBase)
 	}
+	// Asked before the restore: after it the base image is always here,
+	// and a restore that fetched it would be reported without it.
 	withBase := !hasBase()
+	start = time.Now()
+	if err := b.service.Ensure(ctx, ref); err != nil {
+		t.Fatalf("restore: %v\n%s", err, b.logs.String())
+	}
+	restoreTook := time.Since(start)
+	if !hasBase() {
+		t.Fatal("the restore left no base image on daemon-b")
+	}
 	restored := fullStored + incrementalStored
 	if withBase {
 		restored += baseBytes
@@ -667,6 +705,51 @@ func TestVMOffHost(t *testing.T) {
 	}
 }
 
+// removeCgroupTree removes a cgroup and every cgroup under it, deepest
+// first. A cgroup that still holds a process stays, and is named.
+func removeCgroupTree(t *testing.T, root string) {
+	t.Helper()
+	var dirs []string
+	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err == nil && entry.IsDir() {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := syscall.Rmdir(dirs[i]); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			t.Logf("cgroup %s stays: %v", dirs[i], err)
+		}
+	}
+}
+
+// snapshotObjects is a snapshot's own objects, its manifest and chunks:
+// not the pins every check of it writes beside them, nor a condemned
+// copy (the two-phase delete, 2026-11-21). A rotation pins each snapshot
+// it reads.
+func snapshotObjects(objects []s3.Object) []s3.Object {
+	var own []s3.Object
+	for _, object := range objects {
+		if !strings.Contains(object.Key, "/pin/") && !strings.HasSuffix(object.Key, "/condemned") {
+			own = append(own, object)
+		}
+	}
+	return own
+}
+
+// countBeside counts a snapshot's marker objects that are not the
+// snapshot itself: the pins and condemned copies the machinery writes
+// beside it.
+func countBeside(objects []s3.Object, marker string) int {
+	count := 0
+	for _, object := range objects {
+		if strings.Contains(object.Key, marker) {
+			count++
+		}
+	}
+	return count
+}
+
 func sizeOf(objects []s3.Object) int64 {
 	var total int64
 	for _, object := range objects {
@@ -726,6 +809,7 @@ func TestVMKeyRotation(t *testing.T) {
 	configB.Warm = vm.WarmConfig{}
 	newVMManager(t, configB, t.TempDir())
 	configA := offHostPoolA(t, configB)
+	standingPoolAsFound(t, configB.Pool, thisTestsBase(t, configB, configA))
 
 	a := startOffHostDaemon(t, "rot-a", configA, objects, prefix, oldMaster, nil, nil)
 	limits := &run.Limits{MemoryMB: 1024, CPUs: 1}
@@ -737,10 +821,13 @@ func TestVMKeyRotation(t *testing.T) {
 	want := a.digest(t, created.ID)
 	stopped := a.stopDurable(t, created.ID)
 	snapshot := stopped.Remote.Snapshot
-	before := keysUnder("v1/snap/" + snapshot + "/")
+	// The snapshot's own objects: the upload's pins beside them are not
+	// the snapshot, and the rotation adds one of its own.
+	before := snapshotObjects(keysUnder("v1/snap/" + snapshot + "/"))
 	if len(before) < 3 {
 		t.Fatalf("the snapshot is %d objects", len(before))
 	}
+	pinsBefore := countBeside(keysUnder("v1/snap/"+snapshot+"/"), "/pin/")
 	// The run stays stopped and durable: closing the daemon leaves its
 	// record exactly as rotation must find it.
 	if err := a.driver.Close(ctx); err != nil {
@@ -764,7 +851,7 @@ func TestVMKeyRotation(t *testing.T) {
 		t.Fatalf("one pass rewrapped the stop snapshot, the base image and the record: %+v", stats)
 	}
 	t.Logf("rotation pass: %+v in %s", stats, time.Since(start).Round(time.Millisecond))
-	after := keysUnder("v1/snap/" + snapshot + "/")
+	after := snapshotObjects(keysUnder("v1/snap/" + snapshot + "/"))
 	if len(after) != len(before) {
 		t.Fatalf("the rotation moved objects: %d before, %d after", len(before), len(after))
 	}
@@ -772,6 +859,21 @@ func TestVMKeyRotation(t *testing.T) {
 		if before[i].Key != after[i].Key || (before[i].Size != after[i].Size && !strings.HasSuffix(before[i].Key, "manifest")) {
 			t.Fatalf("the rotation changed %s", before[i].Key)
 		}
+		// Chunk keys are positional, not content-addressed, and
+		// encryption preserves length: a rewrite in place under the same
+		// keys would pass every count. The service's ETag is the body's
+		// digest, and no byte of a chunk may change.
+		if !strings.HasSuffix(before[i].Key, "manifest") && before[i].ETag != after[i].ETag {
+			t.Fatalf("the rotation rewrote %s in place (etag %q -> %q)", before[i].Key, before[i].ETag, after[i].ETag)
+		}
+	}
+	// And nothing the counts cannot see: a two-phase marker under this
+	// snapshot, or more pins than the pass's own one beside the upload's.
+	if condemned := countBeside(keysUnder("v1/snap/"+snapshot+"/"), "/condemned"); condemned != 0 {
+		t.Fatalf("the pass left %d condemned copies under the snapshot", condemned)
+	}
+	if pins := countBeside(keysUnder("v1/snap/"+snapshot+"/"), "/pin/"); pins > pinsBefore+1 {
+		t.Fatalf("the pass left %d pins beside the snapshot's %d", pins, pinsBefore)
 	}
 
 	// The old master is gone for good: a daemon given only the new one
@@ -781,7 +883,16 @@ func TestVMKeyRotation(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := startOffHostDaemon(t, "rot-c", configB, objects, prefix, newMaster, nil, nil)
-	defer c.driver.Close(context.Background())
+	defer func() {
+		for _, current := range c.manager.List() {
+			_ = c.manager.Destroy(context.Background(), current.ID)
+		}
+		// The base image the resume received, which nothing holds now.
+		if err := c.driver.Transfer().Reclaim(context.Background()); err != nil {
+			t.Errorf("reclaim the received base image: %v", err)
+		}
+		_ = c.driver.Close(context.Background())
+	}()
 	if _, err := c.manager.SyncRemote(ctx); err != nil {
 		t.Fatalf("sync: %v\n%s", err, c.logs.String())
 	}
@@ -795,7 +906,6 @@ func TestVMKeyRotation(t *testing.T) {
 		t.Fatalf("the resumed run's bytes differ: %s != %s", got, want)
 	}
 	t.Logf("resume from the bucket under the new master only: %s", took.Round(time.Millisecond))
-	_ = c.manager.Destroy(ctx, resumed.ID)
 }
 
 // A caller snapshot is durable, listed, bootable from its universal ID on
@@ -845,6 +955,7 @@ func TestVMCallerSnapshots(t *testing.T) {
 	configB.Warm = vm.WarmConfig{}
 	newVMManager(t, configB, t.TempDir())
 	configA := offHostPoolA(t, configB)
+	standingPoolAsFound(t, configB.Pool, thisTestsBase(t, configB, configA))
 
 	a := startOffHostDaemon(t, "snap-a", configA, objects, prefix, master, nil, nil)
 	defer func() {
@@ -882,6 +993,11 @@ func TestVMCallerSnapshots(t *testing.T) {
 	defer func() {
 		for _, current := range b.manager.List() {
 			_ = b.manager.Destroy(context.Background(), current.ID)
+		}
+		// The base image the boot from the snapshot received, which
+		// nothing holds now.
+		if err := b.driver.Transfer().Reclaim(context.Background()); err != nil {
+			t.Errorf("reclaim the received base image: %v", err)
 		}
 		_ = b.driver.Close(context.Background())
 	}()

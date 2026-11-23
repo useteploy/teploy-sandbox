@@ -192,7 +192,21 @@ func TestVMUsage(t *testing.T) {
 	before := sample("idle")
 	// CPU, disk and some traffic to the run's proxy.
 	vmRun(t, manager, created.ID, "dd if=/dev/zero of=/dev/null bs=1M count=4000; dd if=/dev/urandom of=/work/blob bs=1M count=64; sync; wget -q -T 5 -O /dev/null \"$HTTP_PROXY\" || true", "", nil, 5*time.Minute)
-	busy := sample("busy")
+	// ZFS's `used` does not include the current transaction group's
+	// dirty data: the guest's sync flushes to the volume, and the
+	// accounting catches it at the next txg (the default timeout is
+	// five seconds). Sample until it has — or decide it never will.
+	var busy run.RunUsage
+	for try := 0; ; try++ {
+		busy = sample("busy")
+		if try == 0 && busy.DiskBytes != nil && before.DiskBytes != nil && *busy.DiskBytes >= *before.DiskBytes+32<<20 {
+			break
+		}
+		if try >= 8 {
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
 	if *busy.CPUSeconds <= *before.CPUSeconds || *busy.DiskBytes < *before.DiskBytes+32<<20 || *busy.TxBytes <= *before.TxBytes {
 		t.Fatalf("did not grow (want more CPU and tx, and at least 32 MiB more disk): before %s; busy %s", show(before), show(busy))
 	}

@@ -335,11 +335,20 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rc := http.NewResponseController(w)
+	// ended is set once this handler's own copy loop is done: after it,
+	// no write will come, and returning sends the response's END_STREAM.
+	// A write deadline set before that return kills the final frames of
+	// a response that already arrived whole (found by the first live
+	// run: the body came through, then the stream reset with
+	// INTERNAL_ERROR). An external close still sets both deadlines.
+	var ended bool
 	if !stream.OnClose(func() {
 		_ = guestConn.Close()
 		now := time.Now()
 		_ = rc.SetReadDeadline(now)
-		_ = rc.SetWriteDeadline(now)
+		if !ended {
+			_ = rc.SetWriteDeadline(now)
+		}
 	}) {
 		_ = guestConn.Close()
 		reason := stream.Reason()
@@ -414,9 +423,10 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	// Closing sets the request's read deadline, which ends the other
-	// direction's read; the handler does not return while it still uses
-	// the request.
+	// The response is written; returning ends the stream cleanly. Closing
+	// still runs the bookkeeping (and ends the other direction's read
+	// through the read deadline) — only the write deadline is stood down.
+	ended = true
 	stream.Close("")
 	<-upDone
 }

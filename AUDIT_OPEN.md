@@ -3949,3 +3949,32 @@ daemon sharing a bucket must run a version that knows the access
 fields.** An older daemon resuming and stopping such a run drops them
 from its next record, and an epoch pushed past `now` by repeated
 same-second revokes can come back short until the next move or revoke.
+
+## 2026-11-23 — access and usage: the first live run of the access suite
+
+The merged access daemon (PR #9) and the usage fixes (PR #10) ran live
+for the first time (nested arm64, the rebuilt golden with the protocol
+v2 agent; 38 tests passed, three failed, one of them the source-needing
+CI test run outside a checkout). Two real findings, both fixed:
+
+- **A completed response's stream ended in a reset.** The stream's
+  close callback set the response's WRITE deadline as well as its read
+  one, and the handler called it before returning — killing the final
+  frames of a response whose body had already arrived whole (the client
+  saw INTERNAL_ERROR after every byte, on a clean transfer). The
+  handler now stands the write deadline down once its own copy loop is
+  done; an external close (revoke, stop, expiry) still sets both.
+- **Per-run disk usage lagged a transaction group.** The guest's
+  `sync` flushes to the volume, the data IS on the ZFS dataset (a
+  mid-run snapshot carries it; a direct read back through the guest
+  round-trips), but `used` does not include the current txg's dirty
+  data, so a sample taken in the same ~5 s window reads the old
+  figure. The slow x86-64 host the suite last passed on hid this — a
+  txg always synced between the write and the sample there. The test
+  now samples until the accounting settles (bounded); the semantics
+  are ZFS's, not a defect: per-run disk is current only as of the last
+  transaction group.
+
+The source-needing `TestCIStepsThatPipeFailWithTheirTests` failed only
+because the binary ran outside a checkout; the live pattern now used
+excludes it.

@@ -3978,3 +3978,20 @@ CI test run outside a checkout). Two real findings, both fixed:
 The source-needing `TestCIStepsThatPipeFailWithTheirTests` failed only
 because the binary ran outside a checkout; the live pattern now used
 excludes it.
+
+## 2026-11-23 — the merged access and usage fixes: whole suite green, pool off and on
+
+With PR #11's three fixes (the clean stream end, the transaction-group
+wait, the counter-normalized host-state check), the whole live suite
+ran green on the merged `main` (`d5558cb`) twice over: pool off
+(23/23) and pool on with the small warm pool this 8 GiB nested host
+carries (23/23). This closes the loop the previous entry opened: the
+access daemon, the usage sampling and the none-tier reachability have
+now all run against a real hypervisor, and the register's open item
+from the access review — "nothing has run live" — is no longer true.
+The pool-on gap that remained from 2026-11-17/18 (the three S3 tests
+on a starved host) is closed with them.
+
+Still open, unchanged: x86-64 and bare metal beyond the one
+below-spec laptop pass (the rented box's job); a second physical
+host; `SBX_TEST_RUNTIME=runsc`; and the A5/A6 follow-ons.

@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -151,7 +152,7 @@ func TestVMRecoverableExecs(t *testing.T) {
 }
 
 // TestVMUsage: CPU, network and disk observations of a real VM, and that
-// the counters keep growing across a stop and resume. Not run live yet.
+// the counters keep growing across a stop and resume.
 func TestVMUsage(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Fatal("the vm suite needs root (zfs, /dev/kvm)")
@@ -167,9 +168,12 @@ func TestVMUsage(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = manager.Destroy(context.Background(), created.ID) })
 
+	// Every sample reads disk: the ticker's rounds read it only on the
+	// first and every tenth, so the second plain round would carry the
+	// first one's disk figure and the check below could never pass.
 	sample := func(what string) run.RunUsage {
 		t.Helper()
-		manager.SampleUsage(ctx)
+		manager.SampleUsageWithDisk(ctx)
 		got, err := manager.Get(created.ID)
 		if err != nil {
 			t.Fatal(err)
@@ -181,21 +185,25 @@ func TestVMUsage(t *testing.T) {
 		}
 		return u
 	}
+	// The values, not the pointers that hold them.
+	show := func(u run.RunUsage) string {
+		return fmt.Sprintf("cpu %.2fs rx %d tx %d disk %d", *u.CPUSeconds, *u.RxBytes, *u.TxBytes, *u.DiskBytes)
+	}
 	before := sample("idle")
 	// CPU, disk and some traffic to the run's proxy.
 	vmRun(t, manager, created.ID, "dd if=/dev/zero of=/dev/null bs=1M count=4000; dd if=/dev/urandom of=/work/blob bs=1M count=64; sync; wget -q -T 5 -O /dev/null \"$HTTP_PROXY\" || true", "", nil, 5*time.Minute)
 	busy := sample("busy")
 	if *busy.CPUSeconds <= *before.CPUSeconds || *busy.DiskBytes < *before.DiskBytes+32<<20 || *busy.TxBytes <= *before.TxBytes {
-		t.Fatalf("did not grow: before %+v busy %+v", before, busy)
+		t.Fatalf("did not grow (want more CPU and tx, and at least 32 MiB more disk): before %s; busy %s", show(before), show(busy))
 	}
-	t.Logf("cpu %.2fs rx %d tx %d disk %d", *busy.CPUSeconds, *busy.RxBytes, *busy.TxBytes, *busy.DiskBytes)
+	t.Logf("before %s; busy %s", show(before), show(busy))
 
 	if _, err := manager.Stop(ctx, created.ID); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
 	stopped, _ := manager.Get(created.ID)
 	if *stopped.Usage.CPUSeconds < *busy.CPUSeconds || *stopped.Usage.TxBytes < *busy.TxBytes {
-		t.Fatalf("the stop lost usage: busy %+v stopped %+v", busy, stopped.Usage)
+		t.Fatalf("the stop lost usage: busy %s; stopped cpu %.2fs tx %d", show(busy), *stopped.Usage.CPUSeconds, *stopped.Usage.TxBytes)
 	}
 	if _, err := manager.Resume(ctx, created.ID, 0); err != nil {
 		t.Fatalf("resume: %v", err)
@@ -203,6 +211,6 @@ func TestVMUsage(t *testing.T) {
 	vmRun(t, manager, created.ID, "dd if=/dev/zero of=/dev/null bs=1M count=1000", "", nil, 5*time.Minute)
 	resumed := sample("resumed")
 	if *resumed.CPUSeconds <= *stopped.Usage.CPUSeconds || *resumed.TxBytes < *stopped.Usage.TxBytes || *resumed.RxBytes < *stopped.Usage.RxBytes {
-		t.Fatalf("counters went back across a resume: stopped %+v resumed %+v", stopped.Usage, resumed)
+		t.Fatalf("counters went back across a resume: stopped cpu %.2fs rx %d tx %d; resumed %s", *stopped.Usage.CPUSeconds, *stopped.Usage.RxBytes, *stopped.Usage.TxBytes, show(resumed))
 	}
 }

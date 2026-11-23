@@ -55,6 +55,10 @@ func seccompCall(arch, nr uint32, args ...uint64) [seccompDataSize]byte {
 	return data
 }
 
+// prSetNoNewPrivsOption is PR_SET_NO_NEW_PRIVS, which the jail helper
+// itself makes (the helper's constant is in a Linux-only file).
+const prSetNoNewPrivsOption = 38
+
 const (
 	answerAllow  = seccompAllow
 	answerEPERM  = seccompErrno | errnoEPERM
@@ -221,6 +225,26 @@ func TestSeccompFilterOnBothArchitectures(t *testing.T) {
 				for family, value := range families {
 					check(call.name+"("+family+")", answerEPERM, seccompCall(arch.audit, call.nr, value, 1, 0))
 				}
+			}
+
+			// KSM: refused for the one request each, allowed for the
+			// rest, which the hypervisor makes.
+			const prGetMemoryMerge, prSetName = 68, 15
+			check("prctl(PR_SET_MEMORY_MERGE, 1)", answerEPERM, seccompCall(arch.audit, arch.prctl, prSetMemoryMergeOption, 1))
+			check("prctl(PR_SET_MEMORY_MERGE, 0)", answerEPERM, seccompCall(arch.audit, arch.prctl, prSetMemoryMergeOption, 0))
+			check("prctl(PR_SET_MEMORY_MERGE) with high bits", answerEPERM, seccompCall(arch.audit, arch.prctl, 0xffffffff<<32|prSetMemoryMergeOption, 1))
+			check("prctl(PR_GET_MEMORY_MERGE)", answerAllow, seccompCall(arch.audit, arch.prctl, prGetMemoryMerge))
+			check("prctl(PR_SET_NAME)", answerAllow, seccompCall(arch.audit, arch.prctl, prSetName, 0x1000))
+			check("prctl(PR_SET_NO_NEW_PRIVS)", answerAllow, seccompCall(arch.audit, arch.prctl, prSetNoNewPrivsOption, 1))
+			check("madvise(MADV_MERGEABLE)", answerEPERM, seccompCall(arch.audit, arch.madvise, 0x7f0000000000, 1<<20, madvMergeable))
+			check("madvise(MADV_MERGEABLE) with high bits", answerEPERM, seccompCall(arch.audit, arch.madvise, 0x7f0000000000, 1<<20, 0xffffffff<<32|madvMergeable))
+			for name, advice := range map[string]uint64{"MADV_DONTNEED": 4, "MADV_REMOVE": 9, "MADV_UNMERGEABLE": 13, "MADV_HUGEPAGE": 14, "MADV_DONTDUMP": 16, "MADV_FREE": 8} {
+				check("madvise("+name+")", answerAllow, seccompCall(arch.audit, arch.madvise, 0x7f0000000000, 1<<20, advice))
+			}
+			// The length is not the advice: a range of 12 bytes is fine.
+			check("madvise of 12 bytes", answerAllow, seccompCall(arch.audit, arch.madvise, 0x7f0000000000, madvMergeable, 4))
+			if arch.prctl != seccompNeeded[goarch]["prctl"] || arch.madvise != seccompNeeded[goarch]["madvise"] {
+				t.Errorf("prctl %d and madvise %d, the table of needed calls has %d and %d", arch.prctl, arch.madvise, seccompNeeded[goarch]["prctl"], seccompNeeded[goarch]["madvise"])
 			}
 
 			// Another architecture's table: not judged, killed. The

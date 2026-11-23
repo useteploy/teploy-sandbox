@@ -970,7 +970,9 @@ sleep 1`, nicA.dev, nicA.gatewayMAC, peerAddr, peerUDP, nicA.mac, nicA.addr, nic
 		count := 0
 		for _, line := range strings.Split(logs.String(), "\n") {
 			if r.ns == "" {
-				if strings.Contains(line, "the vm firewall table was removed by something else") || strings.Contains(line, "the vm firewall table was changed by something else") {
+				// Bound to this daemon's table: a listing error alone also
+				// logs "was changed", and must not count as damage.
+				if (strings.Contains(line, "the vm firewall table was removed by something else") || strings.Contains(line, "the vm firewall table was changed by something else")) && strings.Contains(line, "table="+namesFor(config).table) {
 					count++
 				}
 			} else if strings.Contains(line, "a run's ruleset was removed or changed by something else") && strings.Contains(line, "namespace="+r.ns+" ") {

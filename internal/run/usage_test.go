@@ -285,8 +285,12 @@ func TestUsageSamplingCadenceAndParallelism(t *testing.T) {
 	if fmt.Sprint(rt.disks) != fmt.Sprint(want) {
 		t.Fatalf("with a forced disk round, disk asked %v, want %v", rt.disks, want)
 	}
-	// With sampling off it is a no-op, as SampleUsage is.
+	// With sampling off it is a no-op, as SampleUsage is — checked on a
+	// run this manager owns, so there is something to wrongly sample.
 	off := NewManager(rt, testLogger())
+	if _, err := off.Create(ctx, CreateRequest{Image: "x"}); err != nil {
+		t.Fatal(err)
+	}
 	off.SampleUsageWithDisk(ctx)
 	if len(rt.disks) != len(want) {
 		t.Fatalf("sampled with sampling off: %v", rt.disks)

@@ -737,6 +737,19 @@ func snapshotObjects(objects []s3.Object) []s3.Object {
 	return own
 }
 
+// countBeside counts a snapshot's marker objects that are not the
+// snapshot itself: the pins and condemned copies the machinery writes
+// beside it.
+func countBeside(objects []s3.Object, marker string) int {
+	count := 0
+	for _, object := range objects {
+		if strings.Contains(object.Key, marker) {
+			count++
+		}
+	}
+	return count
+}
+
 func sizeOf(objects []s3.Object) int64 {
 	var total int64
 	for _, object := range objects {
@@ -814,6 +827,7 @@ func TestVMKeyRotation(t *testing.T) {
 	if len(before) < 3 {
 		t.Fatalf("the snapshot is %d objects", len(before))
 	}
+	pinsBefore := countBeside(keysUnder("v1/snap/"+snapshot+"/"), "/pin/")
 	// The run stays stopped and durable: closing the daemon leaves its
 	// record exactly as rotation must find it.
 	if err := a.driver.Close(ctx); err != nil {
@@ -845,6 +859,21 @@ func TestVMKeyRotation(t *testing.T) {
 		if before[i].Key != after[i].Key || (before[i].Size != after[i].Size && !strings.HasSuffix(before[i].Key, "manifest")) {
 			t.Fatalf("the rotation changed %s", before[i].Key)
 		}
+		// Chunk keys are positional, not content-addressed, and
+		// encryption preserves length: a rewrite in place under the same
+		// keys would pass every count. The service's ETag is the body's
+		// digest, and no byte of a chunk may change.
+		if !strings.HasSuffix(before[i].Key, "manifest") && before[i].ETag != after[i].ETag {
+			t.Fatalf("the rotation rewrote %s in place (etag %q -> %q)", before[i].Key, before[i].ETag, after[i].ETag)
+		}
+	}
+	// And nothing the counts cannot see: a two-phase marker under this
+	// snapshot, or more pins than the pass's own one beside the upload's.
+	if condemned := countBeside(keysUnder("v1/snap/"+snapshot+"/"), "/condemned"); condemned != 0 {
+		t.Fatalf("the pass left %d condemned copies under the snapshot", condemned)
+	}
+	if pins := countBeside(keysUnder("v1/snap/"+snapshot+"/"), "/pin/"); pins > pinsBefore+1 {
+		t.Fatalf("the pass left %d pins beside the snapshot's %d", pins, pinsBefore)
 	}
 
 	// The old master is gone for good: a daemon given only the new one

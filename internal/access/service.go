@@ -138,6 +138,11 @@ func (s *Service) Serve(ctx context.Context, ln net.Listener, unencryptedHTTP2 b
 	go func() { errCh <- server.Serve(ln) }()
 	select {
 	case err := <-errCh:
+		// The listener is gone: nothing new can come, and what stands
+		// must not linger to its grants' expiry pretending to be served.
+		s.Registry.CloseAll("listener-failed")
+		s.Registry.ListenerFailed()
+		s.Log.Error("the access listener failed; its streams are closed and new ones are refused until a restart", "error", err)
 		return err
 	case <-ctx.Done():
 	}
@@ -235,6 +240,14 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "bad-request", "port must be 1-65535.")
 		return
 	}
+	// The denylist is checked at the handshake; this second look closes
+	// the window for a connection that was admitted before its edge was
+	// denylisted (it takes effect at the next handshake, and until
+	// reconnect at the next stream).
+	if s.Store.Denied(info.peer) {
+		writeProblem(w, http.StatusForbidden, "edge-denied", "The edge this connection belongs to is denylisted.")
+		return
+	}
 	request := SanitizeRequestID(r.Header.Get(HeaderRequest))
 	grants := r.Header.Values(HeaderGrant)
 	if len(grants) > 1 {
@@ -259,10 +272,6 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !info.bind(id) {
-		writeProblem(w, http.StatusMisdirectedRequest, "wrong-connection", "This connection serves another run; open one per run.")
-		return
-	}
 	stream, err := s.Registry.Admit(id, KindConnect, port, anon, info.peer, claims.Jti, request)
 	switch {
 	case errors.Is(err, ErrRunStreams):
@@ -281,6 +290,8 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 	target, err := s.Manager.AccessAdmit(id, port)
 	switch {
 	case errors.Is(err, run.ErrNotFound):
+		// Refused for a run that is not here: binding now would pin this
+		// connection to an ID it never served.
 		writeProblem(w, http.StatusNotFound, "not-here", "No such run on this daemon.")
 		return
 	case errors.Is(err, run.ErrStopped):
@@ -288,6 +299,10 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	case err != nil:
 		writeProblem(w, http.StatusServiceUnavailable, "at-capacity", "The run cannot take access streams now.")
+		return
+	}
+	if !info.bind(id) {
+		writeProblem(w, http.StatusMisdirectedRequest, "wrong-connection", "This connection serves another run; open one per run.")
 		return
 	}
 	if !anon && claims.Ep < target.Epoch {

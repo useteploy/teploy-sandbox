@@ -17,6 +17,9 @@ type ConfigView struct {
 	Listener      string   `json:"listener"`
 	Enabled       bool     `json:"enabled"`
 	ManagedByFile bool     `json:"managedByFile"`
+
+	// ListenerDown: the listener died and nothing is served until a restart.
+	ListenerDown bool `json:"listenerDown,omitempty"`
 }
 
 // View is the configuration as GET /v1/access/config answers it.
@@ -25,6 +28,12 @@ func (c *Control) View() ConfigView {
 	kids := make([]string, 0, len(config.IssuerKeys))
 	for _, key := range config.IssuerKeys {
 		kids = append(kids, key.Kid)
+	}
+	if c.Registry.ListenerDown() {
+		return ConfigView{
+			Audience: config.Audience, Kids: kids, EdgeDenylist: config.EdgeDenylist,
+			Listener: c.Listener, Enabled: false, ListenerDown: true, ManagedByFile: c.Store.ManagedByFile(),
+		}
 	}
 	return ConfigView{
 		Audience: config.Audience, Kids: kids, EdgeDenylist: config.EdgeDenylist,

@@ -54,3 +54,19 @@ func TestAccessFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestAccessFlagsRefuseTheFootGuns(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for name, args := range map[string][]string{
+		"unspecified bind": {"--access-addr", "0.0.0.0:7448", "--access-tls-cert", "c", "--access-tls-key", "k", "--access-client-ca", "a"},
+		"unspecified ipv6": {"--access-addr", "[::]:7448", "--access-tls-cert", "c", "--access-tls-key", "k", "--access-client-ca", "a"},
+		"negative anon":    {"--access-addr", "127.0.0.1:7448", "--access-anon-mbit", "-5"},
+		"negative total":   {"--access-addr", "127.0.0.1:7448", "--access-total-mbit", "-5"},
+		"mbit below -1":    {"--access-addr", "127.0.0.1:7448", "--access-mbit", "-2"},
+	} {
+		m := run.NewManager(nil, log)
+		if _, err := parseAccessFlags(t, args...).prepare(driverDocker, 0, 0, "", m, log); err == nil || !strings.Contains(err.Error(), "access-") {
+			t.Errorf("%s: refused with %v, want an access flag error", name, err)
+		}
+	}
+}

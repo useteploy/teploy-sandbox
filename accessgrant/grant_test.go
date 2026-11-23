@@ -285,13 +285,17 @@ func TestPermitsTable(t *testing.T) {
 		// SSH forward
 		{[]string{"ssh", "tcp:*"}, cnf, false, UseSSHForward, 5432, true},
 		{[]string{"tcp:5432"}, cnf, false, UseSSHForward, 5432, true},
+		// A cnf-bound grant is only good where the key is checked: never
+		// at the daemon's own connect, which has no key authentication.
+		{[]string{"tcp:5432"}, cnf, false, UseDaemonConnect, 5432, false},
+		{[]string{"http:5432"}, cnf, false, UseDaemonConnect, 5432, false},
 		{[]string{"tcp:5432"}, cnf, false, UseSSHForward, 5433, false},
 		{[]string{"http:*"}, cnf, false, UseSSHForward, 5432, false},
 		{[]string{"tcp:*"}, "", false, UseSSHForward, 5432, false},
 		// daemon connect
 		{[]string{"http:3000"}, "", false, UseDaemonConnect, 3000, true},
 		{[]string{"http:*"}, "", false, UseDaemonConnect, 3000, true},
-		{[]string{"tcp:5432"}, cnf, false, UseDaemonConnect, 5432, true},
+		{[]string{"tcp:5432"}, cnf, false, UseDaemonConnect, 5432, false}, // never at the daemon: no key is checked there
 		{[]string{"tcp:5432"}, cnf, false, UseDaemonConnect, 3000, false},
 		{[]string{"ssh"}, cnf, false, UseDaemonConnect, 3000, false}, // ssh alone
 		{[]string{"http:3000"}, "", false, UseDaemonConnect, 0, false},

@@ -180,7 +180,12 @@ func (c Claims) Permits(use Use, port int) bool {
 	case UseSSHForward:
 		return c.Cnf != "" && covers(kindTCP)
 	case UseDaemonConnect:
-		return covers(kindHTTP) || covers(kindTCP)
+		// A cnf-bound grant is only good on an SSH connection
+		// authenticated by that key; at the daemon's connect there is no
+		// key authentication (the unix path has none at all), so it must
+		// not act as a bearer token here. An edge relaying a user's -L
+		// forward obtains its own grant without cnf.
+		return c.Cnf == "" && (covers(kindHTTP) || covers(kindTCP))
 	case UseDaemonSession:
 		return has(kindSSH)
 	}

@@ -19,6 +19,19 @@ func FuzzVerify(f *testing.F) {
 	f.Add("tsg1..", []byte(`{"v":1,"kid":"k1","kid":"k1"}`))
 	f.Add(strings.TrimSuffix(good, "A"), []byte(`{"v":1,"kid":"k1","iss":"x","aud":"usercontent.example.com","run":"01JD8X3Y4Z5A6B7C8D9E0F1G2H","scp":["ssh","tcp:*"],"ep":1,"iat":1764000000,"exp":1764000060,"jti":"a"}`))
 	f.Add("tsg1.e30.AAAA", []byte(`{"v":1,"kid":"k1","iss":"x","aud":"usercontent.example.com","run":"01JD8X3Y4Z5A6B7C8D9E0F1G2H","scp":["http:1"],"ep":0,"iat":1763999990,"exp":1764000060,"jti":"a","own":true,"ref":"b"}`))
+	// Seeds for every refusal class the verifier has: a token that
+	// verifies must never come from these, and the accept path must not
+	// drift open on any of them.
+	f.Add("tsg1.", []byte(`{}`))
+	f.Add(strings.Repeat("A", 64), []byte(`{"v":1,"kid":"k1"}`))
+	f.Add("tsg1."+strings.Repeat("A", 43)+"."+strings.Repeat("B", 86), []byte(`{"v":1,"kid":"k1","kid":"k\\u0031"}`))
+	f.Add(good[:strings.IndexByte(good, '.')+1]+"AAAA", []byte(`{"v":1,"kid":"other","scp":["http:1"]}`))
+	f.Add(good, []byte(`{"v":1,"kid":"k1","ep":1.5}`))
+	f.Add(good, []byte(`{"v":1,"kid":"k1","scp":["http:01"]}`))
+	f.Add(good, []byte(`{"v":1,"kid":"k1","scp":["tcp:0"]}`))
+	f.Add(good, []byte(`{"v":1,"kid":"k1","scp":["http:*"],"cnf":"does-not-matter"}`))
+	f.Add(good, []byte(`{"v":1,"kid":"k1","run":"not-a-ulid-at-all-0123456"}`))
+	f.Add(good, []byte(`{"v":1,"kid":"k1","jti":""}`))
 	f.Fuzz(func(t *testing.T, token string, payload []byte) {
 		if claims, err := ring.Verify(token, testAud, testNow, 0); err == nil {
 			if err := claims.check(); err != nil {

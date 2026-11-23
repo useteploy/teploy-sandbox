@@ -837,6 +837,16 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		m.mu.Lock()
 		live := m.runs[id]
 		live.remoteGen, live.remoteHeld, live.remoteKey = latest.Generation, false, latest.Key
+		// The record may be ahead of this daemon's view in its access
+		// fields: another daemon's revoke rewrites them into a stopped
+		// record this one still holds. Take them, or grants retired over
+		// there keep working here — and this daemon's next stop would
+		// write the old ones back.
+		var stored stateRun
+		if json.Unmarshal(latest.Payload, &stored) == nil && stored.AccessEpoch > live.accessEpoch {
+			live.accessEpoch = stored.AccessEpoch
+			live.accessPorts = stored.AccessPorts
+		}
 		setRemoteLocked(live, RemoteState{State: RemoteDurable, Snapshot: latest.SnapshotID, Local: hasLocal, DurableAt: &at})
 		released := live.base
 		live.base = ""

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -302,11 +303,26 @@ func Listen(spec ListenSpec, store *Store, perPeer int, log *slog.Logger) (net.L
 		if path == "" || !strings.HasPrefix(path, "/") {
 			return nil, false, errors.New("access-addr unix: needs an absolute path")
 		}
-		_ = os.Remove(path)
+		// A live listener already at the path is an operator error (a
+		// second daemon, the same socket); removing it blindly would
+		// steal the socket and leave both halves thinking they serve.
+		if probe, err := net.DialTimeout("unix", path, 250*time.Millisecond); err == nil {
+			probe.Close()
+			return nil, false, fmt.Errorf("access-addr unix: %s already answers; another daemon is serving it", path)
+		}
+		// The socket is 0660 from its first byte, not from a chmod after
+		// a umask-dependent window.
+		oldMask := syscall.Umask(0o077)
 		inner, err := net.Listen("unix", path)
+		syscall.Umask(oldMask)
 		if err != nil {
 			return nil, false, err
 		}
+		defer func() {
+			if err != nil {
+				_ = os.Remove(path)
+			}
+		}()
 		if err := os.Chmod(path, 0o660); err != nil {
 			inner.Close()
 			return nil, false, err

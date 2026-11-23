@@ -91,6 +91,9 @@ var (
 
 // Registry is every open access stream, by run.
 type Registry struct {
+	// failed is set when the access listener died: the control routes
+	// say so, and a probe notices instead of a page at expiry time.
+	failed atomic.Bool
 	limits Limits
 	now    func() time.Time
 	log    *slog.Logger
@@ -110,6 +113,10 @@ type runStreams struct {
 	sessions int
 	granted  *bucket
 	anonRate *bucket
+	// released is when its last stream went, when the set is empty: the
+	// entry stays so its rate buckets are not re-earned by churn, and
+	// goes after a quiet minute.
+	released time.Time
 }
 
 // NewRegistry is an empty registry.
@@ -169,6 +176,13 @@ func (r *Registry) Admit(run string, kind Kind, port int, anon bool, edge, jti, 
 		return nil, ErrAtCapacity
 	}
 	streams := r.runs[run]
+	if streams != nil && len(streams.streams) == 0 && !streams.released.IsZero() && r.now().Sub(streams.released) > time.Minute {
+		// Idle a while: the entry's place in the rate buckets is spent,
+		// and a new stream must not re-earn the burst by waiting out a
+		// quiet minute between blasts.
+		delete(r.runs, run)
+		streams = nil
+	}
 	if streams == nil {
 		streams = &runStreams{
 			streams:  map[*Stream]struct{}{},
@@ -331,7 +345,10 @@ func (s *Stream) Release() {
 			}
 		}
 		if len(streams.streams) == 0 {
-			delete(r.runs, s.Run)
+			// Kept, not deleted: the buckets age out in Admit, so a
+			// stream that churns (open, blast, close, reopen) does not
+			// re-earn its burst each time.
+			streams.released = r.now()
 		}
 	}
 	r.mu.Unlock()
@@ -393,6 +410,12 @@ func (r *Registry) Count() int {
 }
 
 // CloseAll ends every stream and admits no more.
+// ListenerFailed marks the registry's listener as dead.
+func (r *Registry) ListenerFailed() { r.failed.Store(true) }
+
+// ListenerDown says the listener died and nothing is being served.
+func (r *Registry) ListenerDown() bool { return r.failed.Load() }
+
 func (r *Registry) CloseAll(reason string) {
 	r.mu.Lock()
 	r.closed = true

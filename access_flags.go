@@ -123,6 +123,20 @@ func (f *accessFlags) prepare(driver string, vmMaxRuns, vmNetMbit int, stateDir 
 	if edgeConns == 0 {
 		edgeConns = 2 * max(streamsMax/access.DefaultPerRun, 1)
 	}
+	if *f.anonMbit < 0 || *f.totalMbit < 0 {
+		return nil, fmt.Errorf("access-anon-mbit and access-total-mbit must not be negative (0 is no limit)")
+	}
+	if *f.mbit < -1 {
+		return nil, fmt.Errorf("access-mbit must be a rate, 0 for the default, or -1 for the vm driver's own")
+	}
+	if host, _, err := net.SplitHostPort(*f.addr); err == nil {
+		// A private overlay address, never a public one: the listener is
+		// for named and authenticated edges, not the internet, and an
+		// unspecified bind is a copy-paste away from exactly that.
+		if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+			return nil, fmt.Errorf("access-addr %s: an unspecified address would listen on every interface; name the overlay address the edges reach", *f.addr)
+		}
+	}
 	mbit := *f.mbit
 	if mbit < 0 {
 		mbit = 200

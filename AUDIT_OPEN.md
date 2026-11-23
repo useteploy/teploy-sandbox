@@ -3756,3 +3756,55 @@ Limits and choices a reviewer should check:
     callback and post-handshake) and fails only with both reverted.
 19. **Fuzzing**: `FuzzVerify` ran 10 minutes (10.2 M executions, no failure);
     80 corpus entries are committed under `accessgrant/testdata/fuzz`.
+
+## 2026-11-22 — access, part 1: two independent reviews, and what they changed
+
+Two reviewers who did not write the slice went through it (the grant
+crypto and protocol for one, the daemon surface and lifecycle for the
+other) before merge. The grant math, the strict decode, the epoch
+lifecycle, the off-state purity and the VM connect path held under
+every attack; the fixes below are what they found.
+
+- **A cnf-bound grant was a bearer token at the daemon's connect.**
+  `UseDaemonConnect` accepted a grant whose `cnf` binds it to an SSH
+  key nobody checks on that path — on the unix listener there is no key
+  authentication at all, so a stolen cnf-bound port-forward grant was
+  enough. The scope table now refuses `cnf` at the daemon's connect
+  (the package comment and the code agree again); an edge relaying a
+  user's `-L` forward is to obtain its own grant without `cnf` — the
+  shape A6 will build on, not a bearer-for-someone-else.
+- **A cross-daemon revoke was lost on the run's birth host.** The
+  reconcile branch for "our stop, written again by another daemon"
+  kept the local payload and never read the record's access fields, so
+  a revoke written into the stopped record by the host that adopted the
+  run did not travel: the birth host resumed with the old epoch and its
+  next stop wrote the old one back. The branch now takes the record's
+  epoch and ports when the record is ahead. Narrow crash window; the
+  off-host fakes get a test for it with the next pass.
+- **The denylist now bites per stream, not per handshake**: a connection
+  admitted before its edge was denylisted has every further stream
+  refused until it reconnects.
+- **`--access-addr` refuses the foot-gun binds**: an unspecified
+  address (every interface — a copy-paste away from the internet) is
+  refused at start, and the three rate flags refuse their negatives.
+- **A stream for a run that is not here no longer binds its
+  connection** (the 404 came after the bind, leaving a wrong-connection
+  421 for every real run that followed).
+- **The unix socket is 0660 from its first byte** (a umask guard around
+  the listen), a second daemon at the same path is refused instead of
+  blindly stealing the socket, a failed start unlinks it, and close
+  removes it.
+- **A run's rate buckets persist across stream churn** (open, blast,
+  close, reopen no longer re-earns the burst each cycle) and age out
+  after a quiet minute.
+- **A dead access listener is visible**: its streams are closed at
+  once, and the config view says `listenerDown` with `enabled: false`
+  so a probe notices instead of a page at grant expiry.
+- **The fuzz corpus carries real seeds** for every refusal class, not
+  minimized noise.
+
+Deployment rule, same as rotation's and the two-phase delete's: **every
+daemon sharing a bucket must run a version that knows the access
+fields.** An older daemon resuming and stopping such a run drops them
+from its next record, and an epoch pushed past `now` by repeated
+same-second revokes can come back short until the next move or revoke.

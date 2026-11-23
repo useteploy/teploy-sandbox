@@ -49,7 +49,7 @@ func (c *Client) open(ctx context.Context, req Request) (*call, error) {
 	// agent sees it end and kills the command it was running for it.
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	opened := &call{ctx: ctx, conn: conn, stop: stop}
-	req.V = ProtocolVersion
+	req.V = requestVersion(req.Op)
 	if err := writeJSONFrame(conn, frameRequest, req); err != nil {
 		opened.close()
 		return nil, opened.wrap(err)
@@ -224,4 +224,61 @@ func (c *Client) ReadFile(ctx context.Context, path string) ([]byte, error) {
 		data = []byte{}
 	}
 	return data, nil
+}
+
+// connectResultTimeout is ConnectResultTimeout; tests shorten it.
+var connectResultTimeout = ConnectResultTimeout
+
+// Connect opens a byte stream to a TCP port on the guest's loopback
+// (version 2). The returned connection is the stream; closing it closes
+// the guest's socket. A guest with nothing on the port is CodeRefused; an
+// agent older than version 2 is CodeUnsupportedVersion. The agent must
+// answer within ConnectResultTimeout, and its answer is read with
+// MaxV2Frame as the limit.
+func (c *Client) Connect(ctx context.Context, port int) (net.Conn, error) {
+	if port < 1 || port > 65535 {
+		return nil, fmt.Errorf("guest port %d is not 1-65535", port)
+	}
+	conn, err := c.Dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (net.Conn, error) {
+		_ = conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
+	}
+	deadline := time.Now().Add(connectResultTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stop()
+	if err := writeJSONFrame(conn, frameRequest, Request{V: requestVersion(OpConnect), Op: OpConnect, Port: port}); err != nil {
+		return fail(fmt.Errorf("guest agent connection: %w", err))
+	}
+	kind, payload, err := readFrameBounded(conn, MaxV2Frame)
+	if err != nil {
+		return fail(fmt.Errorf("guest agent connection: %w", err))
+	}
+	if kind != frameResult {
+		return fail(fmt.Errorf("guest agent sent an unexpected frame %q for a connect", kind))
+	}
+	var result Result
+	if err := json.Unmarshal(payload, &result); err != nil {
+		return fail(fmt.Errorf("guest agent result is not JSON: %w", err))
+	}
+	if result.Code != "" {
+		return fail(&Error{Code: result.Code, Message: result.Error})
+	}
+	if !stop() {
+		// The context ended as the answer arrived: the deadline it set
+		// may already be on the connection.
+		return fail(ctx.Err())
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
 }

@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,11 +49,27 @@ type Server struct {
 	// Logf, when set, receives one line per failed request.
 	Logf func(format string, args ...any)
 
+	// MaxConnects bounds the connect streams open at once (version 2);
+	// zero is DefaultMaxConnects.
+	MaxConnects int
+	// DialTCP opens a connect's socket; nil dials TCP with a
+	// ConnectResultTimeout bound. Tests substitute it.
+	DialTCP func(address string) (net.Conn, error)
+
 	// killAfter and maxFile override the TERM-to-KILL grace and the file
 	// size limit in tests.
 	killAfter time.Duration
 	maxFile   int64
+	// linger overrides pipeLinger in tests.
+	linger time.Duration
+
+	connectsMu sync.Mutex
+	connects   int
 }
+
+// DefaultMaxConnects is how many connect streams the agent keeps open at
+// once: twice the daemon's own per-run cap.
+const DefaultMaxConnects = 128
 
 func (s *Server) fileLimit() int64 {
 	if s.maxFile > 0 {
@@ -121,7 +140,18 @@ func (s stream) Write(p []byte) (int, error) {
 func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	defer conn.Close()
 	out := &frameWriter{w: conn}
-	result := s.handle(conn, out)
+	result, stream := s.handle(conn, out)
+	if stream != nil {
+		// A connect that reached its port: the result says so, and the
+		// connection becomes the stream.
+		defer stream.Close()
+		payload, err := json.Marshal(Result{V: ProtocolVersion})
+		if err != nil || out.frame(frameResult, payload) != nil {
+			return
+		}
+		s.pipe(conn, stream)
+		return
+	}
 	result.V = ProtocolVersion
 	if result.Code != "" {
 		s.logf("request failed: %s: %s", result.Code, result.Error)
@@ -137,38 +167,172 @@ func failure(code, format string, args ...any) Result {
 	return Result{Code: code, Error: fmt.Sprintf(format, args...), ExitCode: -1}
 }
 
-func (s *Server) handle(conn io.Reader, out *frameWriter) Result {
+// handle serves one request. A connect that reached its port returns the
+// guest socket instead of a result: the caller answers and pipes.
+func (s *Server) handle(conn io.Reader, out *frameWriter) (Result, net.Conn) {
 	kind, payload, err := readFrame(conn)
 	if err != nil {
-		return failure(CodeBadRequest, "read request: %v", err)
+		return failure(CodeBadRequest, "read request: %v", err), nil
 	}
 	if kind != frameRequest {
-		return failure(CodeBadRequest, "first frame must be a request, got %q", kind)
+		return failure(CodeBadRequest, "first frame must be a request, got %q", kind), nil
 	}
 	var req Request
 	if err := json.Unmarshal(payload, &req); err != nil {
-		return failure(CodeBadRequest, "request is not JSON: %v", err)
+		return failure(CodeBadRequest, "request is not JSON: %v", err), nil
 	}
-	if req.V != ProtocolVersion {
-		return failure(CodeUnsupportedVersion, "protocol version %d is not supported; this agent speaks %d", req.V, ProtocolVersion)
+	if req.V < 1 || req.V > ProtocolVersion {
+		return failure(CodeUnsupportedVersion, "protocol version %d is not supported; this agent speaks 1 to %d", req.V, ProtocolVersion), nil
+	}
+	if req.V < requestVersion(req.Op) {
+		return failure(CodeUnsupportedVersion, "op %q needs protocol version %d", req.Op, requestVersion(req.Op)), nil
 	}
 	switch req.Op {
 	case OpPing:
-		return Result{Agent: s.Agent}
+		return Result{Agent: s.Agent}, nil
 	case OpSync:
 		if err := s.sync(); err != nil {
-			return failure(CodeInternal, "sync: %v", err)
+			return failure(CodeInternal, "sync: %v", err), nil
 		}
-		return Result{}
+		return Result{}, nil
 	case OpExec:
-		return s.exec(conn, out, req)
+		return s.exec(conn, out, req), nil
 	case OpWrite:
-		return s.write(conn, req)
+		return s.write(conn, req), nil
 	case OpRead:
-		return s.read(out, req)
+		return s.read(out, req), nil
+	case OpConnect:
+		return s.connect(req)
 	default:
-		return failure(CodeBadRequest, "unknown op %q", req.Op)
+		return failure(CodeBadRequest, "unknown op %q", req.Op), nil
 	}
+}
+
+// connect dials the guest port: 127.0.0.1 first (where dev servers bind),
+// then ::1. The stream it returns holds one of MaxConnects until closed.
+func (s *Server) connect(req Request) (Result, net.Conn) {
+	if req.Port < 1 || req.Port > 65535 {
+		return failure(CodeBadRequest, "connect needs a port 1-65535, got %d", req.Port), nil
+	}
+	limit := s.MaxConnects
+	if limit <= 0 {
+		limit = DefaultMaxConnects
+	}
+	s.connectsMu.Lock()
+	if s.connects >= limit {
+		s.connectsMu.Unlock()
+		return failure(CodeBusy, "the agent has %d connects open, its limit", limit), nil
+	}
+	s.connects++
+	s.connectsMu.Unlock()
+	release := func() {
+		s.connectsMu.Lock()
+		s.connects--
+		s.connectsMu.Unlock()
+	}
+	dial := s.DialTCP
+	if dial == nil {
+		dial = func(address string) (net.Conn, error) {
+			return net.DialTimeout("tcp", address, ConnectResultTimeout/2)
+		}
+	}
+	port := strconv.Itoa(req.Port)
+	var errs []error
+	for _, host := range []string{"127.0.0.1", "::1"} {
+		socket, err := dial(net.JoinHostPort(host, port))
+		if err == nil {
+			return Result{}, &countedConn{Conn: socket, release: release}
+		}
+		errs = append(errs, err)
+	}
+	release()
+	return failure(CodeRefused, "nothing accepted a connection on guest port %d: %v", req.Port, errors.Join(errs...)), nil
+}
+
+// countedConn gives its connect slot back when closed.
+type countedConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *countedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
+func (c *countedConn) CloseWrite() error {
+	if half, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return half.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+// pipeLinger is how long the direction still open after the other ended
+// may go without moving a byte before the stream is closed: the peer it
+// reads from may never close it (a server that keeps a socket after its
+// client half-closed), and the connect slot must come back.
+const pipeLinger = 2 * time.Minute
+
+func (s *Server) lingerTime() time.Duration {
+	if s.linger > 0 {
+		return s.linger
+	}
+	return pipeLinger
+}
+
+type readDeadliner interface{ SetReadDeadline(time.Time) error }
+
+// pipe copies between the daemon's connection and the guest socket until
+// both directions end. An end of one direction is passed on as a
+// half-close where the other side can take one, and as a close where it
+// cannot; the direction left open then has pipeLinger between bytes.
+func (s *Server) pipe(conn io.ReadWriteCloser, socket net.Conn) {
+	var ended atomic.Bool
+	linger := s.lingerTime()
+	done := make(chan struct{}, 2)
+	halfClose := func(w any, closer io.Closer) {
+		if half, ok := w.(interface{ CloseWrite() error }); ok {
+			_ = half.CloseWrite()
+			return
+		}
+		_ = closer.Close()
+	}
+	direction := func(dst io.Writer, src io.Reader, other io.Reader, finish func()) {
+		buf := make([]byte, chunkSize)
+		for {
+			if ended.Load() {
+				if d, ok := src.(readDeadliner); ok {
+					_ = d.SetReadDeadline(time.Now().Add(linger))
+				}
+			}
+			n, err := src.Read(buf)
+			if n > 0 {
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		finish()
+		if !ended.Swap(true) {
+			if d, ok := other.(readDeadliner); ok {
+				_ = d.SetReadDeadline(time.Now().Add(linger))
+			}
+		} else {
+			// Both directions are over.
+			_ = conn.Close()
+			_ = socket.Close()
+		}
+		done <- struct{}{}
+	}
+	go direction(socket, conn, socket, func() { halfClose(socket, socket) })
+	go direction(conn, socket, conn, func() { halfClose(conn, conn) })
+	<-done
+	<-done
 }
 
 func (s *Server) sync() error {

@@ -135,6 +135,9 @@ func (m *Manager) remotePayloadLocked(current *Run) []byte {
 	// this daemon's copy.
 	record.Snapshot, record.Base, record.Remote = "", "", nil
 	record.RemoteGen, record.RemoteHeld, record.RemoteKey = 0, false, ""
+	// Whether the run moved is this daemon's to know; wherever the record
+	// is read it has moved.
+	record.AccessMoved = false
 	payload, err := json.Marshal(record)
 	if err != nil {
 		// A run that was built from validated parts always marshals.
@@ -614,6 +617,17 @@ func (m *Manager) adopt(ctx context.Context, record RemoteRecord, held bool) (*R
 	adopted.remoteGen = record.Generation
 	adopted.remoteHeld = held
 	adopted.remoteKey = record.Key
+	// A run read from its remote record is not this daemon continuing its
+	// own state: its next resume revokes the grants issued before it
+	// moved (access.go). With access off nothing is marked (the registry
+	// stays as it was); a run whose epoch is first set when access is
+	// turned on starts at that moment anyway.
+	if m.access != nil {
+		adopted.accessMoved = true
+		if adopted.accessEpoch == 0 {
+			adopted.accessEpoch = m.accessFloor()
+		}
+	}
 	state := RemoteState{State: RemoteDurable, Snapshot: record.SnapshotID, Local: m.hasLocal(ctx, record.Snapshot)}
 	if held {
 		state.State = RemotePending
@@ -823,6 +837,16 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		m.mu.Lock()
 		live := m.runs[id]
 		live.remoteGen, live.remoteHeld, live.remoteKey = latest.Generation, false, latest.Key
+		// The record may be ahead of this daemon's view in its access
+		// fields: another daemon's revoke rewrites them into a stopped
+		// record this one still holds. Take them, or grants retired over
+		// there keep working here — and this daemon's next stop would
+		// write the old ones back.
+		var stored stateRun
+		if json.Unmarshal(latest.Payload, &stored) == nil && stored.AccessEpoch > live.accessEpoch {
+			live.accessEpoch = stored.AccessEpoch
+			live.accessPorts = stored.AccessPorts
+		}
 		setRemoteLocked(live, RemoteState{State: RemoteDurable, Snapshot: latest.SnapshotID, Local: hasLocal, DurableAt: &at})
 		released := live.base
 		live.base = ""

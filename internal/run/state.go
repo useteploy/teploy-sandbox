@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/useteploy/teploy-sandbox/accessgrant"
 )
 
 // The durable registry: one JSON file holding what must outlive the
@@ -88,6 +90,13 @@ type stateRun struct {
 	RemoteGen  uint64       `json:"remoteGen,omitempty"`
 	RemoteHeld bool         `json:"remoteHeld,omitempty"`
 	RemoteKey  string       `json:"remoteKey,omitempty"`
+	// The run's access state (access.go). Additive, and absent unless
+	// access is on: the epoch and ports travel in the remote record too;
+	// AccessMoved never does.
+	AccessEpoch int64        `json:"accessEpoch,omitempty"`
+	AccessPorts []PortSpec   `json:"accessPorts,omitempty"`
+	AccessMoved bool         `json:"accessMoved,omitempty"`
+	AccessBytes *accessBytes `json:"accessBytes,omitempty"`
 }
 
 // LoadState points the manager at its durable registry in dir and loads
@@ -140,6 +149,10 @@ func (m *Manager) LoadState(ctx context.Context, dir string) (int, error) {
 
 	m.mu.Lock()
 	for _, run := range stopped {
+		if m.access != nil && run.accessEpoch == 0 {
+			// Stopped before access was on: it starts now.
+			run.accessEpoch = m.accessFloor()
+		}
 		m.runs[run.ID] = run
 	}
 	for id, generation := range tombstones {
@@ -295,6 +308,16 @@ func (rec stateRun) stoppedRun(owns func(ref string) bool) (*Run, error) {
 	if (rec.Warm == nil) != (rec.WarmState == nil) {
 		return nil, errors.New("warm request and warm state disagree")
 	}
+	if rec.AccessEpoch < 0 || rec.AccessEpoch > accessgrant.MaxEpoch {
+		return nil, fmt.Errorf("access epoch %d out of range", rec.AccessEpoch)
+	}
+	if err := validatePorts(rec.AccessPorts); err != nil {
+		return nil, fmt.Errorf("access ports: %w", err)
+	}
+	var bytesMoved accessBytes
+	if rec.AccessBytes != nil {
+		bytesMoved = *rec.AccessBytes
+	}
 	return &Run{
 		ID:          rec.ID,
 		Image:       rec.Image,
@@ -322,12 +345,21 @@ func (rec stateRun) stoppedRun(owns func(ref string) bool) (*Run, error) {
 		remoteGen:   rec.RemoteGen,
 		remoteHeld:  rec.RemoteHeld,
 		remoteKey:   rec.RemoteKey,
+		accessEpoch: rec.AccessEpoch,
+		accessPorts: rec.AccessPorts,
+		accessMoved: rec.AccessMoved,
+		accessBytes: bytesMoved,
 	}, nil
 }
 
 // stoppedStateRun is a stopped run as the registry file holds it.
 func stoppedStateRun(run *Run) stateRun {
 	limits := run.limits
+	var moved *accessBytes
+	if !run.accessBytes.empty() {
+		copied := run.accessBytes
+		moved = &copied
+	}
 	var usage *usageTotals
 	if !run.usageCarry.empty() {
 		carry := run.usageCarry
@@ -360,6 +392,10 @@ func stoppedStateRun(run *Run) stateRun {
 		RemoteGen:   run.remoteGen,
 		RemoteHeld:  run.remoteHeld,
 		RemoteKey:   run.remoteKey,
+		AccessEpoch: run.accessEpoch,
+		AccessPorts: run.accessPorts,
+		AccessMoved: run.accessMoved,
+		AccessBytes: moved,
 	}
 }
 

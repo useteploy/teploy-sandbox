@@ -75,7 +75,7 @@ func listenVsock(port uint32) (func() (io.ReadWriteCloser, error), error) {
 			}
 			switch acceptErr {
 			case nil:
-				return os.NewFile(uintptr(conn), "vsock-conn"), nil
+				return vsockConn{os.NewFile(uintptr(conn), "vsock-conn")}, nil
 			case syscall.EINTR, syscall.ECONNABORTED:
 				continue
 			default:
@@ -104,4 +104,21 @@ func vsockSocket() (int, error) {
 		_ = exec.Command("modprobe", "vmw_vsock_virtio_transport").Run()
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// vsockConn is an accepted vsock connection: a file that can also end its
+// sending half (shutdown(SHUT_WR)), which a connect stream passes on when
+// the guest socket stops sending.
+type vsockConn struct{ *os.File }
+
+func (c vsockConn) CloseWrite() error {
+	raw, err := c.File.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var shutErr error
+	if err := raw.Control(func(fd uintptr) { shutErr = syscall.Shutdown(int(fd), syscall.SHUT_WR) }); err != nil {
+		return err
+	}
+	return shutErr
 }

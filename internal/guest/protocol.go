@@ -13,9 +13,20 @@
 //	          for op "read": 'D' chunks
 //	          then always one 'X' JSON(Result), and the server closes
 //
-// Request.V names the protocol version. A server that does not speak it
-// answers with CodeUnsupportedVersion and its own version, so either side
-// can be upgraded first.
+// Version 2 adds op "connect" (Request.V must be 2): the agent dials
+// 127.0.0.1:<port>, then [::1]:<port>, inside the guest, answers one 'X'
+// JSON(Result) — success, or CodeRefused — and on success the connection
+// is from then on a raw byte stream to that socket, in both directions,
+// with no more frames. A half-close travels across where both ends can
+// make one. The client reads that result with MaxV2Frame as its limit,
+// allocating only what has arrived, under ConnectResultTimeout.
+//
+// Request.V names the protocol version. A server answers a version it
+// does not speak with CodeUnsupportedVersion and its own version, so
+// either side can be upgraded first. A version 2 server still answers
+// every version 1 request as before; a version 1 server refuses
+// "connect" (as a version 2 request), which the daemon reports as a guest
+// agent too old for access.
 package guest
 
 import (
@@ -24,10 +35,29 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 )
 
-// ProtocolVersion is the version this package speaks.
-const ProtocolVersion = 1
+// ProtocolVersion is the newest version this package speaks. Requests of
+// version 1 are still sent for, and answered for, every op version 1 had,
+// so a daemon with this package drives an agent built before version 2.
+const ProtocolVersion = 2
+
+// requestVersion is the version a request for op is sent as: the oldest
+// version that has the op.
+func requestVersion(op string) int {
+	if op == OpConnect {
+		return 2
+	}
+	return 1
+}
+
+// MaxV2Frame bounds a frame of a version 2 op; ConnectResultTimeout is how
+// long the agent has to answer a connect.
+const (
+	MaxV2Frame           = 64 << 10
+	ConnectResultTimeout = 5 * time.Second
+)
 
 // Port is the vsock port the agent listens on inside the guest.
 const Port = 7440
@@ -61,6 +91,8 @@ const (
 	OpWrite = "write"
 	OpRead  = "read"
 	OpSync  = "sync"
+	// OpConnect is version 2.
+	OpConnect = "connect"
 )
 
 // Request is the first frame of every connection.
@@ -77,6 +109,9 @@ type Request struct {
 
 	// write, read: an absolute path under the agent's workdir.
 	Path string `json:"path,omitempty"`
+
+	// connect: the guest TCP port, 1-65535.
+	Port int `json:"port,omitempty"`
 }
 
 // Error codes carried in Result.Code.
@@ -86,6 +121,10 @@ const (
 	CodeTooLarge           = "too_large"
 	CodeUnsupportedVersion = "unsupported_version"
 	CodeInternal           = "internal"
+	// CodeRefused: nothing accepted the connection on the guest port.
+	CodeRefused = "refused"
+	// CodeBusy: the agent has as many connects open as it allows.
+	CodeBusy = "busy"
 )
 
 // Result is the last frame of every connection.
@@ -139,6 +178,40 @@ func writeJSONFrame(w io.Writer, kind byte, value any) error {
 		return err
 	}
 	return writeFrame(w, kind, payload)
+}
+
+// readFrameBounded is readFrame for version 2 ops: at most limit bytes of
+// payload, and memory only for what has arrived, so a peer that sends a
+// header and nothing else holds no more than the header. It never reads
+// past the frame.
+func readFrameBounded(r io.Reader, limit int) (kind byte, payload []byte, err error) {
+	var header [5]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return 0, nil, err
+	}
+	size := binary.BigEndian.Uint32(header[1:5])
+	if size > uint32(limit) {
+		return 0, nil, fmt.Errorf("frame of %d bytes exceeds the %d byte limit", size, limit)
+	}
+	const step = 4 << 10
+	payload = make([]byte, 0, min(int(size), step))
+	for len(payload) < int(size) {
+		want := min(int(size)-len(payload), step)
+		if cap(payload)-len(payload) < want {
+			grown := make([]byte, len(payload), min(int(size), 2*cap(payload)+want))
+			copy(grown, payload)
+			payload = grown
+		}
+		n, err := io.ReadFull(r, payload[len(payload):len(payload)+want])
+		payload = payload[:len(payload)+n]
+		if err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return 0, nil, err
+		}
+	}
+	return header[0], payload, nil
 }
 
 func readFrame(r io.Reader) (kind byte, payload []byte, err error) {

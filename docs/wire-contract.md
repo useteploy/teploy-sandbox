@@ -90,6 +90,7 @@ Returned by create, stop, resume and fork, and in `GET /v1/runs`.
 | `warm` | object | Only with a warm volume: `{repo, booted, lockHash?, repoDir?}` |
 | `lease` | object | Only while a lease is held: `{holder, generation, expiresAt}` |
 | `remote` | object | Only with remote storage, on a stopped run: `{state, generation?, snapshot?, local, storedBytes?, uploadMs?, incremental?, durableAt?, error?}`, `state` one of `pending`, `durable`, `failed`, `superseded` |
+| `access` | object | Only when the daemon has access on (`--access-addr`): `{epoch, ports: [{port, visibility, protocol}], streams}`. See [Access](#access) |
 
 ### `usage`
 
@@ -100,6 +101,8 @@ Returned by create, stop, resume and fork, and in `GET /v1/runs`.
 | `rxBytes`, `txBytes` | int | Optional. Bytes the run received / sent on its network device. Only grow |
 | `diskBytes` | int | Optional. The latest observed size of what the run has written (Docker: the container's writable layer; VM: the volume's ZFS `used`). A level: it falls when files are deleted |
 | `sampledAt` | time | Optional. When the observations above were last taken |
+| `accessRxBytes`, `accessTxBytes` | int | Only with access on. Bytes the guest received / sent through access streams (they do not cross the run's network device, so `rxBytes`/`txBytes` do not count them). Only grow; carried across stop, resume and a daemon restart |
+| `accessAnonRxBytes`, `accessAnonTxBytes` | int | Only with access on. The part of the two above that went through streams opened without a grant (public ports) |
 
 The optional fields appear only when the daemon samples usage
 (`--usage-interval`, off by default) and the driver could read them.
@@ -133,6 +136,7 @@ resumed on another daemon from remote storage starts at zero there, as
 | `runs` | `{running, stopped, stoppedRemote?}`; `stoppedRemote` only with remote storage |
 | `allocated` | `{cpus, memoryMb}`: the limits of running runs (and of the warm pool), not measured use |
 | `warmPool` | Only with a VM warm pool: `{sizes: [{cpus, memoryMb, target, ready, booting}]}` |
+| `access` | Only with access on: `{enabled: true, streams, streamsMax}` |
 | `disk` | Optional: `{kind, name, usedBytes, freeBytes}`. `kind` `zfs-pool` (VM driver; `name` is the pool) or `docker-data-dir` (Docker; `name` is the data root's path from `docker info`, statfs'd on the daemon's own filesystem: right only for a daemon on the Docker host, wrong or absent against a remote Docker or a Docker VM). `freeBytes` is what can still be written. Absent when the probe fails or takes over 5 s |
 
 ### Runs
@@ -315,6 +319,153 @@ Limits and lifetime (constants, not configurable in this release):
 | `POST /v1/remote/collect` | 204 |
 | `POST /v1/remote/rotate` | 200 `{manifestsRewrapped, manifestsCurrent, manifestsSkipped, recordsRewrapped, recordsCurrent, recordsRunning, recordsConflicted, recordsUnfenced, recordsDestroyed, recordsRunningPrevious, recordsDestroyedPrevious, localKeysRewrapped, localKeysFailed, previousKeyNeeded, previousKeyNeededFor}` |
 | `POST /v1/remote/scrub` | 200 `{checked, notWhole, unreachable}` |
+
+## Access
+
+SSH and published ports reach runs through an **edge** (a separate
+program, not part of this release) that opens byte streams on the
+daemon's **access listener**. Everything in this section exists only
+when the daemon is started with `--access-addr`; without it there are
+no access routes, no `access` field and no access usage, and the daemon
+is byte for byte what it was. The control API never carries access
+traffic, and the access listener never serves the control API.
+
+### Access grants
+
+An access grant is
+
+```
+tsg1.<base64url(payload JSON)>.<base64url(Ed25519 signature)>
+```
+
+base64url without padding; the signature is over the ASCII bytes
+`tsg1.` followed by the payload's base64url text. The algorithm is fixed
+(there is no `alg`). The payload is at most 1024 bytes. The Go package
+`github.com/useteploy/teploy-sandbox/accessgrant` signs and verifies
+grants; it has no dependencies.
+
+| Claim | Type | Meaning |
+|---|---|---|
+| `v` | int | `1`. A verifier rejects any other value |
+| `kid` | string | The issuer key that signed it, `[A-Za-z0-9._-]{1,64}` |
+| `iss` | string | Who issued it, for logs (`cloud`, `edge:<name>`, `op:<name>`) |
+| `aud` | string | The user-content domain it is for; must equal the daemon's configured audience |
+| `run` | string | The run ID |
+| `scp` | [string] | 1-16 scopes, none repeated: `ssh`, `http:<port>`, `http:*`, `tcp:<port>`, `tcp:*` (port 1-65535, no leading zero). Any other value makes the grant malformed |
+| `ep` | int | The run's access epoch **as the issuer read it from the run** (the run object's `access.epoch`, or the access listener's lookup). Never the issuer's clock. 0 to 2^53-1 |
+| `cnf` | string | Optional: binds the grant to one SSH public key, `sha256:` + unpadded standard base64 of the SHA-256 of the key's wire encoding |
+| `own`, `ref` | bool, string | Optional, together: an owner proof (lifetime at most 60 s) vouching for the grant whose `jti` is `ref`. An owner proof is not an access grant anywhere |
+| `iat`, `exp` | int | Unix seconds; `exp - iat` at most 31 days; `iat` at most 5 minutes in the future |
+| `jti` | string | The grant's ID, `[A-Za-z0-9._-]{1,64}` |
+| `org` | string | Optional, opaque, for logs only |
+
+Verification is strict: the signature is checked against the configured
+keys before the payload is parsed; the payload must be one JSON object
+with no duplicate key (unicode escapes included) and no key that differs
+from a claim's name only in case; every claim must have exactly its type
+(integers in plain decimal, no `null`); unknown claims are ignored. A
+claim that restricts what a grant allows is never added without raising
+`v`, because a verifier that ignores it would drop the restriction.
+
+What a grant allows depends on where it is presented:
+
+| Presented at | Accepts | Refuses |
+|---|---|---|
+| The edge's HTTPS front | `http:<port>` for the port, or `http:*` | a grant with `cnf`; a grant with any `ssh` or `tcp:` scope |
+| An SSH session channel | `ssh`, with `cnf` (checked against the authenticated key) | no `cnf` |
+| An SSH `direct-tcpip` channel | `tcp:<port>` or `tcp:*`, with `cnf` | `http:` scopes |
+| The daemon's `connect` | `http:` or `tcp:` covering the port | `ssh` alone |
+| The daemon's `session` (later) | `ssh` | everything else |
+
+An owner proof is accepted nowhere.
+
+### The access epoch
+
+`access.epoch` is an opaque, strictly increasing integer per run. A
+grant is accepted only while its `ep` is at least the run's epoch, so
+raising the epoch revokes every grant issued before. It is never
+compared with a clock:
+
+- a new run (create or fork) starts at the unix time of its creation;
+- a revoke sets it to `max(now, epoch + 1)` and answers the new value
+  (two revokes in one second, or a clock set back, still raise it);
+- a resume takes `max(epoch, accessEpoch)` when the caller passes one;
+- a run that **moved** (any resume of a run this daemon read from its
+  remote record: stopped on another daemon, taken over, or brought back
+  from its last stop after a restart lost it) resumes with
+  `max(epoch + 1, accessEpoch + 1, now)`: strictly above anything a grant
+  can have copied, so moving a run revokes all of its grants;
+- with remote storage, the epoch and the ports travel in the run's remote
+  record, and a revoke writes them there before it answers.
+
+A caller that stores epochs (a control plane minting grants) stores the
+epoch from every run object it receives and passes it as `accessEpoch`
+on every resume.
+
+### Control routes (control API, bearer token; only with access on)
+
+| Route | Request | Success | Errors |
+|---|---|---|---|
+| `PUT /v1/runs/{id}/ports/{port}` | `{visibility: "public"\|"private", protocol?: "http"\|"h2c"}` | 200, the run | 400 bad port or field, or more than 16 public ports; 404 |
+| `DELETE /v1/runs/{id}/ports/{port}` | | 200, the run | 404 |
+| `POST /v1/runs/{id}/access/revoke` | | 200, the run with the new `access.epoch` | 404; 502 `access-write-through` |
+| `GET /v1/access/config` | | 200 `{audience, kids, edgeDenylist, listener, enabled, managedByFile}` | |
+| `PUT /v1/access/config` | `{audience, issuerKeys: [{kid, ed25519, notAfter?}], edgeDenylist: [names]}` | 204 | 400; 409 when `--access-config` manages it |
+| `POST /v1/runs/{id}/resume` | gains `accessEpoch?` | as before | 400 when negative or above 2^53-1 |
+
+Ports are data and may be set while the run is stopped. Making a public
+port private, or deleting it, closes that port's anonymous streams. A
+revoke closes all of the run's access streams. A 502
+`access-write-through` means the epoch was raised and the streams closed
+on this daemon, but the new epoch is not in remote storage; its body
+carries `epoch`. Revoke again: it raises the epoch once more and retries
+the write. Unknown fields in these routes' bodies are 400. The
+configuration is stored 0600 in `--state-dir`; `ed25519` is a base64
+public key, and `GET` shows key IDs only. A fork's child starts with a
+fresh epoch and no ports.
+
+### Access listener
+
+`--access-addr HOST:PORT` (7448 by convention) speaks HTTP/2 over TLS
+1.3 with a client certificate required and verified during the
+handshake, before any HTTP is read: it must chain to `--access-client-ca`
+(the edge-client CA, which must not be the CA of the daemon's own
+certificate), name exactly one edge as `URI:teploy-edge://<name>`, and
+the name must not be on the denylist. `--access-addr unix:/path` (Linux)
+speaks h2c on a 0660 socket and admits peers by uid or gid (SO_PEERCRED).
+TCP without TLS is refused at start. HTTP/1.1 is accepted too, for
+debugging.
+
+One connection serves one run: the first stream binds it, and a stream
+for another run on it is 421 `wrong-connection`. Open one connection per
+run. Each edge may hold `--access-edge-conns` connections.
+
+| Route | Headers | Success | Errors (`type` suffix) |
+|---|---|---|---|
+| `GET /v1/access/runs/{id}` | | 200 `{id, state, epoch, publicPorts: [{port, protocol}]}` | 404 `not-here` |
+| `POST /v1/access/runs/{id}/connect?port=P` | `Teploy-Grant?`; `Teploy-Edge-Request?` | 200, then raw bytes both ways | 400 `bad-request`; 401 `grant-invalid`, `grant-expired`, `revoked`; 403 `scope`, `not-public`; 404 `not-here`; 409 `stopped`; 421 `wrong-connection`; 429 `run-streams`, `anon-streams`; 502 `refused`, `guest-agent`; 503 `at-capacity`; 501 `unsupported-driver` |
+
+`connect`: the response body is what the guest sends, the request body
+what it receives; the end of the request body is passed to the guest as
+a half-close, and the guest closing its side ends the stream. Without
+`Teploy-Grant` the port must be public on the run. A granted stream is
+closed at its grant's `exp`; every stream of a run is closed on revoke,
+stop and destroy; anonymous streams of a port on unpublish. A stream
+idle for an hour is closed. Every other path is 404. Problem responses
+never echo a grant. `Teploy-Edge-Request` is logged only when it is at
+most 64 characters of `[A-Za-z0-9._-]`.
+
+Caps: per run 64 streams, at most 16 without a grant, and 4 of the 64
+only for sessions; per daemon `--access-streams-max`. Rates, each way:
+granted streams of a run together `--access-mbit`, anonymous streams of
+a run together `--access-anon-mbit` (20), all streams
+`--access-total-mbit` (2000).
+
+`connect` reaches the guest port on the VM driver only (through the
+guest agent; the guest's loopback, `127.0.0.1` then `::1`). An agent
+older than guest protocol version 2 answers 502 `guest-agent`. The
+Docker driver answers 501 `unsupported-driver` in this release, and
+`session` (SSH shells) is not built yet.
 
 ## Not promised
 

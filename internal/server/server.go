@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/useteploy/teploy-sandbox/internal/access"
 	"github.com/useteploy/teploy-sandbox/internal/run"
 )
 
@@ -68,6 +69,9 @@ type Server struct {
 	// NestedVirt is whether a run on this daemon can itself start virtual
 	// machines. Reported by GET /v1/capacity.
 	NestedVirt bool
+	// Access is the access listener's control side; nil (access off)
+	// leaves the API exactly as it was: no access routes, no access field.
+	Access *access.Control
 }
 
 func (s *Server) Handler() http.Handler {
@@ -101,6 +105,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/remote/snapshots", s.auth(s.handleRemoteSnapshots))
 	mux.Handle("PUT /v1/runs/{id}/files/{path...}", s.auth(s.handlePutFile))
 	mux.Handle("GET /v1/runs/{id}/files/{path...}", s.auth(s.handleGetFile))
+	if s.Access != nil {
+		mux.Handle("PUT /v1/runs/{id}/ports/{port}", s.auth(s.handlePutPort))
+		mux.Handle("DELETE /v1/runs/{id}/ports/{port}", s.auth(s.handleDeletePort))
+		mux.Handle("POST /v1/runs/{id}/access/revoke", s.auth(s.handleRevoke))
+		mux.Handle("GET /v1/access/config", s.auth(s.handleAccessConfigGet))
+		mux.Handle("PUT /v1/access/config", s.auth(s.handleAccessConfigPut))
+	}
 	return mux
 }
 
@@ -258,6 +269,9 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 			"cpus":     load.CPUs,
 			"memoryMb": load.MemoryMB,
 		},
+	}
+	if s.Access != nil {
+		body["access"] = map[string]any{"enabled": true, "streams": s.Access.Streams(), "streamsMax": s.Access.StreamsMax()}
 	}
 	if load.WarmPool != nil {
 		// Only from a driver with a warm pool configured; "allocated"

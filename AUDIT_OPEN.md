@@ -3805,3 +3805,147 @@ its own at start (found by review: the daemon holds tenants' data in
 the clear while encrypting and decrypting it), so teploy's own
 processes are safe either way; the warning would still catch the case
 for every other process the operator runs under the same unit.
+## 2026-11-21 — access, daemon side (phase 4, task 4a: A1–A4)
+
+What landed: the `accessgrant` package (grant format, strict verification,
+scope table), the run's access state (epoch, ports, revoke with write-through
+to the remote record, the move rule on resume, fork, access bytes), guest
+protocol version 2 `connect`, and the access listener with `connect` on the
+VM driver. Off unless `--access-addr` is set; with it off the API, run JSON,
+registry file and remote record are unchanged (`TestAccessOffChangesNothing`,
+`TestAccessRoutesAbsentWhenOff`). **Nothing here has run live**: the
+vmintegration tests in `vm_access_integration_test.go` (none-tier reachability
+with host network state unchanged, the daemon's tables deleted, streams ending
+at expiry/revoke/stop, guest-initiated vsock refused) have not been run on a
+KVM host. The Linux-only unix-socket test (`unix_linux_test.go`) runs in CI,
+not on the builder's machine.
+
+Not built (remaining 4a): **A5** `connect` on the Docker driver (held netns
+descriptor from `SandboxKey`, inode check against the daemon's own netns,
+locked-thread dial; the Docker-host overlay rules are documented in the README
+but untested): Docker answers 501 `unsupported-driver`. **A6** `session`
+(guestd PTY/exec/subsystem, root on VM; `docker exec -u` on Docker): the route
+does not exist; the stream caps already reserve 4 session slots per run. No
+HTTP/1.1 `Upgrade: teploy-stream` fallback (HTTP/1.1 with full duplex is
+accepted instead).
+
+Limits and choices a reviewer should check:
+
+1. **Move rule is stricter than the design's letter.** A resume of a run read
+   from its remote record sets `epoch = max(epoch+1, accessEpoch+1, now)`, not
+   `max(record, passed, now)`: with the latter a grant minted at the record's
+   epoch survives a move made within the same second (or with the clock behind).
+   A local resume takes `max(epoch, accessEpoch)`. `TestResumeEpochRules`.
+2. **Write-through needs the run's exclusivity** for the remote write (≤ 30 s
+   timeout): execs, writes, stops and lease acquires on that run get 409 `busy`
+   for its duration, and a revoke while a stop/resume/fork/delete holds the run
+   fails with 502 (epoch raised, streams closed) and must be repeated. A revoke
+   during a stop whose payload was read before the bump can leave the old epoch
+   in the stopped record; the next move still revokes (rule 1), clock skew aside.
+3. **Write-through rewrites another daemon's stopped record** (a stopped run
+   adopted from elsewhere and revoked here): the new generation is this
+   daemon's, with the same snapshot and key. Other daemons adopt it like any
+   newer stop of the same snapshot.
+4. **A run with no remote record** (never stopped with remote storage) has
+   nothing to write through; its first stop carries the epoch.
+5. **Same-host state rollback** restores the old epoch and the old grants until
+   they expire (design residual, README).
+6. **Grant verification tries every key** (≤ 8) before parsing anything, then
+   requires the payload's `kid` to name the key that verified. Cost per invalid
+   grant ≤ 8 Ed25519 verifications; the listener is mTLS-only.
+7. **Owner proofs** (`own`) are refused by the daemon for `connect` (the scope
+   table says "accepted nowhere"); the design's table did not name the daemon
+   row for them.
+8. **One run per connection is enforced** by the daemon (421 `wrong-connection`),
+   beyond the design's per-edge connection cap, so the HTTP/2 connection window
+   is only ever shared by one run's streams. Lookups do not bind a connection.
+9. **HTTP/2 windows**: 256 KiB per stream; the connection window is 4 MiB − 1
+   (Go's maximum), not stream window × 64 as the design wrote. With 16 stalled
+   streams a connection is full, which stalls only that run (rule 8).
+   `TestStalledRunDoesNotStallAnother` shows a healthy run unaffected by eight
+   stalled streams of another; it would not catch a regression in the edge's
+   per-run connections, which is the edge's (4b).
+10. **Memory sizing**: refuse to start when `streamsMax × 320 KiB` exceeds
+    `--access-memory-mb` (default host memory / 10, 1024 MiB where unreadable).
+    The budget fraction is a choice, not measured. Streams counted by Go's
+    HTTP/2 server before the handler admits them (up to 64 per connection ×
+    connections) are bounded by the per-edge connection cap, not by this check.
+11. **Guest protocol frames**: v2 reads (`connect`'s answer) are ≤ 64 KiB,
+    allocated as bytes arrive, under a 5 s deadline. **Pre-existing, unchanged**:
+    the v1 `readFrame` allocates the declared size (≤ 1 MiB) on a five-byte
+    header, so a malicious guest holds ≤ 1 MiB per in-flight v1 call
+    (exec/read/write), as before.
+12. **Half-close**: the end of the edge's request body is passed to the guest as
+    a vsock `CloseWrite` on the hypervisor's unix socket; whether Cloud
+    Hypervisor turns that into a vsock shutdown is **not verified live**.
+    A guest closing its side ends the stream (no reverse half-close).
+13. **guestd linger**: once one direction of a connect ends, the other must move
+    a byte every 2 minutes or the stream closes (so a guest server that keeps a
+    half-closed socket gives its slot back). guestd caps open connects at 128.
+14. **Rates** are token buckets per run (granted, anonymous) and per daemon,
+    burst 0.1 s; `TestAnonymousRate` checks ±15%/−30% at 8 Mbit/s. Daemon CPU per
+    Gbit is not measured (design: 4b).
+15. **Metering**: access bytes are flushed to the run every 10 s and when a
+    stream ends; a destroy loses the last partial interval of streams still
+    open. They are counters, not a ledger.
+16. **Unix socket peer check** is Linux only; on other systems `unix:` is refused
+    at start. The default `--access-unix-uid` is the daemon's own uid.
+17. **Docker-host overlay rules** (S11): documented example only, not installed
+    and not tested (A5).
+18. **Revert proofs**: every behaviour test of this change was run with its
+    change reverted and failed; the edge-name check is two layers (handshake
+    callback and post-handshake) and fails only with both reverted.
+19. **Fuzzing**: `FuzzVerify` ran 10 minutes (10.2 M executions, no failure);
+    80 corpus entries are committed under `accessgrant/testdata/fuzz`.
+
+## 2026-11-22 — access, part 1: two independent reviews, and what they changed
+
+Two reviewers who did not write the slice went through it (the grant
+crypto and protocol for one, the daemon surface and lifecycle for the
+other) before merge. The grant math, the strict decode, the epoch
+lifecycle, the off-state purity and the VM connect path held under
+every attack; the fixes below are what they found.
+
+- **A cnf-bound grant was a bearer token at the daemon's connect.**
+  `UseDaemonConnect` accepted a grant whose `cnf` binds it to an SSH
+  key nobody checks on that path — on the unix listener there is no key
+  authentication at all, so a stolen cnf-bound port-forward grant was
+  enough. The scope table now refuses `cnf` at the daemon's connect
+  (the package comment and the code agree again); an edge relaying a
+  user's `-L` forward is to obtain its own grant without `cnf` — the
+  shape A6 will build on, not a bearer-for-someone-else.
+- **A cross-daemon revoke was lost on the run's birth host.** The
+  reconcile branch for "our stop, written again by another daemon"
+  kept the local payload and never read the record's access fields, so
+  a revoke written into the stopped record by the host that adopted the
+  run did not travel: the birth host resumed with the old epoch and its
+  next stop wrote the old one back. The branch now takes the record's
+  epoch and ports when the record is ahead. Narrow crash window; the
+  off-host fakes get a test for it with the next pass.
+- **The denylist now bites per stream, not per handshake**: a connection
+  admitted before its edge was denylisted has every further stream
+  refused until it reconnects.
+- **`--access-addr` refuses the foot-gun binds**: an unspecified
+  address (every interface — a copy-paste away from the internet) is
+  refused at start, and the three rate flags refuse their negatives.
+- **A stream for a run that is not here no longer binds its
+  connection** (the 404 came after the bind, leaving a wrong-connection
+  421 for every real run that followed).
+- **The unix socket is 0660 from its first byte** (a umask guard around
+  the listen), a second daemon at the same path is refused instead of
+  blindly stealing the socket, a failed start unlinks it, and close
+  removes it.
+- **A run's rate buckets persist across stream churn** (open, blast,
+  close, reopen no longer re-earns the burst each cycle) and age out
+  after a quiet minute.
+- **A dead access listener is visible**: its streams are closed at
+  once, and the config view says `listenerDown` with `enabled: false`
+  so a probe notices instead of a page at grant expiry.
+- **The fuzz corpus carries real seeds** for every refusal class, not
+  minimized noise.
+
+Deployment rule, same as rotation's and the two-phase delete's: **every
+daemon sharing a bucket must run a version that knows the access
+fields.** An older daemon resuming and stopping such a run drops them
+from its next record, and an epoch pushed past `now` by repeated
+same-second revokes can come back short until the next move or revoke.

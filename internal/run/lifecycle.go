@@ -9,6 +9,8 @@ import (
 	"slices"
 	"time"
 	"unicode"
+
+	"github.com/useteploy/teploy-sandbox/accessgrant"
 )
 
 // Persistent runs. A run is either running (it has a container) or
@@ -157,10 +159,19 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool, pu
 	// exists must not abort the removal half way. A cancelled removal is
 	// reported as failed although the runtime may still carry it out, and
 	// the capture — then the only copy of the run — would be thrown away.
+	// No access stream outlives the container, and none is admitted from
+	// here until the run is running again.
+	m.mu.Lock()
+	m.runs[id].accessClosing = true
+	m.mu.Unlock()
+	m.closeAccessRun(id, "stopped")
 	attempt, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	err = m.runtime.Remove(attempt, current.ContainerID)
 	cancel()
 	if err != nil {
+		m.mu.Lock()
+		m.runs[id].accessClosing = false
+		m.mu.Unlock()
 		m.removeImage(ref)
 		return nil, fmt.Errorf("stop run %s: container not removed, run left running: %w", id, err)
 	}
@@ -173,6 +184,7 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool, pu
 	now := m.now()
 	retainUntil := now.Add(m.StoppedRetention)
 	live.State = StateStopped
+	live.accessClosing = false
 	live.ContainerID = ""
 	foldUsageLocked(live)
 	live.CacheDir = ""
@@ -232,6 +244,9 @@ type ResumeRequest struct {
 	// other daemon is gone: this daemon cannot know. Only with remote
 	// storage.
 	Takeover bool `json:"takeover,omitempty"`
+	// AccessEpoch is the caller's stored access epoch of the run (access
+	// on only; ignored otherwise): the run resumes with at least it.
+	AccessEpoch int64 `json:"accessEpoch,omitempty"`
 }
 
 // ResumeWith is Resume with every option.
@@ -248,6 +263,9 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 	if err != nil {
 		return nil, err
 	}
+	if m.access != nil && (req.AccessEpoch < 0 || req.AccessEpoch > accessgrant.MaxEpoch) {
+		return nil, fmt.Errorf("%w: accessEpoch must be 0-%d", ErrBadRequest, int64(accessgrant.MaxEpoch))
+	}
 	if req.Takeover && m.OffHost == nil {
 		return nil, fmt.Errorf("%w: takeover needs remote storage, and this daemon has none", ErrBadRequest)
 	}
@@ -259,6 +277,15 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 		return nil, err
 	}
 	defer release()
+	if m.access != nil {
+		// Before the claim below, so that the run's record carries it:
+		// a run that moved here, or whose caller knows a later epoch,
+		// resumes with its grants revoked.
+		m.mu.Lock()
+		m.moveAccessLocked(m.runs[id], req.AccessEpoch)
+		m.mu.Unlock()
+		m.persist()
+	}
 	durable := false
 	if m.OffHost != nil {
 		if err := m.claimHeld(ctx, current); err != nil {

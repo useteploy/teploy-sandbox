@@ -77,6 +77,11 @@ Usage:
                         [--remote-local keep|drop] [--remote-pool-reserve 15] [--remote-snapshot-retry 12h]
                         [--remote-sync-interval 1m] [--remote-gc-interval 1h] [--remote-gc-grace 24h]
                         [--remote-scrub-interval 6h] [--remote-scrub-read-mb 256] [--remote-unfenced]]
+                       [--access-addr HOST:7448|unix:/run/teploy-sandbox/access.sock
+                        [--access-tls-cert F --access-tls-key F --access-client-ca F]
+                        [--access-unix-uid 0] [--access-unix-gid -1] [--access-config FILE]
+                        [--access-streams-max N] [--access-edge-conns N] [--access-memory-mb N]
+                        [--access-mbit 200] [--access-anon-mbit 20] [--access-total-mbit 2000]]
   teploy-sandbox version`, "DEFAULT_KERNEL", vm.DefaultKernel))
 }
 
@@ -147,6 +152,7 @@ func serve(args []string) error {
 	recoverableMax := flags.Duration("exec-recoverable-max-timeout", envDuration("SBX_EXEC_RECOVERABLE_MAX_TIMEOUT", run.DefaultRecoverableMaxTimeout),
 		"the longest timeoutSec a recoverable exec may ask for (each holds one of the daemon's 64 recoverable-exec slots until it ends); at most 24h")
 	remote := addRemoteFlags(flags)
+	accessFlags := addAccessFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -414,6 +420,12 @@ func serve(args []string) error {
 	}
 
 	manager := run.NewManager(backend, log)
+	// Access is checked and opened before any run exists: a daemon told
+	// to serve it and unable to refuses to start rather than run without.
+	accessSetup, err := accessFlags.prepare(*driverName, *vmMaxRuns, *vmNetMbit, *stateDir, manager, log)
+	if err != nil {
+		return err
+	}
 	manager.ProxyURL = proxyURL
 	manager.SandboxUser = *sandboxUser
 	if *driverName == driverVM {
@@ -510,6 +522,16 @@ func serve(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if accessSetup != nil {
+		srv.Access = accessSetup.control
+		accessDone := accessSetup.serve(ctx)
+		defer func() {
+			// The control API may have ended on its own (a listen error):
+			// the access listener stops with it.
+			stop()
+			<-accessDone
+		}()
+	}
 	return server.Serve(ctx, *addr, srv, *reapInterval)
 }
 

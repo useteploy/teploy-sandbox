@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/useteploy/teploy-sandbox/accessgrant"
@@ -340,13 +341,15 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// A write deadline set before that return kills the final frames of
 	// a response that already arrived whole (found by the first live
 	// run: the body came through, then the stream reset with
-	// INTERNAL_ERROR). An external close still sets both deadlines.
-	var ended bool
+	// INTERNAL_ERROR). An external close still sets both deadlines. The
+	// callback runs on whichever goroutine closed the stream, so the
+	// flag is atomic.
+	var ended atomic.Bool
 	if !stream.OnClose(func() {
 		_ = guestConn.Close()
 		now := time.Now()
 		_ = rc.SetReadDeadline(now)
-		if !ended {
+		if !ended.Load() {
 			_ = rc.SetWriteDeadline(now)
 		}
 	}) {
@@ -426,7 +429,7 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// The response is written; returning ends the stream cleanly. Closing
 	// still runs the bookkeeping (and ends the other direction's read
 	// through the read deadline) — only the write deadline is stood down.
-	ended = true
+	ended.Store(true)
 	stream.Close("")
 	<-upDone
 }

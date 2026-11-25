@@ -269,28 +269,50 @@ func TestADestroyedUnconfirmedRunIsNotAdoptedElsewhere(t *testing.T) {
 	}
 }
 
-// A stale unconfirmed copy of a run another daemon adopted and moved on
-// is deleted here only, at once, and the run there is left alone.
-func TestAnUnconfirmedCopyOfAMovedRunIsDeletedHereOnly(t *testing.T) {
-	for _, stopAgain := range []bool{false, true} {
-		a, b, id := lostFirstRecord(t)
-		b.sync(t)
-		if _, err := b.manager.Resume(bg, id, 0); err != nil {
-			t.Fatal(err)
-		}
-		if stopAgain {
-			b.stop(t, id)
-		}
-		if err := a.manager.Destroy(bg, id); err != nil {
-			t.Fatalf("stopAgain=%v: host-a's stale copy not deleted: %v", stopAgain, err)
-		}
-		if _, err := a.manager.Get(id); err == nil {
-			t.Fatalf("stopAgain=%v: host-a still has the run", stopAgain)
-		}
-		b.sync(t)
-		if _, err := b.manager.Get(id); err != nil {
-			t.Fatalf("stopAgain=%v: host-b's run went away: %v", stopAgain, err)
-		}
+// A stale unconfirmed copy of a run another daemon adopted and runs is
+// deleted here only, at once, and the run there is left alone.
+func TestAnUnconfirmedCopyOfARunRunningElsewhereIsDeletedHereOnly(t *testing.T) {
+	a, b, id := lostFirstRecord(t)
+	b.sync(t)
+	if _, err := b.manager.Resume(bg, id, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.manager.Destroy(bg, id); err != nil {
+		t.Fatalf("host-a's stale copy not deleted: %v", err)
+	}
+	if _, err := a.manager.Get(id); err == nil {
+		t.Fatal("host-a still has the run")
+	}
+	b.sync(t)
+	if _, err := b.manager.Get(id); err != nil {
+		t.Fatalf("host-b's running run went away: %v", err)
+	}
+}
+
+// A run another daemon adopted and stopped again is at rest, for any
+// daemon to adopt: destroying it through a stale unconfirmed copy here
+// destroys it there too.
+func TestDestroyingAnUnconfirmedCopyOfARunStoppedElsewhereDestroysTheRun(t *testing.T) {
+	a, b, id := lostFirstRecord(t)
+	c := newHost(t, a.bucket, "host-c", nil, withAccess(&accessEvents{}))
+	b.sync(t)
+	if _, err := b.manager.Resume(bg, id, 0); err != nil {
+		t.Fatal(err)
+	}
+	b.stop(t, id)
+	if err := a.manager.Destroy(bg, id); err != nil {
+		t.Fatalf("destroy on host-a: %v", err)
+	}
+	record, _, err := a.store.Latest(bg, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != "destroyed" {
+		t.Fatalf("newest record after the destroy: %s by %s", record.State, record.Owner)
+	}
+	c.sync(t)
+	if _, err := c.manager.Get(id); err == nil {
+		t.Fatal("host-c adopted the destroyed run")
 	}
 }
 

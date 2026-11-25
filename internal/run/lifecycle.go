@@ -616,10 +616,16 @@ func (m *Manager) destroyStopped(ctx context.Context, current *Run) error {
 				// Never landed: nothing there to destroy.
 			case err != nil:
 				return fail(remoteErr(err))
+			case !latest.Mine && latest.State == RecordStopped:
+				// Another daemon adopted the record and stopped the run
+				// again: it is the run, at rest, for any daemon to adopt.
+				// Destroyed there, with the conditional write a resume
+				// claims it with, so a daemon taking it now wins instead.
+				current.remoteGen = latest.Generation
 			case !latest.Mine:
-				// Another daemon adopted the record and moved the run on:
-				// this copy was never the run that did. It goes here, as
-				// a superseded copy does, and the run there is left alone.
+				// Another daemon runs the run (or destroyed it): this copy
+				// was never the run that moved on. It goes here, as a
+				// superseded copy does, and the run there is left alone.
 				m.log.Warn("a stopped run's unconfirmed copy is deleted here only: another daemon has the run", "id", current.ID, "owner", latest.Owner, "generation", latest.Generation, "state", latest.State)
 				notSuperseded = false
 			default:

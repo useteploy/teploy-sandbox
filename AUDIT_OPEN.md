@@ -4463,3 +4463,38 @@ covered only through `SyncRemote`.
   request still in flight. Needs either a statement in the storage
   requirements or a fence (for example, a destroyed record written at
   the next generation whenever a first write's outcome is unknown).
+
+## 2026-11-25 — release workflow (binaries and checksums)
+
+There were no release binaries: the only workflow was `ci.yml`, and
+anything that installed the daemon built it from source. This adds
+`.github/workflows/release.yml`, modelled on teploy-ship's: a `v*` tag
+push runs ci.yml's "Tests and vet" step verbatim, builds a statically
+linked binary for linux amd64 and arm64 (`CGO_ENABLED=0`, `-trimpath`,
+`-buildvcs=false`, `-s -w`) with `main.version` set to the tag without its
+`v`, checks each before publishing, writes `checksums.txt` in `sha256sum`
+format and creates the GitHub release with all three as assets. Every
+action is pinned to a commit.
+
+- `TestCIStepsThatPipeFailWithTheirTests` now reads every workflow, not
+  only `ci.yml`, so the pipefail rule above holds for a workflow added
+  later. The `TestReleaseWorkflow*` tests pin the trigger (tags only),
+  the pins, the order (tests, build, checksums, publish, with nothing
+  after the publish) and the two architectures.
+- What the check step can say about arm64: it cannot run on the runner,
+  and `go version -m` does not show linker flags. Its architecture and
+  static linking are read from the build settings; for the version, the
+  string is looked for in the binary's data. A build without
+  `-X main.version` does not contain it (checked on a local build), so
+  the check fails when the flag is dropped. The amd64 binary runs and
+  must report the release.
+- Open: the Docker integration and `vm-root` jobs run on the tag's own
+  CI run (`ci.yml` triggers on every push), and the release job does not
+  wait for it, so a release can be published from a commit that fails
+  those. Making `ci.yml` callable (`workflow_call`) and a `needs` on it
+  would close that, at the price of running CI twice per tag.
+- Open: `ci.yml` still uses floating action tags (`@v4`, `@v5`); only
+  the release workflow is pinned.
+- Not published: `cmd/teploy-guestd` (the vm driver's guest agent). It is
+  still built from source for `scripts/build-golden.sh`.
+- No tag has been pushed, and the workflow has not run for real.

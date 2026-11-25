@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# The job creates the GitHub release and uploads its assets; it needs
+# nothing else.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.26.x"
+
+      # The version is the tag. `teploy-sandbox version` and GET /health
+      # report what -X main.version sets below, and the teploy CLI checks
+      # it after installing a release. Anything else here would either
+      # publish a binary that cannot be checked against its release, or
+      # carry a space into the linker flags.
+      - name: Tag is a version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+            echo "tag $TAG is not a version: vMAJOR.MINOR.PATCH, with an optional -prerelease" >&2
+            exit 1
+          }
+
+      # The release must not publish WITHOUT running the tests: a tag is
+      # where "tested" matters most. This is ci.yml's "Tests and vet" step,
+      # verbatim; the Docker and vm-root jobs run on the tag's own CI run
+      # (ci.yml triggers on every push, tags included).
+      - name: Tests and vet
+        run: go test ./... && go vet ./... && go vet -tags vmintegration ./... && go test -race ./...
+
+      # CGO_ENABLED=0: statically linked, so the binary runs under musl as
+      # well as glibc. -buildvcs=false: the same source gives the same bytes
+      # however the checkout was made, so checksums can be reproduced.
+      - name: Build linux amd64 and arm64
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false \
+              -ldflags "-s -w -X main.version=$version" -o "dist/teploy-sandbox_linux_$arch" .
+          done
+
+      # Each binary's build settings are read back: the architecture, and
+      # static linking. The amd64 one also runs here and must report the
+      # release. arm64 cannot run on this runner, so for it the version the
+      # linker was given is looked for in its data instead (linker flags are
+      # not part of the build settings `go version -m` shows).
+      - name: The binaries carry the release
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          for arch in amd64 arm64; do
+            settings="$(go version -m "dist/teploy-sandbox_linux_$arch")"
+            for want in "GOARCH=$arch" "CGO_ENABLED=0"; do
+              if [[ "$settings" != *"$want"* ]]; then
+                echo "teploy-sandbox_linux_$arch was not built with $want" >&2
+                exit 1
+              fi
+            done
+          done
+          reported="$(dist/teploy-sandbox_linux_amd64 version)"
+          if [ "$reported" != "$version" ]; then
+            echo "the amd64 binary reports '$reported', expected '$version'" >&2
+            exit 1
+          fi
+          if ! grep -a -F -q -- "$version" dist/teploy-sandbox_linux_arm64; then
+            echo "the arm64 binary does not contain the version $version" >&2
+            exit 1
+          fi
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum teploy-sandbox_linux_amd64 teploy-sandbox_linux_arm64 > checksums.txt
+          cat checksums.txt
+
+      # A prerelease tag (v1.2.3-rc1) must not be presented as the latest
+      # stable release.
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@e7a8f85e1c67a31e6ed99a94b41bd0b71bbee6b8 # v2.0.9
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/teploy-sandbox_linux_amd64
+            dist/teploy-sandbox_linux_arm64
+            dist/checksums.txt

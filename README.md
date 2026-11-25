@@ -10,6 +10,19 @@ there instead (see Persistent runs).
 teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/sandbox/token
 ```
 
+## Releases
+
+Push a `vMAJOR.MINOR.PATCH` tag (an optional `-prerelease` is allowed).
+[`.github/workflows/release.yml`](.github/workflows/release.yml) runs the
+unit tests, then builds a statically linked binary for linux amd64 and
+arm64 with the version set to the tag without its `v` (`teploy-sandbox
+version` and `GET /health` report it), and publishes
+`teploy-sandbox_linux_amd64`, `teploy-sandbox_linux_arm64` and
+`checksums.txt` (`sha256sum` format) on a GitHub release. Check a download
+against it with `sha256sum -c --ignore-missing checksums.txt`. The teploy
+CLI's `teploy sandbox host` installs one of these releases by version and
+refuses it when the checksum does not match.
+
 ## API (bearer token on everything except /health)
 
 The full wire contract — every field, status code, retry rule and

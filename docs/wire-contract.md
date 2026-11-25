@@ -514,10 +514,10 @@ replacing it under its `kid`, closes the streams it admitted; a key's
 | `GET /v1/access/runs/{id}` | | 200 `{id, state, epoch, publicPorts: [{port, protocol}]}` | 404 `not-here` |
 | `POST /v1/access/runs/{id}/connect?port=P` | `Teploy-Grant?`; `Teploy-Edge-Request?` | 200, then raw bytes both ways | 400 `bad-request`; 401 `grant-invalid`, `grant-expired`, `revoked`; 403 `scope`, `not-public`, `edge-denied`, `edge-expired`; 404 `not-here`; 409 `stopped`; 421 `wrong-connection`; 429 `run-streams`, `anon-streams`, `run-connections`; 502 `refused`, `guest-agent`; 503 `at-capacity`; 501 `unsupported-driver` |
 
-A lookup binds no connection. One answered 404 on a connection that
-serves no run yet closes it, as every refused `connect` on such a
-connection does, so lookups of made-up run IDs cannot fill the edge's
-connection cap. An edge should send lookups on one connection of its
+A lookup binds no connection. One answered 404, or answered for a run
+that is not running, on a connection that serves no run yet closes it,
+as every refused `connect` on such a connection does, so lookups of
+made-up or stopped runs cannot fill the edge's connection cap. An edge should send lookups on one connection of its
 own, or on the connection that serves the run.
 
 `connect`: the response body is what the guest sends, the request body

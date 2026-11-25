@@ -4427,10 +4427,11 @@ run live.
 
 | Finding | Fix | Test |
 |---|---|---|
-| V7 (both invariants): a run with no remote state whose first publish landed, then a crash before the registry noted it, did not count as unconfirmed after the restart, so a later 200 could be lost | `unconfirmedPublishLocked` no longer requires `Remote != nil`; `writeAccessHeld` only looks when remote storage is on | `TestAPreRemoteRunsLandedFirstRecordIsFoundAfterARestart` |
-| Lookups of unknown runs left unbound connections that filled the edge cap | a 404 lookup on an unbound connection closes it; wire contract says where lookups go | `TestLookupsOfUnknownRunsDoNotFillTheEdgeCap` |
+| V7 (both invariants): a run with no remote state whose first publish landed, then a crash before the registry noted it, did not count as unconfirmed after the restart, so a later 200 could be lost | `publishHeld` notes a run with no remote state as pending, on disk, before its first put (write-ahead), so the run counts as unconfirmed after a restart; `writeAccessHeld` only looks when remote storage is on. (Dropping `Remote != nil` instead, as first tried, made every never-published run wait on storage: a revoke, port change or resume failed while storage was down.) | `TestAPreRemoteRunsLandedFirstRecordIsFoundAfterARestart` |
+| Lookups of unknown or stopped runs left unbound connections that filled the edge cap | a lookup on an unbound connection that finds no running run closes it, so lookup-only connections are bounded by running runs; wire contract says where lookups go | `TestLookupsOfUnknownRunsDoNotFillTheEdgeCap`, `TestLookupsOfStoppedRunsDoNotFillTheEdgeCap` |
 | The reconcile's "this daemon's own newer record" branch took the generation without the record's access state, so a held resume wrote the registry's older ports over it | that branch goes through `reconcileAccessFromRecordLocked` with `newer=true` | `TestAHeldResumeTakesItsOwnNewerRecordsPorts` |
 | `adoptUnconfirmed`'s own-record guard had no test | coverage only | `TestAnUnconfirmedCopyDoesNotWriteOverARunStoppedElsewhere` |
+| A run never published was blocked while storage was down (from the first V7 fix) | covered by the write-ahead note above | `TestANeverPublishedRunIsNotBlockedByStorageBeingDown` |
 
 Left as is: six share links in use lock out a seventh grant, the owner's
 included (429 `run-connections`); the daemon cannot tell an owner's grant

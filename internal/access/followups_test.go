@@ -719,3 +719,29 @@ func TestLookupsOfUnknownRunsDoNotFillTheEdgeCap(t *testing.T) {
 		t.Fatalf("run B unreachable after two 404 lookups left unbound connections: %v", err)
 	}
 }
+
+// A lookup of a run that is here but not running closes the unbound
+// connection it came on too.
+func TestLookupsOfStoppedRunsDoNotFillTheEdgeCap(t *testing.T) {
+	r := newRig(t, func(c *rigConfig) { c.perPeer = 2 })
+	r.manager.dial = func(_ context.Context, _ string, _ int) (net.Conn, error) { return echoConn(), nil }
+	stopped := []string{"01JD8X3Y4Z5A6B7C8D9E0F1G20", "01JD8X3Y4Z5A6B7C8D9E0F1G21"}
+	r.manager.mu.Lock()
+	for _, id := range stopped {
+		r.manager.runs[id] = &fakeRun{state: run.StateStopped, epoch: 100}
+	}
+	r.manager.mu.Unlock()
+	for _, id := range stopped {
+		resp, err := r.client(r.edge).Get("https://" + r.addr + "/v1/access/runs/" + id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		t.Logf("lookup %s: %d", id, resp.StatusCode)
+	}
+	s, err := r.connect(r.client(r.edge), runB, "3000", r.grant(func(c *accessgrant.Claims) { c.Run = runB; c.Jti = "b" }))
+	if err != nil || s.resp.StatusCode != 200 {
+		t.Fatalf("run B unreachable after lookups of two stopped runs left unbound connections: %v", err)
+	}
+}

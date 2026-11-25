@@ -156,3 +156,32 @@ func TestAHeldResumeTakesItsOwnNewerRecordsPorts(t *testing.T) {
 		t.Fatalf("this daemon's own newer record said private; the held resume re-published port 3000")
 	}
 }
+
+// A run with no remote state was never published (publishHeld notes a
+// first publish on disk before its put), so storage being down does not
+// hold its access changes or its resume.
+func TestANeverPublishedRunIsNotBlockedByStorageBeingDown(t *testing.T) {
+	bucket := offhosttest.NewMemory()
+	a := newHost(t, bucket, "host-a", nil, withAccess(&accessEvents{}))
+	created := a.startRun(t, payload(t, 300))
+	id := created.ID
+	bucket.SetFail(func(op, key string) error {
+		if op == "put" {
+			return errors.New("storage down")
+		}
+		return nil
+	})
+	if _, err := a.manager.Stop(bg, id); err != nil {
+		t.Fatal(err)
+	}
+	bucket.SetFail(nil)
+	dropRemoteState(t, a, id)
+	a = newHost(t, bucket, "host-a", a, withAccess(&accessEvents{}))
+	bucket.SetFail(func(op, key string) error { return errors.New("no route to host") })
+	_, revokeErr := a.manager.RevokeAccess(bg, id)
+	_, portErr := a.manager.SetPort(bg, id, 3000, run.PortRequest{Visibility: run.PortPrivate})
+	_, resumeErr := a.manager.Resume(bg, id, 0)
+	if revokeErr != nil || portErr != nil || resumeErr != nil {
+		t.Fatalf("a run never published waits on remote storage: revoke %v, port %v, resume %v", revokeErr, portErr, resumeErr)
+	}
+}

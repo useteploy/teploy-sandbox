@@ -185,7 +185,21 @@ func (m *Manager) publishHeld(ctx context.Context, id string) error {
 		previous = live.Remote.Error
 	}
 	payload := m.remotePayloadLocked(live)
+	// A run with no remote state yet is noted as pending before its first
+	// record can land: a daemon that dies after that put must find the run
+	// unconfirmed after its restart (unconfirmedPublishLocked), or a
+	// change it then answers 200 is not in the record another daemon may
+	// adopt. Write-ahead: no put without the note on disk.
+	noted := live.Remote == nil
+	if noted {
+		setRemoteLocked(live, RemoteState{State: RemotePending, Local: true})
+	}
 	m.mu.Unlock()
+	if noted {
+		if err := m.persistNow(); err != nil {
+			return fmt.Errorf("%w: noting the run's first publish: %v", ErrRemoteUnavailable, err)
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, m.publishTimeout())
 	defer cancel()

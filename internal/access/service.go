@@ -328,12 +328,16 @@ type lookupBody struct {
 // (what a self-hosted issuer copies into a grant) and its public ports.
 // Nothing else of the run: no env, no labels.
 func (s *Service) handleLookup(w http.ResponseWriter, r *http.Request) {
-	// A lookup never binds its connection. One that finds no run closes
-	// an unbound connection once answered, as a refused connect does:
-	// lookups of made-up run IDs, each on a fresh connection, could
-	// otherwise fill the edge's cap for every run on this daemon.
+	// A lookup never binds its connection. One that finds no running run
+	// closes an unbound connection once answered, as a refused connect
+	// does: lookups of made-up run IDs, or of the many stopped runs a
+	// tenant may keep here, each on a fresh connection, could otherwise
+	// fill the edge's cap for every run on this daemon. Lookup-only
+	// connections are then bounded by the running runs, which the cap is
+	// sized for.
+	unbound := !connFrom(r.Context()).bound()
 	notHere := func() {
-		if !connFrom(r.Context()).bound() {
+		if unbound {
 			w.Header().Set("Connection", "close")
 		}
 		writeProblem(w, http.StatusNotFound, "not-here", "No such run on this daemon.")
@@ -353,6 +357,9 @@ func (s *Service) handleLookup(w http.ResponseWriter, r *http.Request) {
 		if p.Visibility == run.PortPublic {
 			body.PublicPorts = append(body.PublicPorts, lookupPort{Port: p.Port, Protocol: p.Protocol})
 		}
+	}
+	if unbound && target.State != run.StateRunning {
+		w.Header().Set("Connection", "close")
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(body)

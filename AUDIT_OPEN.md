@@ -3995,3 +3995,127 @@ on a starved host) is closed with them.
 Still open, unchanged: x86-64 and bare metal beyond the one
 below-spec laptop pass (the rented box's job); a second physical
 host; `SBX_TEST_RUNTIME=runsc`; and the A5/A6 follow-ons.
+
+## 2026-11-24 — G2 code review follow-ups (access, PR #9)
+
+The independent G2 code review of PR #9 (the daemon side of access) was
+only partly addressed before that PR merged. Its reproduction tests,
+which logged results instead of asserting, were re-run against `main`
+(`a8bb0e7`); everything below that was still present is now fixed, each
+with an asserting regression test that was run with its fix reverted and
+failed. **Nothing here has run live** (fakes, the in-memory S3 and real
+TLS sockets on the builder's machine only).
+
+Fixed in PR #9's own fix round (the 2026-11-22 entry above, not repeated
+here): the cnf-bound grant as a bearer token at the daemon's connect;
+the cross-daemon revoke lost on a run's birth host (the "our stop,
+written again" reconcile branch); the denylist checked per stream (the
+first half of S-2); the foot-gun binds; a 404 stream binding its
+connection; the unix socket's mode, double start and cleanup; rate
+buckets re-earned by churn; a dead listener made visible; real fuzz
+seeds.
+
+Fixed here:
+
+- **B-1, adopting a record lowered the local epoch.** A daemon holding a
+  stale view of a stopped run revoked it (each write-through failed:
+  another daemon had moved the run on), then synced; the adopt replaced
+  its run with the record's, epoch and all, so the epoch went back down
+  and the next resume landed below the revokes — a grant minted at the
+  last revoked epoch passed. Every path that updates a stopped run from a
+  newer record (adopt and takeover through `replaceHeld`, and the "stop
+  written again" branch) now keeps `max(local, record)`, under the lock
+  (so a revoke racing the adopt, which reads the record outside it, is
+  kept too), and writes a local epoch found ahead into the record. The
+  ports are the record's on every such path (the newer configuration by
+  generation; a local port change that did not reach the record was
+  answered with an error, below). Tests: `TestAdoptingANewerRecordNeverLowersTheEpoch`,
+  `TestAStopWrittenAgainKeepsTheHigherEpochAndTheRecordsPorts`
+  (`internal/vm`).
+- **S-1, a held resume never wrote its raised epoch.** `claimHeld`
+  returns early for a run this daemon already holds (a takeover), so the
+  running record kept the pre-move epoch; a second takeover from that
+  record landed on the first one's epoch, and the first host's grants
+  passed on the third. A resume whose move changed the epoch of a held
+  run now writes it through before boot (and gives the run back if it
+  cannot). Test: `TestTakeoverResumeWritesTheRaisedEpoch`.
+- **S-2 remainder, expired certificates and removed keys.** A connection
+  now closes at the earliest `notAfter` of its verified chain, and a
+  stream asked for on an expired connection is 403 `edge-expired` (the
+  guard behind the timer). Removing an issuer key, or replacing it under
+  its kid, closes the streams it admitted; a key `notAfter` brought
+  forward ends them by then; a stream admitted with a key removed between
+  verification and the count is refused after the count. Tests:
+  `TestAConnectionEndsWhenItsCertificateExpires`,
+  `TestAStreamOnAnExpiredConnectionIsRefused`,
+  `TestIssuerKeyChangesEndTheirStreams` (`internal/access`).
+- **S-3, anonymous stalls starved the owner.** Sixteen anonymous streams
+  whose guest does not read filled the connection's 4 MiB window, and
+  the owner's granted stream on the same connection stalled. A
+  connection now binds to (run, anonymous or granted); the other kind on
+  it is 421 `wrong-connection` (wire contract updated: edges open one
+  connection per run and kind). An anonymous stream with bytes waiting,
+  either way, that moves none for `Limits.AnonStall` (30 s) is closed; an
+  idle one is not. Test: `TestAnonymousStallsDoNotStarveTheOwner` (the
+  421, the owner's upload on its own connection, the stalled streams
+  closed, the next visitor served, an idle stream left alone).
+- **S-4, a revoke answered 200 with the registry unwritten.** `persist`
+  logged and moved on. A revoke or port change now writes the registry
+  with `persistNow`, and a failure answers 500 `access-not-persisted`
+  with the epoch (the change still holds in memory and the reaper retries
+  the write). Tests: `TestAccessChangeFailsLoudlyWhenTheRegistryIsNotWritten`
+  (`internal/run`), `TestRevokeNotPersistedAnswers500WithTheEpoch`
+  (`internal/server`).
+- **S-5, guest text echoed.** A 34 KB error from the guest agent was the
+  502 `guest-agent` problem's detail. The detail is fixed text now; the
+  guest's text is logged, cut to 256 bytes. Test:
+  `TestGuestErrorTextIsNotEchoed`.
+- **S-7, port changes were not written through.** Publishing,
+  unpublishing and removing a port changed only the local run; another
+  daemon resuming the run from its record served the old ports. They now
+  write through like a revoke (502 `access-write-through` when they
+  cannot; the change holds here). Tests: `TestPortChangesAreWrittenThrough`
+  (`internal/vm`), `TestPortChangeWriteThroughFailureAnswers502`
+  (`internal/server`).
+- **Grant nits.** `"cnf":""`, `"own":false`, `"ref":""` and `"org":""`
+  are malformed (absent is the one spelling of "not set"); the SSH
+  forward row refuses any grant with an `http:` scope (`[http:*, tcp:*]`
+  + cnf was permitted); `NewKeyring` refuses one public key under two
+  kids (the first verified every grant naming the second, so the
+  second's notAfter or removal meant nothing — `PUT /v1/access/config`
+  now refuses such a configuration); a resume's `accessEpoch` must be at
+  most 2^53-1 - 2^20, since an epoch at the maximum can never be raised
+  again. Tests: `TestVerifyRefuses`, `TestNewKeyringRefuses`,
+  `TestPermitsTable` (`accessgrant`), `TestResumeRefusesAnEpochNearTheMaximum`
+  (`internal/run`). `FuzzVerify` ran 60 s after the change (2.1 M
+  executions, no failure) with a seed for the empty claims.
+
+Limits and choices a reviewer should check:
+
+1. **The anonymous stall timeout (30 s) is a choice, not measured.** It
+   counts only time with a write blocked, so long-polls and quiet
+   websockets are untouched; a visitor that reads slower than one write
+   per 30 s is cut. Granted streams are not watched (an owner's stall
+   stalls only the owner's own connection now).
+2. **Writing a local epoch found ahead during a reconcile is best
+   effort** (logged when it fails). Until it lands, a resume on another
+   daemon goes by the record and by the caller's `accessEpoch` — which
+   is what the revoke's 502 told the caller to keep.
+3. **A port change that fails its write-through holds locally**, like a
+   revoke; a later reconcile with a newer record takes the record's
+   ports and so can undo it. The caller was answered 502 and asked to
+   repeat it.
+4. **The registry file carries access state only for stopped runs**
+   (unchanged): a running run's epoch is not in it, and a run lost by a
+   restart comes back through its remote record and the move rule, or
+   not at all.
+5. **Edges must open one connection per run and kind** — the 4b edge
+   has to be built that way; an edge mixing them gets 421s, not stalls.
+6. **The key-removal race** (a key removed between verification and the
+   stream's count) is closed by a recheck after the count; there is no
+   deterministic test for the interleaving itself, only for the closes.
+7. **The unix socket's peers have no expiry**: credentials there are
+   checked at accept, as before.
+
+Deferred: nothing of the list above. Review items not in this
+follow-up's list (S-6 and the review's notes) were not re-run here.

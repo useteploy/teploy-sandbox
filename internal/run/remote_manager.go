@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"slices"
 	"sort"
@@ -234,7 +235,7 @@ func (m *Manager) publishHeld(ctx context.Context, id string) error {
 	m.releaseImages(released)
 	m.persist()
 	if err == nil {
-		err = m.publishAccessSince(ctx, id, payload, local)
+		err = m.publishAccessSince(ctx, id, local)
 	}
 	switch {
 	case err == nil:
@@ -256,29 +257,18 @@ func (m *Manager) publishHeld(ctx context.Context, id string) error {
 	return err
 }
 
-// publishAccessSince writes the run's access state into the record a
-// publish just wrote, when it changed after the payload was taken: a
-// revoke or port change made while the upload ran (with no record yet,
-// nothing else would carry it). The caller holds the run's exclusivity.
-// A failure fails the publish: the run is not durable until its record
-// says what this daemon answered, and the retry writes it from the live
-// run.
-func (m *Manager) publishAccessSince(ctx context.Context, id string, payload []byte, local bool) error {
+// publishAccessSince brings the record a publish just landed in step with
+// the run's live access state. It compares with the record itself, not
+// with the publish's payload: the record can be an older write of this
+// same stop (its answer was lost, and advanceStopped took it as this
+// publish's), carrying access state from before changes answered since;
+// and a revoke or port change made while the upload ran is not in the
+// payload either. writeAccessHeld reads the newest record and writes
+// only what differs. The caller holds the run's exclusivity. A failure
+// fails the publish: the run is not durable until its record says what
+// this daemon answered, and the retry writes it from the live run.
+func (m *Manager) publishAccessSince(ctx context.Context, id string, local bool) error {
 	if m.access == nil {
-		return nil
-	}
-	var written stateRun
-	if err := json.Unmarshal(payload, &written); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	live, ok := m.runs[id]
-	same := !ok || (live.accessEpoch == written.AccessEpoch && slices.Equal(live.accessPorts, written.AccessPorts))
-	if ok && same {
-		live.accessDirty = false
-	}
-	m.mu.Unlock()
-	if same {
 		return nil
 	}
 	err := m.writeAccessHeld(ctx, id)
@@ -698,6 +688,33 @@ func (m *Manager) keepAccessFloor(id string, payload []byte) {
 	m.mu.Unlock()
 }
 
+// pruneAccessFloor drops a run's epoch floor once its record says it
+// was destroyed: a destroyed run never comes back (a run ID is never
+// reused), so no epoch of it can matter again. Nothing else prunes a
+// floor — a record that is merely not there may come back.
+func (m *Manager) pruneAccessFloor(id string) {
+	m.mu.Lock()
+	_, had := m.accessFloors[id]
+	delete(m.accessFloors, id)
+	m.mu.Unlock()
+	if had {
+		m.persist()
+	}
+}
+
+// pruneAccessFloors looks up every run with an epoch floor and prunes
+// those whose record says destroyed.
+func (m *Manager) pruneAccessFloors(ctx context.Context) {
+	m.mu.Lock()
+	ids := slices.Collect(maps.Keys(m.accessFloors))
+	m.mu.Unlock()
+	for _, id := range ids {
+		if latest, err := m.OffHost.Latest(ctx, id); err == nil && latest.State == RecordDestroyed {
+			m.pruneAccessFloor(id)
+		}
+	}
+}
+
 // forgetHeld drops a stopped run from this daemon: the record, and the
 // local copies only it held. Remote storage is not touched. The caller
 // holds the run's exclusivity.
@@ -777,11 +794,19 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 			if !missing {
 				actual = latest.Generation
 			}
-			m.log.Error("remote storage no longer has the record this daemon wrote for a running run; its next stop writes one again", "id", id, "known", local.remoteGen, "remote", actual)
 			local.remoteGen, local.remoteHeld = actual, false
 			if superseded {
-				local.Remote = nil
+				// Taken over, and the takeover's records are gone (lost
+				// objects, a wrong or restored bucket). That is not the
+				// run coming back to this copy: it stays superseded,
+				// taking no access streams, whose state the new holder
+				// may have revoked or unpublished. Only its own newest
+				// record (recovers) undoes the mark.
+				m.log.Error("a running run taken over by another daemon no longer finds that daemon's record; it stays superseded", "id", id, "remote", actual)
+				changed = true
+				break
 			}
+			m.log.Error("remote storage no longer has the record this daemon wrote for a running run; its next stop writes one again", "id", id, "known", local.remoteGen, "remote", actual)
 		case recovers:
 			local.remoteHeld = latest.State == RecordRunning || latest.State == RecordForked
 			local.Remote = nil
@@ -1074,6 +1099,7 @@ func (m *Manager) adoptUnknown(ctx context.Context, latest RemoteRecord, takeove
 	var err error
 	switch {
 	case latest.State == RecordDestroyed:
+		m.pruneAccessFloor(latest.Run)
 		return ErrNotFound
 	case latest.State == RecordStopped:
 		adopted, err = m.adopt(ctx, latest, false)
@@ -1165,6 +1191,7 @@ func (m *Manager) claimHeld(ctx context.Context, current *Run) error {
 	}
 	m.mu.Lock()
 	payload := m.remotePayloadLocked(m.runs[current.ID])
+	ports := slices.Clone(m.runs[current.ID].accessPorts)
 	m.mu.Unlock()
 	key, err := m.OffHost.Advance(ctx, RemoteRecord{Run: current.ID, Generation: current.remoteGen + 1, State: RecordRunning,
 		Snapshot: current.snapshot, Payload: payload, Key: current.remoteKey})
@@ -1173,6 +1200,7 @@ func (m *Manager) claimHeld(ctx context.Context, current *Run) error {
 	}
 	m.mu.Lock()
 	live := m.runs[current.ID]
+	recordCarriesPortsLocked(live, ports)
 	live.remoteGen = current.remoteGen + 1
 	live.remoteHeld = true
 	live.remoteKey = key
@@ -1184,6 +1212,17 @@ func (m *Manager) claimHeld(ctx context.Context, current *Run) error {
 	m.mu.Unlock()
 	m.persist()
 	return nil
+}
+
+// recordCarriesPortsLocked notes that a record this daemon just wrote
+// carries ports: if they are still the run's, the run's ports are no
+// longer changed only here (accessDirty), and a newer record from
+// another daemon replaces them instead of being merged with them.
+// Caller holds mu.
+func recordCarriesPortsLocked(live *Run, ports []PortSpec) {
+	if live != nil && slices.Equal(live.accessPorts, ports) {
+		live.accessDirty = false
+	}
 }
 
 // unclaimHeld gives a run back after a resume that claimed it failed to
@@ -1205,6 +1244,7 @@ func (m *Manager) unclaimHeld(ctx context.Context, id string) {
 	}
 	snapshot, key, generation := live.snapshot, live.remoteKey, live.remoteGen
 	payload := m.remotePayloadLocked(live)
+	ports := slices.Clone(live.accessPorts)
 	var damage *RemoteDamage
 	if live.Remote != nil {
 		damage = live.Remote.Damage
@@ -1257,6 +1297,7 @@ func (m *Manager) unclaimHeld(ctx context.Context, id string) {
 	m.mu.Lock()
 	if live, ok := m.runs[id]; ok {
 		live.remoteGen, live.remoteHeld, live.remoteKey = generation+1, false, key
+		recordCarriesPortsLocked(live, ports)
 		setRemoteLocked(live, state)
 	}
 	m.mu.Unlock()
@@ -1399,6 +1440,7 @@ func (m *Manager) SyncRemote(ctx context.Context) (SyncStats, error) {
 			stats.Changed++
 		}
 	}
+	m.pruneAccessFloors(ctx)
 	m.mu.Lock()
 	m.remoteSeen = next
 	orphans := m.orphans

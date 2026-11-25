@@ -4150,8 +4150,9 @@ no host serves it public. Nothing relies on clocks. Not run live.
 - **A3:** share-link holders are granted streams; they shared the
   owner's connection and were never stall-checked. A connection now
   binds to (run, anonymous | one grant's `jti`): a share link's holders
-  get one connection, the owner's grant another (421 otherwise);
-  `--access-edge-conns` defaults to four per run.
+  get one connection, the owner's grant another (421 otherwise). (The
+  first version of this raised `--access-edge-conns` to four per run,
+  which the third round below found exploitable and replaced.)
   `TestShareLinkHoldersDoNotStarveTheOwner`.
 - **V1/V2:** on a run's first publish (no record yet) a revoke or port
   change skipped its write-through and answered 200, then the publish
@@ -4189,3 +4190,109 @@ no host serves it public. Nothing relies on clocks. Not run live.
   (`TestServeUnregistersItsConfigurationWatch`); denylisting an edge
   closes its open streams (`TestDenylistingAnEdgeEndsItsStreams`); the
   wire contract says a write-through holds the run up to 30 s.
+
+### Third review round on PR #13 (2026-11-25)
+
+A broad reviewer and an invariant reviewer re-read the PR at `8806bb3`.
+Each reproduction below is an asserting regression test, and each one
+fails when its fix is reverted. Every earlier fix and test is kept.
+Nothing here has run live.
+
+- **Blocker: per-grant connections could use up the edge's connection
+  cap.** Binding a connection per grant (`jti`) meant one tenant could
+  mint a few grants for its own run and open one stream per grant. The
+  per-edge cap (then 4 × streamsMax/64) counted all of them, so once it
+  filled, other runs could not be reached through that edge.
+  - **Fix: the reviewer's option (b).** A connection counts against the
+    edge's cap only until its first stream binds it to a run. From then
+    on it counts against that run's connections from that edge, capped
+    at 8 (`DefaultConnsPerRun`). Past the cap, the stream answers 429
+    `run-connections` with `Connection: close`, so Go's HTTP/2 server
+    sends GOAWAY and the unused connection gives its edge slot back.
+  - The edge cap now only bounds connections that do not serve a run
+    yet. The edge opens those itself, and a tenant cannot hold one open,
+    because a refused one closes. Its default goes back to twice the
+    runs the stream cap allows for.
+  - **Why (b) over (a)**, which was: bind per (run, anonymous or
+    granted) and stall-check non-owner granted streams.
+    - The daemon cannot tell an owner's grant from a share link: both
+      are ordinary grants, and the `own` proof never reaches the
+      daemon.
+    - So (a) would mean stall-checking every granted stream. That cuts
+      an owner's own long transfer to a guest that pauses, and lets
+      share-link holders share the owner's connection window until the
+      check fires, so `TestShareLinkHoldersDoNotStarveTheOwner` could
+      not pass.
+    - (b) keeps that isolation and needs no clock. No run's
+      connections, and no set of grants, can take another run's
+      capacity, because the capacity is per run.
+  - **Limits of the fix.**
+    - At most 8 grants per run may hold connections from one edge at
+      once (the anonymous connection is one of the 8). A ninth needs an
+      idle connection closed first.
+    - The total number of connections an edge may hold is now
+      8 × (runs it serves) + its unbound cap. Memory is still bounded
+      by the stream caps (each stream's 256 KiB window); a connection
+      holds no buffer of its own beyond its streams'.
+  - Tests: `TestPerGrantConnectionsDoNotExhaustTheEdgeCap` (the
+    reviewer's repro), `TestARunsConnectionsFromAnEdgeAreCapped`, and
+    `TestShareLinkHoldersDoNotStarveTheOwner` (still passes).
+- **V4: a lost answer on the first record write lost later changes.**
+  1. Generation 1 of the record landed, but its answer was lost. The
+     run was left failed, with `remoteGen` 0 and nobody holding it.
+  2. A port change or revoke then answered 200 with no write to the
+     record.
+  3. The upkeep's retry adopted the stale generation 1 as its own.
+  4. `publishAccessSince` compared the live state with the retry's own
+     payload instead of with the record that landed. They matched, so
+     nothing was written.
+  - Fix: every publish with access on now ends with `writeAccessHeld`,
+    which reads the newest record and writes only what differs.
+  - Across a crash: the change is in the registry file before it is
+    answered. If the daemon restarts, it publishes the change at its
+    next upkeep, or merges it if another daemon has written the record
+    since. The wire contract now says this instead of the earlier,
+    narrower promise.
+  - Tests: `TestAPortChangeAfterALostFirstRecordAnswerReachesTheRecord`,
+    `TestARevokeAfterALostFirstRecordAnswerReachesTheRecord`.
+- **V5: losing the record revived a taken-over running copy.** When a
+  sync found the takeover's records missing (or at an older
+  generation), it cleared the superseded mark. The copy then admitted
+  streams again at its old epoch and served ports the new holder had
+  made private.
+  - Fix: missing or older records no longer clear the mark. Only the
+    `recovers` case (the copy's own newest record) clears it.
+  - Test: `TestASupersededCopyStaysSupersededWhenTheRecordsAreLost`.
+- **Denylist race.** An edge denylisted between the stream's first
+  check and its count could keep its stream. Denied is now rechecked
+  after the count, the same way the issuer-key recheck works.
+  `TestAnEdgeDenylistedBeforeTheCountIsRefused` injects the change
+  through the grant clock, which is read after the first check.
+- **Epoch floors are now pruned.**
+  - A floor is pruned only when the run's record says destroyed: when a
+    sync or lookup sees that record, and on every sync for each floor
+    still held. A run ID is never reused, so a destroyed run cannot
+    come back.
+  - A record that is merely missing does not prune a floor, because the
+    run may still come back.
+  - Test: `TestAnEpochFloorIsPrunedOnlyWhenTheRunIsDestroyed`.
+- **A stale `accessDirty` flag could undo another host's publish.**
+  When a record this daemon writes carries the run's current ports (a
+  resume's claim, or giving the run back after a failed boot), the
+  "changed only here" flag is now cleared. Without that, the next sync
+  failed closed against a port another daemon had published, and wrote
+  the loss through.
+  `TestAPortPublishedElsewhereSurvivesAStaleLocalChange` fails without
+  the fix in both places.
+- **Edge window.** The wire contract now requires the edge's HTTP/2
+  window for one daemon connection to cover 16 streams × the edge's
+  per-stream window. Anonymous stalls are detected only toward the
+  guest, so a visitor that does not read holds the edge's window, not
+  the daemon's.
+- **Behaviour change, kept on purpose: a revoke or port change on a
+  busy run that has never been published now answers 502 instead of
+  200.** "Busy" here means a stop is writing the run's first record.
+  The change still holds on this daemon, and the publish writes it to
+  the record. The 502 tells the caller it is not known to be in remote
+  storage yet, and to repeat it; repeating is harmless. Answering 200
+  would claim a durability that does not exist yet.

@@ -403,8 +403,14 @@ compared with a clock:
   answer, and a resume of a run this daemon already holds (a takeover)
   writes the epoch its move raised there before the run boots;
 - a revoke or port change while a stop is publishing the run's first
-  record answers 502 `access-write-through` (busy) and still reaches the
-  record: the publish writes whatever changed since it began;
+  record answers 502 `access-write-through` (busy), and one made while
+  the run has no record this daemon knows of (its first publish failed,
+  or its answer was lost) answers 200 without a write. Both still reach
+  the record: every publish, once its record lands, writes whatever the
+  newest record lacks of the run's access state. The change is in the
+  registry file before it is answered, so a daemon that restarts in
+  between publishes it at its next upkeep (or, if another daemon wrote
+  the record meanwhile, merges it as below);
 - the epoch never goes down: when a daemon takes a newer remote record
   of a run it holds stopped, it keeps the higher of its own epoch and
   the record's, and a daemon that drops a run whose epoch was ahead of
@@ -471,9 +477,20 @@ One connection serves one run and one kind of stream: anonymous (no
 admitted stream binds it, and a stream for another run, or of another
 kind, on it is 421 `wrong-connection`. Open one connection per run and
 kind, so that a public port's visitors, or one share link's holders,
-never share flow control with the owner's streams. Each edge may hold
-`--access-edge-conns` connections (default: four per run the stream cap
-allows for).
+never share flow control with the owner's streams.
+
+A connection counts against its edge's `--access-edge-conns` (default:
+twice the runs the stream cap allows for) only until its first stream
+binds it to a run; from then on it counts against that run's
+connections from that edge, at most 8. Past that, a new connection's
+stream is 429 `run-connections` and the connection is closed (GOAWAY).
+So no run, and no tenant's grants, can use up the connections another
+run needs.
+
+An edge's HTTP/2 receive window for one daemon connection must cover 16
+streams at the edge's per-stream window: a stalled anonymous stream is
+only detected toward the guest (below), so a visitor that does not read
+holds the edge's window, not the daemon's.
 
 A connection holds only as long as the certificate it was opened with:
 at the earliest `notAfter` of its verified chain the daemon closes it,
@@ -487,7 +504,7 @@ replacing it under its `kid`, closes the streams it admitted; a key's
 | Route | Headers | Success | Errors (`type` suffix) |
 |---|---|---|---|
 | `GET /v1/access/runs/{id}` | | 200 `{id, state, epoch, publicPorts: [{port, protocol}]}` | 404 `not-here` |
-| `POST /v1/access/runs/{id}/connect?port=P` | `Teploy-Grant?`; `Teploy-Edge-Request?` | 200, then raw bytes both ways | 400 `bad-request`; 401 `grant-invalid`, `grant-expired`, `revoked`; 403 `scope`, `not-public`, `edge-denied`, `edge-expired`; 404 `not-here`; 409 `stopped`; 421 `wrong-connection`; 429 `run-streams`, `anon-streams`; 502 `refused`, `guest-agent`; 503 `at-capacity`; 501 `unsupported-driver` |
+| `POST /v1/access/runs/{id}/connect?port=P` | `Teploy-Grant?`; `Teploy-Edge-Request?` | 200, then raw bytes both ways | 400 `bad-request`; 401 `grant-invalid`, `grant-expired`, `revoked`; 403 `scope`, `not-public`, `edge-denied`, `edge-expired`; 404 `not-here`; 409 `stopped`; 421 `wrong-connection`; 429 `run-streams`, `anon-streams`, `run-connections`; 502 `refused`, `guest-agent`; 503 `at-capacity`; 501 `unsupported-driver` |
 
 `connect`: the response body is what the guest sends, the request body
 what it receives; the end of the request body is passed to the guest as

@@ -29,6 +29,12 @@ const (
 	// stalls only its own run.
 	streamWindow = 256 << 10
 	connWindow   = 4<<20 - 1
+	// DefaultConnsPerRun is how many connections one edge may have bound
+	// to one run at once: the anonymous one and seven grants'. They are
+	// counted per (edge, run), apart from the edge's own cap (which
+	// counts only connections not serving a run yet), so no run, and no
+	// tenant's grants, can take the connections another run needs.
+	DefaultConnsPerRun = 8
 	// dialTimeout bounds opening the guest side of a stream; the guest
 	// agent itself has guest.ConnectResultTimeout to answer.
 	dialTimeout    = 10 * time.Second
@@ -50,6 +56,61 @@ type Service struct {
 	Log      *slog.Logger
 	// Now is the clock grants are checked against; nil is time.Now.
 	Now func() time.Time
+	// ConnsPerRun bounds one edge's connections bound to one run;
+	// DefaultConnsPerRun when zero.
+	ConnsPerRun int
+
+	bindMu   sync.Mutex
+	runConns map[string]int
+	conns    sync.Map // net.Conn -> *connInfo
+}
+
+// bind ties a connection to (run, kind) on its first admitted stream,
+// counting it against the edge's connections to that run; a stream for
+// anything else on it is refused (wrong), and a run whose connections
+// from this edge are at their cap refuses a new one (full).
+func (s *Service) bind(info *connInfo, run, kind string) (wrong, full bool) {
+	info.mu.Lock()
+	defer info.mu.Unlock()
+	if info.run != "" {
+		return info.run != run || info.kind != kind, false
+	}
+	limit := s.ConnsPerRun
+	if limit <= 0 {
+		limit = DefaultConnsPerRun
+	}
+	key := info.peer + "\x00" + run
+	s.bindMu.Lock()
+	if s.runConns == nil {
+		s.runConns = map[string]int{}
+	}
+	if s.runConns[key] >= limit {
+		s.bindMu.Unlock()
+		return false, true
+	}
+	s.runConns[key]++
+	s.bindMu.Unlock()
+	info.run, info.kind, info.slot = run, kind, key
+	if info.release != nil {
+		info.release()
+	}
+	return false, false
+}
+
+// unbind gives a closed connection's run slot back.
+func (s *Service) unbind(info *connInfo) {
+	info.mu.Lock()
+	key := info.slot
+	info.slot = ""
+	info.mu.Unlock()
+	if key == "" {
+		return
+	}
+	s.bindMu.Lock()
+	if s.runConns[key]--; s.runConns[key] <= 0 {
+		delete(s.runConns, key)
+	}
+	s.bindMu.Unlock()
 }
 
 func (s *Service) now() time.Time {
@@ -72,6 +133,10 @@ type connInfo struct {
 	mu       sync.Mutex
 	run      string
 	kind     string
+	// slot is the (edge, run) count the connection holds once bound;
+	// release gives its edge slot back then.
+	slot    string
+	release func()
 }
 
 // streamKind is what a connection binds to besides the run: "anonymous",
@@ -140,11 +205,19 @@ func (s *Service) Serve(ctx context.Context, ln net.Listener, unencryptedHTTP2 b
 			if peers != nil {
 				peer := peers.peer(c)
 				info.peer, info.notAfter = peer.name, peer.notAfter
+				info.release = func() { peers.release(c) }
 			}
+			s.conns.Store(c, info)
 			return context.WithValue(ctx, connKey{}, info)
 		},
 		ConnState: func(c net.Conn, state http.ConnState) {
-			if peers != nil && (state == http.StateClosed || state == http.StateHijacked) {
+			if state != http.StateClosed && state != http.StateHijacked {
+				return
+			}
+			if info, ok := s.conns.LoadAndDelete(c); ok {
+				s.unbind(info.(*connInfo))
+			}
+			if peers != nil {
 				peers.forget(c)
 			}
 		},
@@ -337,6 +410,13 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer stream.Release()
+	// Counted first, checked second: an edge denylisted after this check
+	// has the stream closed by the configuration change, and one
+	// denylisted between the check above and the count is seen here.
+	if s.Store.Denied(info.peer) {
+		writeProblem(w, http.StatusForbidden, "edge-denied", "The edge this connection belongs to is denylisted.")
+		return
+	}
 	// Counted first, checked second: a key removal that lands after this
 	// check finds the stream in the registry, and one that landed between
 	// the verification and the count is seen here.
@@ -364,8 +444,15 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusServiceUnavailable, "at-capacity", "The run cannot take access streams now.")
 		return
 	}
-	if !info.bind(id, streamKind(anon, claims.Jti)) {
+	switch wrong, full := s.bind(info, id, streamKind(anon, claims.Jti)); {
+	case wrong:
 		writeProblem(w, http.StatusMisdirectedRequest, "wrong-connection", "This connection serves another run, or another kind of stream (anonymous, or another grant); open one per run and kind.")
+		return
+	case full:
+		// The connection serves nothing and never will: close it once
+		// this answer is out, so that its edge slot comes back.
+		w.Header().Set("Connection", "close")
+		writeProblem(w, http.StatusTooManyRequests, "run-connections", "This edge has as many connections to the run as it may; reuse one (one per run and kind).")
 		return
 	}
 	if !anon && claims.Ep < target.Epoch {

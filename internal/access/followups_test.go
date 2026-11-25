@@ -522,3 +522,87 @@ func TestServeUnregistersItsConfigurationWatch(t *testing.T) {
 		t.Fatalf("%d configuration watches left after Serve returned", n)
 	}
 }
+
+// PR #13, third review round (blocker): connections bound per grant are
+// counted against their run, per edge, not against the edge's cap — one
+// tenant holding several grants to its own run cannot use up the edge's
+// connections and cut another run off.
+func TestPerGrantConnectionsDoNotExhaustTheEdgeCap(t *testing.T) {
+	r := newRig(t, func(c *rigConfig) { c.perPeer = 4 })
+	r.manager.dial = func(context.Context, string, int) (net.Conn, error) { return echoConn(), nil }
+	for i := range 4 {
+		jti := fmt.Sprint("a-", i)
+		s, err := r.connect(r.client(r.edge), runA, "3000", r.grant(func(c *accessgrant.Claims) { c.Jti = jti }))
+		if err != nil || s.resp.StatusCode != 200 {
+			t.Fatalf("run A grant %d: %v", i, err)
+		}
+		roundTrip(t, s, "held open")
+	}
+	s, err := r.connect(r.client(r.edge), runB, "3000", r.grant(func(c *accessgrant.Claims) { c.Run = runB; c.Jti = "b-owner" }))
+	if err != nil || s.resp.StatusCode != 200 {
+		t.Fatalf("run B cannot be reached once run A's grants hold connections: %v", err)
+	}
+	roundTrip(t, s, "run B")
+}
+
+// A run's connections from one edge are capped: past the cap a new
+// connection is refused 429 run-connections and closed, and other runs
+// are not affected.
+func TestARunsConnectionsFromAnEdgeAreCapped(t *testing.T) {
+	r := newRig(t, func(c *rigConfig) { c.conns = 2 })
+	r.manager.dial = func(context.Context, string, int) (net.Conn, error) { return echoConn(), nil }
+	for i := range 2 {
+		jti := fmt.Sprint("a-", i)
+		s, err := r.connect(r.client(r.edge), runA, "3000", r.grant(func(c *accessgrant.Claims) { c.Jti = jti }))
+		if err != nil || s.resp.StatusCode != 200 {
+			t.Fatalf("run A grant %d: %v", i, err)
+		}
+		roundTrip(t, s, "held")
+	}
+	third, err := r.connect(r.client(r.edge), runA, "3000", r.grant(func(c *accessgrant.Claims) { c.Jti = "a-2" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	third.in.Close()
+	if third.resp.StatusCode == http.StatusOK {
+		t.Fatal("a third connection to run A was served")
+	}
+	if status, kind, _ := problemOf(t, third.resp); status != http.StatusTooManyRequests || kind != "run-connections" {
+		t.Fatalf("a third connection to run A: %d %s", status, kind)
+	}
+	s, err := r.connect(r.client(r.edge), runB, "3000", r.grant(func(c *accessgrant.Claims) { c.Run = runB; c.Jti = "b" }))
+	if err != nil || s.resp.StatusCode != 200 {
+		t.Fatalf("run B beside a capped run A: %v", err)
+	}
+}
+
+// PR #13, third review round: an edge denylisted between the stream's
+// first check and its count is caught by the recheck after the count
+// (the configuration change found no stream of it to close).
+func TestAnEdgeDenylistedBeforeTheCountIsRefused(t *testing.T) {
+	var r *rig
+	var once sync.Once
+	r = newRig(t, func(c *rigConfig) {
+		c.now = func() time.Time {
+			// Called while the grant is verified: after the first
+			// denylist check, before the stream is counted.
+			once.Do(func() {
+				if err := r.store.Set(Config{Audience: testAudience, IssuerKeys: r.store.Config().IssuerKeys, EdgeDenylist: []string{"edge-1"}}); err != nil {
+					t.Error(err)
+				}
+			})
+			return time.Now()
+		}
+	})
+	s, err := r.connect(r.client(r.edge), runA, "3000", r.grant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.in.Close()
+	if s.resp.StatusCode == http.StatusOK {
+		t.Fatal("a stream of an edge denylisted before its count was served")
+	}
+	if status, kind, _ := problemOf(t, s.resp); status != http.StatusForbidden || kind != "edge-denied" {
+		t.Fatalf("a stream of an edge denylisted before its count: %d %s", status, kind)
+	}
+}

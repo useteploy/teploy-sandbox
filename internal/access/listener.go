@@ -147,6 +147,9 @@ type servedConn struct {
 	peerInfo
 	// expiry closes the connection at notAfter.
 	expiry *time.Timer
+	// released: the connection serves a run now and is counted against
+	// that run's own connections (Service), not the edge's.
+	released bool
 }
 
 func newPeerListener(inner net.Listener, perPeer int, admit func(net.Conn) (net.Conn, peerInfo, error), log *slog.Logger) *peerListener {
@@ -256,6 +259,22 @@ func (l *peerListener) peer(conn net.Conn) peerInfo {
 	return peerInfo{}
 }
 
+// release gives a connection's edge slot back once it serves a run: from
+// then on it is counted against that run's connections from the edge
+// (Service.bind), so one run's connections never fill the edge's.
+func (l *peerListener) release(conn net.Conn) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	served, ok := l.peers[conn]
+	if !ok || served.released {
+		return
+	}
+	served.released = true
+	if l.counts[served.name]--; l.counts[served.name] <= 0 {
+		delete(l.counts, served.name)
+	}
+}
+
 // forget gives a closed connection's slot back.
 func (l *peerListener) forget(conn net.Conn) {
 	l.mu.Lock()
@@ -268,6 +287,9 @@ func (l *peerListener) forget(conn net.Conn) {
 		served.expiry.Stop()
 	}
 	delete(l.peers, conn)
+	if served.released {
+		return
+	}
 	if l.counts[served.name]--; l.counts[served.name] <= 0 {
 		delete(l.counts, served.name)
 	}

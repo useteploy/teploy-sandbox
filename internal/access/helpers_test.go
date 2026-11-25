@@ -232,6 +232,8 @@ type rigConfig struct {
 	perPeer int
 	meter   func(string, int64, int64, bool)
 	log     *slog.Logger
+	now     func() time.Time
+	conns   int
 }
 
 func newRig(t *testing.T, options ...rigOption) *rig {
@@ -264,7 +266,7 @@ func newRig(t *testing.T, options ...rigOption) *rig {
 	if log == nil {
 		log = quiet()
 	}
-	r.service = &Service{Manager: r.manager, Store: store, Registry: r.registry, Log: log}
+	r.service = &Service{Manager: r.manager, Store: store, Registry: r.registry, Log: log, Now: config.now, ConnsPerRun: config.conns}
 	listener, tlsOn, err := Listen(ListenSpec{Addr: "127.0.0.1:0", TLS: TLSFiles{Cert: certPath, Key: keyPath, ClientCA: caPath}}, store, config.perPeer, quiet())
 	if err != nil {
 		t.Fatal(err)

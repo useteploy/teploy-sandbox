@@ -1561,8 +1561,10 @@ teploy-sandbox serve --driver vm --vm-max-runs 22 \
   the daemon refuses to start when the stream cap times that exceeds
   `--access-memory-mb` (default a tenth of the host's memory), and warns
   when its open file limit is short by `streams + 64`. One connection
-  serves one run, so a guest that stops reading stalls only its own run;
-  each edge may hold `--access-edge-conns` connections. Access streams do
+  serves one run and one kind of stream (anonymous, or one grant), so a
+  guest that stops reading stalls only that run's streams of that kind;
+  each edge may hold `--access-edge-conns` connections not yet serving a
+  run, and 8 per run it serves. Access streams do
   not cross the run's tap, so the daemon shapes them itself: per run,
   granted streams together at `--access-mbit` (default `--vm-net-mbit`),
   anonymous ones together at `--access-anon-mbit` (20), and all of them

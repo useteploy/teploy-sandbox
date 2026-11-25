@@ -268,3 +268,43 @@ func TestADestroyedUnconfirmedRunIsNotAdoptedElsewhere(t *testing.T) {
 		t.Fatalf("host-b adopted run %s, destroyed on host-a: %+v", id, seen.Remote)
 	}
 }
+
+// A stale unconfirmed copy of a run another daemon adopted and moved on
+// is deleted here only, at once, and the run there is left alone.
+func TestAnUnconfirmedCopyOfAMovedRunIsDeletedHereOnly(t *testing.T) {
+	for _, stopAgain := range []bool{false, true} {
+		a, b, id := lostFirstRecord(t)
+		b.sync(t)
+		if _, err := b.manager.Resume(bg, id, 0); err != nil {
+			t.Fatal(err)
+		}
+		if stopAgain {
+			b.stop(t, id)
+		}
+		if err := a.manager.Destroy(bg, id); err != nil {
+			t.Fatalf("stopAgain=%v: host-a's stale copy not deleted: %v", stopAgain, err)
+		}
+		if _, err := a.manager.Get(id); err == nil {
+			t.Fatalf("stopAgain=%v: host-a still has the run", stopAgain)
+		}
+		b.sync(t)
+		if _, err := b.manager.Get(id); err != nil {
+			t.Fatalf("stopAgain=%v: host-b's run went away: %v", stopAgain, err)
+		}
+	}
+}
+
+// With storage down, a never-published run is deleted; an unconfirmed
+// one is not (its record may be there), and is left for a retry.
+func TestDestroyWithStorageDownWaitsOnlyForAnUnconfirmedRun(t *testing.T) {
+	bucket, a, id := legacyRun(t)
+	bucket.SetFail(func(op, key string) error { return errors.New("no route to host") })
+	if err := a.manager.Destroy(bg, id); err != nil {
+		t.Fatalf("never-published run with storage down: %v", err)
+	}
+	a2, _, id2 := lostFirstRecord(t)
+	a2.bucket.SetFail(func(op, key string) error { return errors.New("no route to host") })
+	if err := a2.manager.Destroy(bg, id2); err == nil {
+		t.Fatalf("unconfirmed run deleted with storage down")
+	}
+}

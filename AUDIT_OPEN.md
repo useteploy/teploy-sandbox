@@ -4447,7 +4447,11 @@ covered only through `SyncRemote`.
   daemon adopted the run from that record and could resume it.
   `destroyStopped` now looks up an unconfirmed run's record
   (`adoptUnconfirmed`) and destroys the run there too, or fails the
-  delete on a conflict. Test: `TestADestroyedUnconfirmedRunIsNotAdoptedElsewhere`.
+  delete when the newest record is its own but unexpected. A stale copy
+  of a run another daemon has adopted and moved on is deleted here only,
+  as a superseded copy is. Tests: `TestADestroyedUnconfirmedRunIsNotAdoptedElsewhere`,
+  `TestAnUnconfirmedCopyOfAMovedRunIsDeletedHereOnly`,
+  `TestDestroyWithStorageDownWaitsOnlyForAnUnconfirmedRun`.
 - **Open (assumption, not documented in the off-host docs yet): a record
   write that timed out must not land later.** If one lands after a later
   lookup answered NotFound, the run can be adopted elsewhere: a

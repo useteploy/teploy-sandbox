@@ -602,19 +602,33 @@ func (m *Manager) destroyStopped(ctx context.Context, current *Run) error {
 		}
 		m.mu.Unlock()
 		if unconfirmed {
-			generation, err := m.adoptUnconfirmed(ctx, current.ID, current.snapshot)
-			if err != nil {
+			fail := func(err error) error {
 				m.mu.Lock()
 				if live, ok := m.runs[current.ID]; ok {
 					live.removing = false
 				}
 				m.mu.Unlock()
-				if errors.Is(err, ErrRemoteConflict) {
-					_ = m.reconcileRun(ctx, current.ID, false)
-				}
 				return fmt.Errorf("stopped run %s not deleted: %w", current.ID, err)
 			}
-			current.remoteGen = generation
+			latest, err := m.OffHost.Latest(ctx, current.ID)
+			switch {
+			case errors.Is(err, ErrNotFound):
+				// Never landed: nothing there to destroy.
+			case err != nil:
+				return fail(remoteErr(err))
+			case !latest.Mine:
+				// Another daemon adopted the record and moved the run on:
+				// this copy was never the run that did. It goes here, as
+				// a superseded copy does, and the run there is left alone.
+				m.log.Warn("a stopped run's unconfirmed copy is deleted here only: another daemon has the run", "id", current.ID, "owner", latest.Owner, "generation", latest.Generation, "state", latest.State)
+				notSuperseded = false
+			default:
+				generation, err := m.adoptUnconfirmed(ctx, current.ID, current.snapshot)
+				if err != nil {
+					return fail(err)
+				}
+				current.remoteGen = generation
+			}
 		}
 	}
 	if m.OffHost != nil && current.remoteGen > 0 && notSuperseded {

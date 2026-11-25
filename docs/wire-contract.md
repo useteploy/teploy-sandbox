@@ -363,7 +363,10 @@ Verification is strict: the signature is checked against the configured
 keys before the payload is parsed; the payload must be one JSON object
 with no duplicate key (unicode escapes included) and no key that differs
 from a claim's name only in case; every claim must have exactly its type
-(integers in plain decimal, no `null`); unknown claims are ignored. A
+(integers in plain decimal, no `null`); an optional claim (`cnf`,
+`own`, `ref`, `org`) is either absent or not empty — `"cnf":""`,
+`"own":false`, `"ref":""` and `"org":""` are malformed; unknown claims
+are ignored. A keyring may not hold one public key under two `kid`s. A
 claim that restricts what a grant allows is never added without raising
 `v`, because a verifier that ignores it would drop the restriction.
 
@@ -373,7 +376,7 @@ What a grant allows depends on where it is presented:
 |---|---|---|
 | The edge's HTTPS front | `http:<port>` for the port, or `http:*` | a grant with `cnf`; a grant with any `ssh` or `tcp:` scope |
 | An SSH session channel | `ssh`, with `cnf` (checked against the authenticated key) | no `cnf` |
-| An SSH `direct-tcpip` channel | `tcp:<port>` or `tcp:*`, with `cnf` | `http:` scopes |
+| An SSH `direct-tcpip` channel | `tcp:<port>` or `tcp:*`, with `cnf` | a grant with any `http:` scope; no `cnf` |
 | The daemon's `connect` | `http:` or `tcp:` covering the port | `ssh` alone |
 | The daemon's `session` (later) | `ssh` | everything else |
 
@@ -396,7 +399,13 @@ compared with a clock:
   `max(epoch + 1, accessEpoch + 1, now)`: strictly above anything a grant
   can have copied, so moving a run revokes all of its grants;
 - with remote storage, the epoch and the ports travel in the run's remote
-  record, and a revoke writes them there before it answers.
+  record: a revoke and a port change write them there before they
+  answer, and a resume of a run this daemon already holds (a takeover)
+  writes the epoch its move raised there before the run boots;
+- the epoch never goes down: when a daemon takes a newer remote record
+  of a run it holds stopped, it keeps the higher of its own epoch and
+  the record's (and writes its own to the record when it was ahead); the
+  ports are the record's.
 
 A caller that stores epochs (a control plane minting grants) stores the
 epoch from every run object it receives and passes it as `accessEpoch`
@@ -406,12 +415,12 @@ on every resume.
 
 | Route | Request | Success | Errors |
 |---|---|---|---|
-| `PUT /v1/runs/{id}/ports/{port}` | `{visibility: "public"\|"private", protocol?: "http"\|"h2c"}` | 200, the run | 400 bad port or field, or more than 16 public ports; 404 |
-| `DELETE /v1/runs/{id}/ports/{port}` | | 200, the run | 404 |
-| `POST /v1/runs/{id}/access/revoke` | | 200, the run with the new `access.epoch` | 404; 502 `access-write-through` |
+| `PUT /v1/runs/{id}/ports/{port}` | `{visibility: "public"\|"private", protocol?: "http"\|"h2c"}` | 200, the run | 400 bad port or field, or more than 16 public ports; 404; 500 `access-not-persisted`; 502 `access-write-through` |
+| `DELETE /v1/runs/{id}/ports/{port}` | | 200, the run | 404; 500 `access-not-persisted`; 502 `access-write-through` |
+| `POST /v1/runs/{id}/access/revoke` | | 200, the run with the new `access.epoch` | 404; 500 `access-not-persisted`; 502 `access-write-through` |
 | `GET /v1/access/config` | | 200 `{audience, kids, edgeDenylist, listener, enabled, managedByFile}` | |
 | `PUT /v1/access/config` | `{audience, issuerKeys: [{kid, ed25519, notAfter?}], edgeDenylist: [names]}` | 204 | 400; 409 when `--access-config` manages it |
-| `POST /v1/runs/{id}/resume` | gains `accessEpoch?` | as before | 400 when negative or above 2^53-1 |
+| `POST /v1/runs/{id}/resume` | gains `accessEpoch?` | as before | 400 when negative or above 2^53-1 - 2^20 (an epoch at the maximum could never be raised again) |
 
 Ports are data and may be set while the run is stopped. Making a public
 port private, or deleting it, closes that port's anonymous streams. A
@@ -419,7 +428,12 @@ revoke closes all of the run's access streams. A 502
 `access-write-through` means the epoch was raised and the streams closed
 on this daemon, but the new epoch is not in remote storage; its body
 carries `epoch`. Revoke again: it raises the epoch once more and retries
-the write. Unknown fields in these routes' bodies are 400. The
+the write. On a port route it means the same of the port change: it
+holds on this daemon and is not in remote storage; repeat it. A 500
+`access-not-persisted` (body with `epoch`) means the change holds on
+this daemon but the registry file could not be written, so a restart
+before the next good write would undo it; repeat it once the state
+directory is writable. Unknown fields in these routes' bodies are 400. The
 configuration is stored 0600 in `--state-dir`; `ed25519` is a base64
 public key, and `GET` shows key IDs only. A fork's child starts with a
 fresh epoch and no ports.
@@ -436,14 +450,24 @@ speaks h2c on a 0660 socket and admits peers by uid or gid (SO_PEERCRED).
 TCP without TLS is refused at start. HTTP/1.1 is accepted too, for
 debugging.
 
-One connection serves one run: the first stream binds it, and a stream
-for another run on it is 421 `wrong-connection`. Open one connection per
-run. Each edge may hold `--access-edge-conns` connections.
+One connection serves one run and one kind of stream, anonymous (no
+`Teploy-Grant`) or granted: the first admitted stream binds it, and a
+stream for another run, or of the other kind, on it is 421
+`wrong-connection`. Open one connection per run and kind, so that a
+public port's visitors never share flow control with the owner's
+streams. Each edge may hold `--access-edge-conns` connections.
+
+A connection holds only as long as the certificate it was opened with:
+at the earliest `notAfter` of its verified chain the daemon closes it,
+ending its streams, and a stream asked for on it after that is 403
+`edge-expired`. Removing an issuer key from the configuration, or
+replacing it under its `kid`, closes the streams it admitted; a key's
+`notAfter` brought forward ends them by then.
 
 | Route | Headers | Success | Errors (`type` suffix) |
 |---|---|---|---|
 | `GET /v1/access/runs/{id}` | | 200 `{id, state, epoch, publicPorts: [{port, protocol}]}` | 404 `not-here` |
-| `POST /v1/access/runs/{id}/connect?port=P` | `Teploy-Grant?`; `Teploy-Edge-Request?` | 200, then raw bytes both ways | 400 `bad-request`; 401 `grant-invalid`, `grant-expired`, `revoked`; 403 `scope`, `not-public`; 404 `not-here`; 409 `stopped`; 421 `wrong-connection`; 429 `run-streams`, `anon-streams`; 502 `refused`, `guest-agent`; 503 `at-capacity`; 501 `unsupported-driver` |
+| `POST /v1/access/runs/{id}/connect?port=P` | `Teploy-Grant?`; `Teploy-Edge-Request?` | 200, then raw bytes both ways | 400 `bad-request`; 401 `grant-invalid`, `grant-expired`, `revoked`; 403 `scope`, `not-public`, `edge-denied`, `edge-expired`; 404 `not-here`; 409 `stopped`; 421 `wrong-connection`; 429 `run-streams`, `anon-streams`; 502 `refused`, `guest-agent`; 503 `at-capacity`; 501 `unsupported-driver` |
 
 `connect`: the response body is what the guest sends, the request body
 what it receives; the end of the request body is passed to the guest as
@@ -451,7 +475,10 @@ a half-close, and the guest closing its side ends the stream. Without
 `Teploy-Grant` the port must be public on the run. A granted stream is
 closed at its grant's `exp`; every stream of a run is closed on revoke,
 stop and destroy; anonymous streams of a port on unpublish. A stream
-idle for an hour is closed. Every other path is 404. Problem responses
+idle for an hour is closed. An anonymous stream that has had bytes
+waiting, either way, without moving any for 30 seconds (a guest or a
+visitor that does not read) is closed; an anonymous stream with nothing
+to send is idle, not stalled. Every other path is 404. Problem responses
 never echo a grant. `Teploy-Edge-Request` is logged only when it is at
 most 64 characters of `[A-Za-z0-9._-]`.
 
@@ -463,7 +490,9 @@ a run together `--access-anon-mbit` (20), all streams
 
 `connect` reaches the guest port on the VM driver only (through the
 guest agent; the guest's loopback, `127.0.0.1` then `::1`). An agent
-older than guest protocol version 2 answers 502 `guest-agent`. The
+older than guest protocol version 2 answers 502 `guest-agent`, whose
+`detail` is fixed text: what the guest agent said is logged (shortened)
+and never sent to the edge. The
 Docker driver answers 501 `unsupported-driver` in this release, and
 `session` (SSH shells) is not built yet.
 

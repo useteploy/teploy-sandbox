@@ -10,9 +10,13 @@
 // any, verifies (signature, audience, expiry, run, scope); the stream fits
 // the caps; and then, under the manager's lock, the run is here and
 // running, the grant's epoch is at least the run's, and a stream without
-// a grant is to a public port. A granted stream is closed at its grant's
-// expiry; every stream of a run is closed on revoke, stop and destroy; a
-// public port's anonymous streams on unpublish.
+// a grant is to a public port. A connection serves one run and one kind
+// of stream (anonymous or granted) and is closed when its certificate
+// expires. A granted stream is closed at its grant's expiry and when its
+// issuer key is removed or replaced; every stream of a run is closed on
+// revoke, stop and destroy; a public port's anonymous streams on
+// unpublish; an anonymous stream that stalls with bytes waiting after
+// Limits.AnonStall.
 package access
 
 import (
@@ -68,6 +72,24 @@ type state struct {
 	config  Config
 	keyring *accessgrant.Keyring
 	deny    map[string]bool
+	// keys is the keyring by kid: the public key's bytes and its notAfter.
+	keys map[string]issuerKey
+}
+
+type issuerKey struct {
+	public   string
+	notAfter time.Time
+}
+
+// keeps reports whether this configuration still accepts the key a
+// stream was admitted with (the same kid, the same public key), and that
+// key's notAfter.
+func (st *state) keeps(kid, public string) (bool, time.Time) {
+	key, ok := st.keys[kid]
+	if !ok || key.public != public {
+		return false, time.Time{}
+	}
+	return true, key.notAfter
 }
 
 // Store holds the current configuration. Readers never block.
@@ -80,6 +102,25 @@ type Store struct {
 
 	mu      sync.Mutex
 	current atomic.Pointer[state]
+	// changed are told after every configuration change (the listener
+	// closes the streams of removed issuer keys).
+	changed []func()
+}
+
+// OnChange registers fn to run after every configuration change.
+func (s *Store) OnChange(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.changed = append(s.changed, fn)
+}
+
+func (s *Store) notify() {
+	s.mu.Lock()
+	fns := slices.Clone(s.changed)
+	s.mu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
 }
 
 // OpenStore loads the configuration: from file when given, else from
@@ -124,6 +165,7 @@ func compile(config Config) (*state, error) {
 		return nil, errors.New("issuer keys need an audience")
 	}
 	keys := make([]accessgrant.Key, 0, len(config.IssuerKeys))
+	byKid := map[string]issuerKey{}
 	for _, key := range config.IssuerKeys {
 		public, err := accessgrant.ParsePublicKey(key.Ed25519)
 		if err != nil {
@@ -134,6 +176,7 @@ func compile(config Config) (*state, error) {
 			converted.NotAfter = *key.NotAfter
 		}
 		keys = append(keys, converted)
+		byKid[key.Kid] = issuerKey{public: string(public), notAfter: converted.NotAfter}
 	}
 	ring, err := accessgrant.NewKeyring(keys...)
 	if err != nil {
@@ -155,7 +198,7 @@ func compile(config Config) (*state, error) {
 	if config.EdgeDenylist == nil {
 		config.EdgeDenylist = []string{}
 	}
-	return &state{config: config, keyring: ring, deny: deny}, nil
+	return &state{config: config, keyring: ring, deny: deny, keys: byKid}, nil
 }
 
 // Set replaces the configuration and persists it (0600) before it takes
@@ -169,13 +212,15 @@ func (s *Store) Set(config Config) error {
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.persist != "" {
 		if err := writeConfigFile(s.persist, compiled.config); err != nil {
+			s.mu.Unlock()
 			return fmt.Errorf("persist access config: %w", err)
 		}
 	}
 	s.current.Store(compiled)
+	s.mu.Unlock()
+	s.notify()
 	return nil
 }
 
@@ -200,6 +245,7 @@ func (s *Store) Reload() error {
 	s.mu.Lock()
 	s.current.Store(compiled)
 	s.mu.Unlock()
+	s.notify()
 	return nil
 }
 

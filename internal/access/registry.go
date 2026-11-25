@@ -33,6 +33,7 @@ const (
 	DefaultPerRunAnon     = 16
 	DefaultSessionReserve = 4
 	DefaultIdle           = time.Hour
+	DefaultAnonStall      = 30 * time.Second
 	DefaultAnonMbit       = 20
 	DefaultTotalMbit      = 2000
 	sweepEvery            = 10 * time.Second
@@ -58,6 +59,11 @@ type Limits struct {
 	TotalMbit   int
 	// Idle closes a stream that moved nothing for this long.
 	Idle time.Duration
+	// AnonStall closes an anonymous stream that has had bytes waiting,
+	// in either direction, without moving any for this long: a guest
+	// that does not read, or a visitor that does not. An idle stream
+	// (nothing to send) is not stalled.
+	AnonStall time.Duration
 }
 
 func (l Limits) withDefaults() Limits {
@@ -77,6 +83,9 @@ func (l Limits) withDefaults() Limits {
 	l.PerRunAnon = min(l.PerRunAnon, l.PerRun-l.SessionReserve)
 	if l.Idle <= 0 {
 		l.Idle = DefaultIdle
+	}
+	if l.AnonStall <= 0 {
+		l.AnonStall = DefaultAnonStall
 	}
 	return l
 }
@@ -133,6 +142,16 @@ func NewRegistry(limits Limits, meter func(run string, rx, tx int64, anon bool),
 // Limits is the registry's configuration.
 func (r *Registry) Limits() Limits { return r.limits }
 
+// GrantRef is what a stream keeps of the grant that admitted it: its jti
+// for logs, and the issuer key that verified it, so that the stream ends
+// when that key is removed or replaced.
+type GrantRef struct {
+	Jti string
+	Kid string
+	// Key is the verifying public key's bytes.
+	Key string
+}
+
 // Stream is one admitted access stream.
 type Stream struct {
 	reg     *Registry
@@ -142,11 +161,16 @@ type Stream struct {
 	Anon    bool
 	Edge    string
 	Jti     string
+	Kid     string
+	key     string
 	Request string
 	opened  time.Time
 
-	rx, tx    atomic.Int64
-	last      atomic.Int64
+	rx, tx atomic.Int64
+	last   atomic.Int64
+	// pending is, per direction (to the guest, from it), when a write
+	// started that has not returned (unix nanoseconds, 0: none).
+	pending   [2]atomic.Int64
 	flushMu   sync.Mutex
 	flushedRx int64
 	flushedTx int64
@@ -163,10 +187,11 @@ type Stream struct {
 	reason   string
 	onClose  []func()
 	expiry   *time.Timer
+	until    time.Time
 }
 
 // Admit counts a new stream against the caps. The caller must Release it.
-func (r *Registry) Admit(run string, kind Kind, port int, anon bool, edge, jti, request string) (*Stream, error) {
+func (r *Registry) Admit(run string, kind Kind, port int, anon bool, edge string, grant GrantRef, request string) (*Stream, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
@@ -202,7 +227,7 @@ func (r *Registry) Admit(run string, kind Kind, port int, anon bool, edge, jti, 
 		return nil, ErrAnonStreams
 	}
 	now := r.now()
-	s := &Stream{reg: r, Run: run, Port: port, Kind: kind, Anon: anon, Edge: edge, Jti: jti, Request: request, opened: now, done: make(chan struct{})}
+	s := &Stream{reg: r, Run: run, Port: port, Kind: kind, Anon: anon, Edge: edge, Jti: grant.Jti, Kid: grant.Kid, key: grant.Key, Request: request, opened: now, done: make(chan struct{})}
 	s.last.Store(now.UnixNano())
 	streams.streams[s] = struct{}{}
 	if anon {
@@ -236,9 +261,24 @@ func (s *Stream) OnClose(fn func()) bool {
 func (s *Stream) CloseAt(t time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closeAtLocked(t)
+}
+
+// closeBy brings the stream's end forward to t when it is later (or
+// unset).
+func (s *Stream) closeBy(t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.until.IsZero() || t.Before(s.until) {
+		s.closeAtLocked(t)
+	}
+}
+
+func (s *Stream) closeAtLocked(t time.Time) {
 	if s.closed {
 		return
 	}
+	s.until = t
 	wait := t.Sub(s.reg.now())
 	if s.expiry != nil {
 		s.expiry.Stop()
@@ -286,6 +326,54 @@ func (s *Stream) Moved(rx, tx int) {
 		s.tx.Add(int64(tx))
 	}
 	s.last.Store(s.reg.now().UnixNano())
+}
+
+// Direction of a write, for stall detection.
+const (
+	ToGuest   = 0
+	FromGuest = 1
+)
+
+// Writing marks a write in direction dir as started; Wrote as returned.
+func (s *Stream) Writing(dir int) { s.pending[dir].Store(s.reg.now().UnixNano()) }
+
+// Wrote marks the write in direction dir as returned.
+func (s *Stream) Wrote(dir int) { s.pending[dir].Store(0) }
+
+// stalled reports whether a write has been waiting for longer than d.
+func (s *Stream) stalled(now time.Time, d time.Duration) bool {
+	for i := range s.pending {
+		if since := s.pending[i].Load(); since != 0 && now.Sub(time.Unix(0, since)) > d {
+			return true
+		}
+	}
+	return false
+}
+
+// WatchStall closes an anonymous stream once a write in either direction
+// has waited longer than Limits.AnonStall, until the stream closes. A
+// granted stream is not watched: its owner's own stall is the owner's.
+func (s *Stream) WatchStall() {
+	if !s.Anon {
+		return
+	}
+	limit := s.reg.limits.AnonStall
+	every := min(max(limit/4, 20*time.Millisecond), time.Second)
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.done:
+				return
+			case <-ticker.C:
+				if s.stalled(s.reg.now(), limit) {
+					s.Close("stalled")
+					return
+				}
+			}
+		}
+	}()
 }
 
 // Shape waits until n more bytes of this stream fit its run's and the
@@ -382,6 +470,32 @@ func (r *Registry) matching(run string, pick func(*Stream) bool) []*Stream {
 func (r *Registry) CloseRun(run, reason string) {
 	for _, s := range r.matching(run, func(*Stream) bool { return true }) {
 		s.Close(reason)
+	}
+}
+
+// CloseGranted holds every granted stream, of every run, to the issuer
+// keys now configured: a stream whose key check no longer accepts
+// (removed, or replaced under its kid) is closed, and one whose key now
+// has an earlier notAfter ends by then.
+func (r *Registry) CloseGranted(check func(kid, key string) (keep bool, notAfter time.Time), reason string) {
+	r.mu.Lock()
+	var granted []*Stream
+	for _, streams := range r.runs {
+		for s := range streams.streams {
+			if !s.Anon && s.Kid != "" {
+				granted = append(granted, s)
+			}
+		}
+	}
+	r.mu.Unlock()
+	for _, s := range granted {
+		keep, notAfter := check(s.Kid, s.key)
+		switch {
+		case !keep:
+			s.Close(reason)
+		case !notAfter.IsZero():
+			s.closeBy(notAfter)
+		}
 	}
 }
 

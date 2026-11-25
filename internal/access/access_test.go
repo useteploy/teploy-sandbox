@@ -482,7 +482,9 @@ func TestAnonymousCapOverHTTP(t *testing.T) {
 	if status, kind, _ := problemOf(t, third.resp); status != 429 || kind != "anon-streams" {
 		t.Fatalf("third anonymous stream: %d %s", status, kind)
 	}
-	granted, err := r.connect(client, runA, "8080", r.grant(func(c *accessgrant.Claims) { c.Scp = []string{"http:8080"} }))
+	// Granted streams travel on their own connection (one per run and
+	// kind).
+	granted, err := r.connect(r.client(r.edge), runA, "8080", r.grant(func(c *accessgrant.Claims) { c.Scp = []string{"http:8080"} }))
 	if err != nil || granted.resp.StatusCode != 200 {
 		t.Fatal("a granted stream was refused at the anonymous cap")
 	}

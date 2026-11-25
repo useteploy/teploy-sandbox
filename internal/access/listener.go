@@ -112,16 +112,25 @@ func ServerTLS(files TLSFiles, store *Store) (*tls.Config, error) {
 	}, nil
 }
 
+// peerInfo is who a connection is from, and until when its credential
+// holds: the earliest notAfter of its verified certificate chain (zero
+// on the unix socket, whose peer credentials do not expire).
+type peerInfo struct {
+	name     string
+	notAfter time.Time
+}
+
 // peerListener hands the HTTP server only connections from permitted
-// peers, each with the peer's name, and bounds the connections each peer
-// holds at once.
+// peers, each with the peer's name, bounds the connections each peer
+// holds at once, and closes a connection when its certificate expires:
+// a connection is only as good as the credential it was opened with.
 type peerListener struct {
 	inner   net.Listener
 	log     *slog.Logger
 	perPeer int
 	// admit authenticates a raw connection: it returns the connection to
 	// serve (a *tls.Conn whose handshake is done, for TLS) and the peer.
-	admit func(net.Conn) (net.Conn, string, error)
+	admit func(net.Conn) (net.Conn, peerInfo, error)
 
 	ready chan net.Conn
 	done  chan struct{}
@@ -130,15 +139,21 @@ type peerListener struct {
 
 	mu     sync.Mutex
 	counts map[string]int
-	peers  map[net.Conn]string
+	peers  map[net.Conn]*servedConn
 	err    error
 }
 
-func newPeerListener(inner net.Listener, perPeer int, admit func(net.Conn) (net.Conn, string, error), log *slog.Logger) *peerListener {
+type servedConn struct {
+	peerInfo
+	// expiry closes the connection at notAfter.
+	expiry *time.Timer
+}
+
+func newPeerListener(inner net.Listener, perPeer int, admit func(net.Conn) (net.Conn, peerInfo, error), log *slog.Logger) *peerListener {
 	l := &peerListener{
 		inner: inner, log: log, perPeer: perPeer, admit: admit,
 		ready: make(chan net.Conn), done: make(chan struct{}), slots: make(chan struct{}, maxHandshakes),
-		counts: map[string]int{}, peers: map[net.Conn]string{},
+		counts: map[string]int{}, peers: map[net.Conn]*servedConn{},
 	}
 	go l.acceptLoop()
 	return l
@@ -176,16 +191,25 @@ func (l *peerListener) acceptLoop() {
 				return
 			}
 			l.mu.Lock()
-			if l.perPeer > 0 && l.counts[peer] >= l.perPeer {
+			if l.perPeer > 0 && l.counts[peer.name] >= l.perPeer {
 				l.mu.Unlock()
 				_ = conn.Close()
 				if l.log != nil {
-					l.log.Warn("access listener refused a connection: the edge holds as many as it may", "edge", peer, "limit", l.perPeer)
+					l.log.Warn("access listener refused a connection: the edge holds as many as it may", "edge", peer.name, "limit", l.perPeer)
 				}
 				return
 			}
-			l.counts[peer]++
-			l.peers[conn] = peer
+			l.counts[peer.name]++
+			served := &servedConn{peerInfo: peer}
+			if !peer.notAfter.IsZero() {
+				served.expiry = time.AfterFunc(time.Until(peer.notAfter), func() {
+					if l.log != nil {
+						l.log.Info("access connection closed: its edge certificate expired", "edge", peer.name, "notAfter", peer.notAfter)
+					}
+					_ = conn.Close()
+				})
+			}
+			l.peers[conn] = served
 			l.mu.Unlock()
 			select {
 			case l.ready <- conn:
@@ -222,44 +246,68 @@ func (l *peerListener) Close() error {
 
 func (l *peerListener) Addr() net.Addr { return l.inner.Addr() }
 
-// peer is the name of the peer a served connection came from.
-func (l *peerListener) peer(conn net.Conn) string {
+// peer is the peer a served connection came from.
+func (l *peerListener) peer(conn net.Conn) peerInfo {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.peers[conn]
+	if served, ok := l.peers[conn]; ok {
+		return served.peerInfo
+	}
+	return peerInfo{}
 }
 
 // forget gives a closed connection's slot back.
 func (l *peerListener) forget(conn net.Conn) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	peer, ok := l.peers[conn]
+	served, ok := l.peers[conn]
 	if !ok {
 		return
 	}
+	if served.expiry != nil {
+		served.expiry.Stop()
+	}
 	delete(l.peers, conn)
-	if l.counts[peer]--; l.counts[peer] <= 0 {
-		delete(l.counts, peer)
+	if l.counts[served.name]--; l.counts[served.name] <= 0 {
+		delete(l.counts, served.name)
 	}
 }
 
 // admitTLS runs the handshake (which verifies the client certificate and
-// the denylist) and names the edge.
-func admitTLS(config *tls.Config) func(net.Conn) (net.Conn, string, error) {
-	return func(raw net.Conn) (net.Conn, string, error) {
+// the denylist) and names the edge. The connection holds until the
+// earliest notAfter of the chain the handshake verified.
+func admitTLS(config *tls.Config) func(net.Conn) (net.Conn, peerInfo, error) {
+	return func(raw net.Conn) (net.Conn, peerInfo, error) {
 		conn := tls.Server(raw, config)
 		ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
 		defer cancel()
 		if err := conn.HandshakeContext(ctx); err != nil {
-			return nil, "", err
+			return nil, peerInfo{}, err
 		}
 		state := conn.ConnectionState()
 		name, err := EdgeName(state.PeerCertificates[0])
 		if err != nil {
-			return nil, "", err
+			return nil, peerInfo{}, err
 		}
-		return conn, name, nil
+		return conn, peerInfo{name: name, notAfter: chainNotAfter(state)}, nil
 	}
+}
+
+// chainNotAfter is the earliest notAfter of the verified chain (the leaf
+// alone when there is none, which a required, verified client
+// certificate never leaves).
+func chainNotAfter(state tls.ConnectionState) time.Time {
+	chain := state.PeerCertificates[:1]
+	if len(state.VerifiedChains) > 0 {
+		chain = state.VerifiedChains[0]
+	}
+	notAfter := chain[0].NotAfter
+	for _, cert := range chain[1:] {
+		if cert.NotAfter.Before(notAfter) {
+			notAfter = cert.NotAfter
+		}
+	}
+	return notAfter
 }
 
 // UnixPeers says which local processes may use the unix socket: a peer
@@ -270,16 +318,16 @@ type UnixPeers struct {
 }
 
 // admitUnix checks the peer's credentials (SO_PEERCRED).
-func admitUnix(peers UnixPeers) func(net.Conn) (net.Conn, string, error) {
-	return func(conn net.Conn) (net.Conn, string, error) {
+func admitUnix(peers UnixPeers) func(net.Conn) (net.Conn, peerInfo, error) {
+	return func(conn net.Conn) (net.Conn, peerInfo, error) {
 		uid, gid, err := peerCredentials(conn)
 		if err != nil {
-			return nil, "", err
+			return nil, peerInfo{}, err
 		}
 		if (peers.UID >= 0 && uid == peers.UID) || (peers.GID >= 0 && gid == peers.GID) {
-			return conn, fmt.Sprintf("unix:%d", uid), nil
+			return conn, peerInfo{name: fmt.Sprintf("unix:%d", uid)}, nil
 		}
-		return nil, "", fmt.Errorf("peer uid %d gid %d may not use the access socket", uid, gid)
+		return nil, peerInfo{}, fmt.Errorf("peer uid %d gid %d may not use the access socket", uid, gid)
 	}
 }
 

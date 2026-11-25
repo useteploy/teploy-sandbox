@@ -67,7 +67,23 @@ var ErrGuestAgent = errors.New("the run's guest agent cannot open access streams
 
 // ErrAccessWriteThrough: a revoke raised the epoch and closed the run's
 // streams here, and could not write the new epoch to remote storage.
-var ErrAccessWriteThrough = errors.New("the new access epoch is not in remote storage")
+var ErrAccessWriteThrough = errors.New("the run's new access state is not in remote storage")
+
+// ErrAccessNotPersisted: a revoke or port change took effect on this
+// daemon (the epoch raised and streams closed, or the port changed), and
+// the registry file could not be written: a restart before the next good
+// write would bring the old access state back.
+var ErrAccessNotPersisted = errors.New("the run's new access state is not in the registry file")
+
+// accessEpochHeadroom is how far below accessgrant.MaxEpoch a resume's
+// accessEpoch must stay: an epoch at the maximum can never be raised
+// again, so a run there could never be revoked or moved.
+const accessEpochHeadroom = 1 << 20
+
+// ValidResumeEpoch reports whether a resume may ask for epoch.
+func ValidResumeEpoch(epoch int64) bool {
+	return epoch >= 0 && epoch <= accessgrant.MaxEpoch-accessEpochHeadroom
+}
 
 // PortSpec is one port entry of a run.
 type PortSpec struct {
@@ -240,8 +256,12 @@ func validatePorts(ports []PortSpec) error {
 
 // SetPort records a port's visibility and protocol. It is data only and
 // allowed while the run is stopped. Making a public port private ends
-// its anonymous streams.
-func (m *Manager) SetPort(id string, port int, req PortRequest) (*Run, error) {
+// its anonymous streams. Like a revoke, the change is written to the
+// registry file and, with remote storage and a remote record, to the
+// run's record before it answers; the run it returns carries the change
+// even when either write failed (ErrAccessNotPersisted,
+// ErrAccessWriteThrough).
+func (m *Manager) SetPort(ctx context.Context, id string, port int, req PortRequest) (*Run, error) {
 	if m.access == nil {
 		return nil, ErrAccessDisabled
 	}
@@ -284,17 +304,16 @@ func (m *Manager) SetPort(id string, port int, req PortRequest) (*Run, error) {
 		return nil, fmt.Errorf("%w: %v", ErrBadRequest, err)
 	}
 	run.accessPorts = ports
-	view := m.viewLocked(run)
 	m.mu.Unlock()
 	if wasPublic && req.Visibility != PortPublic {
 		m.closeAccessPort(id, port, "unpublished")
 	}
-	m.persist()
-	return view, nil
+	return m.accessChanged(ctx, id, "run port changed", "port", port)
 }
 
 // DeletePort removes a port entry; a public port's anonymous streams end.
-func (m *Manager) DeletePort(id string, port int) (*Run, error) {
+// It is written through like SetPort.
+func (m *Manager) DeletePort(ctx context.Context, id string, port int) (*Run, error) {
 	if m.access == nil {
 		return nil, ErrAccessDisabled
 	}
@@ -319,12 +338,47 @@ func (m *Manager) DeletePort(id string, port int) (*Run, error) {
 	if len(run.accessPorts) == 0 {
 		run.accessPorts = nil
 	}
-	view := m.viewLocked(run)
 	m.mu.Unlock()
 	if wasPublic {
 		m.closeAccessPort(id, port, "unpublished")
 	}
-	m.persist()
+	return m.accessChanged(ctx, id, "run port removed", "port", port)
+}
+
+// accessChanged makes a change to a run's access state durable before it
+// is answered: the registry file first, then, with remote storage and a
+// remote record, the record (writeAccessThrough). The run it returns
+// carries the change whatever failed; the error says what did, the
+// registry file first (a restart is the nearer way to lose it).
+func (m *Manager) accessChanged(ctx context.Context, id, what string, args ...any) (*Run, error) {
+	m.mu.Lock()
+	run, ok := m.runs[id]
+	published := ok && m.OffHost != nil && run.remoteGen > 0
+	m.mu.Unlock()
+	if !ok {
+		return nil, ErrNotFound
+	}
+	persistErr := m.persistNow()
+	m.log.Info(what, append([]any{"id", id}, args...)...)
+	var throughErr error
+	if published {
+		throughErr = m.writeAccessThrough(ctx, id)
+	}
+	view, err := m.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if persistErr != nil {
+		m.log.Error("access change not written to the registry file; a restart before the next good write brings the old access state back", "id", id, "error", persistErr)
+		if throughErr != nil {
+			return view, fmt.Errorf("%w: %v (and remote storage: %v)", ErrAccessNotPersisted, persistErr, throughErr)
+		}
+		return view, fmt.Errorf("%w: %v", ErrAccessNotPersisted, persistErr)
+	}
+	if throughErr != nil {
+		m.log.Error("access change not written to remote storage; if the run moves before it is, the old access state goes with it", "id", id, "error", throughErr)
+		return view, fmt.Errorf("%w: %v", ErrAccessWriteThrough, throughErr)
+	}
 	return view, nil
 }
 
@@ -338,9 +392,11 @@ func nextEpoch(epoch, now int64) (int64, error) {
 
 // RevokeAccess raises the run's access epoch, ending every grant issued
 // before, closes all of its access streams, and, with remote storage and
-// a remote record, writes the new epoch there before answering. The run
-// it returns carries the new epoch even when the write-through failed
-// (ErrAccessWriteThrough): the bump and the closing happened.
+// a remote record, writes the new epoch there before answering; the
+// registry file is written first, and a failure there is an error too
+// (ErrAccessNotPersisted). The run it returns carries the new epoch even
+// when a write failed (ErrAccessWriteThrough, ErrAccessNotPersisted): the
+// bump and the closing happened.
 func (m *Manager) RevokeAccess(ctx context.Context, id string) (*Run, error) {
 	if m.access == nil {
 		return nil, ErrAccessDisabled
@@ -357,26 +413,11 @@ func (m *Manager) RevokeAccess(ctx context.Context, id string) (*Run, error) {
 		return nil, err
 	}
 	run.accessEpoch = next
-	published := m.OffHost != nil && run.remoteGen > 0
 	m.mu.Unlock()
 	// After the bump: a stream admitted from here on sees the new epoch,
 	// and one admitted before is in the registry and closed now.
 	m.closeAccessRun(id, "revoked")
-	m.persist()
-	m.log.Info("run access revoked", "id", id, "epoch", next)
-	var throughErr error
-	if published {
-		throughErr = m.writeAccessThrough(ctx, id)
-	}
-	view, err := m.Get(id)
-	if err != nil {
-		return nil, err
-	}
-	if throughErr != nil {
-		m.log.Error("access epoch not written to remote storage; grants the old epoch allows may come back if the run moves before it is", "id", id, "epoch", next, "error", throughErr)
-		return view, fmt.Errorf("%w: %v", ErrAccessWriteThrough, throughErr)
-	}
-	return view, nil
+	return m.accessChanged(ctx, id, "run access revoked", "epoch", next)
 }
 
 // accessWriteTimeout bounds a revoke's write to remote storage.
@@ -396,10 +437,9 @@ func (m *Manager) writeAccessThrough(ctx context.Context, id string) error {
 	}
 	if live.exclusive || live.removing {
 		m.mu.Unlock()
-		return fmt.Errorf("%w: the run is busy (a stop, resume, fork or delete is under way); revoke again", ErrBusy)
+		return fmt.Errorf("%w: the run is busy (a stop, resume, fork or delete is under way); try again", ErrBusy)
 	}
 	live.exclusive = true
-	generation, epoch, ports := live.remoteGen, live.accessEpoch, slices.Clone(live.accessPorts)
 	m.mu.Unlock()
 	defer func() {
 		m.mu.Lock()
@@ -408,6 +448,23 @@ func (m *Manager) writeAccessThrough(ctx context.Context, id string) error {
 		}
 		m.mu.Unlock()
 	}()
+	return m.writeAccessHeld(ctx, id)
+}
+
+// writeAccessHeld is writeAccessThrough for a caller that holds the run's
+// exclusivity already (a resume, a reconcile).
+func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
+	m.mu.Lock()
+	live, ok := m.runs[id]
+	if !ok {
+		m.mu.Unlock()
+		return ErrNotFound
+	}
+	generation, epoch, ports := live.remoteGen, live.accessEpoch, slices.Clone(live.accessPorts)
+	m.mu.Unlock()
+	if generation == 0 {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accessWriteTimeout)
 	defer cancel()
 	latest, err := m.OffHost.Latest(ctx, id)
@@ -466,10 +523,11 @@ func (m *Manager) writeAccessThrough(ctx context.Context, id string) error {
 // every epoch a grant can have copied from its record or from the caller,
 // so moving a run revokes all of its grants whatever the clocks say
 // (max(record, passed, now) alone would let a grant minted at the record's
-// epoch survive a move made within the same second). Caller holds mu.
-func (m *Manager) moveAccessLocked(run *Run, passed int64) {
+// epoch survive a move made within the same second). It reports whether
+// the epoch changed. Caller holds mu.
+func (m *Manager) moveAccessLocked(run *Run, passed int64) bool {
 	if m.access == nil {
-		return
+		return false
 	}
 	epoch := max(run.accessEpoch, passed)
 	if run.accessMoved {
@@ -477,10 +535,12 @@ func (m *Manager) moveAccessLocked(run *Run, passed int64) {
 		run.accessMoved = false
 	}
 	epoch = min(epoch, accessgrant.MaxEpoch)
-	if epoch != run.accessEpoch {
+	changed := epoch != run.accessEpoch
+	if changed {
 		m.log.Info("run access epoch raised on resume", "id", run.ID, "from", run.accessEpoch, "to", epoch)
 	}
 	run.accessEpoch = epoch
+	return changed
 }
 
 // AccessTarget is what the access listener needs of a run to admit a

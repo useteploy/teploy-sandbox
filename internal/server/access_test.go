@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -191,5 +192,50 @@ func TestResumeTakesAccessEpoch(t *testing.T) {
 	resumed := decode(t, request(t, ts, "POST", "/v1/runs/"+id+"/resume", "test-token", `{"accessEpoch":9000000000}`))
 	if got := resumed["access"].(map[string]any)["epoch"]; got != float64(9000000000) {
 		t.Fatalf("epoch after a resume with accessEpoch: %v", got)
+	}
+}
+
+// S-7: a port change whose write-through fails answers 502 like a revoke.
+func TestPortChangeWriteThroughFailureAnswers502(t *testing.T) {
+	ts, manager, _ := newAccessServer(t)
+	manager.OffHost = &remoteDown{}
+	id := createRun(t, ts)
+	request(t, ts, "POST", "/v1/runs/"+id+"/stop", "test-token", "").Body.Close()
+	for _, call := range []struct{ method, body string }{{"PUT", `{"visibility":"public"}`}, {"DELETE", ""}} {
+		resp := request(t, ts, call.method, "/v1/runs/"+id+"/ports/3000", "test-token", call.body)
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("%s port: status %d", call.method, resp.StatusCode)
+		}
+		if body := decode(t, resp); body["type"] != "https://neutron.dev/errors/access-write-through" {
+			t.Fatalf("%s port: %v", call.method, body)
+		}
+	}
+}
+
+// S-4: a revoke whose registry write fails answers 500 with the epoch,
+// not 200.
+func TestRevokeNotPersistedAnswers500WithTheEpoch(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes anywhere")
+	}
+	ts, manager, _ := newAccessServer(t)
+	dir := t.TempDir()
+	if _, err := manager.LoadState(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	id := createRun(t, ts)
+	request(t, ts, "POST", "/v1/runs/"+id+"/stop", "test-token", "").Body.Close()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	resp := request(t, ts, "POST", "/v1/runs/"+id+"/access/revoke", "test-token", "")
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	body := decode(t, resp)
+	after, _ := manager.Get(id)
+	if body["type"] != "https://neutron.dev/errors/access-not-persisted" || body["epoch"] != float64(after.Access.Epoch) {
+		t.Fatalf("500 body %v, epoch %d", body, after.Access.Epoch)
 	}
 }

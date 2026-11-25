@@ -843,9 +843,9 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		// there keep working here — and this daemon's next stop would
 		// write the old ones back.
 		var stored stateRun
-		if json.Unmarshal(latest.Payload, &stored) == nil && stored.AccessEpoch > live.accessEpoch {
-			live.accessEpoch = stored.AccessEpoch
-			live.accessPorts = stored.AccessPorts
+		ahead := false
+		if json.Unmarshal(latest.Payload, &stored) == nil && stored.AccessEpoch > 0 {
+			ahead = takeRecordAccessLocked(live, stored.AccessEpoch, stored.AccessPorts)
 		}
 		setRemoteLocked(live, RemoteState{State: RemoteDurable, Snapshot: latest.SnapshotID, Local: hasLocal, DurableAt: &at})
 		released := live.base
@@ -853,6 +853,9 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		m.mu.Unlock()
 		m.releaseImages([]string{released})
 		m.persist()
+		if ahead {
+			m.writeLocalEpoch(ctx, id)
+		}
 		return nil
 	case latest.Mine:
 		// This daemon wrote the newest record and the run is stopped
@@ -883,7 +886,9 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		if err != nil {
 			return err
 		}
-		m.replaceHeld(id, adopted)
+		if m.replaceHeld(id, adopted) {
+			m.writeLocalEpoch(ctx, id)
+		}
 		return nil
 	case latest.State == RecordRunning && takeover:
 		if !follow {
@@ -893,7 +898,9 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		if err != nil {
 			return err
 		}
-		m.replaceHeld(id, adopted)
+		if m.replaceHeld(id, adopted) {
+			m.writeLocalEpoch(ctx, id)
+		}
 		return nil
 	default:
 		// Running on another daemon.
@@ -910,16 +917,52 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 // replaceHeld swaps a stopped run's record for a newer view of it and
 // lets go of the local copies only the old view held. The caller holds
 // the run's exclusivity, which the new record keeps until released.
-func (m *Manager) replaceHeld(id string, adopted *Run) {
+//
+// The access epoch never goes down by it: a revoke made here whose write
+// to the record failed (or that raced the adopt, which reads the record
+// outside the lock) is kept, so the newer view takes max(local, record).
+// The ports are the record's, the newer configuration by generation: a
+// port change here that did not reach the record was answered with an
+// error. It reports whether the local epoch was ahead of the record's,
+// which the caller then writes through (writeLocalEpoch).
+func (m *Manager) replaceHeld(id string, adopted *Run) (ahead bool) {
 	m.mu.Lock()
 	old := m.runs[id]
 	adopted.exclusive = old.exclusive
 	adopted.leftover = old.leftover
+	if m.access != nil && old.accessEpoch > adopted.accessEpoch {
+		m.log.Warn("a run's newer remote record carries an older access epoch than this daemon's; keeping this daemon's", "id", id, "local", old.accessEpoch, "record", adopted.accessEpoch)
+		adopted.accessEpoch = old.accessEpoch
+		ahead = true
+	}
 	released := []string{old.snapshot, old.base}
 	m.runs[id] = adopted
 	m.mu.Unlock()
 	m.releaseImages(released)
 	m.persist()
+	return ahead
+}
+
+// takeRecordAccessLocked brings a run's access state in line with its
+// newer record's, by the rule replaceHeld keeps: the higher epoch, the
+// record's ports. It reports whether the local epoch was ahead. Caller
+// holds mu.
+func takeRecordAccessLocked(live *Run, epoch int64, ports []PortSpec) (ahead bool) {
+	ahead = live.accessEpoch > epoch
+	live.accessEpoch = max(live.accessEpoch, epoch)
+	live.accessPorts = slices.Clone(ports)
+	return ahead
+}
+
+// writeLocalEpoch writes a run's epoch, found ahead of its newer record's
+// during a reconcile, into that record: the revoke that raised it failed
+// to, and until it is there a resume on another daemon goes by the
+// record. The caller holds the run's exclusivity. Best effort: the next
+// revoke or resume here writes it too.
+func (m *Manager) writeLocalEpoch(ctx context.Context, id string) {
+	if err := m.writeAccessHeld(ctx, id); err != nil {
+		m.log.Error("a run's access epoch, ahead of its record's, is still not in remote storage; a resume on another daemon goes by the record's", "id", id, "error", err)
+	}
 }
 
 // takeover claims a run another daemon holds as running, and returns it

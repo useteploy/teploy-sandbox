@@ -263,8 +263,11 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 	if err != nil {
 		return nil, err
 	}
-	if m.access != nil && (req.AccessEpoch < 0 || req.AccessEpoch > accessgrant.MaxEpoch) {
-		return nil, fmt.Errorf("%w: accessEpoch must be 0-%d", ErrBadRequest, int64(accessgrant.MaxEpoch))
+	if m.access != nil && !ValidResumeEpoch(req.AccessEpoch) {
+		// An epoch at (or a hair below) the maximum could never be raised
+		// again: the run could not be revoked, and a move would not
+		// revoke either.
+		return nil, fmt.Errorf("%w: accessEpoch must be 0-%d", ErrBadRequest, int64(accessgrant.MaxEpoch-accessEpochHeadroom))
 	}
 	if req.Takeover && m.OffHost == nil {
 		return nil, fmt.Errorf("%w: takeover needs remote storage, and this daemon has none", ErrBadRequest)
@@ -277,12 +280,13 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 		return nil, err
 	}
 	defer release()
+	raised := false
 	if m.access != nil {
 		// Before the claim below, so that the run's record carries it:
 		// a run that moved here, or whose caller knows a later epoch,
 		// resumes with its grants revoked.
 		m.mu.Lock()
-		m.moveAccessLocked(m.runs[id], req.AccessEpoch)
+		raised = m.moveAccessLocked(m.runs[id], req.AccessEpoch)
 		m.mu.Unlock()
 		m.persist()
 	}
@@ -290,6 +294,18 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 	if m.OffHost != nil {
 		if err := m.claimHeld(ctx, current); err != nil {
 			return nil, err
+		}
+		if raised && current.remoteHeld {
+			// The claim was made before this resume (a takeover, or a
+			// resume a crash interrupted), so the record still carries
+			// the epoch from before the move. Write the raised one there
+			// before anything boots: a daemon that takes the run over
+			// from that record next must land above every grant this
+			// one honours, not on the same epoch.
+			if err := m.writeAccessHeld(ctx, id); err != nil {
+				m.unclaimHeld(ctx, id)
+				return nil, remoteErr(fmt.Errorf("the run's raised access epoch: %w", err))
+			}
 		}
 		// From here a failure gives the run back (unclaimHeld).
 		durable = current.Remote != nil && current.Remote.State == RemoteDurable

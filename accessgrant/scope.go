@@ -138,7 +138,7 @@ func parseScopes(list []string) ([]scope, error) {
 //	                                                  ssh or tcp: scope; own proofs
 //	SSH session     ssh, with cnf                     no cnf (the caller also checks cnf
 //	                                                  against the authenticated key)
-//	SSH forward     tcp:<port>, tcp:*, with cnf       http: scopes; no cnf
+//	SSH forward     tcp:<port>, tcp:*, with cnf       a grant with any http: scope; no cnf
 //	daemon connect  http: or tcp: covering the port   ssh alone; own proofs
 //	daemon session  ssh                               everything else
 //
@@ -178,7 +178,10 @@ func (c Claims) Permits(use Use, port int) bool {
 	case UseSSHSession:
 		return c.Cnf != "" && has(kindSSH)
 	case UseSSHForward:
-		return c.Cnf != "" && covers(kindTCP)
+		// A grant that also carries an http: scope is an HTTPS grant
+		// someone bound to a key; the table refuses it here as it does
+		// a tcp: scope on HTTPS.
+		return c.Cnf != "" && !has(kindHTTP) && covers(kindTCP)
 	case UseDaemonConnect:
 		// A cnf-bound grant is only good on an SSH connection
 		// authenticated by that key; at the daemon's connect there is no

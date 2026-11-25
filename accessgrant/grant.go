@@ -22,6 +22,8 @@
 //     escapes included) and no key that differs only in case from a known
 //     claim (encoding/json would otherwise match it), every known claim
 //     must have exactly its type, and integers must be plain decimal;
+//   - an optional claim (cnf, own, ref, org) is absent or not empty:
+//     "cnf":"", "own":false, "ref":"" and "org":"" are malformed;
 //   - unknown claims are ignored, which is why a claim that restricts what
 //     a grant allows is never added without raising V: verifiers reject a
 //     version they do not know (see Version).
@@ -181,12 +183,15 @@ type Keyring struct {
 }
 
 // NewKeyring checks the keys: at most MaxKeys, each with a well-formed
-// unique kid and a 32-byte Ed25519 public key.
+// unique kid and a 32-byte Ed25519 public key, and no public key under
+// two kids (the first would verify every grant naming the second, so the
+// second's notAfter, or its removal, would mean nothing).
 func NewKeyring(keys ...Key) (*Keyring, error) {
 	if len(keys) > MaxKeys {
 		return nil, fmt.Errorf("access grant keyring: %d keys, at most %d", len(keys), MaxKeys)
 	}
 	seen := map[string]bool{}
+	public := map[string]string{}
 	ring := &Keyring{keys: make([]Key, 0, len(keys))}
 	for _, key := range keys {
 		if !validKid(key.Kid) {
@@ -199,6 +204,10 @@ func NewKeyring(keys ...Key) (*Keyring, error) {
 		if len(key.Public) != ed25519.PublicKeySize {
 			return nil, fmt.Errorf("access grant keyring: key %q is %d bytes, an Ed25519 public key is %d", key.Kid, len(key.Public), ed25519.PublicKeySize)
 		}
+		if kid, ok := public[string(key.Public)]; ok {
+			return nil, fmt.Errorf("access grant keyring: keys %q and %q are the same public key", kid, key.Kid)
+		}
+		public[string(key.Public)] = key.Kid
 		key.Public = bytes.Clone(key.Public)
 		ring.keys = append(ring.keys, key)
 	}
@@ -465,6 +474,17 @@ func decodeClaims(payload []byte) (Claims, error) {
 		}
 		if err := decodeExact(value, field.into); err != nil {
 			return malformed("claim %q: %v", field.name, err)
+		}
+	}
+	// An optional claim is either absent or says something: one grant,
+	// one spelling ("cnf":"" and no cnf would otherwise both mean
+	// "not key-bound").
+	for _, empty := range []struct {
+		name string
+		is   bool
+	}{{"cnf", claims.Cnf == ""}, {"ref", claims.Ref == ""}, {"org", claims.Org == ""}, {"own", !claims.Own}} {
+		if _, ok := raw[empty.name]; ok && empty.is {
+			return malformed("claim %q is present and empty; leave it out", empty.name)
 		}
 	}
 	if v < 0 || v > 1<<31 {

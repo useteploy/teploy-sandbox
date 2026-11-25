@@ -1,6 +1,7 @@
 package accessgrant
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
@@ -140,6 +141,12 @@ func TestVerifyRefuses(t *testing.T) {
 			m["own"], m["ref"], m["iat"], m["exp"] = true, "abc", testNow.Unix(), testNow.Unix()+120
 		}), key), ReasonMalformed},
 		{"bad cnf", signRaw(payloadOf(func(m map[string]any) { m["cnf"] = "sha256:short" }), key), ReasonMalformed},
+		// An optional claim present and empty (G2 code review): absent is
+		// the one spelling of "not set".
+		{"empty cnf", signRaw(payloadOf(func(m map[string]any) { m["cnf"] = "" }), key), ReasonMalformed},
+		{"empty ref", signRaw(payloadOf(func(m map[string]any) { m["ref"] = "" }), key), ReasonMalformed},
+		{"empty org", signRaw(payloadOf(func(m map[string]any) { m["org"] = "" }), key), ReasonMalformed},
+		{"own false", signRaw(payloadOf(func(m map[string]any) { m["own"] = false }), key), ReasonMalformed},
 		{"wrong audience", mustSign(t, func() Claims { c := baseClaims(); c.Aud = "other.example.com"; return c }(), "k1", key), ReasonAudience},
 		{"expired", mustSign(t, func() Claims { c := baseClaims(); c.Exp = testNow.Unix(); return c }(), "k1", key), ReasonExpired},
 		{"issued in the future", mustSign(t, func() Claims {
@@ -210,12 +217,17 @@ func TestNewKeyringRefuses(t *testing.T) {
 	if _, err := NewKeyring(Key{Kid: "a", Public: pub}, Key{Kid: "a", Public: pub}); err == nil {
 		t.Error("duplicate kid accepted")
 	}
+	// The same key under two kids: the first verifies every grant naming
+	// the second, so the second's notAfter or removal would mean nothing.
+	if _, err := NewKeyring(Key{Kid: "old", Public: pub}, Key{Kid: "new", Public: bytes.Clone(pub)}); err == nil {
+		t.Error("one public key under two kids accepted")
+	}
 	if _, err := NewKeyring(Key{Kid: "a", Public: pub[:31]}); err == nil {
 		t.Error("short key accepted")
 	}
 	keys := make([]Key, MaxKeys+1)
 	for i := range keys {
-		keys[i] = Key{Kid: fmt.Sprint("k", i), Public: pub}
+		keys[i] = Key{Kid: fmt.Sprint("k", i), Public: testKey(t, byte(10+i)).Public().(ed25519.PublicKey)}
 	}
 	if _, err := NewKeyring(keys...); err == nil {
 		t.Error("too many keys accepted")
@@ -291,6 +303,8 @@ func TestPermitsTable(t *testing.T) {
 		{[]string{"http:5432"}, cnf, false, UseDaemonConnect, 5432, false},
 		{[]string{"tcp:5432"}, cnf, false, UseSSHForward, 5433, false},
 		{[]string{"http:*"}, cnf, false, UseSSHForward, 5432, false},
+		{[]string{"http:*", "tcp:*"}, cnf, false, UseSSHForward, 5432, false}, // any http: scope refuses the grant
+		{[]string{"http:3000", "tcp:5432"}, cnf, false, UseSSHForward, 5432, false},
 		{[]string{"tcp:*"}, "", false, UseSSHForward, 5432, false},
 		// daemon connect
 		{[]string{"http:3000"}, "", false, UseDaemonConnect, 3000, true},

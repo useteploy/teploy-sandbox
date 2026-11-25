@@ -138,7 +138,7 @@ func (m *Manager) remotePayloadLocked(current *Run) []byte {
 	record.RemoteGen, record.RemoteHeld, record.RemoteKey = 0, false, ""
 	// Whether the run moved is this daemon's to know; wherever the record
 	// is read it has moved.
-	record.AccessMoved, record.AccessDirty = false, false
+	record.AccessMoved, record.AccessDirty, record.FirstRecordTried = false, false, false
 	payload, err := json.Marshal(record)
 	if err != nil {
 		// A run that was built from validated parts always marshals.
@@ -185,21 +185,7 @@ func (m *Manager) publishHeld(ctx context.Context, id string) error {
 		previous = live.Remote.Error
 	}
 	payload := m.remotePayloadLocked(live)
-	// A run with no remote state yet is noted as pending before its first
-	// record can land: a daemon that dies after that put must find the run
-	// unconfirmed after its restart (unconfirmedPublishLocked), or a
-	// change it then answers 200 is not in the record another daemon may
-	// adopt. Write-ahead: no put without the note on disk.
-	noted := live.Remote == nil
-	if noted {
-		setRemoteLocked(live, RemoteState{State: RemotePending, Local: true})
-	}
 	m.mu.Unlock()
-	if noted {
-		if err := m.persistNow(); err != nil {
-			return fmt.Errorf("%w: noting the run's first publish: %v", ErrRemoteUnavailable, err)
-		}
-	}
 
 	ctx, cancel := context.WithTimeout(ctx, m.publishTimeout())
 	defer cancel()
@@ -329,6 +315,22 @@ func (m *Manager) publishAccessSince(ctx context.Context, id string, local bool)
 func (m *Manager) advanceStopped(ctx context.Context, id string, generation uint64, snapshot string, payload []byte, key string) (uint64, string, string, *RemoteRecord, error) {
 	var err error
 	for try := 0; ; try++ {
+		if generation == 0 {
+			// The run's first record: noted on disk before the write
+			// (write-ahead, every time: an earlier note may not have
+			// landed). A daemon that dies after the record lands, before
+			// it notes the generation, finds the run unconfirmed after
+			// its restart (unconfirmedPublishLocked), and so does one
+			// whose answer is lost. No write without the note.
+			m.mu.Lock()
+			if live, ok := m.runs[id]; ok {
+				live.firstRecordTried = true
+			}
+			m.mu.Unlock()
+			if noteErr := m.persistNow(); noteErr != nil {
+				return generation, key, "", nil, fmt.Errorf("%w: noting the run's first record: %v", ErrRemoteUnavailable, noteErr)
+			}
+		}
 		var written string
 		written, err = m.OffHost.Advance(ctx, RemoteRecord{Run: id, Generation: generation + 1, State: RecordStopped, Snapshot: snapshot, Payload: payload, Key: key})
 		if err == nil {

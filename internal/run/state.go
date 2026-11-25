@@ -95,11 +95,13 @@ type stateRun struct {
 	// The run's access state (access.go). Additive, and absent unless
 	// access is on: the epoch and ports travel in the remote record too;
 	// AccessMoved never does.
-	AccessEpoch int64        `json:"accessEpoch,omitempty"`
-	AccessPorts []PortSpec   `json:"accessPorts,omitempty"`
-	AccessMoved bool         `json:"accessMoved,omitempty"`
-	AccessDirty bool         `json:"accessDirty,omitempty"`
-	AccessBytes *accessBytes `json:"accessBytes,omitempty"`
+	AccessEpoch int64      `json:"accessEpoch,omitempty"`
+	AccessPorts []PortSpec `json:"accessPorts,omitempty"`
+	AccessMoved bool       `json:"accessMoved,omitempty"`
+	AccessDirty bool       `json:"accessDirty,omitempty"`
+	// FirstRecordTried never travels in the remote record.
+	FirstRecordTried bool         `json:"firstRecordTried,omitempty"`
+	AccessBytes      *accessBytes `json:"accessBytes,omitempty"`
 }
 
 // LoadState points the manager at its durable registry in dir and loads
@@ -365,6 +367,8 @@ func (rec stateRun) stoppedRun(owns func(ref string) bool) (*Run, error) {
 		accessMoved: rec.AccessMoved,
 		accessDirty: rec.AccessDirty,
 		accessBytes: bytesMoved,
+
+		firstRecordTried: rec.FirstRecordTried,
 	}, nil
 }
 
@@ -413,6 +417,8 @@ func stoppedStateRun(run *Run) stateRun {
 		AccessMoved: run.accessMoved,
 		AccessDirty: run.accessDirty,
 		AccessBytes: moved,
+
+		FirstRecordTried: run.firstRecordTried,
 	}
 }
 

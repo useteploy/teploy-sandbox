@@ -208,6 +208,11 @@ type Run struct {
 	// this daemon wrote or took. A newer record then does not simply
 	// replace them: the two are merged failing closed (mergePorts).
 	accessDirty bool
+	// firstRecordTried: a write of the run's first record has been
+	// attempted (noted on disk before it), so with no generation known
+	// that record may be in remote storage all the same (its answer
+	// lost, or the daemon died before noting it). Guarded by Manager.mu.
+	firstRecordTried bool
 }
 
 // RunUsage is what a run has consumed so far.

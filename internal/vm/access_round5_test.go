@@ -157,8 +157,8 @@ func TestAHeldResumeTakesItsOwnNewerRecordsPorts(t *testing.T) {
 	}
 }
 
-// A run with no remote state was never published (publishHeld notes a
-// first publish on disk before its put), so storage being down does not
+// A run with no remote state was never published (advanceStopped notes
+// a first record write on disk before it), so storage being down does not
 // hold its access changes or its resume.
 func TestANeverPublishedRunIsNotBlockedByStorageBeingDown(t *testing.T) {
 	bucket := offhosttest.NewMemory()
@@ -183,5 +183,68 @@ func TestANeverPublishedRunIsNotBlockedByStorageBeingDown(t *testing.T) {
 	_, resumeErr := a.manager.Resume(bg, id, 0)
 	if revokeErr != nil || portErr != nil || resumeErr != nil {
 		t.Fatalf("a run never published waits on remote storage: revoke %v, port %v, resume %v", revokeErr, portErr, resumeErr)
+	}
+}
+
+// legacyRun is a stopped run whose registry entry has no remote state (a
+// registry written before remote storage was configured).
+func legacyRun(t *testing.T) (*offhosttest.Memory, *remoteHost, string) {
+	bucket := offhosttest.NewMemory()
+	a := newHost(t, bucket, "host-a", nil, withAccess(&accessEvents{}))
+	created := a.startRun(t, payload(t, 300))
+	bucket.SetFail(func(op, key string) error {
+		if op == "put" {
+			return errors.New("storage down")
+		}
+		return nil
+	})
+	if _, err := a.manager.Stop(bg, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	bucket.SetFail(nil)
+	dropRemoteState(t, a, created.ID)
+	a = newHost(t, bucket, "host-a", a, withAccess(&accessEvents{}))
+	return bucket, a, created.ID
+}
+
+// An upkeep tick whose upload fails before any record write (storage
+// down) leaves the run as it was: nothing of it can be in another
+// daemon's hands, so its access changes and its resume do not wait on
+// storage.
+func TestANeverPublishedRunIsNotBlockedAfterAFailedUpkeep(t *testing.T) {
+	bucket, a, id := legacyRun(t)
+	bucket.SetFail(func(op, key string) error { return errors.New("no route to host") })
+	a.manager.Maintain(bg)
+	_, revokeErr := a.manager.RevokeAccess(bg, id)
+	_, portErr := a.manager.SetPort(bg, id, 3000, run.PortRequest{Visibility: run.PortPrivate})
+	_, resumeErr := a.manager.Resume(bg, id, 0)
+	if revokeErr != nil || portErr != nil || resumeErr != nil {
+		t.Fatalf("after one failed upkeep tick: revoke %v, port %v, resume %v", revokeErr, portErr, resumeErr)
+	}
+}
+
+// The note of a first record write is written ahead of it every time:
+// while the registry cannot be written, no record of the run is.
+func TestNoFirstRecordIsWrittenWhileItsNoteCannotBe(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the read-only state directory")
+	}
+	_, a, id := legacyRun(t)
+	if err := os.Chmod(a.stateDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(a.stateDir, 0o700) })
+	records := 0
+	a.bucket.SetFail(func(op, key string) error {
+		if op == "put" && strings.Contains(key, "/run/"+id+"/") {
+			records++
+		}
+		return nil
+	})
+	a.manager.Maintain(bg)
+	a.manager.Maintain(bg)
+	a.manager.Maintain(bg)
+	if records > 0 {
+		t.Fatalf("%d record writes while the note of the first was never on disk", records)
 	}
 }

@@ -567,14 +567,15 @@ func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
 }
 
 // unconfirmedPublishLocked reports whether a run is stopped with no
-// record this daemon knows of, though a publish of it was attempted: its
-// first record may be in remote storage with the answer lost, or the
-// daemon died before noting it. A run with no remote state at all (a
-// registry written before remote storage was configured) was never
-// published: publishHeld notes it pending, on disk, before its first
-// put. Caller holds mu, and only calls this with remote storage on.
+// record this daemon knows of, though a write of its first record was
+// attempted: that record may be in remote storage with the answer lost,
+// or the daemon died before noting it. advanceStopped notes the attempt
+// on disk before the write, so this survives a restart. A run whose
+// snapshot upload failed before any record write (storage down) is not
+// unconfirmed: nothing of it can be in another daemon's hands. Caller
+// holds mu, and only calls this with remote storage on.
 func unconfirmedPublishLocked(run *Run) bool {
-	return run.State == StateStopped && run.remoteGen == 0 && run.Remote != nil
+	return run.State == StateStopped && run.remoteGen == 0 && run.firstRecordTried
 }
 
 // adoptUnconfirmed looks for the record an unconfirmed publish may have

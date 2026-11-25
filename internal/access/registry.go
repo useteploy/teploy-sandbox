@@ -168,12 +168,15 @@ type Stream struct {
 
 	rx, tx atomic.Int64
 	last   atomic.Int64
-	// pending is, per direction (to the guest, from it), when a write
-	// started that has not returned (unix nanoseconds, 0: none).
-	pending   [2]atomic.Int64
-	flushMu   sync.Mutex
-	flushedRx int64
-	flushedTx int64
+	// pending is when a write to the guest started that has not returned
+	// (unix nanoseconds, 0: none).
+	pending atomic.Int64
+	// certNotAfter is when the certificate of the connection the stream
+	// came on expires (zero: never), checked against the wall clock.
+	certNotAfter atomic.Int64
+	flushMu      sync.Mutex
+	flushedRx    int64
+	flushedTx    int64
 
 	done chan struct{}
 
@@ -328,31 +331,38 @@ func (s *Stream) Moved(rx, tx int) {
 	s.last.Store(s.reg.now().UnixNano())
 }
 
-// Direction of a write, for stall detection.
-const (
-	ToGuest   = 0
-	FromGuest = 1
-)
+// Writing marks a write to the guest as started; Wrote as returned.
+//
+// Only this direction counts as a stall: while it waits the daemon stops
+// reading the request body, and the bytes the edge keeps sending sit in
+// the connection's shared receive window. The other direction (a visitor
+// that does not read, say a paused <video>) holds only this stream's own
+// send window and is bounded by the idle timeout and the caps.
+func (s *Stream) Writing() { s.pending.Store(s.reg.now().UnixNano()) }
 
-// Writing marks a write in direction dir as started; Wrote as returned.
-func (s *Stream) Writing(dir int) { s.pending[dir].Store(s.reg.now().UnixNano()) }
+// Wrote marks the write to the guest as returned.
+func (s *Stream) Wrote() { s.pending.Store(0) }
 
-// Wrote marks the write in direction dir as returned.
-func (s *Stream) Wrote(dir int) { s.pending[dir].Store(0) }
-
-// stalled reports whether a write has been waiting for longer than d.
-func (s *Stream) stalled(now time.Time, d time.Duration) bool {
-	for i := range s.pending {
-		if since := s.pending[i].Load(); since != 0 && now.Sub(time.Unix(0, since)) > d {
-			return true
-		}
+// ExpireWith ties the stream to its connection's certificate: the sweep
+// closes it once the wall clock passes notAfter, whatever the
+// connection's own timer (on the monotonic clock) says.
+func (s *Stream) ExpireWith(notAfter time.Time) {
+	if !notAfter.IsZero() {
+		s.certNotAfter.Store(notAfter.UnixNano())
 	}
-	return false
 }
 
-// WatchStall closes an anonymous stream once a write in either direction
-// has waited longer than Limits.AnonStall, until the stream closes. A
-// granted stream is not watched: its owner's own stall is the owner's.
+// stalled reports whether a write to the guest has been waiting for
+// longer than d.
+func (s *Stream) stalled(now time.Time, d time.Duration) bool {
+	since := s.pending.Load()
+	return since != 0 && now.Sub(time.Unix(0, since)) > d
+}
+
+// WatchStall closes an anonymous stream once a write to the guest has
+// waited longer than Limits.AnonStall, until the stream closes. A granted
+// stream is not watched: a connection carries one grant's streams (one
+// per jti), so a stall there stalls only that grant's holders.
 func (s *Stream) WatchStall() {
 	if !s.Anon {
 		return
@@ -499,6 +509,23 @@ func (r *Registry) CloseGranted(check func(kid, key string) (keep bool, notAfter
 	}
 }
 
+// CloseEdges ends every stream, of every run, whose edge denied names.
+func (r *Registry) CloseEdges(denied func(edge string) bool, reason string) {
+	r.mu.Lock()
+	var out []*Stream
+	for _, streams := range r.runs {
+		for s := range streams.streams {
+			if denied(s.Edge) {
+				out = append(out, s)
+			}
+		}
+	}
+	r.mu.Unlock()
+	for _, s := range out {
+		s.Close(reason)
+	}
+}
+
 // ClosePort ends a port's anonymous streams (run.AccessStreams).
 func (r *Registry) ClosePort(run string, port int, reason string) {
 	for _, s := range r.matching(run, func(s *Stream) bool { return s.Anon && s.Kind == KindConnect && s.Port == port }) {
@@ -557,10 +584,14 @@ func (r *Registry) sweep() {
 	}
 	r.mu.Unlock()
 	cutoff := r.now().Add(-r.limits.Idle).UnixNano()
+	wall := time.Now().UnixNano()
 	for _, s := range all {
 		s.flush()
 		if s.last.Load() < cutoff {
 			s.Close("idle")
+		}
+		if notAfter := s.certNotAfter.Load(); notAfter != 0 && wall >= notAfter {
+			s.Close("edge-expired")
 		}
 	}
 }

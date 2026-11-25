@@ -949,7 +949,10 @@ on another daemon is that statement: it resumes the run **from its last
 durable stop**. If the old holder was alive after all, its copy keeps
 running but can no longer become the run: its next stop is kept on its
 host as `remote.state: "superseded"`, which can be forked or deleted,
-not resumed. Only a record **another** daemon wrote supersedes a copy; a
+not resumed. With access on, such a copy's access streams are closed and
+refused from the moment its daemon sees the takeover (its next sync, or
+a request that reads the run's record); until then it serves the access
+state it had. Only a record **another** daemon wrote supersedes a copy; a
 daemon that finds its own record newer than it remembered (a crash
 between a write and its note) carries on from it. A daemon that restarts
 finds the runs it was running (lost with their VMs, as always) back as

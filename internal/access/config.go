@@ -104,19 +104,41 @@ type Store struct {
 	current atomic.Pointer[state]
 	// changed are told after every configuration change (the listener
 	// closes the streams of removed issuer keys).
-	changed []func()
+	changed map[int]func()
+	serial  int
 }
 
-// OnChange registers fn to run after every configuration change.
-func (s *Store) OnChange(fn func()) {
+// OnChange registers fn to run after every configuration change, until
+// the returned function unregisters it.
+func (s *Store) OnChange(fn func()) (unregister func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.changed = append(s.changed, fn)
+	s.serial++
+	id := s.serial
+	if s.changed == nil {
+		s.changed = map[int]func(){}
+	}
+	s.changed[id] = fn
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		delete(s.changed, id)
+	}
+}
+
+// watchers is how many functions OnChange holds.
+func (s *Store) watchers() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.changed)
 }
 
 func (s *Store) notify() {
 	s.mu.Lock()
-	fns := slices.Clone(s.changed)
+	fns := make([]func(), 0, len(s.changed))
+	for _, fn := range s.changed {
+		fns = append(fns, fn)
+	}
 	s.mu.Unlock()
 	for _, fn := range fns {
 		fn()

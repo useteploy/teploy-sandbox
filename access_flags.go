@@ -50,7 +50,7 @@ func addAccessFlags(flags *flag.FlagSet) *accessFlags {
 		streamsMax: flags.Int("access-streams-max", int(envFloat("SBX_ACCESS_STREAMS_MAX", 0)),
 			"access streams the daemon holds at once; 0 is --vm-max-runs x 64, and it must be set when there is no --vm-max-runs"),
 		edgeConns: flags.Int("access-edge-conns", int(envFloat("SBX_ACCESS_EDGE_CONNS", 0)),
-			"connections one edge may hold at once (an edge opens one per run it serves); 0 is twice the most runs the stream cap allows for"),
+			"connections one edge may hold at once (an edge opens one per run and kind it serves: anonymous, or one per grant); 0 is four times the most runs the stream cap allows for"),
 		memoryMB: flags.Int("access-memory-mb", int(envFloat("SBX_ACCESS_MEMORY_MB", 0)),
 			"memory (MiB) the access listener's worst case may take; the daemon refuses to start when --access-streams-max does not fit it. 0 is a tenth of the host's memory (1024 where that cannot be read)"),
 		mbit:      flags.Int("access-mbit", int(envFloat("SBX_ACCESS_MBIT", -1)), "each run's granted access streams, together, each way, in megabits per second; -1 (default) is --vm-net-mbit (200 under the docker driver), 0 no limit"),
@@ -121,7 +121,7 @@ func (f *accessFlags) prepare(driver string, vmMaxRuns, vmNetMbit int, stateDir 
 		return nil, errors.New("access-edge-conns must not be negative")
 	}
 	if edgeConns == 0 {
-		edgeConns = 2 * max(streamsMax/access.DefaultPerRun, 1)
+		edgeConns = 4 * max(streamsMax/access.DefaultPerRun, 1)
 	}
 	if *f.anonMbit < 0 || *f.totalMbit < 0 {
 		return nil, fmt.Errorf("access-anon-mbit and access-total-mbit must not be negative (0 is no limit)")

@@ -61,27 +61,37 @@ func (s *Service) now() time.Time {
 
 // connInfo is one connection from an edge: who, until when its
 // certificate holds, and what it serves. A connection serves one run, and
-// either that run's anonymous streams or its granted ones (an edge opens
-// one per run and kind it serves), so HTTP/2 flow control is shared only
-// by streams of one run and one kind: a public port's visitors, stalled
-// or not, never hold the window the owner's streams need.
+// either that run's anonymous streams or the streams of one grant (by
+// jti): an edge opens one per run and kind it serves. HTTP/2 flow control
+// is then shared only by streams of one run and one kind: a public port's
+// visitors, or one share link's holders, stalled or not, never hold the
+// window the owner's streams need.
 type connInfo struct {
 	peer     string
 	notAfter time.Time
 	mu       sync.Mutex
 	run      string
-	anon     bool
+	kind     string
 }
 
-// bind ties the connection to (run, anonymous or granted) on its first
-// admitted stream; a stream for anything else on it is refused.
-func (c *connInfo) bind(run string, anon bool) bool {
+// streamKind is what a connection binds to besides the run: "anonymous",
+// or the grant's jti.
+func streamKind(anon bool, jti string) string {
+	if anon {
+		return "anonymous"
+	}
+	return "grant:" + jti
+}
+
+// bind ties the connection to (run, kind) on its first admitted stream; a
+// stream for anything else on it is refused.
+func (c *connInfo) bind(run, kind string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.run == "" {
-		c.run, c.anon = run, anon
+		c.run, c.kind = run, kind
 	}
-	return c.run == run && c.anon == anon
+	return c.run == run && c.kind == kind
 }
 
 // expired reports whether the connection's certificate has expired.
@@ -149,9 +159,13 @@ func (s *Service) Serve(ctx context.Context, ln net.Listener, unencryptedHTTP2 b
 	// A removed or replaced issuer key ends the streams it admitted, as a
 	// revoke ends a run's: grants it signed no longer verify, and what
 	// they opened must not outlive that.
-	s.Store.OnChange(func() {
-		s.Registry.CloseGranted(s.Store.state().keeps, "issuer-key-removed")
+	// A denylisted edge's streams end too, not only its next one.
+	unwatch := s.Store.OnChange(func() {
+		current := s.Store.state()
+		s.Registry.CloseGranted(current.keeps, "issuer-key-removed")
+		s.Registry.CloseEdges(func(edge string) bool { return current.deny[edge] }, "edge-denied")
 	})
+	defer unwatch()
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.Serve(ln) }()
 	select {
@@ -350,8 +364,8 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusServiceUnavailable, "at-capacity", "The run cannot take access streams now.")
 		return
 	}
-	if !info.bind(id, anon) {
-		writeProblem(w, http.StatusMisdirectedRequest, "wrong-connection", "This connection serves another run, or the other kind of stream (anonymous or granted); open one per run and kind.")
+	if !info.bind(id, streamKind(anon, claims.Jti)) {
+		writeProblem(w, http.StatusMisdirectedRequest, "wrong-connection", "This connection serves another run, or another kind of stream (anonymous, or another grant); open one per run and kind.")
 		return
 	}
 	if !anon && claims.Ep < target.Epoch {
@@ -369,8 +383,11 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 		if !keyNotAfter.IsZero() && keyNotAfter.Before(end) {
 			end = keyNotAfter
 		}
-		stream.CloseAt(end)
+		// Never later than an end set meanwhile (a key notAfter brought
+		// forward by a configuration change since the check above).
+		stream.closeBy(end)
 	}
+	stream.ExpireWith(info.notAfter)
 	dialCtx, cancel := context.WithTimeout(r.Context(), dialTimeout)
 	guestConn, err := s.Manager.DialPort(dialCtx, id, port)
 	cancel()
@@ -448,9 +465,13 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 				if !stream.Shape(n) {
 					return
 				}
-				stream.Writing(ToGuest)
+				if info.expired(time.Now()) {
+					stream.Close("edge-expired")
+					return
+				}
+				stream.Writing()
 				_, werr := guestConn.Write(buf[:n])
-				stream.Wrote(ToGuest)
+				stream.Wrote()
 				if werr != nil {
 					stream.Close("")
 					return
@@ -478,12 +499,14 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 			if !stream.Shape(n) {
 				break
 			}
-			stream.Writing(FromGuest)
+			if info.expired(time.Now()) {
+				stream.Close("edge-expired")
+				break
+			}
 			_, werr := w.Write(buf[:n])
 			if werr == nil {
 				werr = rc.Flush()
 			}
-			stream.Wrote(FromGuest)
 			if werr != nil {
 				break
 			}

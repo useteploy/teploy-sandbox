@@ -402,10 +402,21 @@ compared with a clock:
   record: a revoke and a port change write them there before they
   answer, and a resume of a run this daemon already holds (a takeover)
   writes the epoch its move raised there before the run boots;
+- a revoke or port change while a stop is publishing the run's first
+  record answers 502 `access-write-through` (busy) and still reaches the
+  record: the publish writes whatever changed since it began;
 - the epoch never goes down: when a daemon takes a newer remote record
   of a run it holds stopped, it keeps the higher of its own epoch and
-  the record's (and writes its own to the record when it was ahead); the
-  ports are the record's.
+  the record's, and a daemon that drops a run whose epoch was ahead of
+  its record keeps that epoch should the run come back. The ports are the
+  record's, unless they were changed on this daemon since it last wrote
+  or took a record (a change answered 502): then a port is public only if
+  both say so. Whatever is ahead of the record is written to it;
+- a running copy of a run that another daemon took over (`remote.state`
+  `superseded`) keeps running, but its access streams are closed and no
+  more are admitted once this daemon sees the takeover — at its next
+  sync, or the next request that reads the run's record. Until then it
+  serves the access state it had.
 
 A caller that stores epochs (a control plane minting grants) stores the
 epoch from every run object it receives and passes it as `accessEpoch`
@@ -421,6 +432,11 @@ on every resume.
 | `GET /v1/access/config` | | 200 `{audience, kids, edgeDenylist, listener, enabled, managedByFile}` | |
 | `PUT /v1/access/config` | `{audience, issuerKeys: [{kid, ed25519, notAfter?}], edgeDenylist: [names]}` | 204 | 400; 409 when `--access-config` manages it |
 | `POST /v1/runs/{id}/resume` | gains `accessEpoch?` | as before | 400 when negative or above 2^53-1 - 2^20 (an epoch at the maximum could never be raised again) |
+
+A write-through holds the run for up to 30 s: execs, writes, stops and
+lease acquires on it meanwhile answer 409 `busy`, and a revoke or port
+change made while a stop, resume, fork or delete holds the run answers
+502 and is to be repeated.
 
 Ports are data and may be set while the run is stopped. Making a public
 port private, or deleting it, closes that port's anonymous streams. A
@@ -450,17 +466,21 @@ speaks h2c on a 0660 socket and admits peers by uid or gid (SO_PEERCRED).
 TCP without TLS is refused at start. HTTP/1.1 is accepted too, for
 debugging.
 
-One connection serves one run and one kind of stream, anonymous (no
-`Teploy-Grant`) or granted: the first admitted stream binds it, and a
-stream for another run, or of the other kind, on it is 421
-`wrong-connection`. Open one connection per run and kind, so that a
-public port's visitors never share flow control with the owner's
-streams. Each edge may hold `--access-edge-conns` connections.
+One connection serves one run and one kind of stream: anonymous (no
+`Teploy-Grant`), or the streams of one grant (by its `jti`). The first
+admitted stream binds it, and a stream for another run, or of another
+kind, on it is 421 `wrong-connection`. Open one connection per run and
+kind, so that a public port's visitors, or one share link's holders,
+never share flow control with the owner's streams. Each edge may hold
+`--access-edge-conns` connections (default: four per run the stream cap
+allows for).
 
 A connection holds only as long as the certificate it was opened with:
 at the earliest `notAfter` of its verified chain the daemon closes it,
 ending its streams, and a stream asked for on it after that is 403
-`edge-expired`. Removing an issuer key from the configuration, or
+`edge-expired`. The expiry is also checked against the wall clock on
+every read and by the periodic sweep, so a clock corrected forward ends
+the streams too. Denylisting an edge ends its open streams at once. Removing an issuer key from the configuration, or
 replacing it under its `kid`, closes the streams it admitted; a key's
 `notAfter` brought forward ends them by then.
 
@@ -475,10 +495,15 @@ a half-close, and the guest closing its side ends the stream. Without
 `Teploy-Grant` the port must be public on the run. A granted stream is
 closed at its grant's `exp`; every stream of a run is closed on revoke,
 stop and destroy; anonymous streams of a port on unpublish. A stream
-idle for an hour is closed. An anonymous stream that has had bytes
-waiting, either way, without moving any for 30 seconds (a guest or a
-visitor that does not read) is closed; an anonymous stream with nothing
-to send is idle, not stalled. Every other path is 404. Problem responses
+idle for an hour is closed. An anonymous stream whose write to the guest
+has been blocked for 30 seconds (a guest that does not read: the edge's
+bytes then sit in the connection's shared window) is closed. A visitor
+that does not read (a paused `<video>`) is not a stall: it holds only its
+own stream's send window, and is bounded by the idle timeout and the
+caps. A guest that reads just often enough (a trickle, one write per
+less than 30 s) is not caught; it holds at most its stream's 256 KiB
+window, and the 16 anonymous streams of a run at most the anonymous
+connection's 4 MiB — that run's visitors, never its owner. Every other path is 404. Problem responses
 never echo a grant. `Teploy-Edge-Request` is logged only when it is at
 most 64 characters of `[A-Za-z0-9._-]`.
 

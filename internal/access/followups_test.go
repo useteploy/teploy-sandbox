@@ -330,3 +330,195 @@ func TestGuestErrorTextIsNotEchoed(t *testing.T) {
 		t.Fatalf("the guest's text is not logged shortened (%d bytes)", logged.Len())
 	}
 }
+
+// PR #13 review, A3: a share link's holders are granted streams; they get
+// a connection of their own (one per grant), so sixteen of them stalled
+// on an app that does not read cannot starve the owner, whose grant is
+// another one: on their connection the owner is 421, on its own it moves.
+func TestShareLinkHoldersDoNotStarveTheOwner(t *testing.T) {
+	r := newRig(t)
+	var held []net.Conn
+	var mu sync.Mutex
+	r.manager.dial = func(_ context.Context, _ string, port int) (net.Conn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		ours, guest := net.Pipe()
+		if port == 8080 {
+			held = append(held, guest) // the shared app does not read
+			return ours, nil
+		}
+		go func() { _, _ = io.Copy(io.Discard, guest) }()
+		return ours, nil
+	}
+	defer func() {
+		mu.Lock()
+		for _, c := range held {
+			c.Close()
+		}
+		mu.Unlock()
+	}()
+	shared := r.client(r.edge)
+	link := r.grant(func(c *accessgrant.Claims) { c.Scp = []string{"http:8080"}; c.Jti = "share" })
+	chunk := bytes.Repeat([]byte("s"), 64<<10)
+	for i := range 16 {
+		s, err := r.connect(shared, runA, "8080", link)
+		if err != nil || s.resp.StatusCode != 200 {
+			t.Fatalf("share-link connect %d: %v", i, err)
+		}
+		go func() {
+			for {
+				if _, err := s.in.Write(chunk); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	time.Sleep(500 * time.Millisecond)
+	answer := make(chan string, 1)
+	go func() {
+		s, err := r.connect(shared, runA, "3000", r.grant())
+		if err != nil {
+			answer <- err.Error()
+			return
+		}
+		s.in.Close()
+		_, kind, _ := problemOf(t, s.resp)
+		answer <- kind
+	}()
+	select {
+	case got := <-answer:
+		if got != "wrong-connection" {
+			t.Fatalf("the owner's grant on the share link's connection: %s", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the owner's grant was admitted on the share link's connection and queued behind it")
+	}
+	owner, err := r.connect(r.client(r.edge), runA, "3000", r.grant())
+	if err != nil || owner.resp.StatusCode != 200 {
+		t.Fatalf("owner connect: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := owner.in.Write(bytes.Repeat([]byte("o"), 1<<20)); done <- err }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the owner's 1 MiB upload stalled behind the share link's streams")
+	}
+	owner.in.Close()
+	owner.resp.Body.Close()
+}
+
+// PR #13 review nit: certificate expiry is also checked against the wall
+// clock on every read, so a stream ends even if the connection's timer
+// (on the monotonic clock) has not fired.
+func TestAStreamEndsOnItsFirstReadAfterTheCertificateExpired(t *testing.T) {
+	r := newRig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	info := &connInfo{peer: "edge-1", notAfter: time.Now().Add(300 * time.Millisecond)}
+	body, in := io.Pipe()
+	defer in.Close()
+	req := httptest.NewRequestWithContext(context.WithValue(ctx, connKey{}, info), http.MethodPost, "/v1/access/runs/"+runA+"/connect?port=3000", body)
+	req.Header.Set(HeaderGrant, r.grant())
+	done := make(chan struct{})
+	go func() { r.service.Handler().ServeHTTP(httptest.NewRecorder(), req); close(done) }()
+	waitFor(t, 5*time.Second, "the stream", func() bool { return r.registry.Count() == 1 })
+	time.Sleep(500 * time.Millisecond)
+	go func() { _, _ = in.Write([]byte("x")) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("a stream kept moving bytes after its connection's certificate expired")
+	}
+}
+
+// The sweep closes a stream whose connection's certificate has expired by
+// the wall clock.
+func TestTheSweepClosesStreamsPastTheirCertificate(t *testing.T) {
+	r := NewRegistry(Limits{Total: 10}, nil, quiet())
+	expired, _ := r.Admit(runA, KindConnect, 1, false, "e", GrantRef{}, "")
+	valid, _ := r.Admit(runA, KindConnect, 2, false, "e", GrantRef{}, "")
+	expired.ExpireWith(time.Now().Add(-time.Second))
+	valid.ExpireWith(time.Now().Add(time.Hour))
+	r.sweep()
+	if expired.Reason() != "edge-expired" || valid.Reason() != "" {
+		t.Fatalf("after the sweep: expired %q, valid %q", expired.Reason(), valid.Reason())
+	}
+}
+
+// closeBy only ever brings a stream's end forward: an end set later than
+// one already set does not push it back.
+func TestCloseByOnlyBringsTheEndForward(t *testing.T) {
+	r := NewRegistry(Limits{Total: 10}, nil, quiet())
+	s, _ := r.Admit(runA, KindConnect, 1, false, "e", GrantRef{}, "")
+	s.closeBy(time.Now().Add(100 * time.Millisecond))
+	s.closeBy(time.Now().Add(time.Hour))
+	select {
+	case <-s.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("a later end pushed back an earlier one")
+	}
+}
+
+// PR #13 review nit: a visitor that does not read (a paused <video>) is
+// not a stall: only a guest that does not read is.
+func TestAVisitorThatDoesNotReadIsNotStalled(t *testing.T) {
+	r := newRig(t, func(c *rigConfig) { c.limits = Limits{AnonStall: 300 * time.Millisecond} })
+	r.manager.set(runA, func(f *fakeRun) {
+		f.ports = []run.PortSpec{{Port: 8080, Visibility: run.PortPublic, Protocol: run.PortHTTP}}
+	})
+	r.manager.dial = func(context.Context, string, int) (net.Conn, error) {
+		ours, guest := net.Pipe()
+		go func() {
+			chunk := bytes.Repeat([]byte("v"), 32<<10)
+			for {
+				if _, err := guest.Write(chunk); err != nil {
+					return
+				}
+			}
+		}()
+		return ours, nil
+	}
+	s, err := r.connect(r.client(r.edge), runA, "8080", "")
+	if err != nil || s.resp.StatusCode != 200 {
+		t.Fatalf("connect: %v", err)
+	}
+	defer s.in.Close()
+	time.Sleep(1500 * time.Millisecond) // the visitor pauses; the windows fill
+	if r.registry.Count() != 1 {
+		t.Fatal("a paused visitor's stream was closed as stalled")
+	}
+	got := make([]byte, 1<<20)
+	if _, err := io.ReadFull(s.resp.Body, got); err != nil {
+		t.Fatalf("resuming the read: %v", err)
+	}
+	s.resp.Body.Close()
+}
+
+// PR #13 review nit: denylisting an edge ends its open streams at once,
+// not only its next stream or handshake.
+func TestDenylistingAnEdgeEndsItsStreams(t *testing.T) {
+	r := newRig(t)
+	s, err := r.connect(r.client(r.edge), runA, "3000", r.grant())
+	if err != nil || s.resp.StatusCode != 200 {
+		t.Fatalf("connect: %v", err)
+	}
+	roundTrip(t, s, "before")
+	if err := r.store.Set(Config{Audience: testAudience, IssuerKeys: r.store.Config().IssuerKeys, EdgeDenylist: []string{"edge-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if !readEnds(s.resp.Body, 2*time.Second) {
+		t.Fatal("a denylisted edge's stream kept moving bytes")
+	}
+}
+
+// PR #13 review nit: Serve's configuration watch goes when Serve does.
+func TestServeUnregistersItsConfigurationWatch(t *testing.T) {
+	r := newRig(t)
+	waitFor(t, 5*time.Second, "the watch", func() bool { return r.store.watchers() == 1 })
+	r.cancel()
+	<-r.done
+	if n := r.store.watchers(); n != 0 {
+		t.Fatalf("%d configuration watches left after Serve returned", n)
+	}
+}

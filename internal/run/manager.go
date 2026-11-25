@@ -357,18 +357,18 @@ type Manager struct {
 	// was last looked at. orphans are the snapshots held by runs the
 	// previous daemon life lost, kept until the first sync has decided
 	// which of those runs come back. All guarded by mu.
-	tombstones  map[string]uint64
+	tombstones map[string]uint64
 	// accessFloors are epochs of runs this daemon let go of while its
 	// epoch was ahead of the run's record (a revoke here whose write
 	// failed): adopting the run again never goes below them. Persisted.
 	accessFloors map[string]int64
-	remoteSeen  map[string]uint64
-	orphans     []string
-	lastSync    time.Time
-	lastGC      time.Time
-	lastScrub   time.Time
-	maintaining atomic.Bool
-	publishing  atomic.Bool
+	remoteSeen   map[string]uint64
+	orphans      []string
+	lastSync     time.Time
+	lastGC       time.Time
+	lastScrub    time.Time
+	maintaining  atomic.Bool
+	publishing   atomic.Bool
 
 	// forking are the IDs of fork children whose record is in remote
 	// storage and whose VM is still booting: runs the registry does not

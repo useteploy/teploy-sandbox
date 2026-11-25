@@ -549,7 +549,7 @@ func TestPerGrantConnectionsDoNotExhaustTheEdgeCap(t *testing.T) {
 // connection is refused 429 run-connections and closed, and other runs
 // are not affected.
 func TestARunsConnectionsFromAnEdgeAreCapped(t *testing.T) {
-	r := newRig(t, func(c *rigConfig) { c.conns = 2 })
+	r := newRig(t, func(c *rigConfig) { c.conns = 3 }) // 1 anonymous, 2 granted
 	r.manager.dial = func(context.Context, string, int) (net.Conn, error) { return echoConn(), nil }
 	for i := range 2 {
 		jti := fmt.Sprint("a-", i)
@@ -605,4 +605,98 @@ func TestAnEdgeDenylistedBeforeTheCountIsRefused(t *testing.T) {
 	if status, kind, _ := problemOf(t, s.resp); status != http.StatusForbidden || kind != "edge-denied" {
 		t.Fatalf("a stream of an edge denylisted before its count: %d %s", status, kind)
 	}
+}
+
+// PR #13, fourth review round, B1: every refusal on a connection that
+// serves no run yet closes it, so refused requests (here: to a stopped
+// run, each on a fresh connection as an edge opens one per grant) cannot
+// fill the edge's cap and cut another run off.
+func TestRefusalsOnUnboundConnectionsDoNotFillTheEdgeCap(t *testing.T) {
+	r := newRig(t, func(c *rigConfig) { c.perPeer = 2 })
+	r.manager.dial = func(context.Context, string, int) (net.Conn, error) { return echoConn(), nil }
+	r.manager.set(runA, func(f *fakeRun) { f.state = run.StateStopped })
+	for i := range 2 {
+		jti := fmt.Sprint("a-", i)
+		s, err := r.connect(r.client(r.edge), runA, "3000", r.grant(func(c *accessgrant.Claims) { c.Jti = jti }))
+		if err != nil {
+			t.Fatalf("run A request %d: %v", i, err)
+		}
+		s.in.Close()
+		if status, kind, _ := problemOf(t, s.resp); status != http.StatusConflict || kind != "stopped" {
+			t.Fatalf("premise: run A is stopped: %d %s", status, kind)
+		}
+	}
+	waitFor(t, 5*time.Second, "run B reachable", func() bool {
+		s, err := r.connect(r.client(r.edge), runB, "3000", r.grant(func(c *accessgrant.Claims) { c.Run = runB; c.Jti = "b-owner" }))
+		if err != nil {
+			return false
+		}
+		defer s.in.Close()
+		defer s.resp.Body.Close()
+		return s.resp.StatusCode == http.StatusOK
+	})
+}
+
+// B1: the 429 run-connections refusal really closes its connection, and
+// gives the edge's slot back.
+func TestARunConnectionsRefusalClosesTheConnection(t *testing.T) {
+	r := newRig(t, func(c *rigConfig) { c.perPeer = 1; c.conns = 1 })
+	r.manager.dial = func(context.Context, string, int) (net.Conn, error) { return echoConn(), nil }
+	first, err := r.connect(r.client(r.edge), runA, "3000", r.grant(func(c *accessgrant.Claims) { c.Jti = "a-1" }))
+	if err != nil || first.resp.StatusCode != 200 {
+		t.Fatalf("first: %v", err)
+	}
+	full, err := r.connect(r.client(r.edge), runA, "3000", r.grant(func(c *accessgrant.Claims) { c.Jti = "a-2" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	full.in.Close()
+	if status, kind, _ := problemOf(t, full.resp); status != http.StatusTooManyRequests || kind != "run-connections" {
+		t.Fatalf("premise: %d %s", status, kind)
+	}
+	waitFor(t, 5*time.Second, "the edge's slot back", func() bool {
+		s, err := r.connect(r.client(r.edge), runB, "3000", r.grant(func(c *accessgrant.Claims) { c.Run = runB; c.Jti = "b" }))
+		if err != nil {
+			return false
+		}
+		defer s.in.Close()
+		defer s.resp.Body.Close()
+		return s.resp.StatusCode == http.StatusOK
+	})
+}
+
+// PR #13, fourth review round, S1: grant holders filling the run's
+// connections from an edge do not lock a public port's anonymous
+// visitors out: anonymous connections have slots of their own.
+func TestGrantHoldersCannotLockOutAnonymousVisitors(t *testing.T) {
+	r := newRig(t)
+	r.manager.dial = func(context.Context, string, int) (net.Conn, error) { return echoConn(), nil }
+	r.manager.set(runA, func(f *fakeRun) {
+		f.ports = []run.PortSpec{{Port: 8080, Visibility: run.PortPublic, Protocol: run.PortHTTP}}
+	})
+	refused := false
+	for i := range DefaultConnsPerRun + 1 {
+		jti := fmt.Sprint("share-", i)
+		s, err := r.connect(r.client(r.edge), runA, "8080", r.grant(func(c *accessgrant.Claims) { c.Jti = jti; c.Scp = []string{"http:8080"} }))
+		if err != nil {
+			t.Fatalf("grant %d: %v", i, err)
+		}
+		if s.resp.StatusCode != http.StatusOK {
+			s.in.Close()
+			if _, kind, _ := problemOf(t, s.resp); kind != "run-connections" {
+				t.Fatalf("grant %d refused with %s", i, kind)
+			}
+			refused = true
+			break
+		}
+		roundTrip(t, s, "held")
+	}
+	if !refused {
+		t.Fatal("premise: the grants fill their share of the run's connections")
+	}
+	anon, err := r.connect(r.client(r.edge), runA, "8080", "")
+	if err != nil || anon.resp.StatusCode != http.StatusOK {
+		t.Fatalf("an anonymous visitor to the public port is locked out: %v", err)
+	}
+	roundTrip(t, anon, "visitor")
 }

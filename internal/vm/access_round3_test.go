@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -312,5 +313,76 @@ func TestARestartedDaemonFindsItsUnconfirmedFirstRecord(t *testing.T) {
 	}
 	if target, err := b.manager.AccessAdmit(id, 3000); err != nil || target.Public {
 		t.Fatalf("host-b serves the port public: %+v %v", target, err)
+	}
+}
+
+// anotherDaemonsWriteOfTheStop has host-b write the next generation of
+// the same stop as host-a's unconfirmed first record, with its access
+// state changed: port 3000 private (unless keepPorts) and the epoch 7
+// above. It returns that epoch.
+func anotherDaemonsWriteOfTheStop(t *testing.T, a, b *remoteHost, id string, keepPorts bool) int64 {
+	t.Helper()
+	record, key, err := a.store.Latest(bg, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored map[string]any
+	if err := json.Unmarshal(record.Payload, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if !keepPorts {
+		stored["accessPorts"] = []run.PortSpec{{Port: 3000, Visibility: run.PortPrivate, Protocol: run.PortHTTP}}
+	}
+	epoch := int64(stored["accessEpoch"].(float64)) + 7
+	stored["accessEpoch"] = epoch
+	rewritten := *record
+	rewritten.Generation++
+	if rewritten.Payload, err = json.Marshal(stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.store.Advance(bg, rewritten, key, "host-b", false); err != nil {
+		t.Fatal(err)
+	}
+	return epoch
+}
+
+// PR #13, fourth review round, B2: a publish that takes another daemon's
+// newer write of the same stop as its own takes that record's access
+// state (ports and epoch), instead of writing this daemon's stale ports
+// over it.
+func TestAPublishTakesAnotherDaemonsNewerWriteOfTheStop(t *testing.T) {
+	a, b, id := lostFirstRecord(t)
+	epoch := anotherDaemonsWriteOfTheStop(t, a, b, id, false)
+	a.manager.Maintain(bg)
+	if got := a.get(t, id).Remote; got == nil || got.State != run.RemoteDurable {
+		t.Fatalf("premise: host-a's retry takes host-b's record as its stop: %+v", got)
+	}
+	inRecord, ports := recordAccess(t, a, id)
+	if len(ports) != 1 || ports[0].Visibility != run.PortPrivate {
+		t.Fatalf("host-a's publish re-published port 3000 that host-b's newer record had private: %+v", ports)
+	}
+	if local := epochOf(t, a.get(t, id)); local < epoch || inRecord < epoch {
+		t.Fatalf("host-a at %d, record at %d, below host-b's %d", local, inRecord, epoch)
+	}
+}
+
+// B3: the epoch never goes down — not locally after a record with a
+// higher one is accepted, and not in the record when a local resume
+// claims the run.
+func TestALocalResumeNeverLowersTheRecordsEpoch(t *testing.T) {
+	a, b, id := lostFirstRecord(t)
+	epoch := anotherDaemonsWriteOfTheStop(t, a, b, id, true)
+	a.manager.Maintain(bg)
+	before, _ := recordAccess(t, a, id)
+	if before < epoch {
+		t.Fatalf("premise: the record carries host-b's epoch %d: %d", epoch, before)
+	}
+	resumed, err := a.manager.Resume(bg, id, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _ := recordAccess(t, a, id)
+	if epochOf(t, resumed) < before || after < before {
+		t.Fatalf("record %d before the resume; host-a runs at %d and the record says %d after", before, epochOf(t, resumed), after)
 	}
 }

@@ -472,7 +472,7 @@ func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
 		m.mu.Unlock()
 		return ErrNotFound
 	}
-	generation, epoch, ports := live.remoteGen, live.accessEpoch, slices.Clone(live.accessPorts)
+	generation := live.remoteGen
 	unconfirmed, snapshot := unconfirmedPublishLocked(live), live.snapshot
 	m.mu.Unlock()
 	if generation == 0 && unconfirmed {
@@ -485,6 +485,7 @@ func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
 	if generation == 0 {
 		return nil
 	}
+	var ports []PortSpec
 	written := false
 	defer func() {
 		if !written {
@@ -519,11 +520,24 @@ func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
 	if err := json.Unmarshal(latest.Payload, &stored); err != nil {
 		return fmt.Errorf("the run's remote record: %w", err)
 	}
-	if stored.AccessEpoch >= epoch && slices.Equal(stored.AccessPorts, ports) {
+	// The record is the one this daemon knows (in step): its access
+	// state is taken by the one rule (the epoch can only rise here), and
+	// this daemon's ports, the newer, go back if they differ.
+	m.mu.Lock()
+	live, ok = m.runs[id]
+	if !ok {
+		m.mu.Unlock()
+		return ErrNotFound
+	}
+	writeBack := m.reconcileAccessFromRecordLocked(live, recordAccess{Epoch: stored.AccessEpoch, Ports: stored.AccessPorts}, false)
+	epoch := live.accessEpoch
+	ports = slices.Clone(live.accessPorts)
+	m.mu.Unlock()
+	if !writeBack {
 		written = true
 		return nil
 	}
-	stored.AccessEpoch = max(stored.AccessEpoch, epoch)
+	stored.AccessEpoch = epoch
 	stored.AccessPorts = ports
 	payload, err := json.Marshal(stored)
 	if err != nil {

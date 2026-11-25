@@ -30,10 +30,12 @@ const (
 	streamWindow = 256 << 10
 	connWindow   = 4<<20 - 1
 	// DefaultConnsPerRun is how many connections one edge may have bound
-	// to one run at once: the anonymous one and seven grants'. They are
-	// counted per (edge, run), apart from the edge's own cap (which
-	// counts only connections not serving a run yet), so no run, and no
-	// tenant's grants, can take the connections another run needs.
+	// to one run at once. They are counted per (edge, run), apart from
+	// the edge's own cap (which counts only connections not serving a run
+	// yet), so no run, and no tenant's grants, can take the connections
+	// another run needs. Within a run, a quarter (at least one) are for
+	// anonymous connections and the rest for grants', so grant holders
+	// cannot lock a public port's visitors out, nor visitors the grants.
 	DefaultConnsPerRun = 8
 	// dialTimeout bounds opening the guest side of a stream; the guest
 	// agent itself has guest.ConnectResultTimeout to answer.
@@ -79,7 +81,13 @@ func (s *Service) bind(info *connInfo, run, kind string) (wrong, full bool) {
 	if limit <= 0 {
 		limit = DefaultConnsPerRun
 	}
+	anonymous := max(1, limit/4)
 	key := info.peer + "\x00" + run
+	if kind == streamKind(true, "") {
+		limit, key = anonymous, key+"\x00anonymous"
+	} else {
+		limit, key = max(1, limit-anonymous), key+"\x00granted"
+	}
 	s.bindMu.Lock()
 	if s.runConns == nil {
 		s.runConns = map[string]int{}
@@ -157,6 +165,13 @@ func (c *connInfo) bind(run, kind string) bool {
 		c.run, c.kind = run, kind
 	}
 	return c.run == run && c.kind == kind
+}
+
+// bound reports whether the connection serves a run.
+func (c *connInfo) bound() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.run != ""
 }
 
 // expired reports whether the connection's certificate has expired.
@@ -346,14 +361,24 @@ func grantFailure(w http.ResponseWriter, err error) {
 // is what the guest sends, the request body what it receives.
 func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 	info := connFrom(r.Context())
+	// A refusal on a connection that serves no run yet closes it once the
+	// answer is out (GOAWAY): it would otherwise hold its edge's slot for
+	// the idle timeout, and requests that are refused (a stopped run, a
+	// bad grant, a full run) could fill the edge's cap for every run.
+	refuse := func(status int, suffix, detail string) {
+		if !info.bound() {
+			w.Header().Set("Connection", "close")
+		}
+		writeProblem(w, status, suffix, detail)
+	}
 	id := r.PathValue("id")
 	if !accessgrant.ValidRunID(id) {
-		writeProblem(w, http.StatusNotFound, "not-here", "No such run on this daemon.")
+		refuse(http.StatusNotFound, "not-here", "No such run on this daemon.")
 		return
 	}
 	port, err := run.ParsePort(r.URL.Query().Get("port"))
 	if err != nil {
-		writeProblem(w, http.StatusBadRequest, "bad-request", "port must be 1-65535.")
+		refuse(http.StatusBadRequest, "bad-request", "port must be 1-65535.")
 		return
 	}
 	// The denylist is checked at the handshake; this second look closes
@@ -361,19 +386,19 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// denylisted (it takes effect at the next handshake, and until
 	// reconnect at the next stream).
 	if s.Store.Denied(info.peer) {
-		writeProblem(w, http.StatusForbidden, "edge-denied", "The edge this connection belongs to is denylisted.")
+		refuse(http.StatusForbidden, "edge-denied", "The edge this connection belongs to is denylisted.")
 		return
 	}
 	// The connection is closed when its certificate expires; this is the
 	// same check per stream, so a stream never opens in between.
 	if info.expired(time.Now()) {
-		writeProblem(w, http.StatusForbidden, "edge-expired", "The certificate this connection was opened with has expired; reconnect.")
+		refuse(http.StatusForbidden, "edge-expired", "The certificate this connection was opened with has expired; reconnect.")
 		return
 	}
 	request := SanitizeRequestID(r.Header.Get(HeaderRequest))
 	grants := r.Header.Values(HeaderGrant)
 	if len(grants) > 1 {
-		writeProblem(w, http.StatusUnauthorized, "grant-invalid", "More than one grant.")
+		refuse(http.StatusUnauthorized, "grant-invalid", "More than one grant.")
 		return
 	}
 	anon := len(grants) == 0
@@ -389,24 +414,24 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 		ref = GrantRef{Jti: claims.Jti, Kid: claims.Kid, Key: current.keys[claims.Kid].public}
 		if claims.Run != id {
-			writeProblem(w, http.StatusUnauthorized, "grant-invalid", "The grant is for another run.")
+			refuse(http.StatusUnauthorized, "grant-invalid", "The grant is for another run.")
 			return
 		}
 		if !claims.Permits(accessgrant.UseDaemonConnect, port) {
-			writeProblem(w, http.StatusForbidden, "scope", "The grant does not cover this port.")
+			refuse(http.StatusForbidden, "scope", "The grant does not cover this port.")
 			return
 		}
 	}
 	stream, err := s.Registry.Admit(id, KindConnect, port, anon, info.peer, ref, request)
 	switch {
 	case errors.Is(err, ErrRunStreams):
-		writeProblem(w, http.StatusTooManyRequests, "run-streams", err.Error())
+		refuse(http.StatusTooManyRequests, "run-streams", err.Error())
 		return
 	case errors.Is(err, ErrAnonStreams):
-		writeProblem(w, http.StatusTooManyRequests, "anon-streams", err.Error())
+		refuse(http.StatusTooManyRequests, "anon-streams", err.Error())
 		return
 	case err != nil:
-		writeProblem(w, http.StatusServiceUnavailable, "at-capacity", err.Error())
+		refuse(http.StatusServiceUnavailable, "at-capacity", err.Error())
 		return
 	}
 	defer stream.Release()
@@ -414,7 +439,7 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// has the stream closed by the configuration change, and one
 	// denylisted between the check above and the count is seen here.
 	if s.Store.Denied(info.peer) {
-		writeProblem(w, http.StatusForbidden, "edge-denied", "The edge this connection belongs to is denylisted.")
+		refuse(http.StatusForbidden, "edge-denied", "The edge this connection belongs to is denylisted.")
 		return
 	}
 	// Counted first, checked second: a key removal that lands after this
@@ -423,7 +448,7 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if !anon {
 		keep, notAfter := s.Store.state().keeps(ref.Kid, ref.Key)
 		if !keep {
-			writeProblem(w, http.StatusUnauthorized, "grant-invalid", "The grant is not valid here: its issuer key was removed.")
+			refuse(http.StatusUnauthorized, "grant-invalid", "The grant is not valid here: its issuer key was removed.")
 			return
 		}
 		keyNotAfter = notAfter
@@ -435,32 +460,32 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, run.ErrNotFound):
 		// Refused for a run that is not here: binding now would pin this
 		// connection to an ID it never served.
-		writeProblem(w, http.StatusNotFound, "not-here", "No such run on this daemon.")
+		refuse(http.StatusNotFound, "not-here", "No such run on this daemon.")
 		return
 	case errors.Is(err, run.ErrStopped):
-		writeProblem(w, http.StatusConflict, "stopped", "The run is not running.")
+		refuse(http.StatusConflict, "stopped", "The run is not running.")
 		return
 	case err != nil:
-		writeProblem(w, http.StatusServiceUnavailable, "at-capacity", "The run cannot take access streams now.")
+		refuse(http.StatusServiceUnavailable, "at-capacity", "The run cannot take access streams now.")
 		return
 	}
 	switch wrong, full := s.bind(info, id, streamKind(anon, claims.Jti)); {
 	case wrong:
-		writeProblem(w, http.StatusMisdirectedRequest, "wrong-connection", "This connection serves another run, or another kind of stream (anonymous, or another grant); open one per run and kind.")
+		refuse(http.StatusMisdirectedRequest, "wrong-connection", "This connection serves another run, or another kind of stream (anonymous, or another grant); open one per run and kind.")
 		return
 	case full:
 		// The connection serves nothing and never will: close it once
 		// this answer is out, so that its edge slot comes back.
 		w.Header().Set("Connection", "close")
-		writeProblem(w, http.StatusTooManyRequests, "run-connections", "This edge has as many connections to the run as it may; reuse one (one per run and kind).")
+		refuse(http.StatusTooManyRequests, "run-connections", "This edge has as many connections to the run as it may; reuse one (one per run and kind).")
 		return
 	}
 	if !anon && claims.Ep < target.Epoch {
-		writeProblem(w, http.StatusUnauthorized, "revoked", "The grant was revoked.")
+		refuse(http.StatusUnauthorized, "revoked", "The grant was revoked.")
 		return
 	}
 	if anon && !target.Public {
-		writeProblem(w, http.StatusForbidden, "not-public", "The port is not public; a grant is needed.")
+		refuse(http.StatusForbidden, "not-public", "The port is not public; a grant is needed.")
 		return
 	}
 	if !anon {
@@ -480,13 +505,13 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 	cancel()
 	switch {
 	case errors.Is(err, run.ErrUnsupportedDriver):
-		writeProblem(w, http.StatusNotImplemented, "unsupported-driver", "This daemon's driver cannot open access streams.")
+		refuse(http.StatusNotImplemented, "unsupported-driver", "This daemon's driver cannot open access streams.")
 		return
 	case errors.Is(err, run.ErrPortRefused):
-		writeProblem(w, http.StatusBadGateway, "refused", "Nothing is listening on that port in the run.")
+		refuse(http.StatusBadGateway, "refused", "Nothing is listening on that port in the run.")
 		return
 	case errors.Is(err, run.ErrStopped), errors.Is(err, run.ErrNotFound):
-		writeProblem(w, http.StatusConflict, "stopped", "The run is not running.")
+		refuse(http.StatusConflict, "stopped", "The run is not running.")
 		return
 	case err != nil:
 		// The error's text can come from inside the guest: it is logged,
@@ -494,7 +519,7 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 		if s.Log != nil {
 			s.Log.Warn("access stream: the guest agent refused", "run", id, "port", port, "edge", info.peer, "request", request, "error", truncate(err.Error(), maxGuestErrorLog))
 		}
-		writeProblem(w, http.StatusBadGateway, "guest-agent", "The run's guest agent could not open the stream: it is older than guest protocol version 2 (rebuild the golden image), or at its own limit.")
+		refuse(http.StatusBadGateway, "guest-agent", "The run's guest agent could not open the stream: it is older than guest protocol version 2 (rebuild the golden image), or at its own limit.")
 		return
 	}
 	rc := http.NewResponseController(w)
@@ -518,9 +543,9 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 		_ = guestConn.Close()
 		reason := stream.Reason()
 		if reason == "revoked" {
-			writeProblem(w, http.StatusUnauthorized, "revoked", "The grant was revoked.")
+			refuse(http.StatusUnauthorized, "revoked", "The grant was revoked.")
 		} else {
-			writeProblem(w, http.StatusConflict, "stopped", "The stream was closed before it opened ("+reason+").")
+			refuse(http.StatusConflict, "stopped", "The stream was closed before it opened ("+reason+").")
 		}
 		return
 	}

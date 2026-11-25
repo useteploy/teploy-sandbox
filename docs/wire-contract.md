@@ -488,10 +488,12 @@ never share flow control with the owner's streams.
 A connection counts against its edge's `--access-edge-conns` (default:
 twice the runs the stream cap allows for) only until its first stream
 binds it to a run; from then on it counts against that run's
-connections from that edge, at most 8. Past that, a new connection's
-stream is 429 `run-connections` and the connection is closed (GOAWAY).
-So no run, and no tenant's grants, can use up the connections another
-run needs.
+connections from that edge: at most 2 anonymous and 6 granted ones, so
+grant holders cannot lock a public port's visitors out. Past that, a new
+connection's stream is 429 `run-connections`. Any refusal on a
+connection that serves no run yet closes it once the answer is out
+(GOAWAY), so refused requests cannot fill the edge's cap. No run, and no
+tenant's grants, can use up the connections another run needs.
 
 An edge's HTTP/2 receive window for one daemon connection must cover 16
 streams at the edge's per-stream window: a stalled anonymous stream is

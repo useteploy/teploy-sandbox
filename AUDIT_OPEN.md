@@ -4347,3 +4347,73 @@ reverted. Nothing here has run live.
   every daemon in the fleet, restore, then revoke and set the ports
   again.
 
+The broad reviewer's findings at `2c85649`, fixed in the same round:
+
+- **B1: refused requests could fill the edge's connection cap.** Only
+  the 429 `run-connections` refusal closed its connection. Every other
+  refusal (409 stopped, 429 run-streams, 404, 401, 403) left the
+  connection open and unbound, holding an edge slot for the 2-minute
+  idle timeout. A tenant could fill the cap with fresh-grant requests to
+  its own stopped run.
+  - Fix: every refusal on a connection that serves no run yet now sends
+    `Connection: close`, which makes Go's HTTP/2 server send GOAWAY and
+    close the connection once the answer is out.
+  - Tests: `TestRefusalsOnUnboundConnectionsDoNotFillTheEdgeCap`, and
+    `TestARunConnectionsRefusalClosesTheConnection` (which checks the
+    slot really comes back).
+  - Not covered: lookups (`GET /v1/access/runs/{id}`) don't bind a
+    connection and don't close it. Only the edge issues them, and they
+    can't be refused into a pile of open connections.
+- **B2: a publish could write stale ports over another daemon's newer
+  record.** When a publish accepted another daemon's newer write of the
+  same stop, it then wrote this daemon's own ports over it.
+  - Fix: the accepted record's access state is now taken by the single
+    rule below before anything is written back.
+  - Test: `TestAPublishTakesAnotherDaemonsNewerWriteOfTheStop`.
+- **B3: the epoch could go down, locally and then in the record.** This
+  predates the PR. A record with a higher epoch could be read and
+  accepted without raising the local epoch. A later local resume then
+  ran at the lower epoch, and its claim wrote that lower epoch into the
+  record.
+  - Fix: every record that is read and accepted now raises the local
+    epoch, both in the publish acceptance and in `writeAccessHeld` for
+    the record it reads.
+  - Test: `TestALocalResumeNeverLowersTheRecordsEpoch`. It fails only
+    when both of those paths are reverted together, since each alone
+    suffices.
+- **S1: grant holders could lock anonymous visitors out.** Nothing in a
+  run's 8 connection slots per edge was kept for the anonymous
+  connection.
+  - Fix: the slots are now split, 2 for anonymous connections and 6 for
+    grants' (a quarter, at least one, for anonymous).
+  - No slot is reserved for the owner's grant: the daemon can't tell it
+    apart from a share link.
+  - Test: `TestGrantHoldersCannotLockOutAnonymousVisitors`.
+- **Structural: one rule for reading a record's access state,
+  `reconcileAccessFromRecordLocked`.** Every path that reads and accepts
+  a record's access state now goes through this one function:
+  - `replaceHeld` (adopt and takeover)
+  - `adoptUnknown`
+  - the "stop written again" reconcile branch
+  - a publish that accepts an existing write of its stop
+  - `writeAccessHeld` (also reached by write-through, `adoptUnconfirmed`
+    and `publishAccessSince`)
+
+  The rule is documented in one comment block at that function:
+  - **Epoch:** max(local, record, floor).
+  - **Ports, when the record is newer than this daemon's view:** the
+    record's ports, or `mergePorts` when the ports were changed here
+    (`accessDirty`).
+  - **Ports, when the record is in step:** this daemon's.
+  - **Result:** whether the record needs a write-back.
+
+  The remaining places that set the epoch or ports are not record reads,
+  or are justified in a comment:
+  - `adopt` builds a run from a record alone, and its callers then apply
+    the rule.
+  - `claimHeld` and the give-back write this daemon's state to a record
+    it has just reconciled.
+  - create, fork and registry load set the floor from the clock.
+  - revoke, `SetPort` and `DeletePort` are local changes.
+  - `moveAccessLocked` is the resume rule.
+

@@ -226,14 +226,20 @@ func TestANeverPublishedRunIsNotBlockedAfterAFailedUpkeep(t *testing.T) {
 // The note of a first record write is written ahead of it every time:
 // while the registry cannot be written, no record of the run is.
 func TestNoFirstRecordIsWrittenWhileItsNoteCannotBe(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root ignores the read-only state directory")
-	}
 	_, a, id := legacyRun(t)
-	if err := os.Chmod(a.stateDir, 0o500); err != nil {
+	// The registry cannot be written, root or not: a plain file stands
+	// where its directory was.
+	aside := a.stateDir + ".aside"
+	if err := os.Rename(a.stateDir, aside); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(a.stateDir, 0o700) })
+	if err := os.WriteFile(a.stateDir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(a.stateDir)
+		_ = os.Rename(aside, a.stateDir)
+	})
 	records := 0
 	a.bucket.SetFail(func(op, key string) error {
 		if op == "put" && strings.Contains(key, "/run/"+id+"/") {

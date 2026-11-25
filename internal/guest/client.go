@@ -282,3 +282,20 @@ func (c *Client) Connect(ctx context.Context, port int) (net.Conn, error) {
 	_ = conn.SetDeadline(time.Time{})
 	return conn, nil
 }
+
+// Restored is the handshake of a VM the daemon restored from a memory
+// image (version 3): the agent sets the guest's clock to nowNs, adds the
+// entropy to the kernel's random pool and reseeds the generator. A guest
+// restored from saved memory has the wall clock and the random state it
+// was saved with, so both are replaced before the guest is handed back.
+// An agent older than version 3 answers CodeUnsupportedVersion.
+func (c *Client) Restored(ctx context.Context, nowNs int64, entropy []byte) (RestoredResult, error) {
+	result, err := c.simple(ctx, Request{Op: OpRestored, NowNs: nowNs, Entropy: entropy})
+	if err != nil || result.Restored == nil {
+		if err == nil {
+			err = errors.New("guest agent sent no restored result")
+		}
+		return RestoredResult{}, err
+	}
+	return *result.Restored, nil
+}

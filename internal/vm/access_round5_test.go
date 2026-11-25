@@ -254,3 +254,17 @@ func TestNoFirstRecordIsWrittenWhileItsNoteCannotBe(t *testing.T) {
 		t.Fatalf("%d record writes while the note of the first was never on disk", records)
 	}
 }
+
+// Destroying a stopped run whose first record landed with its answer
+// lost finds that record and destroys the run there too: another daemon
+// must not adopt and resume a run destroyed here.
+func TestADestroyedUnconfirmedRunIsNotAdoptedElsewhere(t *testing.T) {
+	a, b, id := lostFirstRecord(t)
+	if err := a.manager.Destroy(bg, id); err != nil {
+		t.Fatal(err)
+	}
+	b.sync(t)
+	if seen, err := b.manager.Get(id); err == nil {
+		t.Fatalf("host-b adopted run %s, destroyed on host-a: %+v", id, seen.Remote)
+	}
+}

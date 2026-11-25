@@ -590,7 +590,34 @@ func (m *Manager) destroyStopped(ctx context.Context, current *Run) error {
 		m.mu.Unlock()
 		return err
 	}
-	if m.OffHost != nil && current.remoteGen > 0 && (current.Remote == nil || current.Remote.State != RemoteSuperseded) {
+	notSuperseded := current.Remote == nil || current.Remote.State != RemoteSuperseded
+	if m.OffHost != nil && current.remoteGen == 0 && notSuperseded {
+		// A first record whose write was tried may be in remote storage
+		// with its answer lost: find it, or the run, destroyed here,
+		// stays there for any daemon to adopt and resume.
+		m.mu.Lock()
+		unconfirmed := false
+		if live, ok := m.runs[current.ID]; ok {
+			unconfirmed = unconfirmedPublishLocked(live)
+		}
+		m.mu.Unlock()
+		if unconfirmed {
+			generation, err := m.adoptUnconfirmed(ctx, current.ID, current.snapshot)
+			if err != nil {
+				m.mu.Lock()
+				if live, ok := m.runs[current.ID]; ok {
+					live.removing = false
+				}
+				m.mu.Unlock()
+				if errors.Is(err, ErrRemoteConflict) {
+					_ = m.reconcileRun(ctx, current.ID, false)
+				}
+				return fmt.Errorf("stopped run %s not deleted: %w", current.ID, err)
+			}
+			current.remoteGen = generation
+		}
+	}
+	if m.OffHost != nil && current.remoteGen > 0 && notSuperseded {
 		// A stopped run that is in remote storage is destroyed there
 		// first, with the same write a resume claims it with: a run
 		// another daemon resumed a moment ago is not deleted from under

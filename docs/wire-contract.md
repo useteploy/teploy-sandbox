@@ -363,7 +363,10 @@ Verification is strict: the signature is checked against the configured
 keys before the payload is parsed; the payload must be one JSON object
 with no duplicate key (unicode escapes included) and no key that differs
 from a claim's name only in case; every claim must have exactly its type
-(integers in plain decimal, no `null`); unknown claims are ignored. A
+(integers in plain decimal, no `null`); an optional claim (`cnf`,
+`own`, `ref`, `org`) is either absent or not empty — `"cnf":""`,
+`"own":false`, `"ref":""` and `"org":""` are malformed; unknown claims
+are ignored. A keyring may not hold one public key under two `kid`s. A
 claim that restricts what a grant allows is never added without raising
 `v`, because a verifier that ignores it would drop the restriction.
 
@@ -373,7 +376,7 @@ What a grant allows depends on where it is presented:
 |---|---|---|
 | The edge's HTTPS front | `http:<port>` for the port, or `http:*` | a grant with `cnf`; a grant with any `ssh` or `tcp:` scope |
 | An SSH session channel | `ssh`, with `cnf` (checked against the authenticated key) | no `cnf` |
-| An SSH `direct-tcpip` channel | `tcp:<port>` or `tcp:*`, with `cnf` | `http:` scopes |
+| An SSH `direct-tcpip` channel | `tcp:<port>` or `tcp:*`, with `cnf` | a grant with any `http:` scope; no `cnf` |
 | The daemon's `connect` | `http:` or `tcp:` covering the port | `ssh` alone |
 | The daemon's `session` (later) | `ssh` | everything else |
 
@@ -396,7 +399,36 @@ compared with a clock:
   `max(epoch + 1, accessEpoch + 1, now)`: strictly above anything a grant
   can have copied, so moving a run revokes all of its grants;
 - with remote storage, the epoch and the ports travel in the run's remote
-  record, and a revoke writes them there before it answers.
+  record: a revoke and a port change write them there before they
+  answer, and a resume of a run this daemon already holds (a takeover)
+  writes the epoch its move raised there before the run boots;
+- a revoke or port change while a stop is publishing the run's first
+  record answers 502 `access-write-through` (busy), and one made while
+  the run has no record this daemon knows of (its first publish failed,
+  or its answer was lost) answers 200 without a write. Both still reach
+  the record: every publish, once its record lands, writes whatever the
+  newest record lacks of the run's access state. The change is in the
+  registry file before it is answered, so a daemon that restarts in
+  between publishes it at its next upkeep (or, if another daemon wrote
+  the record meanwhile, merges it as below);
+- the epoch never goes down: when a daemon takes a newer remote record
+  of a run it holds stopped, it keeps the higher of its own epoch and
+  the record's, and a daemon that drops a run whose epoch was ahead of
+  its record keeps that epoch should the run come back. The ports are the
+  record's, unless they were changed on this daemon since it last wrote
+  or took a record (a change answered 502): then a port is public only if
+  both say so. Whatever is ahead of the record is written to it;
+- a running copy of a run that another daemon took over (`remote.state`
+  `superseded`) keeps running, but its access streams are closed and no
+  more are admitted once this daemon sees the takeover — at its next
+  sync, or the next request that reads the run's record. Until then it
+  serves the access state it had.
+
+These guarantees assume a run's records in remote storage only move
+forward. **Never roll a bucket back while daemons use it**: a bucket
+restored from an older backup can let a daemon adopt a record below a
+revoke or unpublish already answered with success. Stop the fleet to
+restore storage, then revoke and set the ports again.
 
 A caller that stores epochs (a control plane minting grants) stores the
 epoch from every run object it receives and passes it as `accessEpoch`
@@ -406,12 +438,17 @@ on every resume.
 
 | Route | Request | Success | Errors |
 |---|---|---|---|
-| `PUT /v1/runs/{id}/ports/{port}` | `{visibility: "public"\|"private", protocol?: "http"\|"h2c"}` | 200, the run | 400 bad port or field, or more than 16 public ports; 404 |
-| `DELETE /v1/runs/{id}/ports/{port}` | | 200, the run | 404 |
-| `POST /v1/runs/{id}/access/revoke` | | 200, the run with the new `access.epoch` | 404; 502 `access-write-through` |
+| `PUT /v1/runs/{id}/ports/{port}` | `{visibility: "public"\|"private", protocol?: "http"\|"h2c"}` | 200, the run | 400 bad port or field, or more than 16 public ports; 404; 500 `access-not-persisted`; 502 `access-write-through` |
+| `DELETE /v1/runs/{id}/ports/{port}` | | 200, the run | 404; 500 `access-not-persisted`; 502 `access-write-through` |
+| `POST /v1/runs/{id}/access/revoke` | | 200, the run with the new `access.epoch` | 404; 500 `access-not-persisted`; 502 `access-write-through` |
 | `GET /v1/access/config` | | 200 `{audience, kids, edgeDenylist, listener, enabled, managedByFile}` | |
 | `PUT /v1/access/config` | `{audience, issuerKeys: [{kid, ed25519, notAfter?}], edgeDenylist: [names]}` | 204 | 400; 409 when `--access-config` manages it |
-| `POST /v1/runs/{id}/resume` | gains `accessEpoch?` | as before | 400 when negative or above 2^53-1 |
+| `POST /v1/runs/{id}/resume` | gains `accessEpoch?` | as before | 400 when negative or above 2^53-1 - 2^20 (an epoch at the maximum could never be raised again) |
+
+A write-through holds the run for up to 30 s: execs, writes, stops and
+lease acquires on it meanwhile answer 409 `busy`, and a revoke or port
+change made while a stop, resume, fork or delete holds the run answers
+502 and is to be repeated.
 
 Ports are data and may be set while the run is stopped. Making a public
 port private, or deleting it, closes that port's anonymous streams. A
@@ -419,7 +456,12 @@ revoke closes all of the run's access streams. A 502
 `access-write-through` means the epoch was raised and the streams closed
 on this daemon, but the new epoch is not in remote storage; its body
 carries `epoch`. Revoke again: it raises the epoch once more and retries
-the write. Unknown fields in these routes' bodies are 400. The
+the write. On a port route it means the same of the port change: it
+holds on this daemon and is not in remote storage; repeat it. A 500
+`access-not-persisted` (body with `epoch`) means the change holds on
+this daemon but the registry file could not be written, so a restart
+before the next good write would undo it; repeat it once the state
+directory is writable. Unknown fields in these routes' bodies are 400. The
 configuration is stored 0600 in `--state-dir`; `ed25519` is a base64
 public key, and `GET` shows key IDs only. A fork's child starts with a
 fresh epoch and no ports.
@@ -436,14 +478,47 @@ speaks h2c on a 0660 socket and admits peers by uid or gid (SO_PEERCRED).
 TCP without TLS is refused at start. HTTP/1.1 is accepted too, for
 debugging.
 
-One connection serves one run: the first stream binds it, and a stream
-for another run on it is 421 `wrong-connection`. Open one connection per
-run. Each edge may hold `--access-edge-conns` connections.
+One connection serves one run and one kind of stream: anonymous (no
+`Teploy-Grant`), or the streams of one grant (by its `jti`). The first
+admitted stream binds it, and a stream for another run, or of another
+kind, on it is 421 `wrong-connection`. Open one connection per run and
+kind, so that a public port's visitors, or one share link's holders,
+never share flow control with the owner's streams.
+
+A connection counts against its edge's `--access-edge-conns` (default:
+twice the runs the stream cap allows for) only until its first stream
+binds it to a run; from then on it counts against that run's
+connections from that edge: at most 2 anonymous and 6 granted ones, so
+grant holders cannot lock a public port's visitors out. Past that, a new
+connection's stream is 429 `run-connections`. Any refusal on a
+connection that serves no run yet closes it once the answer is out
+(GOAWAY), so refused requests cannot fill the edge's cap. No run, and no
+tenant's grants, can use up the connections another run needs.
+
+An edge's HTTP/2 receive window for one daemon connection must cover 16
+streams at the edge's per-stream window: a stalled anonymous stream is
+only detected toward the guest (below), so a visitor that does not read
+holds the edge's window, not the daemon's.
+
+A connection holds only as long as the certificate it was opened with:
+at the earliest `notAfter` of its verified chain the daemon closes it,
+ending its streams, and a stream asked for on it after that is 403
+`edge-expired`. The expiry is also checked against the wall clock on
+every read and by the periodic sweep, so a clock corrected forward ends
+the streams too. Denylisting an edge ends its open streams at once. Removing an issuer key from the configuration, or
+replacing it under its `kid`, closes the streams it admitted; a key's
+`notAfter` brought forward ends them by then.
 
 | Route | Headers | Success | Errors (`type` suffix) |
 |---|---|---|---|
 | `GET /v1/access/runs/{id}` | | 200 `{id, state, epoch, publicPorts: [{port, protocol}]}` | 404 `not-here` |
-| `POST /v1/access/runs/{id}/connect?port=P` | `Teploy-Grant?`; `Teploy-Edge-Request?` | 200, then raw bytes both ways | 400 `bad-request`; 401 `grant-invalid`, `grant-expired`, `revoked`; 403 `scope`, `not-public`; 404 `not-here`; 409 `stopped`; 421 `wrong-connection`; 429 `run-streams`, `anon-streams`; 502 `refused`, `guest-agent`; 503 `at-capacity`; 501 `unsupported-driver` |
+| `POST /v1/access/runs/{id}/connect?port=P` | `Teploy-Grant?`; `Teploy-Edge-Request?` | 200, then raw bytes both ways | 400 `bad-request`; 401 `grant-invalid`, `grant-expired`, `revoked`; 403 `scope`, `not-public`, `edge-denied`, `edge-expired`; 404 `not-here`; 409 `stopped`; 421 `wrong-connection`; 429 `run-streams`, `anon-streams`, `run-connections`; 502 `refused`, `guest-agent`; 503 `at-capacity`; 501 `unsupported-driver` |
+
+A lookup binds no connection. One answered 404, or answered for a run
+that is not running, on a connection that serves no run yet closes it,
+as every refused `connect` on such a connection does, so lookups of
+made-up or stopped runs cannot fill the edge's connection cap. An edge should send lookups on one connection of its
+own, or on the connection that serves the run.
 
 `connect`: the response body is what the guest sends, the request body
 what it receives; the end of the request body is passed to the guest as
@@ -451,7 +526,15 @@ a half-close, and the guest closing its side ends the stream. Without
 `Teploy-Grant` the port must be public on the run. A granted stream is
 closed at its grant's `exp`; every stream of a run is closed on revoke,
 stop and destroy; anonymous streams of a port on unpublish. A stream
-idle for an hour is closed. Every other path is 404. Problem responses
+idle for an hour is closed. An anonymous stream whose write to the guest
+has been blocked for 30 seconds (a guest that does not read: the edge's
+bytes then sit in the connection's shared window) is closed. A visitor
+that does not read (a paused `<video>`) is not a stall: it holds only its
+own stream's send window, and is bounded by the idle timeout and the
+caps. A guest that reads just often enough (a trickle, one write per
+less than 30 s) is not caught; it holds at most its stream's 256 KiB
+window, and the 16 anonymous streams of a run at most the anonymous
+connection's 4 MiB — that run's visitors, never its owner. Every other path is 404. Problem responses
 never echo a grant. `Teploy-Edge-Request` is logged only when it is at
 most 64 characters of `[A-Za-z0-9._-]`.
 
@@ -463,7 +546,9 @@ a run together `--access-anon-mbit` (20), all streams
 
 `connect` reaches the guest port on the VM driver only (through the
 guest agent; the guest's loopback, `127.0.0.1` then `::1`). An agent
-older than guest protocol version 2 answers 502 `guest-agent`. The
+older than guest protocol version 2 answers 502 `guest-agent`, whose
+`detail` is fixed text: what the guest agent said is logged (shortened)
+and never sent to the edge. The
 Docker driver answers 501 `unsupported-driver` in this release, and
 `session` (SSH shells) is not built yet.
 

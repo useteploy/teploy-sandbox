@@ -62,7 +62,7 @@ func TestRevokeReachesTheRecordAndAMoveRevokes(t *testing.T) {
 	a := newHost(t, bucket, "host-a", nil, withAccess(&accessEvents{}))
 	b := newHost(t, bucket, "host-b", nil, withAccess(&accessEvents{}))
 	created := a.startRun(t, payload(t, 300))
-	if _, err := a.manager.SetPort(created.ID, 3000, run.PortRequest{Visibility: run.PortPublic}); err != nil {
+	if _, err := a.manager.SetPort(bg, created.ID, 3000, run.PortRequest{Visibility: run.PortPublic}); err != nil {
 		t.Fatal(err)
 	}
 	stopped := a.stop(t, created.ID)

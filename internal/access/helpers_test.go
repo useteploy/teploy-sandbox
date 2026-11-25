@@ -1,6 +1,7 @@
 package access
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -230,6 +231,9 @@ type rigConfig struct {
 	limits  Limits
 	perPeer int
 	meter   func(string, int64, int64, bool)
+	log     *slog.Logger
+	now     func() time.Time
+	conns   int
 }
 
 func newRig(t *testing.T, options ...rigOption) *rig {
@@ -258,7 +262,11 @@ func newRig(t *testing.T, options ...rigOption) *rig {
 	}
 	r.store = store
 	r.registry = NewRegistry(config.limits, config.meter, quiet())
-	r.service = &Service{Manager: r.manager, Store: store, Registry: r.registry, Log: quiet()}
+	log := config.log
+	if log == nil {
+		log = quiet()
+	}
+	r.service = &Service{Manager: r.manager, Store: store, Registry: r.registry, Log: log, Now: config.now, ConnsPerRun: config.conns}
 	listener, tlsOn, err := Listen(ListenSpec{Addr: "127.0.0.1:0", TLS: TLSFiles{Cert: certPath, Key: keyPath, ClientCA: caPath}}, store, config.perPeer, quiet())
 	if err != nil {
 		t.Fatal(err)
@@ -405,3 +413,19 @@ func readEnds(body io.Reader, d time.Duration) bool {
 }
 
 var errBoom = errors.New("boom")
+
+// slogTo is a logger writing text to buf under mu.
+func slogTo(buf *bytes.Buffer, mu *sync.Mutex) *slog.Logger {
+	return slog.New(slog.NewTextHandler(lockedWriter{buf: buf, mu: mu}, nil))
+}
+
+type lockedWriter struct {
+	buf *bytes.Buffer
+	mu  *sync.Mutex
+}
+
+func (w lockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}

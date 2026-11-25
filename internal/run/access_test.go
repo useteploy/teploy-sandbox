@@ -92,7 +92,7 @@ func TestAccessOffChangesNothing(t *testing.T) {
 	if strings.Contains(strings.ToLower(string(registry)), "access") {
 		t.Fatalf("registry file with access off mentions access: %s", registry)
 	}
-	if _, err := m.SetPort(created.ID, 3000, PortRequest{Visibility: PortPublic}); !errors.Is(err, ErrAccessDisabled) {
+	if _, err := m.SetPort(context.Background(), created.ID, 3000, PortRequest{Visibility: PortPublic}); !errors.Is(err, ErrAccessDisabled) {
 		t.Fatalf("SetPort with access off: %v", err)
 	}
 	if _, err := m.RevokeAccess(context.Background(), created.ID); !errors.Is(err, ErrAccessDisabled) {
@@ -160,22 +160,22 @@ func TestPortRules(t *testing.T) {
 	m, _, streams, _ := newAccessManager(t)
 	created := mustCreate(t, m, CreateRequest{})
 	for port := 3000; port < 3000+MaxPublicPorts; port++ {
-		if _, err := m.SetPort(created.ID, port, PortRequest{Visibility: PortPublic}); err != nil {
+		if _, err := m.SetPort(context.Background(), created.ID, port, PortRequest{Visibility: PortPublic}); err != nil {
 			t.Fatalf("public port %d: %v", port, err)
 		}
 	}
-	if _, err := m.SetPort(created.ID, 4000, PortRequest{Visibility: PortPublic}); !errors.Is(err, ErrBadRequest) {
+	if _, err := m.SetPort(context.Background(), created.ID, 4000, PortRequest{Visibility: PortPublic}); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("a 17th public port: %v", err)
 	}
-	if _, err := m.SetPort(created.ID, 4000, PortRequest{Visibility: PortPrivate, Protocol: PortH2C}); err != nil {
+	if _, err := m.SetPort(context.Background(), created.ID, 4000, PortRequest{Visibility: PortPrivate, Protocol: PortH2C}); err != nil {
 		t.Fatalf("a private port beside 16 public ones: %v", err)
 	}
 	for _, bad := range []PortRequest{{Visibility: "open"}, {Visibility: PortPublic, Protocol: "grpc"}} {
-		if _, err := m.SetPort(created.ID, 5000, bad); !errors.Is(err, ErrBadRequest) {
+		if _, err := m.SetPort(context.Background(), created.ID, 5000, bad); !errors.Is(err, ErrBadRequest) {
 			t.Fatalf("%+v accepted: %v", bad, err)
 		}
 	}
-	if _, err := m.SetPort(created.ID, 0, PortRequest{Visibility: PortPublic}); !errors.Is(err, ErrBadRequest) {
+	if _, err := m.SetPort(context.Background(), created.ID, 0, PortRequest{Visibility: PortPublic}); !errors.Is(err, ErrBadRequest) {
 		t.Fatal("port 0 accepted")
 	}
 	view := mustGet(t, m, created.ID)
@@ -184,13 +184,13 @@ func TestPortRules(t *testing.T) {
 	}
 	// Unpublishing ends the port's anonymous streams; making a private
 	// port private again does not close anything.
-	if _, err := m.SetPort(created.ID, 3000, PortRequest{Visibility: PortPrivate}); err != nil {
+	if _, err := m.SetPort(context.Background(), created.ID, 3000, PortRequest{Visibility: PortPrivate}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.SetPort(created.ID, 4000, PortRequest{Visibility: PortPrivate}); err != nil {
+	if _, err := m.SetPort(context.Background(), created.ID, 4000, PortRequest{Visibility: PortPrivate}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.DeletePort(created.ID, 3001); err != nil {
+	if _, err := m.DeletePort(context.Background(), created.ID, 3001); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"close-port " + created.ID + " 3000 unpublished", "close-port " + created.ID + " 3001 unpublished"}
@@ -199,10 +199,10 @@ func TestPortRules(t *testing.T) {
 	}
 	// Data only: allowed while stopped.
 	mustStop(t, m, created.ID)
-	if _, err := m.SetPort(created.ID, 8080, PortRequest{Visibility: PortPublic}); err != nil {
+	if _, err := m.SetPort(context.Background(), created.ID, 8080, PortRequest{Visibility: PortPublic}); err != nil {
 		t.Fatalf("set port while stopped: %v", err)
 	}
-	if _, err := m.SetPort("01JD8X3Y4Z5A6B7C8D9E0F1G2H", 8080, PortRequest{Visibility: PortPublic}); !errors.Is(err, ErrNotFound) {
+	if _, err := m.SetPort(context.Background(), "01JD8X3Y4Z5A6B7C8D9E0F1G2H", 8080, PortRequest{Visibility: PortPublic}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown run: %v", err)
 	}
 }
@@ -259,7 +259,7 @@ func TestNoAdmissionWhileAStopClosesStreams(t *testing.T) {
 func TestForkChildHasAFreshEpochAndNoPorts(t *testing.T) {
 	m, _, _, clock := newAccessManager(t)
 	source := mustCreate(t, m, CreateRequest{})
-	if _, err := m.SetPort(source.ID, 3000, PortRequest{Visibility: PortPublic}); err != nil {
+	if _, err := m.SetPort(context.Background(), source.ID, 3000, PortRequest{Visibility: PortPublic}); err != nil {
 		t.Fatal(err)
 	}
 	for range 3 {
@@ -344,7 +344,7 @@ func TestAccessStatePersists(t *testing.T) {
 		t.Fatal(err)
 	}
 	created := mustCreate(t, m, CreateRequest{})
-	if _, err := m.SetPort(created.ID, 3000, PortRequest{Visibility: PortPublic, Protocol: PortH2C}); err != nil {
+	if _, err := m.SetPort(context.Background(), created.ID, 3000, PortRequest{Visibility: PortPublic, Protocol: PortH2C}); err != nil {
 		t.Fatal(err)
 	}
 	revoked, _ := m.RevokeAccess(context.Background(), created.ID)

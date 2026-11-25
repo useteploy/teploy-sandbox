@@ -949,7 +949,10 @@ on another daemon is that statement: it resumes the run **from its last
 durable stop**. If the old holder was alive after all, its copy keeps
 running but can no longer become the run: its next stop is kept on its
 host as `remote.state: "superseded"`, which can be forked or deleted,
-not resumed. Only a record **another** daemon wrote supersedes a copy; a
+not resumed. With access on, such a copy's access streams are closed and
+refused from the moment its daemon sees the takeover (its next sync, or
+a request that reads the run's record); until then it serves the access
+state it had. Only a record **another** daemon wrote supersedes a copy; a
 daemon that finds its own record newer than it remembered (a crash
 between a write and its note) carries on from it. A daemon that restarts
 finds the runs it was running (lost with their VMs, as always) back as
@@ -970,6 +973,15 @@ meanwhile publishes the run again; because the record outlives the
 retention, such a copy is past its own retention by then and the
 daemon's reaper destroys it within a tick or two of coming back. Give
 every daemon of a fleet the same `--stopped-retention`.
+
+**Never roll a bucket back while daemons use it.** Everything above
+assumes a run's records only move forward. A bucket (or prefix) restored
+from an older backup puts older generations back as the newest: a daemon
+can then adopt a run from a record below a revoke or an unpublish it
+already answered with success, and serve grants and public ports that
+were withdrawn. Nothing in the bucket can tell a rollback from the real
+history. To restore storage, stop every daemon of the fleet first, and
+revoke the runs' access (and set their ports) again afterwards.
 
 **Without conditional writes.** The daemon tests the service at start. If
 `If-None-Match` is not honoured, uploads, restores and forks work as
@@ -1558,8 +1570,10 @@ teploy-sandbox serve --driver vm --vm-max-runs 22 \
   the daemon refuses to start when the stream cap times that exceeds
   `--access-memory-mb` (default a tenth of the host's memory), and warns
   when its open file limit is short by `streams + 64`. One connection
-  serves one run, so a guest that stops reading stalls only its own run;
-  each edge may hold `--access-edge-conns` connections. Access streams do
+  serves one run and one kind of stream (anonymous, or one grant), so a
+  guest that stops reading stalls only that run's streams of that kind;
+  each edge may hold `--access-edge-conns` connections not yet serving a
+  run, and 8 per run it serves (2 anonymous, 6 granted). Access streams do
   not cross the run's tap, so the daemon shapes them itself: per run,
   granted streams together at `--access-mbit` (default `--vm-net-mbit`),
   anonymous ones together at `--access-anon-mbit` (20), and all of them

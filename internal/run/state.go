@@ -52,6 +52,8 @@ type stateFile struct {
 	// exist yet. Read back, they are released like the images of a run
 	// the restart lost. Additive.
 	Fetching []string `json:"fetching,omitempty"`
+	// AccessFloors: see Manager.accessFloors. Additive.
+	AccessFloors map[string]int64 `json:"accessFloors,omitempty"`
 }
 
 // stateRun is one persisted record. A running run carries only ID, State
@@ -93,10 +95,13 @@ type stateRun struct {
 	// The run's access state (access.go). Additive, and absent unless
 	// access is on: the epoch and ports travel in the remote record too;
 	// AccessMoved never does.
-	AccessEpoch int64        `json:"accessEpoch,omitempty"`
-	AccessPorts []PortSpec   `json:"accessPorts,omitempty"`
-	AccessMoved bool         `json:"accessMoved,omitempty"`
-	AccessBytes *accessBytes `json:"accessBytes,omitempty"`
+	AccessEpoch int64      `json:"accessEpoch,omitempty"`
+	AccessPorts []PortSpec `json:"accessPorts,omitempty"`
+	AccessMoved bool       `json:"accessMoved,omitempty"`
+	AccessDirty bool       `json:"accessDirty,omitempty"`
+	// FirstRecordTried never travels in the remote record.
+	FirstRecordTried bool         `json:"firstRecordTried,omitempty"`
+	AccessBytes      *accessBytes `json:"accessBytes,omitempty"`
 }
 
 // LoadState points the manager at its durable registry in dir and loads
@@ -157,6 +162,18 @@ func (m *Manager) LoadState(ctx context.Context, dir string) (int, error) {
 	}
 	for id, generation := range tombstones {
 		m.tombstones[id] = generation
+	}
+	if len(data) > 0 {
+		var floors struct {
+			AccessFloors map[string]int64 `json:"accessFloors"`
+		}
+		if json.Unmarshal(data, &floors) == nil {
+			for id, epoch := range floors.AccessFloors {
+				if validULID(id) && epoch > 0 && epoch <= accessgrant.MaxEpoch {
+					m.accessFloors[id] = epoch
+				}
+			}
+		}
 	}
 	for _, note := range notes {
 		if note.State == noteUploading {
@@ -348,7 +365,10 @@ func (rec stateRun) stoppedRun(owns func(ref string) bool) (*Run, error) {
 		accessEpoch: rec.AccessEpoch,
 		accessPorts: rec.AccessPorts,
 		accessMoved: rec.AccessMoved,
+		accessDirty: rec.AccessDirty,
 		accessBytes: bytesMoved,
+
+		firstRecordTried: rec.FirstRecordTried,
 	}, nil
 }
 
@@ -395,7 +415,10 @@ func stoppedStateRun(run *Run) stateRun {
 		AccessEpoch: run.accessEpoch,
 		AccessPorts: run.accessPorts,
 		AccessMoved: run.accessMoved,
+		AccessDirty: run.accessDirty,
 		AccessBytes: moved,
+
+		FirstRecordTried: run.firstRecordTried,
 	}
 }
 
@@ -439,6 +462,9 @@ func (m *Manager) writeState() error {
 	}
 	if len(m.tombstones) > 0 {
 		file.Tombstones = maps.Clone(m.tombstones)
+	}
+	if len(m.accessFloors) > 0 {
+		file.AccessFloors = maps.Clone(m.accessFloors)
 	}
 	for _, note := range m.snapshotNotes {
 		file.SnapshotNotes = append(file.SnapshotNotes, *note)

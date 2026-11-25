@@ -16,7 +16,7 @@ func TestRegistryCaps(t *testing.T) {
 	r := NewRegistry(Limits{Total: 1000}, nil, quiet())
 	var held []*Stream
 	admit := func(run string, kind Kind, anon bool) error {
-		s, err := r.Admit(run, kind, 3000, anon, "edge", "", "")
+		s, err := r.Admit(run, kind, 3000, anon, "edge", GrantRef{}, "")
 		if err == nil {
 			held = append(held, s)
 		}
@@ -63,9 +63,9 @@ func TestRegistryCaps(t *testing.T) {
 		t.Fatalf("after a release: %v", err)
 	}
 	small := NewRegistry(Limits{Total: 2}, nil, quiet())
-	_, _ = small.Admit(runA, KindConnect, 1, false, "e", "", "")
-	_, _ = small.Admit(runB, KindConnect, 1, false, "e", "", "")
-	if _, err := small.Admit("01JD8X3Y4Z5A6B7C8D9E0F1G2K", KindSession, 1, false, "e", "", ""); !errors.Is(err, ErrAtCapacity) {
+	_, _ = small.Admit(runA, KindConnect, 1, false, "e", GrantRef{}, "")
+	_, _ = small.Admit(runB, KindConnect, 1, false, "e", GrantRef{}, "")
+	if _, err := small.Admit("01JD8X3Y4Z5A6B7C8D9E0F1G2K", KindSession, 1, false, "e", GrantRef{}, ""); !errors.Is(err, ErrAtCapacity) {
 		t.Fatalf("over the daemon total: %v", err)
 	}
 }
@@ -81,24 +81,24 @@ func TestSaturatedRunsDoNotBlockAnother(t *testing.T) {
 	}
 	for _, id := range runs[:16] {
 		for {
-			if _, err := r.Admit(id, KindConnect, 1, true, "e", "", ""); err != nil {
+			if _, err := r.Admit(id, KindConnect, 1, true, "e", GrantRef{}, ""); err != nil {
 				break
 			}
 		}
 		for {
-			if _, err := r.Admit(id, KindConnect, 1, false, "e", "", ""); err != nil {
+			if _, err := r.Admit(id, KindConnect, 1, false, "e", GrantRef{}, ""); err != nil {
 				break
 			}
 		}
 	}
-	if _, err := r.Admit(runs[16], KindSession, 0, false, "e", "", ""); err != nil {
+	if _, err := r.Admit(runs[16], KindSession, 0, false, "e", GrantRef{}, ""); err != nil {
 		t.Fatalf("a session to a 17th run beside 16 saturated ones: %v", err)
 	}
 }
 
 func TestStreamCloseAndRelease(t *testing.T) {
 	r := NewRegistry(Limits{Total: 10}, nil, quiet())
-	s, _ := r.Admit(runA, KindConnect, 1, false, "e", "", "")
+	s, _ := r.Admit(runA, KindConnect, 1, false, "e", GrantRef{}, "")
 	calls := 0
 	if !s.OnClose(func() { calls++ }) {
 		t.Fatal("OnClose on an open stream")
@@ -120,7 +120,7 @@ func TestStreamCloseAndRelease(t *testing.T) {
 		t.Fatalf("after release: %d", r.Count())
 	}
 	// CloseAt in the past closes at once.
-	s2, _ := r.Admit(runA, KindConnect, 1, false, "e", "", "")
+	s2, _ := r.Admit(runA, KindConnect, 1, false, "e", GrantRef{}, "")
 	s2.CloseAt(time.Now().Add(-time.Second))
 	select {
 	case <-s2.Done():
@@ -132,7 +132,7 @@ func TestStreamCloseAndRelease(t *testing.T) {
 	}
 	s2.Release()
 	r.CloseAll("shutdown")
-	if _, err := r.Admit(runA, KindConnect, 1, false, "e", "", ""); !errors.Is(err, ErrClosed) {
+	if _, err := r.Admit(runA, KindConnect, 1, false, "e", GrantRef{}, ""); !errors.Is(err, ErrClosed) {
 		t.Fatalf("admit after CloseAll: %v", err)
 	}
 }
@@ -142,8 +142,8 @@ func TestIdleStreamsAreClosedAndBytesMetered(t *testing.T) {
 	r := NewRegistry(Limits{Total: 10, Idle: time.Minute}, func(_ string, rx, tx int64, _ bool) { meteredRx += rx; meteredTx += tx }, quiet())
 	now := time.Now()
 	r.now = func() time.Time { return now }
-	busy, _ := r.Admit(runA, KindConnect, 1, false, "e", "", "")
-	idle, _ := r.Admit(runA, KindConnect, 2, false, "e", "", "")
+	busy, _ := r.Admit(runA, KindConnect, 1, false, "e", GrantRef{}, "")
+	idle, _ := r.Admit(runA, KindConnect, 2, false, "e", GrantRef{}, "")
 	busy.Moved(10, 20)
 	now = now.Add(50 * time.Second)
 	busy.Moved(1, 2)

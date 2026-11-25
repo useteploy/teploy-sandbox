@@ -32,6 +32,7 @@ func FuzzVerify(f *testing.F) {
 	f.Add(good, []byte(`{"v":1,"kid":"k1","scp":["http:*"],"cnf":"does-not-matter"}`))
 	f.Add(good, []byte(`{"v":1,"kid":"k1","run":"not-a-ulid-at-all-0123456"}`))
 	f.Add(good, []byte(`{"v":1,"kid":"k1","jti":""}`))
+	f.Add(good, []byte(`{"v":1,"kid":"k1","iss":"x","aud":"usercontent.example.com","run":"01JD8X3Y4Z5A6B7C8D9E0F1G2H","scp":["tcp:*"],"ep":1,"iat":1763999990,"exp":1764000060,"jti":"a","cnf":"","own":false,"org":""}`))
 	f.Fuzz(func(t *testing.T, token string, payload []byte) {
 		if claims, err := ring.Verify(token, testAud, testNow, 0); err == nil {
 			if err := claims.check(); err != nil {

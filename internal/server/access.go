@@ -32,12 +32,8 @@ func (s *Server) handlePutPort(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON: {\"visibility\": \"public\"|\"private\", \"protocol\"?: \"http\"|\"h2c\"}."))
 		return
 	}
-	updated, err := s.Manager.SetPort(r.PathValue("id"), port, req)
-	if err != nil {
-		s.writeError(w, err)
-		return
-	}
-	s.writeRun(w, http.StatusOK, updated)
+	updated, err := s.Manager.SetPort(r.Context(), r.PathValue("id"), port, req)
+	s.writeAccessChange(w, updated, err, "The port change took effect on this daemon")
 }
 
 func (s *Server) handleDeletePort(w http.ResponseWriter, r *http.Request) {
@@ -46,40 +42,59 @@ func (s *Server) handleDeletePort(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	updated, err := s.Manager.DeletePort(r.PathValue("id"), port)
-	if err != nil {
-		s.writeError(w, err)
-		return
-	}
-	s.writeRun(w, http.StatusOK, updated)
+	updated, err := s.Manager.DeletePort(r.Context(), r.PathValue("id"), port)
+	s.writeAccessChange(w, updated, err, "The port was removed on this daemon")
 }
 
-// writeThroughProblem is a revoke whose new epoch did not reach remote
-// storage: 502, with the new epoch, so that a caller can store it anyway.
-type writeThroughProblem struct {
+// accessChangeProblem is a revoke or port change that took effect on this
+// daemon and is not durable everywhere it must be: 502 when the run's
+// remote record was not written, 500 when the registry file was not. It
+// carries the run's epoch, so that a caller can store it anyway.
+type accessChangeProblem struct {
 	Problem
 	Epoch int64 `json:"epoch"`
 }
 
-func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
-	revoked, err := s.Manager.RevokeAccess(r.Context(), r.PathValue("id"))
-	if errors.Is(err, run.ErrAccessWriteThrough) && revoked != nil && revoked.Access != nil {
-		body := writeThroughProblem{Problem: Problem{
-			Type:   "https://neutron.dev/errors/access-write-through",
-			Title:  "Bad Gateway",
-			Status: http.StatusBadGateway,
-			Detail: "The access epoch was raised and the run's access streams closed on this daemon, but the new epoch is not in remote storage: " + err.Error(),
-		}, Epoch: revoked.Access.Epoch}
-		w.Header().Set("Content-Type", "application/problem+json")
-		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(body)
+// writeAccessChange answers a revoke or port change.
+func (s *Server) writeAccessChange(w http.ResponseWriter, changed *run.Run, err error, done string) {
+	if err == nil {
+		s.writeRun(w, http.StatusOK, changed)
 		return
 	}
-	if err != nil {
+	if changed == nil || changed.Access == nil {
 		s.writeError(w, err)
 		return
 	}
-	s.writeRun(w, http.StatusOK, revoked)
+	var body accessChangeProblem
+	switch {
+	case errors.Is(err, run.ErrAccessNotPersisted):
+		s.Log.Error("access change not persisted", "id", changed.ID, "error", err)
+		body.Problem = Problem{
+			Type:   "https://neutron.dev/errors/access-not-persisted",
+			Title:  "Internal Server Error",
+			Status: http.StatusInternalServerError,
+			Detail: done + ", but could not be written to its registry file; a restart before the next good write would undo it. Repeat it: " + err.Error(),
+		}
+	case errors.Is(err, run.ErrAccessWriteThrough):
+		body.Problem = Problem{
+			Type:   "https://neutron.dev/errors/access-write-through",
+			Title:  "Bad Gateway",
+			Status: http.StatusBadGateway,
+			Detail: done + ", but is not in remote storage; repeat it: " + err.Error(),
+		}
+	default:
+		s.writeError(w, err)
+		return
+	}
+	body.Epoch = changed.Access.Epoch
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(body.Status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	revoked, err := s.Manager.RevokeAccess(r.Context(), r.PathValue("id"))
+	s.writeAccessChange(w, revoked, err, "The access epoch was raised and the run's access streams closed on this daemon")
 }
 
 func (s *Server) handleAccessConfigGet(w http.ResponseWriter, _ *http.Request) {

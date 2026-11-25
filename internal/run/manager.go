@@ -204,6 +204,15 @@ type Run struct {
 	accessMoved   bool
 	accessClosing bool
 	accessBytes   accessBytes
+	// accessDirty: the ports were changed here since the last record
+	// this daemon wrote or took. A newer record then does not simply
+	// replace them: the two are merged failing closed (mergePorts).
+	accessDirty bool
+	// firstRecordTried: a write of the run's first record has been
+	// attempted (noted on disk before it), so with no generation known
+	// that record may be in remote storage all the same (its answer
+	// lost, or the daemon died before noting it). Guarded by Manager.mu.
+	firstRecordTried bool
 }
 
 // RunUsage is what a run has consumed so far.
@@ -353,14 +362,18 @@ type Manager struct {
 	// was last looked at. orphans are the snapshots held by runs the
 	// previous daemon life lost, kept until the first sync has decided
 	// which of those runs come back. All guarded by mu.
-	tombstones  map[string]uint64
-	remoteSeen  map[string]uint64
-	orphans     []string
-	lastSync    time.Time
-	lastGC      time.Time
-	lastScrub   time.Time
-	maintaining atomic.Bool
-	publishing  atomic.Bool
+	tombstones map[string]uint64
+	// accessFloors are epochs of runs this daemon let go of while its
+	// epoch was ahead of the run's record (a revoke here whose write
+	// failed): adopting the run again never goes below them. Persisted.
+	accessFloors map[string]int64
+	remoteSeen   map[string]uint64
+	orphans      []string
+	lastSync     time.Time
+	lastGC       time.Time
+	lastScrub    time.Time
+	maintaining  atomic.Bool
+	publishing   atomic.Bool
 
 	// forking are the IDs of fork children whose record is in remote
 	// storage and whose VM is still booting: runs the registry does not
@@ -406,6 +419,7 @@ func NewManager(runtime Runtime, log *slog.Logger) *Manager {
 		runs:    make(map[string]*Run),
 
 		tombstones:    make(map[string]uint64),
+		accessFloors:  make(map[string]int64),
 		snapshotNotes: make(map[string]*snapshotNote),
 		remoteSeen:    make(map[string]uint64),
 		forking:       make(map[string]struct{}),

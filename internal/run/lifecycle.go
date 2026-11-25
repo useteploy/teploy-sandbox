@@ -280,13 +280,12 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 		return nil, err
 	}
 	defer release()
-	raised := false
 	if m.access != nil {
 		// Before the claim below, so that the run's record carries it:
 		// a run that moved here, or whose caller knows a later epoch,
 		// resumes with its grants revoked.
 		m.mu.Lock()
-		raised = m.moveAccessLocked(m.runs[id], req.AccessEpoch)
+		m.moveAccessLocked(m.runs[id], req.AccessEpoch)
 		m.mu.Unlock()
 		m.persist()
 	}
@@ -295,13 +294,16 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 		if err := m.claimHeld(ctx, current); err != nil {
 			return nil, err
 		}
-		if raised && current.remoteHeld {
+		if current.remoteHeld {
 			// The claim was made before this resume (a takeover, or a
-			// resume a crash interrupted), so the record still carries
-			// the epoch from before the move. Write the raised one there
-			// before anything boots: a daemon that takes the run over
-			// from that record next must land above every grant this
-			// one honours, not on the same epoch.
+			// resume a crash or a failed give-back interrupted), so the
+			// record may still carry an epoch from before the move —
+			// whether or not this resume raised it (a retry raises
+			// nothing: the move is spent). Write the run's access state
+			// there before anything boots (a no-op when the record is
+			// in step): a daemon that takes the run over from that
+			// record next must land above every grant this one
+			// honours, not on the same epoch.
 			if err := m.writeAccessHeld(ctx, id); err != nil {
 				m.unclaimHeld(ctx, id)
 				return nil, remoteErr(fmt.Errorf("the run's raised access epoch: %w", err))

@@ -304,6 +304,7 @@ func (m *Manager) SetPort(ctx context.Context, id string, port int, req PortRequ
 		return nil, fmt.Errorf("%w: %v", ErrBadRequest, err)
 	}
 	run.accessPorts = ports
+	run.accessDirty = true
 	m.mu.Unlock()
 	if wasPublic && req.Visibility != PortPublic {
 		m.closeAccessPort(id, port, "unpublished")
@@ -338,6 +339,7 @@ func (m *Manager) DeletePort(ctx context.Context, id string, port int) (*Run, er
 	if len(run.accessPorts) == 0 {
 		run.accessPorts = nil
 	}
+	run.accessDirty = true
 	m.mu.Unlock()
 	if wasPublic {
 		m.closeAccessPort(id, port, "unpublished")
@@ -353,7 +355,12 @@ func (m *Manager) DeletePort(ctx context.Context, id string, port int) (*Run, er
 func (m *Manager) accessChanged(ctx context.Context, id, what string, args ...any) (*Run, error) {
 	m.mu.Lock()
 	run, ok := m.runs[id]
-	published := ok && m.OffHost != nil && run.remoteGen > 0
+	// A run with no record yet whose first record is being written (a
+	// stop's publish holds the run) is written through too: the attempt
+	// answers busy, so the caller is not told the change landed while
+	// the publish carries a payload taken before it. The publish also
+	// writes what changed meanwhile (publishHeld).
+	published := ok && m.OffHost != nil && (run.remoteGen > 0 || run.exclusive)
 	m.mu.Unlock()
 	if !ok {
 		return nil, ErrNotFound
@@ -465,6 +472,19 @@ func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
 	if generation == 0 {
 		return nil
 	}
+	written := false
+	defer func() {
+		if !written {
+			return
+		}
+		// The record carries these ports now: they are no longer only
+		// this daemon's.
+		m.mu.Lock()
+		if live, ok := m.runs[id]; ok && slices.Equal(live.accessPorts, ports) {
+			live.accessDirty = false
+		}
+		m.mu.Unlock()
+	}()
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accessWriteTimeout)
 	defer cancel()
 	latest, err := m.OffHost.Latest(ctx, id)
@@ -487,6 +507,7 @@ func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
 		return fmt.Errorf("the run's remote record: %w", err)
 	}
 	if stored.AccessEpoch >= epoch && slices.Equal(stored.AccessPorts, ports) {
+		written = true
 		return nil
 	}
 	stored.AccessEpoch = max(stored.AccessEpoch, epoch)
@@ -502,6 +523,7 @@ func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
 	if err != nil {
 		return remoteErr(err)
 	}
+	written = true
 	m.mu.Lock()
 	if live, ok := m.runs[id]; ok && live.remoteGen == generation {
 		live.remoteGen = next.Generation
@@ -583,7 +605,7 @@ func (m *Manager) AccessAdmit(id string, port int) (AccessTarget, error) {
 	if !ok || run.pendingCleanup {
 		return AccessTarget{}, ErrNotFound
 	}
-	if run.State != StateRunning || run.removing || run.accessClosing {
+	if run.State != StateRunning || run.removing || run.accessClosing || superseded(run) {
 		return AccessTarget{Epoch: run.accessEpoch, State: StateStopped}, stoppedErr(id)
 	}
 	target := AccessTarget{Epoch: run.accessEpoch, Protocol: PortHTTP, State: run.State}
@@ -615,13 +637,46 @@ func (m *Manager) DialPort(ctx context.Context, id string, port int) (net.Conn, 
 		m.mu.Unlock()
 		return nil, ErrNotFound
 	}
-	if run.State != StateRunning || run.removing || run.accessClosing {
+	if run.State != StateRunning || run.removing || run.accessClosing || superseded(run) {
 		m.mu.Unlock()
 		return nil, stoppedErr(id)
 	}
 	container := run.ContainerID
 	m.mu.Unlock()
 	return dialer.DialPort(ctx, container, port)
+}
+
+// superseded reports whether another daemon took the run over: this copy
+// may keep running (killing it would lose what only it has), but it is no
+// longer the run, and the access state it holds is not the run's — the
+// new holder's revokes and unpublishes never reach it. It takes no access
+// streams. Caller holds mu.
+func superseded(run *Run) bool {
+	return run.Remote != nil && run.Remote.State == RemoteSuperseded
+}
+
+// mergePorts is a run's ports when this daemon changed them (dirty) and a
+// newer record says otherwise: this daemon's entries, each public only if
+// the record has it public too. Failing closed: a port either side made
+// private stays private, a port either side removed is not public, and
+// nothing becomes public that this daemon's user did not make public.
+func mergePorts(local, record []PortSpec) []PortSpec {
+	if len(local) == 0 {
+		return nil
+	}
+	public := map[int]bool{}
+	for _, p := range record {
+		if p.Visibility == PortPublic {
+			public[p.Port] = true
+		}
+	}
+	merged := slices.Clone(local)
+	for i := range merged {
+		if merged[i].Visibility == PortPublic && !public[merged[i].Port] {
+			merged[i].Visibility = PortPrivate
+		}
+	}
+	return merged
 }
 
 // CanDialPorts reports whether the driver can open access streams.

@@ -4093,24 +4093,27 @@ Fixed here:
 Limits and choices a reviewer should check:
 
 1. **The anonymous stall timeout (30 s) is a choice, not measured.** It
-   counts only time with a write blocked, so long-polls and quiet
-   websockets are untouched; a visitor that reads slower than one write
-   per 30 s is cut. Granted streams are not watched (an owner's stall
-   stalls only the owner's own connection now).
+   counts only time with a write to the guest blocked (after the review
+   round below), so long-polls, quiet websockets and paused visitors are
+   untouched. A guest that trickle-reads (one write per < 30 s) is not
+   caught; it holds at most 256 KiB per stream, 4 MiB for the run's
+   anonymous connection — that run's visitors only. Granted streams are
+   not watched: each grant has its own connection.
 2. **Writing a local epoch found ahead during a reconcile is best
    effort** (logged when it fails). Until it lands, a resume on another
    daemon goes by the record and by the caller's `accessEpoch` — which
    is what the revoke's 502 told the caller to keep.
 3. **A port change that fails its write-through holds locally**, like a
-   revoke; a later reconcile with a newer record takes the record's
-   ports and so can undo it. The caller was answered 502 and asked to
-   repeat it.
+   revoke, and is marked as changed here (`accessDirty`, persisted); a
+   later reconcile with a newer record merges it failing closed (review
+   round below) instead of taking the record's.
 4. **The registry file carries access state only for stopped runs**
    (unchanged): a running run's epoch is not in it, and a run lost by a
    restart comes back through its remote record and the move rule, or
    not at all.
-5. **Edges must open one connection per run and kind** — the 4b edge
-   has to be built that way; an edge mixing them gets 421s, not stalls.
+5. **Edges must open one connection per run and kind** (anonymous, or
+   one per grant `jti`, after the review round below) — the 4b edge has
+   to be built that way; an edge mixing them gets 421s, not stalls.
 6. **The key-removal race** (a key removed between verification and the
    stream's count) is closed by a recheck after the count; there is no
    deterministic test for the interleaving itself, only for the closes.
@@ -4119,3 +4122,70 @@ Limits and choices a reviewer should check:
 
 Deferred: nothing of the list above. Review items not in this
 follow-up's list (S-6 and the review's notes) were not re-run here.
+
+### Review round on PR #13 (2026-11-25)
+
+Two independent reviews of this PR (both: not yet) found the following;
+each reproduction is now an asserting regression test, run with its fix
+reverted and failing. Invariants held: a run's epoch never goes down on
+any host, and once any host answers a revoke with E no host admits a
+grant below E; once a user gets a success answer making a port private,
+no host serves it public. Nothing relies on clocks. Not run live.
+
+- **A1 (blocker, a regression this PR introduced):** the "stop written
+  again" branch took the record's ports unconditionally, so an unpublish
+  answered 502 ("holds on this daemon") was undone by the next sync.
+  Ports changed here since the last record this daemon wrote or took
+  (`accessDirty`, persisted, never in the record) are now merged with a
+  newer record failing closed — this daemon's entries, each public only
+  if the record has it public too — and written through; same rule on
+  adopt/takeover (`replaceHeld`). A run not changed here takes the
+  record's ports (a stale copy does not unpublish ports published
+  elsewhere). `TestAnUnpublishThatFailedItsWriteIsNotUndoneBySync`.
+- **A2:** a resume of a held run wrote its epoch only when it raised it;
+  after a takeover resume whose write and give-back both failed, the
+  retry raised nothing (the move was spent) and booted on the old
+  record. Every held resume now writes its access state before boot (a
+  no-op when in step). `TestAHeldResumeRetryWritesTheEpoch`.
+- **A3:** share-link holders are granted streams; they shared the
+  owner's connection and were never stall-checked. A connection now
+  binds to (run, anonymous | one grant's `jti`): a share link's holders
+  get one connection, the owner's grant another (421 otherwise);
+  `--access-edge-conns` defaults to four per run.
+  `TestShareLinkHoldersDoNotStarveTheOwner`.
+- **V1/V2:** on a run's first publish (no record yet) a revoke or port
+  change skipped its write-through and answered 200, then the publish
+  wrote generation 1 from its earlier payload — a private port served
+  public, revokes lost, on the next host. Such a change now answers 502
+  (the run is busy), and the publish compares the live access state with
+  its payload after the record lands and writes the difference
+  (`publishAccessSince`; a failure fails the publish, whose retry writes
+  from the live run). This covers publishPending retries, republish
+  from generation 0 and registries from before remote storage.
+  `TestAPortChangeDuringTheFirstPublishReachesTheRecord`,
+  `TestARevokeDuringTheFirstPublishReachesTheRecord`.
+- **V3:** a running copy superseded by a takeover kept admitting grants
+  below the new holder's revoked epoch and serving ports it made
+  private. On learning of the takeover the daemon closes the copy's
+  streams (`superseded`), and `AccessAdmit`/`DialPort` refuse it.
+  **Window:** until this daemon sees the takeover (its next sync, or a
+  request that reads the run's record) the copy serves the access state
+  it had — documented in the README and the wire contract.
+  `TestASupersededRunningCopyTakesNoStreams`.
+- **Epoch floors:** a run dropped here (resumed elsewhere) while its
+  epoch was ahead of its record (a revoke whose write failed) keeps that
+  epoch as a persisted floor; adopting the run here again applies it and
+  writes it through. Floors are kept only in that case and are consumed
+  on re-adopt; one for a run that never comes back stays in the registry
+  file (a few bytes). `TestARunDroppedAheadOfItsRecordComesBackNoLower`.
+- **Nits:** the handler ends a stream with `closeBy` (never later than
+  an end a configuration change set meanwhile; `closeBy` is unit-tested,
+  the race in the handler itself has no deterministic test);
+  certificate expiry is also checked against the wall clock per read
+  and by the sweep (`TestAStreamEndsOnItsFirstReadAfterTheCertificateExpired`,
+  `TestTheSweepClosesStreamsPastTheirCertificate`); only a blocked write
+  to the guest is a stall (`TestAVisitorThatDoesNotReadIsNotStalled`);
+  Serve unregisters its configuration watch
+  (`TestServeUnregistersItsConfigurationWatch`); denylisting an edge
+  closes its open streams (`TestDenylistingAnEdgeEndsItsStreams`); the
+  wire contract says a write-through holds the run up to 30 s.

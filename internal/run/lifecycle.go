@@ -590,7 +590,54 @@ func (m *Manager) destroyStopped(ctx context.Context, current *Run) error {
 		m.mu.Unlock()
 		return err
 	}
-	if m.OffHost != nil && current.remoteGen > 0 && (current.Remote == nil || current.Remote.State != RemoteSuperseded) {
+	notSuperseded := current.Remote == nil || current.Remote.State != RemoteSuperseded
+	if m.OffHost != nil && current.remoteGen == 0 && notSuperseded {
+		// A first record whose write was tried may be in remote storage
+		// with its answer lost: find it, or the run, destroyed here,
+		// stays there for any daemon to adopt and resume.
+		m.mu.Lock()
+		unconfirmed := false
+		if live, ok := m.runs[current.ID]; ok {
+			unconfirmed = unconfirmedPublishLocked(live)
+		}
+		m.mu.Unlock()
+		if unconfirmed {
+			fail := func(err error) error {
+				m.mu.Lock()
+				if live, ok := m.runs[current.ID]; ok {
+					live.removing = false
+				}
+				m.mu.Unlock()
+				return fmt.Errorf("stopped run %s not deleted: %w", current.ID, err)
+			}
+			latest, err := m.OffHost.Latest(ctx, current.ID)
+			switch {
+			case errors.Is(err, ErrNotFound):
+				// Never landed: nothing there to destroy.
+			case err != nil:
+				return fail(remoteErr(err))
+			case !latest.Mine && latest.State == RecordStopped:
+				// Another daemon adopted the record and stopped the run
+				// again: it is the run, at rest, for any daemon to adopt.
+				// Destroyed there, with the conditional write a resume
+				// claims it with, so a daemon taking it now wins instead.
+				current.remoteGen = latest.Generation
+			case !latest.Mine:
+				// Another daemon runs the run (or destroyed it): this copy
+				// was never the run that moved on. It goes here, as a
+				// superseded copy does, and the run there is left alone.
+				m.log.Warn("a stopped run's unconfirmed copy is deleted here only: another daemon has the run", "id", current.ID, "owner", latest.Owner, "generation", latest.Generation, "state", latest.State)
+				notSuperseded = false
+			default:
+				generation, err := m.adoptUnconfirmed(ctx, current.ID, current.snapshot)
+				if err != nil {
+					return fail(err)
+				}
+				current.remoteGen = generation
+			}
+		}
+	}
+	if m.OffHost != nil && current.remoteGen > 0 && notSuperseded {
 		// A stopped run that is in remote storage is destroyed there
 		// first, with the same write a resume claims it with: a run
 		// another daemon resumed a moment ago is not deleted from under

@@ -4438,3 +4438,28 @@ Left as is: six share links in use lock out a seventh grant, the owner's
 included (429 `run-connections`); the daemon cannot tell an owner's grant
 from a share link. `refreshRemote`'s lookup of an unconfirmed run is
 covered only through `SyncRemote`.
+
+### Follow-ups from the PR #13 review (2026-11-25)
+
+- **Fixed (this PR): a destroyed run could come back on another daemon.**
+  Destroying a stopped run whose first record landed with its answer lost
+  wrote no destroyed record (its generation was unknown), so another
+  daemon adopted the run from that record and could resume it.
+  `destroyStopped` now looks up an unconfirmed run's record
+  (`adoptUnconfirmed`) and destroys the run there too, or fails the
+  delete when the newest record is its own but unexpected. A stale copy
+  of a run another daemon has adopted and runs (or destroyed) is deleted
+  here only, as a superseded copy is; one another daemon stopped again is
+  destroyed there with a conditional write at its next generation. Tests:
+  `TestADestroyedUnconfirmedRunIsNotAdoptedElsewhere`,
+  `TestAnUnconfirmedCopyOfARunRunningElsewhereIsDeletedHereOnly`,
+  `TestDestroyingAnUnconfirmedCopyOfARunStoppedElsewhereDestroysTheRun`,
+  `TestDestroyWithStorageDownWaitsOnlyForAnUnconfirmedRun`.
+- **Open (assumption, not documented in the off-host docs yet): a record
+  write that timed out must not land later.** If one lands after a later
+  lookup answered NotFound, the run can be adopted elsewhere: a
+  split-brain for the run as a whole, not only its access state. S3
+  conditional writes make this unlikely but do not rule it out for a
+  request still in flight. Needs either a statement in the storage
+  requirements or a fence (for example, a destroyed record written at
+  the next generation whenever a first write's outcome is unknown).

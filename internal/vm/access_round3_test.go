@@ -233,3 +233,84 @@ func TestAPortPublishedElsewhereSurvivesAStaleLocalChange(t *testing.T) {
 		t.Fatalf("the record lost host-b's port: %+v", ports)
 	}
 }
+
+// PR #13, fourth review round, V6: a port change answered 200 after the
+// first record's lost answer reaches that record before another daemon
+// can adopt it, even when no upkeep runs in between.
+func TestAPortChangeAfterALostAnswerReachesTheRecordBeforeTheUpkeep(t *testing.T) {
+	a, b, id := lostFirstRecord(t)
+	if _, err := a.manager.SetPort(bg, id, 3000, run.PortRequest{Visibility: run.PortPrivate}); err != nil {
+		t.Fatalf("premise: the port change on this daemon's own record is answered 200: %v", err)
+	}
+	b.sync(t)
+	if _, err := b.manager.Resume(bg, id, 0); err != nil {
+		t.Fatal(err)
+	}
+	a.manager.Maintain(bg)
+	if target, err := b.manager.AccessAdmit(id, 3000); err != nil || target.Public {
+		t.Fatalf("host-b serves the port host-a made private public: %+v %v", target, err)
+	}
+}
+
+// V6, the same for revokes.
+func TestARevokeAfterALostAnswerReachesTheRecordBeforeTheUpkeep(t *testing.T) {
+	a, b, id := lostFirstRecord(t)
+	var last int64
+	for range 5 {
+		revoked, err := a.manager.RevokeAccess(bg, id)
+		if err != nil {
+			t.Fatalf("premise: the revoke on this daemon's own record is answered 200: %v", err)
+		}
+		last = epochOf(t, revoked)
+	}
+	b.sync(t)
+	resumed, err := b.manager.Resume(bg, id, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := epochOf(t, resumed); got <= last {
+		t.Fatalf("host-a answered a revoke with %d; host-b runs at %d", last, got)
+	}
+}
+
+// V6: a record that is not this daemon's own makes a change on an
+// unconfirmed copy fail loudly instead of answering 200.
+func TestAChangeOnAnUnconfirmedCopyOfAMovedRunFails(t *testing.T) {
+	a, b, id := lostFirstRecord(t)
+	b.sync(t)
+	if _, err := b.manager.Resume(bg, id, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.manager.SetPort(bg, id, 3000, run.PortRequest{Visibility: run.PortPrivate}); !errors.Is(err, run.ErrAccessWriteThrough) {
+		t.Fatalf("a port change on a copy whose run another daemon holds: %v", err)
+	}
+	if _, err := a.manager.RevokeAccess(bg, id); !errors.Is(err, run.ErrAccessWriteThrough) {
+		t.Fatalf("a revoke on a copy whose run another daemon holds: %v", err)
+	}
+}
+
+// V6, crash variant: a daemon restarted before noting its first record's
+// generation finds the record at its next sync (reconcileRun no longer
+// stops at "never published" for an unconfirmed publish), and a change
+// made after the restart reaches the record.
+func TestARestartedDaemonFindsItsUnconfirmedFirstRecord(t *testing.T) {
+	a, b, id := lostFirstRecord(t)
+	a = newHost(t, a.bucket, "host-a", a, withAccess(&accessEvents{}))
+	if got := a.get(t, id).Remote; got == nil || got.Generation != 0 {
+		t.Fatalf("premise: after the restart the run knows no generation: %+v", got)
+	}
+	a.sync(t)
+	if got := a.get(t, id).Remote; got == nil || got.Generation == 0 {
+		t.Fatalf("the sync did not take the unconfirmed record's generation: %+v", got)
+	}
+	if _, err := a.manager.SetPort(bg, id, 3000, run.PortRequest{Visibility: run.PortPrivate}); err != nil {
+		t.Fatal(err)
+	}
+	b.sync(t)
+	if _, err := b.manager.Resume(bg, id, 0); err != nil {
+		t.Fatal(err)
+	}
+	if target, err := b.manager.AccessAdmit(id, 3000); err != nil || target.Public {
+		t.Fatalf("host-b serves the port public: %+v %v", target, err)
+	}
+}

@@ -4296,3 +4296,54 @@ Nothing here has run live.
   the record. The 502 tells the caller it is not known to be in remote
   storage yet, and to repeat it; repeating is harmless. Answering 200
   would claim a durability that does not exist yet.
+
+### Fourth review round on PR #13 (2026-11-25)
+
+The invariant reviewer found V6 at `2c85649`. Both invariants broke.
+Each repro is now an asserting test that fails when its fix is
+reverted. Nothing here has run live.
+
+- **V6: a change answered 200 could be lost before the upkeep ran.** The
+  sequence:
+  1. Host-a's first record lands, but the answer is lost. The run is
+     left with `remoteGen` 0, failed, and not held.
+  2. A port change or revoke on host-a is answered 200 with no write,
+     because the run has no known record.
+  3. Before host-a's upkeep runs, host-b adopts that record and resumes
+     the run with the old access state.
+  4. Host-a's upkeep then finds the run held by host-b and marks its own
+     copy superseded. The change never reaches the record.
+- **Crash variant:** a daemon that restarts before noting the record's
+  generation never looked at that record again. `reconcileRun` stopped
+  at "never published".
+- **Fix, for a stopped run whose publish was attempted but not
+  confirmed** (`remoteGen` 0 with a `remote` state). A revoke or port
+  change now looks up the newest record, under the run's exclusivity,
+  inside `writeAccessHeld` (via `adoptUnconfirmed`):
+  - No record: answered 200 as before. The next publish writes the
+    change.
+  - This daemon's own "stopped" record with the run's snapshot: its
+    generation is taken, the change is written there, and the answer is
+    200.
+  - Anything else: 502 `access-write-through`.
+- **The same rule now applies when the run is looked up**
+  (`refreshRemote`, and `reconcileRun` during a sync), access on only. A
+  restarted daemon takes its unconfirmed record's generation and writes
+  its access state there.
+- With access off, nothing changes.
+- **Tests:**
+  - `TestAPortChangeAfterALostAnswerReachesTheRecordBeforeTheUpkeep`,
+    `TestARevokeAfterALostAnswerReachesTheRecordBeforeTheUpkeep` (the
+    reviewer's repros)
+  - `TestAChangeOnAnUnconfirmedCopyOfAMovedRunFails`
+  - `TestARestartedDaemonFindsItsUnconfirmedFirstRecord`
+  - The third round's two lost-answer tests still pass, answered 200.
+- **Operator rule: never roll a bucket back while daemons use it.** Now
+  stated in `docs/wire-contract.md` and in the README's off-host
+  section. All of this assumes a run's records only move forward. A
+  bucket restored from an older backup can let a daemon adopt a record
+  below a revoke or unpublish that was already answered with success,
+  and nothing in the bucket can detect it. To restore storage: stop
+  every daemon in the fleet, restore, then revoke and set the ports
+  again.
+

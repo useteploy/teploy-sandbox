@@ -974,6 +974,15 @@ retention, such a copy is past its own retention by then and the
 daemon's reaper destroys it within a tick or two of coming back. Give
 every daemon of a fleet the same `--stopped-retention`.
 
+**Never roll a bucket back while daemons use it.** Everything above
+assumes a run's records only move forward. A bucket (or prefix) restored
+from an older backup puts older generations back as the newest: a daemon
+can then adopt a run from a record below a revoke or an unpublish it
+already answered with success, and serve grants and public ports that
+were withdrawn. Nothing in the bucket can tell a rollback from the real
+history. To restore storage, stop every daemon of the fleet first, and
+revoke the runs' access (and set their ports) again afterwards.
+
 **Without conditional writes.** The daemon tests the service at start. If
 `If-None-Match` is not honoured, uploads, restores and forks work as
 above, but a daemon only resumes or deletes runs whose record it wrote

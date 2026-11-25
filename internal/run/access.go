@@ -360,7 +360,12 @@ func (m *Manager) accessChanged(ctx context.Context, id, what string, args ...an
 	// answers busy, so the caller is not told the change landed while
 	// the publish carries a payload taken before it. The publish also
 	// writes what changed meanwhile (publishHeld).
-	published := ok && m.OffHost != nil && (run.remoteGen > 0 || run.exclusive)
+	//
+	// So is a stopped run whose publish was attempted and not confirmed
+	// (its record may have landed with the answer lost, and another
+	// daemon may adopt that record before this one's upkeep runs):
+	// writeAccessHeld looks, and writes to this daemon's own record.
+	published := ok && m.OffHost != nil && (run.remoteGen > 0 || run.exclusive || unconfirmedPublishLocked(run))
 	m.mu.Unlock()
 	if !ok {
 		return nil, ErrNotFound
@@ -468,7 +473,15 @@ func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
 		return ErrNotFound
 	}
 	generation, epoch, ports := live.remoteGen, live.accessEpoch, slices.Clone(live.accessPorts)
+	unconfirmed, snapshot := unconfirmedPublishLocked(live), live.snapshot
 	m.mu.Unlock()
+	if generation == 0 && unconfirmed {
+		adopted, err := m.adoptUnconfirmed(ctx, id, snapshot)
+		if err != nil || adopted == 0 {
+			return err
+		}
+		generation = adopted
+	}
 	if generation == 0 {
 		return nil
 	}
@@ -537,6 +550,48 @@ func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
 	m.mu.Unlock()
 	m.persist()
 	return nil
+}
+
+// unconfirmedPublishLocked reports whether a run is stopped with no
+// record this daemon knows of, though a publish of it was attempted: its
+// first record may be in remote storage with the answer lost (or the
+// daemon died before noting it). Caller holds mu.
+func unconfirmedPublishLocked(run *Run) bool {
+	return run.State == StateStopped && run.remoteGen == 0 && run.Remote != nil
+}
+
+// adoptUnconfirmed looks for the record an unconfirmed publish may have
+// landed. None: 0, nothing to write to (the next publish writes the
+// run's access state as it is then). This daemon's own "stopped" with
+// the run's snapshot: its generation, taken as the run's (the publish's
+// retry builds on it). Anything else is a conflict: another daemon has
+// the run, and what this daemon changes is not the run's. The caller
+// holds the run's exclusivity.
+func (m *Manager) adoptUnconfirmed(ctx context.Context, id, snapshot string) (uint64, error) {
+	latest, err := m.OffHost.Latest(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, remoteErr(err)
+	}
+	if !latest.Mine || latest.State != RecordStopped || latest.Snapshot != snapshot {
+		return 0, fmt.Errorf("%w: remote storage has generation %d of the run's record (%s, by %s), which this daemon did not know it wrote", ErrRemoteConflict, latest.Generation, latest.State, latest.Owner)
+	}
+	m.mu.Lock()
+	live, ok := m.runs[id]
+	if ok && live.remoteGen == 0 {
+		live.remoteGen, live.remoteKey = latest.Generation, latest.Key
+		if live.Remote != nil {
+			state := *live.Remote
+			state.Generation = live.remoteGen
+			live.Remote = &state
+		}
+	}
+	m.mu.Unlock()
+	m.persist()
+	m.log.Warn("a stopped run's first record was in remote storage though its publish was not confirmed; taking its generation", "id", id, "generation", latest.Generation)
+	return latest.Generation, nil
 }
 
 // moveAccessLocked applies the resume rule. A run continuing on this

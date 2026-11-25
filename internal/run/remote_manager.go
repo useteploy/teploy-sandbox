@@ -779,6 +779,29 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 	// A superseded copy whose record turns out to be this daemon's own,
 	// at the generation it knows, was never taken over: see below.
 	recovers := superseded && !missing && latest.Mine && latest.State != RecordDestroyed && latest.Generation == local.remoteGen
+	if m.access != nil && unconfirmedPublishLocked(local) && !missing && latest.Mine && latest.State == RecordStopped && latest.Snapshot == local.snapshot {
+		// A publish of this daemon's whose record landed unconfirmed
+		// (the answer lost, or the daemon died before noting it): take
+		// its generation, and write the run's access state there if it
+		// moved on since — a revoke or port change answered meanwhile
+		// must be in the record before another daemon adopts it.
+		if local.exclusive || local.removing {
+			m.mu.Unlock()
+			return ErrBusy
+		}
+		local.exclusive = true
+		m.mu.Unlock()
+		err := m.writeAccessHeld(ctx, id)
+		m.mu.Lock()
+		if live, ok := m.runs[id]; ok {
+			live.exclusive = false
+		}
+		m.mu.Unlock()
+		if err != nil {
+			m.log.Error("a stopped run's unconfirmed first record could not be brought in step with its access state", "id", id, "error", err)
+		}
+		return nil
+	}
 	if local.remoteGen == 0 || (!missing && latest.Generation == local.remoteGen && !recovers) {
 		// Never published, or in step.
 		m.mu.Unlock()
@@ -1160,7 +1183,9 @@ func (m *Manager) refreshRemote(ctx context.Context, id string, takeover, strict
 	}
 	m.mu.Lock()
 	local, known := m.runs[id]
-	published := known && local.remoteGen > 0
+	// With access on, a stopped run whose first publish is unconfirmed
+	// is looked up too (reconcileRun takes its record's generation).
+	published := known && (local.remoteGen > 0 || (m.access != nil && unconfirmedPublishLocked(local)))
 	m.mu.Unlock()
 	if known && !published {
 		return nil

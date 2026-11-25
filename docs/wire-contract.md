@@ -424,6 +424,12 @@ compared with a clock:
   sync, or the next request that reads the run's record. Until then it
   serves the access state it had.
 
+These guarantees assume a run's records in remote storage only move
+forward. **Never roll a bucket back while daemons use it**: a bucket
+restored from an older backup can let a daemon adopt a record below a
+revoke or unpublish already answered with success. Stop the fleet to
+restore storage, then revoke and set the ports again.
+
 A caller that stores epochs (a control plane minting grants) stores the
 epoch from every run object it receives and passes it as `accessEpoch`
 on every resume.

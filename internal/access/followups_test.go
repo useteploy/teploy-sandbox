@@ -700,3 +700,22 @@ func TestGrantHoldersCannotLockOutAnonymousVisitors(t *testing.T) {
 	}
 	roundTrip(t, anon, "visitor")
 }
+
+// A lookup that finds no run closes the unbound connection it came on.
+func TestLookupsOfUnknownRunsDoNotFillTheEdgeCap(t *testing.T) {
+	r := newRig(t, func(c *rigConfig) { c.perPeer = 2 })
+	r.manager.dial = func(_ context.Context, _ string, _ int) (net.Conn, error) { return echoConn(), nil }
+	for _, id := range []string{"01JD8X3Y4Z5A6B7C8D9E0F1G20", "01JD8X3Y4Z5A6B7C8D9E0F1G21"} {
+		resp, err := r.client(r.edge).Get("https://" + r.addr + "/v1/access/runs/" + id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		t.Logf("lookup %s: %d", id, resp.StatusCode)
+	}
+	s, err := r.connect(r.client(r.edge), runB, "3000", r.grant(func(c *accessgrant.Claims) { c.Run = runB; c.Jti = "b" }))
+	if err != nil || s.resp.StatusCode != 200 {
+		t.Fatalf("run B unreachable after two 404 lookups left unbound connections: %v", err)
+	}
+}

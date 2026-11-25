@@ -989,11 +989,19 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		// here: a resume of ours that claimed the run and never booted
 		// it (the daemon died in between), or a record the registry lost
 		// track of. Nobody else moved the run; say so there, at the next
-		// publish.
+		// publish. The record is newer than what the registry knows
+		// (a registry that lagged, or was restored), so its access state
+		// is taken by the one rule: else the next write of this daemon's
+		// access state treats the registry's as the newer and writes it
+		// over the record (a port made private there, public again).
 		m.mu.Lock()
 		live := m.runs[id]
 		live.remoteGen = latest.Generation
 		live.remoteHeld = latest.State == RecordRunning || latest.State == RecordForked
+		ahead := false
+		if record, ok := recordAccessOf(latest.Payload); ok && m.access != nil {
+			ahead = m.reconcileAccessFromRecordLocked(live, record, true)
+		}
 		var damage *RemoteDamage
 		if live.Remote != nil {
 			damage = live.Remote.Damage
@@ -1001,6 +1009,9 @@ func (m *Manager) reconcileRun(ctx context.Context, id string, takeover bool) er
 		setRemoteLocked(live, RemoteState{State: RemotePending, Local: hasLocal, Damage: damage})
 		m.mu.Unlock()
 		m.persist()
+		if ahead {
+			m.writeLocalEpoch(ctx, id)
+		}
 		return nil
 	case latest.State == RecordStopped:
 		// Resumed and stopped again somewhere else: the remote record
@@ -1093,8 +1104,8 @@ func recordAccessOf(payload []byte) (recordAccess, bool) {
 // reconcileAccessFromRecordLocked is THE rule for taking a remote
 // record's access state into a run this daemon holds. Every path that
 // reads a record and accepts it goes through it (adopt and takeover via
-// replaceHeld, adoptUnknown, the "stop written again" reconcile branch,
-// a publish that accepts another daemon's write of the same stop, and
+// replaceHeld, adoptUnknown, the "stop written again" and "this
+// daemon's own newer record" reconcile branches, a publish that accepts another daemon's write of the same stop, and
 // writeAccessHeld for the record it is about to write after):
 //
 //   - epoch = max(this daemon's, the record's, this daemon's floor for

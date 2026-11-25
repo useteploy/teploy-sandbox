@@ -4417,3 +4417,22 @@ The broad reviewer's findings at `2c85649`, fixed in the same round:
   - revoke, `SetPort` and `DeletePort` are local changes.
   - `moveAccessLocked` is the resume rule.
 
+
+### Fifth review round on PR #13 (2026-11-25)
+
+Both reviewers checked `1aa6032`. Every earlier fix was still real
+(mutation-checked), and four findings remained. Each is fixed here with
+an asserting test that fails when its fix is reverted. Nothing here has
+run live.
+
+| Finding | Fix | Test |
+|---|---|---|
+| V7 (both invariants): a run with no remote state whose first publish landed, then a crash before the registry noted it, did not count as unconfirmed after the restart, so a later 200 could be lost | `unconfirmedPublishLocked` no longer requires `Remote != nil`; `writeAccessHeld` only looks when remote storage is on | `TestAPreRemoteRunsLandedFirstRecordIsFoundAfterARestart` |
+| Lookups of unknown runs left unbound connections that filled the edge cap | a 404 lookup on an unbound connection closes it; wire contract says where lookups go | `TestLookupsOfUnknownRunsDoNotFillTheEdgeCap` |
+| The reconcile's "this daemon's own newer record" branch took the generation without the record's access state, so a held resume wrote the registry's older ports over it | that branch goes through `reconcileAccessFromRecordLocked` with `newer=true` | `TestAHeldResumeTakesItsOwnNewerRecordsPorts` |
+| `adoptUnconfirmed`'s own-record guard had no test | coverage only | `TestAnUnconfirmedCopyDoesNotWriteOverARunStoppedElsewhere` |
+
+Left as is: six share links in use lock out a seventh grant, the owner's
+included (429 `run-connections`); the daemon cannot tell an owner's grant
+from a share link. `refreshRemote`'s lookup of an unconfirmed run is
+covered only through `SyncRemote`.

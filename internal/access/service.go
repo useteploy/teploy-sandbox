@@ -328,14 +328,24 @@ type lookupBody struct {
 // (what a self-hosted issuer copies into a grant) and its public ports.
 // Nothing else of the run: no env, no labels.
 func (s *Service) handleLookup(w http.ResponseWriter, r *http.Request) {
+	// A lookup never binds its connection. One that finds no run closes
+	// an unbound connection once answered, as a refused connect does:
+	// lookups of made-up run IDs, each on a fresh connection, could
+	// otherwise fill the edge's cap for every run on this daemon.
+	notHere := func() {
+		if !connFrom(r.Context()).bound() {
+			w.Header().Set("Connection", "close")
+		}
+		writeProblem(w, http.StatusNotFound, "not-here", "No such run on this daemon.")
+	}
 	id := r.PathValue("id")
 	if !accessgrant.ValidRunID(id) {
-		writeProblem(w, http.StatusNotFound, "not-here", "No such run on this daemon.")
+		notHere()
 		return
 	}
 	target, err := s.Manager.AccessLookup(id)
 	if err != nil {
-		writeProblem(w, http.StatusNotFound, "not-here", "No such run on this daemon.")
+		notHere()
 		return
 	}
 	body := lookupBody{ID: id, State: target.State, Epoch: target.Epoch, PublicPorts: []lookupPort{}}

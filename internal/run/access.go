@@ -475,7 +475,7 @@ func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
 	generation := live.remoteGen
 	unconfirmed, snapshot := unconfirmedPublishLocked(live), live.snapshot
 	m.mu.Unlock()
-	if generation == 0 && unconfirmed {
+	if generation == 0 && unconfirmed && m.OffHost != nil {
 		adopted, err := m.adoptUnconfirmed(ctx, id, snapshot)
 		if err != nil || adopted == 0 {
 			return err
@@ -567,11 +567,14 @@ func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
 }
 
 // unconfirmedPublishLocked reports whether a run is stopped with no
-// record this daemon knows of, though a publish of it was attempted: its
-// first record may be in remote storage with the answer lost (or the
-// daemon died before noting it). Caller holds mu.
+// record this daemon knows of: its first record may be in remote storage
+// with the answer lost, or the daemon died before noting it. That holds
+// even with no remote state at all, since a run from a registry written
+// before remote storage was configured is published by the upkeep, and a
+// crash right after that put leaves Remote nil. Caller holds mu, and
+// only calls this with remote storage on.
 func unconfirmedPublishLocked(run *Run) bool {
-	return run.State == StateStopped && run.remoteGen == 0 && run.Remote != nil
+	return run.State == StateStopped && run.remoteGen == 0
 }
 
 // adoptUnconfirmed looks for the record an unconfirmed publish may have

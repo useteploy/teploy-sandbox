@@ -353,7 +353,13 @@ func hypervisorFor(confine *confinement, standIn *string) {
 		if err != nil {
 			return nil, err
 		}
-		replacement := exec.Command(os.Args[0], append([]string{"-test.run=^" + *standIn + "$", "--"}, args...)...)
+		// The test binary by its absolute path: the hypervisor runs from
+		// "/", where a relative one names nothing.
+		executable, err := os.Executable()
+		if err != nil {
+			return nil, err
+		}
+		replacement := exec.Command(executable, append([]string{"-test.run=^" + *standIn + "$", "--"}, args...)...)
 		replacement.SysProcAttr = cmd.SysProcAttr
 		return replacement, nil
 	}
@@ -485,7 +491,10 @@ func TestAHypervisorStartedForARestoreIsConfinedAndGivenTheDaemonsConfiguration(
 	// What the process mapped is what MapsFile reports: a file of its own
 	// over its whole length, and nothing else.
 	if runtime.GOOS == "linux" {
-		executable, _ := os.Executable()
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !strings.Contains(diagnostics, "mapped "+executable+" ") || !machine.MapsFile(executable) {
 			t.Errorf("the stand-in's mapping of its own binary was not seen:\n%s", diagnostics)
 		}

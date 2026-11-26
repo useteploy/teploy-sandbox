@@ -169,6 +169,9 @@ const (
 	// image of another host, which runs restored here are clones of. It
 	// goes when nothing is cloned from it any more.
 	kindBase = "base"
+	// kindImage is a memory image (memory_images.go): a filesystem, not
+	// a volume, and never part of a stream.
+	kindImage = "image"
 )
 
 // Dataset is a volume as the driver needs to see it.
@@ -200,8 +203,10 @@ type ZFS interface {
 	// Volumes lists every volume under root (root itself excluded).
 	Volumes(ctx context.Context, root string) ([]Dataset, error)
 	// Filesystems lists every filesystem under root (root itself
-	// excluded). The driver creates none: one that carries its mark came
-	// out of a stream that was not a volume's, and only goes.
+	// excluded). Run volumes and snapshot holders are volumes; the
+	// filesystems are the daemon's memory images (kind image), and
+	// whatever came out of a stream that was not a volume's, which only
+	// goes.
 	Filesystems(ctx context.Context, root string) ([]Dataset, error)
 	// Snapshots lists a dataset's own snapshots, oldest first.
 	Snapshots(ctx context.Context, dataset string) ([]SnapshotInfo, error)
@@ -240,6 +245,25 @@ type ZFS interface {
 	Space(ctx context.Context, root string) (available, used int64, err error)
 }
 
+// imageFS is the part of ZFS memory images need beyond ZFS (see
+// memory_images.go): filesystems that are each their own encryption root.
+type imageFS interface {
+	ZFS
+	// CreateFilesystem creates an empty dataset with the properties.
+	// key, when not nil, is the raw key of its new encryption root: it
+	// reaches zfs on standard input (keylocation is prompt) and is
+	// written nowhere.
+	CreateFilesystem(ctx context.Context, name string, props map[string]string, key []byte) error
+	// Mount mounts a dataset that is not mounted; Unmount unmounts one
+	// that is (neither recursively).
+	Mount(ctx context.Context, name string) error
+	Unmount(ctx context.Context, name string) error
+	// LoadKey loads the raw key of a dataset's encryption root from
+	// standard input; CheckKey only verifies it, loaded or not.
+	LoadKey(ctx context.Context, name string, key []byte) error
+	CheckKey(ctx context.Context, name string, key []byte) error
+}
+
 // zfsCLI is ZFS over the zfs(8) command.
 type zfsCLI struct {
 	bin string
@@ -249,6 +273,8 @@ type zfsCLI struct {
 	// probes every new device node.
 	busyRetry time.Duration
 }
+
+var _ imageFS = (*zfsCLI)(nil)
 
 func newZFSCLI(bin string, cmd Commander) *zfsCLI {
 	if bin == "" {
@@ -391,6 +417,44 @@ func (z *zfsCLI) CreateVolume(ctx context.Context, name string, bytes int64, pro
 	}
 	_, err := z.run(ctx, append(args, name)...)
 	return err
+}
+
+// props are -o arguments, sorted so a command line is always the same.
+func zfsProps(props map[string]string) []string {
+	var args []string
+	for _, key := range slices.Sorted(maps.Keys(props)) {
+		args = append(args, "-o", key+"="+props[key])
+	}
+	return args
+}
+
+func (z *zfsCLI) CreateFilesystem(ctx context.Context, name string, props map[string]string, key []byte) error {
+	args := append([]string{"create"}, zfsProps(props)...)
+	args = append(args, name)
+	if key == nil {
+		_, err := z.run(ctx, args...)
+		return err
+	}
+	// With keylocation=prompt, zfs reads the raw key from standard input.
+	return z.stream(ctx, bytes.NewReader(key), nil, args...)
+}
+
+func (z *zfsCLI) Mount(ctx context.Context, name string) error {
+	_, err := z.run(ctx, "mount", name)
+	return err
+}
+
+func (z *zfsCLI) Unmount(ctx context.Context, name string) error {
+	_, err := z.run(ctx, "unmount", name)
+	return err
+}
+
+func (z *zfsCLI) LoadKey(ctx context.Context, name string, key []byte) error {
+	return z.stream(ctx, bytes.NewReader(key), nil, "load-key", name)
+}
+
+func (z *zfsCLI) CheckKey(ctx context.Context, name string, key []byte) error {
+	return z.stream(ctx, bytes.NewReader(key), nil, "load-key", "-n", name)
 }
 
 func (z *zfsCLI) Snapshot(ctx context.Context, name string) error {

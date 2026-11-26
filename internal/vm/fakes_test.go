@@ -51,6 +51,9 @@ type fakeZFS struct {
 	// dataset it was asked about.
 	available, used int64
 	spaceAsked      string
+	// fsCalls are the mounts and key loads of filesystems: they change
+	// nothing in the pool, so they are not among calls.
+	fsCalls []string
 	// receiveAnything turns off Receive's check of a stream's first
 	// record: for tests of what holds when that check is not there.
 	receiveAnything bool
@@ -60,8 +63,14 @@ type fakeDataset struct {
 	origin string
 	props  map[string]string
 	files  map[string][]byte
-	// filesystem: not a volume. The driver makes none; a stream can.
+	// filesystem: not a volume. The driver makes only memory images;
+	// a stream can.
 	filesystem bool
+	// For a filesystem that is an encryption root: its raw key, whether
+	// the kernel has it (LoadKey), and whether it is mounted.
+	fsKey       []byte
+	fsKeyLoaded bool
+	fsMounted   bool
 }
 
 type fakeSnapshot struct {
@@ -327,6 +336,27 @@ func (z *fakeZFS) Property(_ context.Context, name, key string) (string, error) 
 		}
 		if value, ok := dataset.props[key]; ok {
 			return value, nil
+		}
+		// What zfs reports of an encrypted filesystem, as zfs get does.
+		if dataset.filesystem {
+			switch key {
+			case propMounted:
+				if dataset.fsKey == nil {
+					return "-", nil
+				}
+				if dataset.fsMounted {
+					return "yes", nil
+				}
+				return "no", nil
+			case propKeyStatus:
+				if dataset.fsKey == nil {
+					return "-", nil
+				}
+				if dataset.fsKeyLoaded {
+					return "available", nil
+				}
+				return "unavailable", nil
+			}
 		}
 	}
 	return z.poolProps[key], nil
@@ -953,4 +983,98 @@ func (z *fakeZFS) liveRefs() []string {
 	}
 	sort.Strings(refs)
 	return refs
+}
+
+// The memory images' half of the fake pool: filesystems that are each
+// their own encryption root, as zfs has them.
+
+func (z *fakeZFS) CreateFilesystem(_ context.Context, name string, props map[string]string, key []byte) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	if err := z.record("createfs " + name); err != nil {
+		return err
+	}
+	parent := name[:strings.LastIndex(name, "/")]
+	if _, ok := z.datasets[parent]; !ok && parent != testPool && parent != "tank" {
+		return fmt.Errorf("cannot create '%s': parent '%s' does not exist", name, parent)
+	}
+	if _, exists := z.datasets[name]; exists {
+		return fmt.Errorf("cannot create '%s': dataset already exists", name)
+	}
+	if key != nil && len(key) != 32 {
+		return errors.New("Raw key too short (expected 32)")
+	}
+	// As zfs does: created mounted at its mountpoint, which it makes.
+	if props["mountpoint"] != "none" {
+		if err := os.MkdirAll(props["mountpoint"], 0o755); err != nil {
+			return err
+		}
+	}
+	z.datasets[name] = &fakeDataset{
+		props: maps.Clone(props), files: map[string][]byte{}, filesystem: true,
+		fsKey: bytes.Clone(key), fsKeyLoaded: key != nil, fsMounted: props["mountpoint"] != "none",
+	}
+	return nil
+}
+
+func (z *fakeZFS) Mount(_ context.Context, name string) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.fsCalls = append(z.fsCalls, "mount "+name)
+	dataset, ok := z.datasets[name]
+	if !ok || !dataset.filesystem {
+		return fmt.Errorf("cannot mount '%s': not a filesystem", name)
+	}
+	if dataset.fsMounted {
+		return fmt.Errorf("cannot mount '%s': filesystem already mounted", name)
+	}
+	if dataset.fsKey != nil && !dataset.fsKeyLoaded {
+		return fmt.Errorf("cannot mount '%s': encryption key not loaded", name)
+	}
+	dataset.fsMounted = true
+	return nil
+}
+
+func (z *fakeZFS) Unmount(_ context.Context, name string) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.fsCalls = append(z.fsCalls, "unmount "+name)
+	dataset, ok := z.datasets[name]
+	if !ok || !dataset.fsMounted {
+		return fmt.Errorf("cannot unmount '%s': not currently mounted", name)
+	}
+	dataset.fsMounted = false
+	return nil
+}
+
+func (z *fakeZFS) LoadKey(_ context.Context, name string, key []byte) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.fsCalls = append(z.fsCalls, "load-key "+name)
+	dataset, ok := z.datasets[name]
+	if !ok || dataset.fsKey == nil {
+		return fmt.Errorf("cannot load key for '%s': not an encryption root", name)
+	}
+	if !bytes.Equal(dataset.fsKey, key) {
+		return fmt.Errorf("Key load error: Incorrect key provided for '%s'", name)
+	}
+	if dataset.fsKeyLoaded {
+		return fmt.Errorf("Key load error: Key already loaded for '%s'", name)
+	}
+	dataset.fsKeyLoaded = true
+	return nil
+}
+
+func (z *fakeZFS) CheckKey(_ context.Context, name string, key []byte) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.fsCalls = append(z.fsCalls, "check-key "+name)
+	dataset, ok := z.datasets[name]
+	if !ok || dataset.fsKey == nil {
+		return fmt.Errorf("Key load error: '%s' is not encrypted", name)
+	}
+	if !bytes.Equal(dataset.fsKey, key) {
+		return fmt.Errorf("Key load error: Incorrect key provided for '%s'", name)
+	}
+	return nil
 }

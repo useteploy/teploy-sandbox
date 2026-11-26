@@ -111,8 +111,22 @@ func enterJail(args, env []string) error {
 		}
 		return nil
 	}
-	// Nothing mounted from here on reaches the host's namespace.
-	if err := step("make the mount tree private", syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, "")); err != nil {
+	// Nothing mounted from here on reaches the host's namespace. With a
+	// slave path the tree is instead made a slave of the host's mounts
+	// (MS_SLAVE): that too receives and never sends, and it is what lets
+	// what the host mounts below the slave path arrive in the jail. Every
+	// mount of the jail but the slave ones is made private again once the
+	// jail is entered, below; until then the host's tree is still this
+	// process's, and it is detached a few steps from now.
+	slaves := false
+	for _, each := range spec.Paths {
+		slaves = slaves || each.Slave
+	}
+	propagation := uintptr(syscall.MS_PRIVATE)
+	if slaves {
+		propagation = syscall.MS_SLAVE
+	}
+	if err := step("make the mount tree private", syscall.Mount("", "/", "", syscall.MS_REC|propagation, "")); err != nil {
 		return err
 	}
 	if err := step("mount the jail's root on "+spec.Root,
@@ -138,6 +152,24 @@ func enterJail(args, env []string) error {
 	}
 	if err := step("enter the jail's root", syscall.Chdir("/")); err != nil {
 		return err
+	}
+	if slaves {
+		// Only the slave paths keep receiving from the host. Everything
+		// else the jail holds is private again, so a mount under it (a
+		// library directory of a dynamically linked hypervisor, say)
+		// stays where it is. Not recursive: the slave binds hang below
+		// the root and the directories that lead to them.
+		for _, each := range spec.Paths {
+			if each.Slave || each.Kind == jailSymlink {
+				continue
+			}
+			if err := step("make "+each.Path+" private", syscall.Mount("", each.Path, "", syscall.MS_PRIVATE, "")); err != nil {
+				return err
+			}
+		}
+		if err := step("make the jail's root private", syscall.Mount("", "/", "", syscall.MS_PRIVATE, "")); err != nil {
+			return err
+		}
 	}
 	if err := step("make the jail's root read-only",
 		syscall.Mount("", "/", "", syscall.MS_REMOUNT|syscall.MS_BIND|syscall.MS_RDONLY|syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, "")); err != nil {

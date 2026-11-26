@@ -144,6 +144,12 @@ type Run struct {
 	// Access is the run's access state (access.go), on the copies Get and
 	// List hand out, and only when the daemon has access on.
 	Access *AccessView `json:"access,omitempty"`
+	// Memory is what a stopped run says of its memory image, and
+	// ResumedFrom how a run came back from its last stop (memory.go): on
+	// the copies Get and List hand out, and only when the driver keeps
+	// memory images.
+	Memory      *MemoryView `json:"memory,omitempty"`
+	ResumedFrom string      `json:"resumedFrom,omitempty"`
 
 	// leaseGen is the run's monotonic lease generation counter — it only
 	// grows, so credentials from any earlier lease stay dead forever.
@@ -213,6 +219,14 @@ type Run struct {
 	// that record may be in remote storage all the same (its answer
 	// lost, or the daemon died before noting it). Guarded by Manager.mu.
 	firstRecordTried bool
+
+	// memory is the run's memory image while it is stopped (memory.go):
+	// nil when none is kept, and memoryNote says why none is. resumedFrom
+	// is how the run came back from its last stop. All three guarded by
+	// Manager.mu, and replaced, never mutated.
+	memory      *MemoryImage
+	memoryNote  *memoryNote
+	resumedFrom string
 }
 
 // RunUsage is what a run has consumed so far.
@@ -340,6 +354,11 @@ type Manager struct {
 	// (DefaultTransfers when zero); with more than one, uploads take at
 	// most all but one of them. Set before the first one.
 	Transfers int
+	// MemoryImages is the driver's keeping of stopped runs' memory
+	// images (memory.go), for a driver that keeps them; nil otherwise,
+	// and then a stop and a resume are what they were before images
+	// existed. Set before the registry is loaded.
+	MemoryImages MemoryKeeper
 
 	mu   sync.Mutex
 	runs map[string]*Run
@@ -638,6 +657,9 @@ type bootRequest struct {
 	user string
 	// warm is the normalized warm request, nil for a run without a volume.
 	warm *WarmRequest
+	// memory is the stopped run's memory image, for a resume that has
+	// one (nil otherwise).
+	memory *MemoryImage
 }
 
 // bootResult is what a boot produced. It is filled in as far as the boot
@@ -649,6 +671,11 @@ type bootResult struct {
 	warm        *WarmState
 	cacheDir    string
 	cachePath   string
+	// resumedFrom is how a run with a memory image came back
+	// (ResumedFromMemory or ResumedFromDisk), and memoryNote why the
+	// image was not used when it was not.
+	resumedFrom string
+	memoryNote  string
 }
 
 // ContainerName is the name a run's container (or VM) is created under.
@@ -737,6 +764,23 @@ func (m *Manager) boot(ctx context.Context, b bootRequest) (res bootResult, left
 		spec.ProxyURL = proxyURL
 	}
 
+	if b.memory != nil && m.MemoryImages != nil {
+		// The image is tried, and the disk booted if it is not used
+		// (MemoryKeeper.ResumeMemory). Exactly what a create does is done
+		// around it: the fallback to root for an image without the
+		// sandbox user, and the proxy given back on a failure.
+		res.containerID, res.resumedFrom, res.memoryNote, err = m.MemoryImages.ResumeMemory(ctx, b.id, spec, b.memory)
+		if errors.Is(err, ErrNoSuchUser) && res.containerID == "" {
+			m.log.Warn("image has no sandbox user; running as root", "id", b.id, "image", b.image, "user", spec.User)
+			spec.User = RootUser
+			res.containerID, res.resumedFrom, res.memoryNote, err = m.MemoryImages.ResumeMemory(ctx, b.id, spec, b.memory)
+		}
+		res.user = spec.User
+		if err != nil {
+			m.closeEgress(b.id)
+		}
+		return res, res.containerID, err
+	}
 	containerID, err := m.runtime.Create(ctx, spec)
 	if errors.Is(err, ErrNoSuchUser) && containerID == "" {
 		// An image without the sandbox user — built before it existed, or a
@@ -836,6 +880,7 @@ func (m *Manager) viewLocked(run *Run) *Run {
 		usageViewLocked(run, &view.Usage)
 	}
 	m.accessViewLocked(run, &view)
+	m.memoryViewLocked(run, &view)
 	return &view
 }
 
@@ -1367,6 +1412,9 @@ func (m *Manager) Reap(ctx context.Context) int {
 			}
 		}
 	}
+	// A pool below its reserve loses memory images, the oldest stop
+	// first: a cache, and the first thing to go.
+	m.evictMemoryUnderPressure(ctx)
 	if m.Cache != nil {
 		m.Cache.Sweep(ctx)
 	}

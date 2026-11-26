@@ -102,6 +102,11 @@ type stateRun struct {
 	// FirstRecordTried never travels in the remote record.
 	FirstRecordTried bool         `json:"firstRecordTried,omitempty"`
 	AccessBytes      *accessBytes `json:"accessBytes,omitempty"`
+	// The run's memory image while stopped (memory.go): this host's own
+	// cache beside Snapshot, which it is paired with by its disk's guid.
+	// Additive, and never in a remote record; one that is not an image
+	// this daemon could have made is dropped from the record on load.
+	Memory *MemoryImage `json:"memory,omitempty"`
 }
 
 // LoadState points the manager at its durable registry in dir and loads
@@ -335,6 +340,13 @@ func (rec stateRun) stoppedRun(owns func(ref string) bool) (*Run, error) {
 	if rec.AccessBytes != nil {
 		bytesMoved = *rec.AccessBytes
 	}
+	// An image is a cache. A record's that is not one the daemon could
+	// have written is not trusted, and is not a reason to refuse the
+	// registry either: the run resumes from its disk.
+	memory := rec.Memory
+	if memory != nil && !validMemoryImage(*memory) {
+		memory = nil
+	}
 	return &Run{
 		ID:          rec.ID,
 		Image:       rec.Image,
@@ -367,6 +379,7 @@ func (rec stateRun) stoppedRun(owns func(ref string) bool) (*Run, error) {
 		accessMoved: rec.AccessMoved,
 		accessDirty: rec.AccessDirty,
 		accessBytes: bytesMoved,
+		memory:      memory,
 
 		firstRecordTried: rec.FirstRecordTried,
 	}, nil
@@ -417,6 +430,7 @@ func stoppedStateRun(run *Run) stateRun {
 		AccessMoved: run.accessMoved,
 		AccessDirty: run.accessDirty,
 		AccessBytes: moved,
+		Memory:      run.memory,
 
 		FirstRecordTried: run.firstRecordTried,
 	}

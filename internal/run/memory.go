@@ -1,6 +1,11 @@
 package run
 
-import "context"
+import (
+	"context"
+	"sort"
+	"strings"
+	"time"
+)
 
 // Memory images.
 //
@@ -16,12 +21,15 @@ import "context"
 // failed. Losing one costs speed, never data.
 //
 // The manager knows a driver through MemoryKeeper, and only when the
-// driver is keeping images (Manager.Memory); without one a stop and a
-// resume are what they always were.
+// driver is keeping images (Manager.MemoryImages); without one a stop
+// and a resume are what they always were. An image is this host's own:
+// its key is wrapped under this host's secret and it lives in this
+// host's pool, so it never travels in a remote record (remote.go), and a
+// run that comes back from another daemon resumes from its disk here.
 
-// How a run came back from a stop, as a resume answer's `resumedFrom`
-// says. Only a driver that keeps memory images reports it: without one
-// every resume boots from the disk, as it always did.
+// How a run came back from its last stop, as a running run's
+// `resumedFrom` says. Only a driver that keeps memory images reports
+// it: without one every resume boots from the disk, as it always did.
 const (
 	// ResumedFromMemory: the VM was restored from its saved memory.
 	ResumedFromMemory = "memory"
@@ -37,15 +45,15 @@ type MemoryImage struct {
 	// ID names the image; it is its dataset's name.
 	ID string `json:"id"`
 	// Key is the image's own key, wrapped under the host's secret: the
-	// base64 of a nonce and the ciphertext. A registry copied to another
-	// host holds keys that host's secret does not open, and its runs
-	// resume from their disks.
+	// base64 of a nonce and the ciphertext, bound to this run and image.
+	// A registry copied to another host holds keys that host's secret
+	// does not open, and its runs resume from their disks.
 	Key string `json:"key"`
 	// Disk is the guid of the ZFS snapshot the memory was saved with: an
 	// image is only ever restored with the disk it was saved beside.
 	Disk string `json:"disk"`
 	// DiskNode is the private device node the saved VM had its disk at,
-	// which its saved configuration names and the rewrite checks.
+	// which its saved configuration names and the driver's rewrite checks.
 	DiskNode string `json:"diskNode,omitempty"`
 	// MAC is the address of the network device the guest had, by which
 	// the handshake finds it and moves it to its new address.
@@ -64,16 +72,21 @@ type MemoryImage struct {
 	Kernel     string `json:"kernel,omitempty"`
 }
 
-// What a stopped run says of its memory image (`memory` on the run).
+// What a stopped run says of its memory image (`memory.state` on the
+// run), only when the driver keeps images.
 const (
 	// MemorySaved: there is an image, and the next resume on this host
 	// restores from it.
 	MemorySaved = "saved"
-	// MemoryFailed: the last stop saved none; the reason is in error.
+	// MemoryFailed: the last stop saved none; `memory.error` says why.
 	MemoryFailed = "failed"
-	// MemoryEvicted: there was one, and it was dropped to keep the pool's
-	// reserve; the reason is in error.
+	// MemoryEvicted: there was one, and it was dropped (the pool's
+	// reserve, or a resume that did not use it); `memory.error` says why.
 	MemoryEvicted = "evicted"
+	// MemoryNone: there is none and this daemon did not record why (the
+	// run was stopped by a daemon life that is gone, or before images
+	// were on).
+	MemoryNone = "none"
 )
 
 // MemoryView is a stopped run's memory image as the API shows it.
@@ -85,11 +98,19 @@ type MemoryView struct {
 	Error string `json:"error,omitempty"`
 }
 
-// memoryNote is why a stopped run has no memory image. Guarded by
-// Manager.mu.
+// memoryNote is why a stopped run has no memory image. Never persisted:
+// a daemon's next life finds none and says so (MemoryNone). Guarded by
+// Manager.mu, and replaced, never mutated.
 type memoryNote struct {
 	State  string `json:"state"`
 	Reason string `json:"reason"`
+}
+
+func (n *memoryNote) reason() string {
+	if n == nil {
+		return ""
+	}
+	return n.Reason
 }
 
 // MemoryKeeper is implemented by a driver that keeps stopped runs'
@@ -105,22 +126,22 @@ type MemoryKeeper interface {
 	// image that could not be saved is no error: image is nil and note
 	// says why, and the stop goes on as it did before images existed.
 	SaveMemory(ctx context.Context, runID, containerID, snapshotRef string) (image *MemoryImage, note string, err error)
-	// ResumeMemory is Create for a stopped run whose record names a
-	// memory image. It tries the image first and falls back to booting
-	// spec.Image on any failure; from is ResumedFromMemory or
-	// ResumedFromDisk, and note says why the image was not used when it
-	// was not. A non-empty containerID with an error means something of
-	// that name could not be cleaned up.
-	ResumeMemory(ctx context.Context, spec CreateSpec, image *MemoryImage) (containerID, from, note string, err error)
+	// ResumeMemory is Create for the stopped run runID whose record
+	// names a memory image. It tries the image first and falls back to
+	// booting spec.Image on any failure, on a fresh clone; from is
+	// ResumedFromMemory or ResumedFromDisk, and note says why the image
+	// was not used when it was not. A non-empty containerID with an
+	// error means something of that name could not be cleaned up.
+	ResumeMemory(ctx context.Context, runID string, spec CreateSpec, image *MemoryImage) (containerID, from, note string, err error)
 	// ReleaseMemory says the run's record no longer names its image:
 	// the run resumed, was destroyed, or the image is being dropped. An
-	// image a restored VM still maps lives until that VM is gone.
+	// image a VM still may hold lives until that VM is gone.
 	ReleaseMemory(ctx context.Context, image *MemoryImage) error
-	// RetainMemory is called once the registry is loaded: every image of
-	// this daemon that no stopped run names is destroyed, and every
-	// image a run names that is not on this host is reported, so the
-	// record can stop claiming it. Also retries what could not be
-	// destroyed before.
+	// RetainMemory is called once the registry is loaded, before any run
+	// is served: every image of this daemon that no stopped run names is
+	// destroyed, and every image a run names that is not on this host is
+	// reported, so the record can stop claiming it. Also retries what
+	// could not be destroyed before.
 	RetainMemory(ctx context.Context, images []*MemoryImage) (missing []string, err error)
 	// MemoryShortOf reports whether the pool has less than need bytes
 	// plus its reserve free. An image is not saved into a short pool,
@@ -129,4 +150,258 @@ type MemoryKeeper interface {
 	// MemoryNeedsBytes is the most an image of a guest of memoryMB may
 	// take on the pool.
 	MemoryNeedsBytes(memoryMB int) int64
+}
+
+// memoryReleaseTimeout bounds letting one image go.
+const memoryReleaseTimeout = 30 * time.Second
+
+// memoryIDShape: an image's id is a lower-cased ULID.
+func memoryID(id string) bool {
+	if len(id) != 26 || id[0] != '0' {
+		return false
+	}
+	for _, c := range id {
+		if !strings.ContainsRune("0123456789abcdefghjkmnpqrstvwxyz", c) {
+			return false
+		}
+	}
+	return true
+}
+
+// validMemoryImage is whether a record's memory image is one the daemon
+// could have written. One that is not is dropped from the record (it is
+// a cache, and must not hold the registry hostage), never trusted: the
+// driver checks everything in it again before a VM is restored.
+func validMemoryImage(image MemoryImage) bool {
+	return memoryID(image.ID) && image.Key != "" && len(image.Key) <= 512 && image.Class != "" && len(image.Class) <= 128 &&
+		image.Disk != "" && image.MemoryMB > 0 && image.CPUs > 0 && image.CPUs <= 4096
+}
+
+// memoryViewLocked fills what a run says of its memory image. Only for
+// a driver that keeps them, and only for a stopped run: a running one
+// has none, and says how it came back. Caller holds Manager.mu.
+func (m *Manager) memoryViewLocked(run *Run, view *Run) {
+	if m.MemoryImages == nil {
+		return
+	}
+	view.ResumedFrom = run.resumedFrom
+	switch {
+	case run.State != StateStopped:
+	case run.memory != nil:
+		view.Memory = &MemoryView{State: MemorySaved, Image: run.memory.ID}
+	case run.memoryNote != nil:
+		view.Memory = &MemoryView{State: run.memoryNote.State, Error: run.memoryNote.Reason}
+	default:
+		view.Memory = &MemoryView{State: MemoryNone}
+	}
+}
+
+// captureWithMemory is capture (a fresh snapshot ref and the runtime's
+// Snapshot) for a driver that may also save the VM's memory beside the
+// disk snapshot. Room is made for the image first; an image that could
+// not be saved is no error: note says why, for the run to carry while
+// it is stopped. On an error the disk snapshot is the one that failed
+// and nothing of the image is left behind.
+func (m *Manager) captureWithMemory(ctx context.Context, current *Run) (ref string, image *MemoryImage, note *memoryNote, err error) {
+	ref = m.newSnapshotRef()
+	keeper := m.MemoryImages
+	if keeper == nil {
+		return ref, nil, nil, m.runtime.Snapshot(ctx, current.ContainerID, current.CachePath, ref)
+	}
+	if err := m.makeMemoryRoom(ctx, keeper.MemoryNeedsBytes(current.limits.MemoryMB)); err != nil {
+		// The driver asks the pool itself before it saves, and saves
+		// nothing into a pool it cannot read.
+		m.log.Error("the pool's space could not be read before a memory image was saved", "id", current.ID, "error", err)
+	}
+	var why string
+	image, why, err = keeper.SaveMemory(ctx, current.ID, current.ContainerID, ref)
+	if err == nil && image == nil && why != "" {
+		note = &memoryNote{State: MemoryFailed, Reason: why}
+	}
+	return ref, image, note, err
+}
+
+// releaseMemory says the registry no longer names a stopped run's
+// memory image. Nothing to do without one, or without a driver that
+// keeps them. Under a deadline of its own: an image no record names must
+// go, whatever deadline the caller is under.
+func (m *Manager) releaseMemory(image *MemoryImage) {
+	if image == nil || m.MemoryImages == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), memoryReleaseTimeout)
+	defer cancel()
+	if err := m.MemoryImages.ReleaseMemory(ctx, image); err != nil {
+		m.log.Error("a memory image could not be released; it is tried again when the registry is next loaded", "image", image.ID, "error", err)
+	}
+}
+
+// memorySpent ends a stopped run's claim on its memory image once a
+// resume tried it: whichever way the resume went, the image is released
+// (a VM restored from it keeps it until it is gone), so the record no
+// longer names it. A resume that is still stopped afterwards says why
+// its resume did not use it.
+func (m *Manager) memorySpent(id string, image *MemoryImage, note string) {
+	if image == nil || m.MemoryImages == nil {
+		return
+	}
+	m.releaseMemory(image)
+	m.mu.Lock()
+	live, ok := m.runs[id]
+	if !ok || live.State != StateStopped || live.memory != image {
+		m.mu.Unlock()
+		return
+	}
+	live.memory = nil
+	if note != "" {
+		live.memoryNote = &memoryNote{State: MemoryEvicted, Reason: note}
+	}
+	// Before the write, which takes the lock itself.
+	m.mu.Unlock()
+	m.persist()
+}
+
+// makeMemoryRoom drops memory images, the oldest stop first, until the
+// pool has need bytes plus its reserve free: an image is kept while the
+// pool has room, and never at the cost of a new one.
+func (m *Manager) makeMemoryRoom(ctx context.Context, need int64) error {
+	for {
+		short, err := m.MemoryImages.MemoryShortOf(ctx, need)
+		if err != nil || !short {
+			return err
+		}
+		if !m.evictOldestMemory(ctx, MemoryEvicted, "the pool is below its reserve") {
+			return nil
+		}
+	}
+}
+
+// evictMemoryUnderPressure drops memory images, the oldest stop first,
+// while the pool is below its reserve. Images go from a pool under
+// pressure before any local copy of a disk snapshot does.
+func (m *Manager) evictMemoryUnderPressure(ctx context.Context) {
+	if m.MemoryImages == nil {
+		return
+	}
+	for {
+		if !m.hasMemoryImages() {
+			return
+		}
+		short, err := m.MemoryImages.MemoryShortOf(ctx, 0)
+		if err != nil || !short {
+			return
+		}
+		if !m.evictOldestMemory(ctx, MemoryEvicted, "the pool is below its reserve") {
+			return
+		}
+	}
+}
+
+func (m *Manager) hasMemoryImages() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, live := range m.runs {
+		if live.State == StateStopped && live.memory != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// evictOldestMemory drops the memory image of the stopped run that was
+// stopped longest ago, if any: under that run's exclusivity, so that a
+// resume under way is never racing it. It reports whether one went.
+func (m *Manager) evictOldestMemory(ctx context.Context, state, why string) bool {
+	m.mu.Lock()
+	var oldestID string
+	var oldest *Run
+	for id, live := range m.runs {
+		if live.State != StateStopped || live.memory == nil || live.exclusive || live.removing {
+			continue
+		}
+		if oldest == nil || live.StoppedAt.Before(*oldest.StoppedAt) {
+			copied := *live
+			oldest, oldestID = &copied, id
+		}
+	}
+	m.mu.Unlock()
+	if oldest == nil {
+		return false
+	}
+	current, release, err := m.beginStopped(oldestID)
+	if err != nil {
+		return false
+	}
+	defer release()
+	if current.memory == nil || current.memory != oldest.memory {
+		// Dropped, or taken by a resume, since.
+		return false
+	}
+	m.dropMemory(current.ID, current.memory, &memoryNote{State: state, Reason: why})
+	return true
+}
+
+// dropMemory takes a stopped run's memory image from its record and
+// releases it. The caller holds the run's exclusivity.
+func (m *Manager) dropMemory(id string, image *MemoryImage, note *memoryNote) {
+	m.mu.Lock()
+	live, ok := m.runs[id]
+	if !ok || live.memory != image {
+		m.mu.Unlock()
+		return
+	}
+	live.memory, live.memoryNote = nil, note
+	m.mu.Unlock()
+	m.releaseMemory(image)
+	m.persist()
+	m.log.Info("memory image dropped", "id", id, "image", image.ID, "why", note.Reason)
+}
+
+// ReconcileMemoryImages is called once the registry is loaded and
+// before any run is served: the images the registry names are kept and
+// the rest go (MemoryKeeper.RetainMemory), and a run whose image is not
+// on this host stops claiming it. It reports how many stopped runs keep
+// one. Without a driver that keeps images it does nothing.
+func (m *Manager) ReconcileMemoryImages(ctx context.Context) (kept int, err error) {
+	keeper := m.MemoryImages
+	if keeper == nil {
+		return 0, nil
+	}
+	m.mu.Lock()
+	var named []*MemoryImage
+	for _, live := range m.runs {
+		if live.State == StateStopped && live.memory != nil {
+			named = append(named, live.memory)
+		}
+	}
+	m.mu.Unlock()
+	missing, err := keeper.RetainMemory(ctx, named)
+	if err != nil {
+		m.log.Error("memory images could not be reconciled with the registry; what could not be removed is tried again when the registry is next loaded", "error", err)
+	}
+	sort.Strings(missing)
+	m.mu.Lock()
+	var dropped []*Run
+	for _, live := range m.runs {
+		if live.State == StateStopped && live.memory != nil {
+			if i := sort.SearchStrings(missing, live.memory.ID); i < len(missing) && missing[i] == live.memory.ID {
+				copied := *live
+				dropped = append(dropped, &copied)
+			}
+		}
+	}
+	kept = len(named) - len(dropped)
+	m.mu.Unlock()
+	for _, current := range dropped {
+		stopped, release, err := m.beginStopped(current.ID)
+		if err != nil {
+			continue
+		}
+		m.dropMemory(current.ID, stopped.memory, &memoryNote{State: MemoryEvicted, Reason: "the image is not on this host"})
+		release()
+	}
+	if len(dropped) > 0 {
+		m.persist()
+	}
+	return kept, err
 }

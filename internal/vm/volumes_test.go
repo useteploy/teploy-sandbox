@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 var bg = context.Background()
@@ -734,4 +735,45 @@ func TestCaptureRollsBackAStepThatFailedAfterTakingEffect(t *testing.T) {
 			t.Errorf("%s: run volume origin changed to %q", step, fake.originOf(volume))
 		}
 	}
+}
+
+// A capture's quiesce can be long: with memory images the hypervisor
+// writes all of guest RAM while the VM is paused. It runs before the
+// pool's lock is taken, so that another run's volume can be made, or
+// removed, meanwhile; only the snapshot itself is under the lock.
+func TestACapturesQuiesceDoesNotHoldThePool(t *testing.T) {
+	z := newFakeZFS()
+	v := newTestVolumes(z)
+	if _, err := v.CreateRun(bg, runName(1), ""); err != nil {
+		t.Fatal(err)
+	}
+	ref := v.NewRef(refID(1))
+	inQuiesce, release := make(chan struct{}), make(chan struct{})
+	captured := make(chan error, 1)
+	go func() {
+		captured <- v.Capture(bg, runName(1), ref, func() (func() error, error) {
+			close(inQuiesce)
+			<-release
+			return func() error { return nil }, nil
+		})
+	}()
+	<-inQuiesce
+	// Another run's volume comes and goes while the first is held still.
+	done := make(chan error, 1)
+	go func() {
+		_, err := v.CreateRun(bg, runName(2), "")
+		if err == nil {
+			err = v.RemoveRun(bg, runName(2))
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		must(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("another run's volume waited for a capture's quiesce: the pool's lock is held while the VM is quiesced")
+	}
+	close(release)
+	must(t, <-captured)
+	assertPool(t, z, testPool+"/golden", testGolden, testPool+"/"+runName(1), datasetOf(ref), ref)
 }

@@ -236,6 +236,13 @@ const (
 // before the snapshot is taken and returns the function that undoes it;
 // the run is only held still for the snapshot itself.
 //
+// quiesce runs before the pool's lock is taken, and what it returns
+// after the snapshot is taken with it held: a quiesce can be long (a
+// stop that also saves the VM's memory has the hypervisor write all of
+// guest RAM while the VM is paused), and every other volume operation
+// of the driver takes that lock. The caller admits one capture of a run
+// at a time, so nothing else touches this volume meanwhile.
+//
 // Once the run has been quiesced the capture no longer follows the
 // caller's context: it is a handful of short commands, and a caller that
 // leaves between two of them would otherwise strand a snapshot on the
@@ -244,8 +251,6 @@ func (v *Volumes) Capture(ctx context.Context, name, ref string, quiesce func() 
 	if !v.OwnsRef(ref) {
 		return fmt.Errorf("refusing to capture into %q: not a reference minted by this driver", ref)
 	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
 	volume := v.runVolume(name)
 	holder := datasetOf(ref)
 	// The snapshot is taken on the run's volume under the name it will
@@ -256,6 +261,8 @@ func (v *Volumes) Capture(ctx context.Context, name, ref string, quiesce func() 
 	if err != nil {
 		return err
 	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), captureTimeout)
 	defer cancel()
 	// The device flush is what makes "the bytes at this instant" true: the

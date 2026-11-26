@@ -378,9 +378,14 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 	live.StoppedAt = nil
 	live.RetainUntil = nil
 	live.runningSince = now
-	// A running run has no memory image; it says how it came back.
+	// A running run has no memory image; it says how it came back. A
+	// daemon that keeps images says it of every resume, and one that had
+	// no image for this run booted it from its disk like any other.
 	live.memory, live.memoryNote = nil, nil
 	live.resumedFrom = res.resumedFrom
+	if live.resumedFrom == "" && m.MemoryImages != nil {
+		live.resumedFrom = ResumedFromDisk
+	}
 	// The new container was created from the stop snapshot, so the ref
 	// moves from "this run's filesystem" to "an image this run holds".
 	live.snapshot = ""

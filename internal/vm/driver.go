@@ -89,6 +89,9 @@ type Driver struct {
 	// reservePercent is the share of the pool kept free: an image is
 	// not saved into a pool below it, and images go from one.
 	reservePercent int
+	// restoreReady is how long a restored guest's agent has to answer
+	// once its VM runs; 0 is restoreReadyTimeout.
+	restoreReady time.Duration
 }
 
 // bootBackoff is a snapshot whose last boots failed.

@@ -50,6 +50,15 @@ const (
 	restoreReadyTimeout = 30 * time.Second
 )
 
+// restoreTimeout is how long a restored guest's agent has to answer
+// (restoreReadyTimeout, unless a test says otherwise).
+func (d *Driver) restoreTimeout() time.Duration {
+	if d.restoreReady > 0 {
+		return d.restoreReady
+	}
+	return restoreReadyTimeout
+}
+
 // snapshotTimeout bounds the hypervisor's memory snapshot of a guest of
 // memoryMB MiB. It writes the whole of guest RAM (measured, M0: 2.5 to
 // 5 s per 512 MiB, 4 to 9 s encrypted), so it grows with the guest,
@@ -111,6 +120,14 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 		}
 	}
 
+	if !alive {
+		// Nothing is asked of a VM that is not there, as for every capture
+		// of a VM that is gone: its disk is captured as it is.
+		err := d.volumes.Capture(ctx, containerID, snapshotRef, func() (func() error, error) {
+			return func() error { return nil }, nil
+		})
+		return nil, note, err
+	}
 	syncCtx, cancelSync := context.WithTimeout(ctx, syncTimeout)
 	err := current.machine.Agent().Sync(syncCtx)
 	cancelSync()
@@ -252,13 +269,15 @@ func (d *Driver) RetainMemory(ctx context.Context, images []*run.MemoryImage) ([
 // a resume without an image boots it, and the note says why the image
 // was not used.
 func (d *Driver) ResumeMemory(ctx context.Context, runID string, spec run.CreateSpec, image *run.MemoryImage) (string, string, string, error) {
+	// Refused before anything is allocated or the image is reached: the
+	// run's record keeps its image for a resume this daemon can serve.
 	proxyPort, err := d.checkCreate(spec)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", fmt.Errorf("%w: %w", run.ErrMemoryNotTried, err)
 	}
 	admitted, err := d.admit(spec.Name)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", fmt.Errorf("%w: %w", run.ErrMemoryNotTried, err)
 	}
 	defer admitted()
 
@@ -266,15 +285,15 @@ func (d *Driver) ResumeMemory(ctx context.Context, runID string, spec run.Create
 	cpus, memoryMB := vcpus(spec.CPUs), spec.MemoryMB
 	machine, guestNet, restoreErr := d.restore(ctx, runID, spec, image, proxyPort)
 	if restoreErr == nil {
-		d.track(spec.Name, &instance{machine: machine, env: createEnv(spec, proxyPort), network: spec.Name, mac: guestNet.MAC, cpus: cpus, memoryMB: memoryMB})
-		d.noteBoot(spec.Image, true, 0, time.Now())
+		d.track(spec.Name, &instance{machine: machine, env: createEnv(spec, proxyPort), network: spec.Name, mac: macOf(guestNet), cpus: cpus, memoryMB: memoryMB})
 		d.log.Info("vm restored from its memory image", "name", spec.Name, "run", runID, "image", image.ID, "memory", time.Since(began).String())
 		return spec.Name, run.ResumedFromMemory, "", nil
 	}
 
 	// The image is not used. What it started is given back, and the disk
-	// is booted on a fresh clone. A restore that did not work is not a
-	// boot: it is not charged to the snapshot's failed boots.
+	// is booted on a fresh clone. A restore is not a boot of the disk,
+	// and neither clears nor is charged to the snapshot's failed boots:
+	// it read nothing from the disk.
 	note := "resumed from the disk: " + restoreErr.Error()
 	d.log.Warn("vm memory image not used; booting from the disk", "name", spec.Name, "run", runID, "image", image.ID, "error", restoreErr)
 	// Rollbacks run under a deadline of their own, as a create's do.
@@ -413,7 +432,7 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 	if err = result.Resume(ctx); err != nil {
 		return result, network, fmt.Errorf("resume: %w", err)
 	}
-	if err = d.waitAgent(ctx, result, restoreReadyTimeout); err != nil {
+	if err = d.waitAgent(ctx, result, d.restoreTimeout()); err != nil {
 		return result, network, fmt.Errorf("the restored guest's agent: %w", err)
 	}
 	if err = d.restoreClock(ctx, result); err != nil {
@@ -435,4 +454,12 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 func (d *Driver) poolName() string {
 	pool, _, _ := strings.Cut(d.volumes.root, "/")
 	return pool
+}
+
+// macOf is the address of a VM's network device, "" without one.
+func macOf(network *GuestNetwork) string {
+	if network == nil {
+		return ""
+	}
+	return network.MAC
 }

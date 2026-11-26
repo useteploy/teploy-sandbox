@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 	"time"
@@ -132,6 +133,10 @@ type MemoryKeeper interface {
 	// ResumedFromMemory or ResumedFromDisk, and note says why the image
 	// was not used when it was not. A non-empty containerID with an
 	// error means something of that name could not be cleaned up.
+	// An error that wraps ErrMemoryNotTried is one the run met before
+	// its image was reached (a create this daemon refuses): the record
+	// keeps the image for the next resume. Any other leaves the image
+	// released (ReleaseMemory).
 	ResumeMemory(ctx context.Context, runID string, spec CreateSpec, image *MemoryImage) (containerID, from, note string, err error)
 	// ReleaseMemory says the run's record no longer names its image:
 	// the run resumed, was destroyed, or the image is being dropped. An
@@ -151,6 +156,12 @@ type MemoryKeeper interface {
 	// take on the pool.
 	MemoryNeedsBytes(memoryMB int) int64
 }
+
+// ErrMemoryNotTried is wrapped by the error of a resume that was refused
+// before it reached the run's memory image, as a create is refused
+// before anything is allocated: at capacity, or for a request this
+// daemon cannot serve. The image is as it was, and the record keeps it.
+var ErrMemoryNotTried = errors.New("the run's memory image was not tried")
 
 // memoryReleaseTimeout bounds letting one image go.
 const memoryReleaseTimeout = 30 * time.Second

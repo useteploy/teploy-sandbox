@@ -103,10 +103,10 @@ type Machine interface {
 	// Inbox is the directory a VM restored from a memory image reads it
 	// from, as its jail names it; "" for a booted VM.
 	Inbox() string
-	// MapsFile reports whether the hypervisor process has the whole of
-	// the file at the host path mapped from the file, copy-on-write
-	// (a shared, private file mapping): what a copy-on-write restore
-	// leaves and a restore that copied the memory does not.
+	// MapsFile reports whether the hypervisor process maps the whole of
+	// the file at the host path from the file (a private file mapping,
+	// MAP_PRIVATE): what a copy-on-write restore leaves, and a restore
+	// that copied the memory does not.
 	MapsFile(hostPath string) bool
 	// HasMount reports whether path is a mount point in the
 	// hypervisor's mount namespace.
@@ -676,9 +676,11 @@ func (m *chMachine) waitAPI(ctx context.Context) error {
 }
 
 // MapsFile reports whether the hypervisor's process maps the file at
-// hostPath copy-on-write, over its whole length: found by device and
-// inode, so that it holds however the kernel spells the path inside the
-// jail. A restore that copied the memory leaves no such mapping.
+// hostPath over its whole length: found by device and inode, so that it
+// holds however the kernel spells the path inside the jail. A
+// copy-on-write restore maps the memory file, privately (MAP_PRIVATE:
+// guest writes never reach the file), where a restore that copied the
+// memory read the file and maps nothing of it.
 func (m *chMachine) MapsFile(hostPath string) bool {
 	info, err := os.Stat(hostPath)
 	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
@@ -693,16 +695,20 @@ func (m *chMachine) MapsFile(hostPath string) bool {
 		return false
 	}
 	wantDev := fmt.Sprintf("%02x:%02x", deviceMajor(uint64(stat.Dev)), deviceMinor(uint64(stat.Dev)))
+	return mapsFile(raw, wantDev, strconv.FormatUint(uint64(stat.Ino), 10), info.Size())
+}
+
+// mapsFile says whether maps, a /proc/PID/maps, maps the file with the
+// device number dev (as the file spells it, "mm:nm") and the inode ino
+// over at least size bytes, summed over its mappings of that file. A
+// mapping the process can only read is not one: the hypervisor maps the
+// guest's memory to write it (copy-on-write).
+func mapsFile(maps []byte, dev, ino string, size int64) bool {
 	var mapped int64
-	for _, line := range strings.Split(string(raw), "\n") {
+	for line := range strings.SplitSeq(string(maps), "\n") {
 		fields := strings.Fields(line)
-		// addr perms offset dev inode pathname
-		if len(fields) < 5 || fields[3] != wantDev || fields[4] != strconv.FormatUint(uint64(stat.Ino), 10) {
-			continue
-		}
-		if !strings.Contains(fields[1], "s") {
-			// Not a shared file mapping: a private copy of the file's
-			// pages is not the image.
+		// addr perms offset dev inode [pathname]
+		if len(fields) < 5 || fields[3] != dev || fields[4] != ino || !strings.Contains(fields[1], "w") {
 			continue
 		}
 		start, end, ok := strings.Cut(fields[0], "-")
@@ -717,9 +723,11 @@ func (m *chMachine) MapsFile(hostPath string) bool {
 		if err != nil {
 			continue
 		}
-		mapped += to - from
+		if to > from {
+			mapped += to - from
+		}
 	}
-	return mapped >= info.Size()
+	return mapped >= size
 }
 
 // deviceMajor and deviceMinor are a device number's parts, as

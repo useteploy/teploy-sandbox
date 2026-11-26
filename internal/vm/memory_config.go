@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 )
 
@@ -175,6 +176,10 @@ type chConsole struct {
 type chDebugConsole struct {
 	File *string `json:"file,omitempty"`
 	Mode string  `json:"mode"`
+	// IOBase is the port the device would answer on: x86_64 only, where
+	// the hypervisor's default configuration names its own default port
+	// even with the device off.
+	IOBase *uint16 `json:"iobase,omitempty"`
 }
 
 type chVsock struct {
@@ -211,19 +216,27 @@ type chConfig struct {
 // What the daemon configures, as Cloud Hypervisor v54.1 fills it in from
 // the daemon's command line and its vm.add-net.
 const (
-	chMaxPhysBits     = 46
-	chDiskQueues      = 1
-	chDiskQueueSize   = 128
-	chNetQueues       = 2
-	chNetQueueSize    = 256
-	chImageRaw        = "Raw"
-	chVhostClient     = "Client"
-	chCoreScheduling  = "Vm"
-	chCPUProfileHost  = "Host"
-	chHotplugAcpi     = "Acpi"
-	chLockGranularity = "Full"
-	chConsoleOff      = "Off"
-	chConsoleTty      = "Tty"
+	chMaxPhysBits    = 46
+	chDiskQueues     = 1
+	chDiskQueueSize  = 128
+	chNetQueues      = 2
+	chNetQueueSize   = 256
+	chImageRaw       = "Raw"
+	chVhostClient    = "Client"
+	chCoreScheduling = "Vm"
+	chCPUProfileHost = "Host"
+	chHotplugAcpi    = "Acpi"
+	chConsoleOff     = "Off"
+	chConsoleTty     = "Tty"
+	// chDebugConsolePort is the hypervisor's default port for its debug
+	// console (0xe9), which its configuration names with the console off.
+	chDebugConsolePort = 0xe9
+	// How the hypervisor can lock a disk image: the choice its command
+	// line leaves by default (ByteRange), and the other it offers. The
+	// daemon sets neither: they are how the hypervisor keeps other
+	// hypervisors off the same image, and mean nothing to the guest.
+	chLockByteRange = "ByteRange"
+	chLockFull      = "Full"
 )
 
 // rewriteMemoryConfig reads an image's config.json and returns the
@@ -240,8 +253,10 @@ func rewriteMemoryConfig(raw []byte, want memoryConfigWant) ([]byte, error) {
 	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("the saved configuration is not one this daemon could have written: %w", err)
 	}
-	if decoder.More() {
-		return nil, errors.New("the saved configuration holds more than one document")
+	// Nothing may follow: not a second document, and not what More would
+	// not call one (a closing bracket, which CH's own reader stops at).
+	if _, err := decoder.Token(); err != io.EOF {
+		return nil, errors.New("the saved configuration holds more than one document, or more than a document")
 	}
 	if err := config.check(want); err != nil {
 		return nil, err
@@ -296,7 +311,7 @@ func (c chConfig) check(want memoryConfigWant) error {
 	if disk.Path == nil || *disk.Path != want.savedDisk || disk.Readonly || !disk.Direct || disk.NumQueues != chDiskQueues || disk.QueueSize != chDiskQueueSize ||
 		disk.VhostUser || disk.VhostSocket != nil || disk.RateLimitGroup != nil || disk.RateLimiter != nil || disk.DisableIoUring || disk.DisableAIO ||
 		disk.Serial != nil || disk.QueueAffinity != nil || disk.BackingFiles || !disk.Sparse || disk.ImageType != chImageRaw ||
-		disk.LockGranularity != chLockGranularity || disk.GuestBlockSize != nil {
+		(disk.LockGranularity != chLockByteRange && disk.LockGranularity != chLockFull) || disk.GuestBlockSize != nil {
 		return errors.New("the saved VM's disk is not the raw, direct, writable disk this daemon gives every VM")
 	}
 	if err := disk.plain(""); err != nil {
@@ -340,38 +355,39 @@ func (c chConfig) check(want memoryConfigWant) error {
 	if err := c.Console.plain(""); err != nil {
 		return err
 	}
-	if c.DebugConsole != nil && (c.DebugConsole.Mode != chConsoleOff || c.DebugConsole.File != nil) {
-		return errors.New("the saved VM has a debug console")
+	// The debug console is x86_64's: there the hypervisor's configuration
+	// has it, off and on its default port. Any other debug console is a
+	// device the daemon gives no VM, and one that would be made before
+	// the hypervisor's sandbox is applied to it.
+	if c.DebugConsole != nil && (c.DebugConsole.Mode != chConsoleOff || c.DebugConsole.File != nil ||
+		(c.DebugConsole.IOBase != nil && *c.DebugConsole.IOBase != chDebugConsolePort)) {
+		return errors.New("the saved VM has a debug console, and this daemon gives every VM none")
 	}
 	if c.Pvpanic || c.Watchdog || !c.LandlockEnable || len(c.LandlockRules) != 1 || c.LandlockRules[0].Access != "rw" {
 		return errors.New("the saved VM's hypervisor was not run with the sandbox this daemon gives every hypervisor")
 	}
-	savedDir, err := savedVMDir(c.Vsock.Socket, c.LandlockRules[0].Path, want.runtimeRoot)
-	if err != nil {
+	if err := savedVMDir(c.Vsock.Socket, c.LandlockRules[0].Path, want.runtimeRoot); err != nil {
 		return err
 	}
-	if err := c.Vsock.plain(""); err != nil {
-		return err
-	}
-	_ = savedDir
-	return nil
+	return c.Vsock.plain("")
 }
 
 // savedVMDir checks that the saved vsock socket and the saved Landlock
-// rule are those of one VM of this daemon's runtime dir, and returns
-// that VM's directory.
-func savedVMDir(vsockSocket, landlockPath, runtimeRoot string) (string, error) {
+// rule are those of one VM of this daemon's runtime directory: the
+// restoring hypervisor would otherwise be pointed at a socket, or given
+// a rule, that is anything's.
+func savedVMDir(vsockSocket, landlockPath, runtimeRoot string) error {
 	if !filepath.IsAbs(vsockSocket) || filepath.Clean(vsockSocket) != vsockSocket || filepath.Base(vsockSocket) != vsockSocketName {
-		return "", fmt.Errorf("the saved VM's vsock socket %q is not a VM's", vsockSocket)
+		return fmt.Errorf("the saved VM's vsock socket %q is not a VM's", vsockSocket)
 	}
 	dir := filepath.Dir(vsockSocket)
-	if filepath.Dir(dir) != runtimeRoot || !runNameShape.MatchString(filepath.Base(dir)) {
-		return "", fmt.Errorf("the saved VM's vsock socket %q is not under this daemon's runtime directory", vsockSocket)
+	if filepath.Dir(dir) != filepath.Clean(runtimeRoot) || !runNameShape.MatchString(filepath.Base(dir)) {
+		return fmt.Errorf("the saved VM's vsock socket %q is not under this daemon's runtime directory", vsockSocket)
 	}
 	if landlockPath != filepath.Join(dir, outboxName) {
-		return "", fmt.Errorf("the saved VM's Landlock rule names %q, not its own outbox", landlockPath)
+		return fmt.Errorf("the saved VM's Landlock rule names %q, not its own outbox", landlockPath)
 	}
-	return dir, nil
+	return nil
 }
 
 func ptr[T any](value T) *T { return &value }

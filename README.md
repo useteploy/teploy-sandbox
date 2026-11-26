@@ -13,15 +13,23 @@ teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/s
 ## Releases
 
 Push a `vMAJOR.MINOR.PATCH` tag (an optional `-prerelease` is allowed).
-[`.github/workflows/release.yml`](.github/workflows/release.yml) runs the
-unit tests, then builds a statically linked binary for linux amd64 and
-arm64 with the version set to the tag without its `v` (`teploy-sandbox
-version` and `GET /health` report it), and publishes
-`teploy-sandbox_linux_amd64`, `teploy-sandbox_linux_arm64` and
-`checksums.txt` (`sha256sum` format) on a GitHub release. Check a download
-against it with `sha256sum -c --ignore-missing checksums.txt`. The teploy
-CLI's `teploy sandbox host` installs one of these releases by version and
-refuses it when the checksum does not match.
+[`.github/workflows/release.yml`](.github/workflows/release.yml) runs all of
+[`ci.yml`](.github/workflows/ci.yml) on the tagged commit and waits for it, so
+a tag cannot publish while a test fails. It then runs the unit tests again,
+builds a statically linked binary for linux amd64 and arm64 with Go 1.26.11
+(exactly: the workflow's pin and `go.mod`'s `toolchain` line) and the version
+set to the tag without its `v` (`teploy-sandbox version` and `GET /health`
+report it), and publishes `teploy-sandbox_linux_amd64`,
+`teploy-sandbox_linux_arm64` and `checksums.txt` (`sha256sum` format) on a
+GitHub release. Check a download against it with `sha256sum -c --ignore-missing
+checksums.txt`. The teploy CLI's `teploy sandbox host` installs one of these
+releases by version and refuses it when the checksum does not match.
+
+The build runs in a job whose token can only read. A second job, the only one
+that can write, takes the three files it uploaded, checks them against
+`checksums.txt`, and creates the release: no test and no build step runs with
+a token that can publish. Every action, in both workflows, is pinned to a
+commit.
 
 ## API (bearer token on everything except /health)
 

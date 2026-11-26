@@ -4469,18 +4469,19 @@ covered only through `SyncRemote`.
 There were no release binaries: the only workflow was `ci.yml`, and
 anything that installed the daemon built it from source. This adds
 `.github/workflows/release.yml`, modelled on teploy-ship's: a `v*` tag
-push runs ci.yml's "Tests and vet" step verbatim, builds a statically
-linked binary for linux amd64 and arm64 (`CGO_ENABLED=0`, `-trimpath`,
-`-buildvcs=false`, `-s -w`) with `main.version` set to the tag without its
-`v`, checks each before publishing, writes `checksums.txt` in `sha256sum`
-format and creates the GitHub release with all three as assets. Every
-action is pinned to a commit.
+push runs all of `ci.yml` and waits for it, then runs ci.yml's "Tests and
+vet" step verbatim, builds a statically linked binary for linux amd64 and
+arm64 (`CGO_ENABLED=0`, `-trimpath`, `-buildvcs=false`, `-s -w`) with
+`main.version` set to the tag without its `v`, checks each before
+publishing, writes `checksums.txt` in `sha256sum` format and creates the
+GitHub release with all three as assets. Every action, in both workflows,
+is pinned to a commit and runs on node24.
 
 - `TestCIStepsThatPipeFailWithTheirTests` now reads every workflow, not
   only `ci.yml`, so the pipefail rule above holds for a workflow added
-  later. The `TestReleaseWorkflow*` tests pin the trigger (tags only),
-  the pins, the order (tests, build, checksums, publish, with nothing
-  after the publish) and the two architectures.
+  later. The `TestReleaseWorkflow*` tests pin the trigger (tags only, and
+  not callable), the pins, the order (tests, build, checksums, upload,
+  publish, with nothing after the publish) and the two architectures.
 - What the check step can say about arm64: it cannot run on the runner,
   and `go version -m` does not show linker flags. Its architecture and
   static linking are read from the build settings; for the version, the
@@ -4488,13 +4489,61 @@ action is pinned to a commit.
   `-X main.version` does not contain it (checked on a local build), so
   the check fails when the flag is dropped. The amd64 binary runs and
   must report the release.
-- Open: the Docker integration and `vm-root` jobs run on the tag's own
-  CI run (`ci.yml` triggers on every push), and the release job does not
-  wait for it, so a release can be published from a commit that fails
-  those. Making `ci.yml` callable (`workflow_call`) and a `needs` on it
-  would close that, at the price of running CI twice per tag.
-- Open: `ci.yml` still uses floating action tags (`@v4`, `@v5`); only
-  the release workflow is pinned.
+
+Review of 2026-11-26 (PR #16):
+
+- **Closed: the token is split by job.** `build` (token: `contents:
+  read`; checkout with `persist-credentials: false`) runs the tests,
+  builds, checks, writes the checksums and uploads the three files as one
+  artifact. `publish`, the one job with `contents: write`, checks out no
+  code and runs no go command: it downloads that artifact, checks the two
+  binaries against `checksums.txt` with `sha256sum`, and creates the
+  release (`fail_on_unmatched_files`, so a release is never made with an
+  asset missing). `ci.yml`'s checkouts keep no credentials either: its
+  integration tests run as root. `TestReleaseWorkflowPublishesWithoutRunningCode`.
+- **Closed: the release waits for the whole CI.** `ci.yml` is callable
+  (`workflow_call`) and `release.yml` runs it as a job; `publish` needs
+  that job and the build, so a tag cannot publish while the Docker
+  acceptance or `vm-root` fails. `ci.yml`'s own triggers are kept (a push
+  and a pull request), so a tag runs it twice; the tag's standalone CI
+  run stays visible, and a pull request is unchanged.
+  `TestReleaseWorkflowWaitsForTheCI`.
+- **Closed: the toolchain is one exact patch release.** go1.26.11, in
+  every `setup-go` step and in `go.mod`'s `toolchain` line, with
+  `cache: false`. setup-go v6 sets `GOTOOLCHAIN=local`, so in CI `go`
+  uses the one it installed. By hand the toolchain line is a floor, not a
+  lock: `GOTOOLCHAIN=auto` uses 1.26.11 unless a newer Go is installed;
+  `GOTOOLCHAIN=go1.26.11` builds with exactly what a release is built
+  with. `TestWorkflowsPinTheToolchain`.
+- **Closed: floating action tags.** checkout v5.1.0
+  (`fbc6f399…`), setup-go v6.5.0 (`924ae3a1…`), upload-artifact v6.0.0
+  (`b7c566a7…`), download-artifact v7.0.0 (`37930b1c…`) and
+  action-gh-release v3.0.4. Its tag is annotated: `v3.0.4` is the tag
+  object `28ab305d…`, and the commit it names, `8a0cd651…`, is what the
+  workflow pins. Each is the node24 release closest to what was pinned
+  before (the least change in behaviour), read from the action's
+  `action.yml` at that commit; not the newest majors (checkout v7.0.1,
+  setup-go v7.1.0, upload-artifact v7.0.2, download-artifact v8.0.2).
+  `ci.yml`'s two actions are pinned too, because the release runs them.
+  `TestReleaseWorkflowActionsArePinned` reads every workflow.
+- Open, for the owner (the workflow does not touch repository settings):
+  a ruleset on `v*` tags, so only who should can push or move one, and
+  immutable releases, so a published asset cannot be replaced under the
+  checksums (and the hashes the teploy CLI pins) that name it.
+- Open: the workflow has still not run for real (it starts on a tag push
+  only). What was checked here: both workflow files parse and pass
+  actionlint 1.7.12; the build job's steps ran with go1.26.11 for both
+  architectures (build settings read back, the arm64 version string
+  found; the amd64 binary cannot run on darwin, so that one line was not);
+  the publish job's checksum step passed on the three files after a
+  zip/unzip round trip laid out as the artifact store lays them out.
+- Each test was checked to fail on the change it guards: a job with the
+  write token that is not the publish job, a kept credential, a go
+  command in the publish job, a publish that does not wait for the CI,
+  `ci.yml` that is not callable or has lost a trigger, another trigger on
+  the release, a floating action, another Go than go.mod's, a cache, the
+  tests after the build, a step after the publish, an asset missing at
+  either end.
 - Not published: `cmd/teploy-guestd` (the vm driver's guest agent). It is
   still built from source for `scripts/build-golden.sh`.
-- No tag has been pushed, and the workflow has not run for real.
+- No tag has been pushed.

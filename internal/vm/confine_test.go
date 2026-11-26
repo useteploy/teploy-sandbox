@@ -411,6 +411,8 @@ type confineLog struct {
 	fail  map[string]error
 	// mounted is how many socket filesystems are mounted on each dir.
 	mounted map[string]int
+	// shared is every directory made a shared mount.
+	shared []string
 }
 
 // newTestConfinement confines against a fake host under root: device
@@ -493,6 +495,16 @@ func newTestConfinement(t *testing.T, root string) (*confinement, *confineLog, *
 				log.mu.Lock()
 				defer log.mu.Unlock()
 				delete(log.mounted, dir)
+				return nil
+			},
+			// A shared directory is a mark here too.
+			mountShared: func(dir string) error {
+				if err := failing("mountShared"); err != nil {
+					return err
+				}
+				log.mu.Lock()
+				defer log.mu.Unlock()
+				log.shared = append(log.shared, dir)
 				return nil
 			},
 		},
@@ -1207,5 +1219,117 @@ func TestAKilledGroupIsNotHeldByItsDiskLimit(t *testing.T) {
 	// A group that is gone, or has no io controller, is not an error.
 	if err := c.unthrottle(runName(9)); err != nil {
 		t.Fatalf("a group that is not there: %v", err)
+	}
+}
+
+// A VM whose driver keeps memory images gets an outbox: the daemon's
+// directory inside the VM's own, made a shared mount so that the jail's
+// slave bind of it receives the images. Nothing else of its jail
+// changes, and a VM restored from an image gets the image's files and
+// the daemon's config.json, read-only, and nothing of them once it is
+// gone.
+func TestAVMWhoseDriverKeepsImagesGetsAnOutboxAndARestoredOneTheImage(t *testing.T) {
+	root := t.TempDir()
+	c, log, _ := newTestConfinement(t, root)
+	ctx := context.Background()
+	config := MachineConfig{Name: runName(1), Disk: "/dev/zvol/tank/" + runName(1), CPUs: 1, MemoryMB: 512}
+	dir := filepath.Join(root, "run", config.Name)
+	plain, err := c.enter(ctx, config, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Without memory images there is no outbox: the jail is what it was.
+	if plain.outbox != "" || len(log.shared) != 0 {
+		t.Fatalf("a VM whose driver keeps no images got an outbox %q (shared %v)", plain.outbox, log.shared)
+	}
+	if _, err := os.Stat(filepath.Join(dir, outboxName)); !os.IsNotExist(err) {
+		t.Fatalf("an outbox directory was made: %v", err)
+	}
+	if err := plain.release(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	c.outboxes = true
+	restored := MachineConfig{Name: runName(2), Disk: "/dev/zvol/tank/" + runName(2), CPUs: 1, MemoryMB: 512}
+	dir = filepath.Join(root, "run", restored.Name)
+	cell, err := c.enter(ctx, restored, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox := filepath.Join(dir, outboxName)
+	if cell.outbox != outbox || !slices.Equal(log.shared, []string{outbox}) {
+		t.Fatalf("the VM's outbox %q, shared %v", cell.outbox, log.shared)
+	}
+	if info, err := os.Stat(outbox); err != nil || !info.IsDir() || info.Mode().Perm() != 0o755 {
+		t.Fatalf("the outbox: %v %v", info, err)
+	}
+	if _, touched := log.chowns[outbox]; touched {
+		t.Fatal("the outbox was handed to the VM's user: it is the daemon's")
+	}
+	if _, err := cell.command("/opt/ch", "/boot/Image", []string{"--api-socket", "x"}); err != nil {
+		t.Fatal(err)
+	}
+	// The one more path of the jail is the outbox, writable, a slave.
+	jail := log.jails[len(log.jails)-1]
+	want := jailPath{Path: outbox, Kind: jailDir, Write: true, Slave: true}
+	if len(jail.Paths) != 7 || jail.Paths[6] != want {
+		t.Fatalf("the jail's paths: %+v", jail.Paths)
+	}
+	// A restored VM reads its image from three read-only files under a
+	// directory beside its own: the daemon's config.json, and the
+	// image's state.json and memory-ranges.
+	inbox := dir + inboxSuffix
+	cell.setInbox(inbox, "/images/one")
+	if _, err := cell.command("/opt/ch", "/boot/Image", []string{"--api-socket", "x"}); err != nil {
+		t.Fatal(err)
+	}
+	jail = log.jails[len(log.jails)-1]
+	files := []jailPath{
+		{Path: filepath.Join(inbox, imageConfigFile), Kind: jailFile},
+		{Path: filepath.Join(inbox, imageStateFile), Source: "/images/one/" + imageStateFile, Kind: jailFile},
+		{Path: filepath.Join(inbox, imageMemoryFile), Source: "/images/one/" + imageMemoryFile, Kind: jailFile},
+	}
+	if len(jail.Paths) != 10 || !reflect.DeepEqual(jail.Paths[7:], files) || jail.Descriptors != standardDescriptors {
+		t.Fatalf("the jail of a restored VM: %+v", jail)
+	}
+	for _, each := range jail.Paths[7:] {
+		if each.Write || each.Exec {
+			t.Errorf("a file of the image is writable or executable in the jail: %+v", each)
+		}
+	}
+	if err := os.Mkdir(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inbox, imageConfigFile), []byte("{}"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := cell.release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(inbox); !os.IsNotExist(err) {
+		t.Fatalf("the restored VM's inbox outlived it: %v", err)
+	}
+}
+
+// An outbox that cannot be made a shared mount is no outbox: nothing
+// would reach the jail, so the VM does not start, and everything it was
+// given comes back.
+func TestAVMDoesNotStartWithoutASharedOutbox(t *testing.T) {
+	root := t.TempDir()
+	c, log, _ := newTestConfinement(t, root)
+	c.outboxes = true
+	log.mu.Lock()
+	log.fail["mountShared"] = errors.New("operation not permitted")
+	log.mu.Unlock()
+	config := MachineConfig{Name: runName(1), Disk: "/dev/zvol/tank/" + runName(1), CPUs: 1, MemoryMB: 512}
+	dir := filepath.Join(root, "run", config.Name)
+	if _, err := c.enter(context.Background(), config, dir); err == nil || !strings.Contains(err.Error(), "share the outbox") {
+		t.Fatalf("a VM started without a shared outbox: %v", err)
+	}
+	if len(log.started) != 0 || len(log.mounted) != 0 || len(c.uids.held) != 0 {
+		t.Fatalf("started %v, mounted %v, uids held %v", log.started, log.mounted, c.uids.held)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("the runtime dir outlived the failed start: %v", err)
 	}
 }

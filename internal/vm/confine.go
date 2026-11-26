@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,6 +75,10 @@ type confinement struct {
 	// log is for what a VM's confinement cannot do; nil logs nothing.
 	log *slog.Logger
 	sys confineSys
+	// outboxes: every VM's jail holds an outbox, where the daemon
+	// mounts its memory images for the moment of their snapshot (the
+	// driver keeps memory images).
+	outboxes bool
 }
 
 // confineSys is the host as confinement uses it; tests replace it.
@@ -96,6 +101,9 @@ type confineSys struct {
 	// and succeeds when nothing is.
 	mountSockets   func(dir string) error
 	unmountSockets func(dir string) error
+	// mountShared makes a directory a shared mount of its own, so that
+	// a jail's slave bind of it receives what is mounted below it.
+	mountShared func(dir string) error
 }
 
 // What a VM's socket directory holds: the hypervisor's API socket, its
@@ -123,6 +131,7 @@ func realConfineSys() confineSys {
 		socketOwner:    socketOwner,
 		mountSockets:   mountSocketDir,
 		unmountSockets: unmountSocketDir,
+		mountShared:    mountSharedDir,
 	}
 }
 
@@ -166,6 +175,17 @@ type cell struct {
 	// read is what the VM has read from its disk under its boot limits,
 	// as last seen.
 	read int64
+
+	// outbox is the directory in the VM's runtime dir that its jail
+	// binds as a slave, where the daemon mounts the VM's memory images
+	// while it snapshots them; "" when the driver keeps no images.
+	outbox string
+	// extra is what else the jail holds: the files of the memory image a
+	// VM is restored from (setInbox).
+	extra []jailPath
+	// inbox is the host directory the image's rewritten config.json is
+	// written to, beside the runtime dir; "" unless the VM is restored.
+	inbox string
 }
 
 // jailRoot is the mount point of the VM's jail.
@@ -201,6 +221,20 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 	}
 	if err = c.sys.chown(dir, uid, uid); err != nil {
 		return nil, err
+	}
+	if c.outboxes {
+		// The outbox is the daemon's directory inside the VM's own: root's,
+		// so that the VM cannot put anything there itself, and a shared
+		// mount, so that the jail's slave bind of it receives every image
+		// the daemon mounts below it, and sends nothing back.
+		outbox := filepath.Join(dir, outboxName)
+		if err = os.Mkdir(outbox, 0o755); err != nil {
+			return nil, err
+		}
+		if err = c.sys.mountShared(outbox); err != nil {
+			return nil, fmt.Errorf("share the outbox %s: %w", outbox, err)
+		}
+		current.outbox = outbox
 	}
 	// Where the VM's jail is mounted, in the VM's own mount namespace:
 	// on the host an empty directory of root's, and nothing more.
@@ -250,6 +284,11 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 // started closes it.
 func (c *cell) command(bin, kernel string, args []string, files ...*os.File) (*exec.Cmd, error) {
 	jail := jailFor(c.jailRoot(), c.uid, c.owner.groups, bin, kernel, c.disk, c.dir, c.owner.libraries)
+	if c.outbox != "" {
+		// The outbox, writable and a slave of the host's mount of it.
+		jail.Paths = append(jail.Paths, jailPath{Path: c.outbox, Kind: jailDir, Write: true, Slave: true})
+	}
+	jail.Paths = append(jail.Paths, slices.Clone(c.extra)...)
 	jail.Descriptors += len(files)
 	cmd, err := c.owner.sys.command(jail, c.cgroup, bin, args)
 	if err != nil {
@@ -474,9 +513,30 @@ func (c *cell) release(ctx context.Context) error {
 	if err := os.Remove(c.jailRoot()); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	if c.inbox != "" {
+		// The daemon's config.json of a restore: nothing of a run's, gone
+		// with the VM.
+		if err := os.RemoveAll(c.inbox); err != nil {
+			return err
+		}
+	}
 	c.owner.uids.release(c.uid)
 	c.released = true
 	return nil
+}
+
+// setInbox is for a VM about to be restored from a memory image: its
+// jail holds the three files the hypervisor reads the image from, under
+// the directory inbox beside the VM's runtime dir. The daemon's
+// rewritten config.json is written to inbox; the image's other two files
+// are bound from the sealed image's directory (imageDir).
+func (c *cell) setInbox(inbox, imageDir string) {
+	c.inbox = inbox
+	c.extra = []jailPath{
+		{Path: filepath.Join(inbox, imageConfigFile), Kind: jailFile},
+		{Path: filepath.Join(inbox, imageStateFile), Source: filepath.Join(imageDir, imageStateFile), Kind: jailFile},
+		{Path: filepath.Join(inbox, imageMemoryFile), Source: filepath.Join(imageDir, imageMemoryFile), Kind: jailFile},
+	}
 }
 
 // clearDir removes a VM's runtime dir: the filesystem mounted on it, with

@@ -6,9 +6,13 @@ import (
 )
 
 // realMountOps binds and unbinds with mount(8)'s own calls. An unbind
-// is detached: the mount leaves the namespace at once, and with it the
-// copy of it in the VM's jail (a slave of the outbox), which is the
-// point; whatever still holds it, keeps it only until it lets go.
+// is a plain unmount: the copy of the mount in the VM's jail (a slave of
+// the outbox) goes with it, so the VM has no path left to its image
+// once the snapshot is written (measured on Linux 6.12:
+// TestJailOutboxReceivesWhatTheHostMountsAndSendsNothingBack). Plain
+// and not lazy because the daemon holds nothing below the outbox
+// itself: a busy answer would mean something unexpected does, and is
+// reported rather than left as a dangling reference.
 func realMountOps() mountOps {
 	return mountOps{
 		bind: func(source, target string) error {
@@ -18,7 +22,7 @@ func realMountOps() mountOps {
 			return nil
 		},
 		unbind: func(target string) error {
-			if err := syscall.Unmount(target, mntDetach); err != nil {
+			if err := syscall.Unmount(target, 0); err != nil {
 				return &os.PathError{Op: "umount", Path: target, Err: err}
 			}
 			return nil

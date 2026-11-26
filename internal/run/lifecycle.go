@@ -349,8 +349,11 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 	})
 	// The image was the record's while the run was stopped; a resume
 	// that tried it, whichever way it went, leaves it released (a VM
-	// restored from it keeps it until it is gone).
-	m.memorySpent(id, current.memory, res.memoryNote)
+	// restored from it keeps it until it is gone). A resume refused
+	// before it reached the image leaves the image for the next one.
+	if !errors.Is(err, ErrMemoryNotTried) {
+		m.memorySpent(id, current.memory, res.memoryNote)
+	}
 	if err != nil {
 		if leftover != "" {
 			// The container name derives from the run ID, so this one

@@ -5,20 +5,44 @@ on:
     tags:
       - 'v*'
 
-# The job creates the GitHub release and uploads its assets; it needs
-# nothing else.
+# The token is split by job. Everything that runs code from the repository
+# (the CI below, the build) has a token that can read and nothing more, so
+# no test and no action can publish or push. Only the publish job can
+# write, and it has nothing to run: it takes the files the build job
+# uploaded and creates the release with them.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+  # All of ci.yml on the tagged commit: the unit tests, the Docker and
+  # network acceptance, and the vm driver's tests as root. ci.yml also
+  # starts on its own for the tag push (its own trigger), so a tag runs it
+  # twice; the release waits for this one.
+  ci:
+    uses: ./.github/workflows/ci.yml
 
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+  # The tests, then the binaries and their checksums. Nothing here can
+  # publish: the job ends by handing its files to the publish job.
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          go-version: "1.26.x"
+          # Nothing in this job uses the token after the checkout, so it
+          # is not left in the checkout.
+          persist-credentials: false
+
+      # The exact patch release, the same as go.mod's toolchain line: the
+      # same source built by another toolchain is another file. setup-go
+      # v6 makes `go` use the one it installed (GOTOOLCHAIN=local), so
+      # nothing is downloaded at build time. cache: false: nothing
+      # restored from a cache takes part in a release.
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.11"
+          cache: false
 
       # The version is the tag. `teploy-sandbox version` and GET /health
       # report what -X main.version sets below, and the teploy CLI checks
@@ -36,8 +60,9 @@ jobs:
 
       # The release must not publish WITHOUT running the tests: a tag is
       # where "tested" matters most. This is ci.yml's "Tests and vet" step,
-      # verbatim; the Docker and vm-root jobs run on the tag's own CI run
-      # (ci.yml triggers on every push, tags included).
+      # verbatim, on the toolchain the binaries are built with; the Docker
+      # and vm-root jobs are the ci job above, which the publish job waits
+      # for.
       - name: Tests and vet
         run: go test ./... && go vet ./... && go vet -tags vmintegration ./... && go test -race ./...
 
@@ -89,13 +114,50 @@ jobs:
           sha256sum teploy-sandbox_linux_amd64 teploy-sandbox_linux_arm64 > checksums.txt
           cat checksums.txt
 
+      # The only thing that passes from the job that builds to the job
+      # that publishes: three files, and no way to run code with them. A
+      # day is longer than any run of this workflow.
+      - name: Keep the release files for the publish job
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release
+          path: |
+            dist/teploy-sandbox_linux_amd64
+            dist/teploy-sandbox_linux_arm64
+            dist/checksums.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  # Waits for the CI and for the build. This is the one job with a token
+  # that can write, so it checks out no code and runs no go command: it
+  # has the three files and the release it makes of them.
+  publish:
+    runs-on: ubuntu-latest
+    needs: [ci, build]
+    permissions:
+      contents: write
+    steps:
+      - name: Take the release files the build job made
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release
+          path: dist
+
+      # The two binaries are the ones checksums.txt was written for, whole
+      # as they came through the artifact store. sha256sum is coreutils:
+      # the publish job has no toolchain.
+      - name: The files are the ones that were built
+        run: cd dist && sha256sum -c --strict checksums.txt
+
       # A prerelease tag (v1.2.3-rc1) must not be presented as the latest
-      # stable release.
+      # stable release. fail_on_unmatched_files: a release is never
+      # created with an asset missing.
       - name: Create GitHub release
-        uses: softprops/action-gh-release@e7a8f85e1c67a31e6ed99a94b41bd0b71bbee6b8 # v2.0.9
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
           files: |
             dist/teploy-sandbox_linux_amd64
             dist/teploy-sandbox_linux_arm64

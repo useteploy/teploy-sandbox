@@ -36,14 +36,14 @@ const savedConfigJSON = `{
   "cpus": {"boot_vcpus": 1, "max_vcpus": 1, "kvm_hyperv": false, "max_phys_bits": 46, "features": {"amx": false}, "nested": false, "core_scheduling": "Vm", "profile": "Host"},
   "memory": {"size": 536870912, "mergeable": false, "hotplug_method": "Acpi", "shared": false, "hugepages": false, "prefault": false, "thp": true},
   "payload": {"kernel": "/kernel", "cmdline": "` + savedCmdline + `"},
-  "disks": [{"pci_segment": 0, "path": "` + savedDisk + `", "readonly": false, "direct": true, "num_queues": 1, "queue_size": 128, "vhost_user": false, "disable_io_uring": false, "disable_aio": false, "backing_files": false, "sparse": true, "image_type": "Raw", "lock_granularity": "ByteRange"}],
+  "disks": [{"id": "_disk0", "pci_segment": 0, "path": "` + savedDisk + `", "readonly": false, "direct": true, "num_queues": 1, "queue_size": 128, "vhost_user": false, "disable_io_uring": false, "disable_aio": false, "backing_files": false, "sparse": true, "image_type": "Raw", "lock_granularity": "ByteRange"}],
   "net": [{"id": "net0", "pci_segment": 0, "mac": "` + savedMAC + `", "num_queues": 2, "queue_size": 256, "vhost_user": false, "vhost_mode": "Client", "fds": [17], "offload_tso": false, "offload_ufo": false, "offload_csum": false}],
   "rng": {"pci_segment": 0, "src": "/dev/urandom"},
   "balloon": {"pci_segment": 0, "size": 0, "deflate_on_oom": true, "free_page_reporting": true},
-  "serial": {"file": null, "mode": "Tty", "socket": null},
-  "console": {"file": null, "mode": "Off", "socket": null, "pci_segment": 0},
+  "serial": {"mode": "Tty"},
+  "console": {"mode": "Off", "pci_segment": 0},
   "debug_console": {"mode": "Off", "iobase": 233},
-  "vsock": {"pci_segment": 0, "cid": 4, "socket": "` + savedDir + `/vsock.sock"},
+  "vsock": {"id": "_vsock1", "pci_segment": 0, "cid": 4, "socket": "` + savedDir + `/vsock.sock"},
   "pvpanic": false,
   "watchdog": false,
   "landlock_enable": true,
@@ -123,7 +123,7 @@ func TestASavedConfigurationIsRewrittenForTheVMThatRestoresIt(t *testing.T) {
 	if len(got.Disks) != 1 || got.Disks[0].Path == nil || *got.Disks[0].Path != want.disk {
 		t.Errorf("the disks: %+v", got.Disks)
 	}
-	if got.Vsock == nil || got.Vsock.Socket != want.vsockSocket || got.Vsock.CID != 4 {
+	if got.Vsock == nil || got.Vsock.Socket != want.vsockSocket || got.Vsock.CID != 4 || got.Vsock.ID == nil || *got.Vsock.ID != chVsockID {
 		t.Errorf("the vsock: %+v", got.Vsock)
 	}
 	if !got.LandlockEnable || !reflect.DeepEqual(got.LandlockRules, []chLandlockRule{{Path: want.outbox, Access: "rw"}}) {
@@ -220,35 +220,38 @@ func TestASavedConfigurationThatIsNotThisDaemonsRefusesTheImage(t *testing.T) {
 		"no kernel":                       del("payload.kernel"),
 		"no command line":                 del("payload.cmdline"),
 		// The disk: the saved VM's own, by the node the daemon made for it.
-		"the saved disk is another VM's":        set("disks.0.path", savedDevDir+"/"+otherVM),
-		"the saved disk is a host file":         set("disks.0.path", secret),
-		"the saved disk is the zvol's own node": set("disks.0.path", "/dev/zvol/tank/sbx/"+savedVM),
-		"a read-only disk":                      set("disks.0.readonly", true),
-		"a disk through the page cache":         set("disks.0.direct", false),
-		"another disk queue count":              set("disks.0.num_queues", float64(2)),
-		"another disk queue size":               set("disks.0.queue_size", float64(256)),
-		"a vhost-user disk":                     set("disks.0.vhost_user", true),
-		"a vhost-user socket":                   set("disks.0.vhost_socket", "/run/x.sock"),
-		"a disk rate limit group":               set("disks.0.rate_limit_group", "g"),
-		"a disk rate limiter":                   set("disks.0.rate_limiter_config", map[string]any{"bw_size": float64(1000)}),
-		"io_uring disabled":                     set("disks.0.disable_io_uring", true),
-		"aio disabled":                          set("disks.0.disable_aio", true),
-		"a disk serial number":                  set("disks.0.serial", "x"),
-		"disk queue affinity":                   set("disks.0.queue_affinity", []any{}),
-		"backing files":                         set("disks.0.backing_files", true),
-		"a disk without holes":                  set("disks.0.sparse", false),
-		"a qcow2 disk":                          set("disks.0.image_type", "Qcow2"),
-		"a disk of unknown format":              set("disks.0.image_type", "Unknown"),
-		"an unknown lock granularity":           set("disks.0.lock_granularity", "none"),
-		"a guest block size":                    set("disks.0.guest_block_size", float64(4096)),
-		"a disk id":                             set("disks.0.id", "disk0"),
-		"a disk on another PCI segment":         set("disks.0.pci_segment", float64(1)),
-		"a disk at a PCI slot":                  set("disks.0.pci_device_id", float64(5)),
-		"an IOMMU for the disk":                 set("disks.0.iommu", "Virtio"),
-		"the disk lock left default":            del("disks.0.lock_granularity"),
-		"no disk":                               del("disks"),
-		"no disk path":                          del("disks.0.path"),
-		"two disks":                             func(d map[string]any) { d["disks"] = []any{d["disks"].([]any)[0], d["disks"].([]any)[0]} },
+		"the saved disk is another VM's":         set("disks.0.path", savedDevDir+"/"+otherVM),
+		"the saved disk is a host file":          set("disks.0.path", secret),
+		"the saved disk is the zvol's own node":  set("disks.0.path", "/dev/zvol/tank/sbx/"+savedVM),
+		"a read-only disk":                       set("disks.0.readonly", true),
+		"a disk through the page cache":          set("disks.0.direct", false),
+		"another disk queue count":               set("disks.0.num_queues", float64(2)),
+		"another disk queue size":                set("disks.0.queue_size", float64(256)),
+		"a vhost-user disk":                      set("disks.0.vhost_user", true),
+		"a vhost-user socket":                    set("disks.0.vhost_socket", "/run/x.sock"),
+		"a disk rate limit group":                set("disks.0.rate_limit_group", "g"),
+		"a disk rate limiter":                    set("disks.0.rate_limiter_config", map[string]any{"bw_size": float64(1000)}),
+		"io_uring disabled":                      set("disks.0.disable_io_uring", true),
+		"aio disabled":                           set("disks.0.disable_aio", true),
+		"a disk serial number":                   set("disks.0.serial", "x"),
+		"disk queue affinity":                    set("disks.0.queue_affinity", []any{}),
+		"backing files":                          set("disks.0.backing_files", true),
+		"a disk without holes":                   set("disks.0.sparse", false),
+		"a qcow2 disk":                           set("disks.0.image_type", "Qcow2"),
+		"a disk of unknown format":               set("disks.0.image_type", "Unknown"),
+		"an unknown lock granularity":            set("disks.0.lock_granularity", "none"),
+		"a guest block size":                     set("disks.0.guest_block_size", float64(4096)),
+		"a disk id of the run's choosing":        set("disks.0.id", "disk0"),
+		"the disk named like the network device": set("disks.0.id", netDeviceID),
+		"the disk named like the vsock":          set("disks.0.id", chVsockID),
+		"no id on the disk":                      del("disks.0.id"),
+		"a disk on another PCI segment":          set("disks.0.pci_segment", float64(1)),
+		"a disk at a PCI slot":                   set("disks.0.pci_device_id", float64(5)),
+		"an IOMMU for the disk":                  set("disks.0.iommu", "Virtio"),
+		"the disk lock left default":             del("disks.0.lock_granularity"),
+		"no disk":                                del("disks"),
+		"no disk path":                           del("disks.0.path"),
+		"two disks":                              func(d map[string]any) { d["disks"] = []any{d["disks"].([]any)[0], d["disks"].([]any)[0]} },
 		// The network device: the one the run's tier gave, found again by
 		// its recorded MAC, and backed by a descriptor the daemon hands
 		// over, never by a name.
@@ -323,8 +326,10 @@ func TestASavedConfigurationThatIsNotThisDaemonsRefusesTheImage(t *testing.T) {
 		"a vsock socket deeper than a VM's":              set("vsock.socket", savedDir+"/x/vsock.sock"),
 		"a vsock socket in another runtime directory":    set("vsock.socket", savedRunDir+"/x/"+savedVM+"/vsock.sock"),
 		"a vsock socket of another VM than the rule's":   set("vsock.socket", savedRunDir+"/"+otherVM+"/vsock.sock"),
-		"no vsock":   del("vsock"),
-		"a vsock id": set("vsock.id", "vsock0"),
+		"no vsock":                         del("vsock"),
+		"a vsock id of the run's choosing": set("vsock.id", "vsock0"),
+		"the vsock named like the disk":    set("vsock.id", chDiskID),
+		"no id on the vsock":               del("vsock.id"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			document := savedDocument()
@@ -431,11 +436,9 @@ func TestASavedConfigurationThatIsNoFileAtAllRefusesTheImage(t *testing.T) {
 		"the whole-file disk lock":   set("disks.0.lock_granularity", "Full"),
 		"the debug console unnamed":  del("debug_console"),
 		"the debug console unported": del("debug_console.iobase"),
-		"the console's nulls left out": func(d map[string]any) {
-			for _, field := range []string{"file", "socket"} {
-				delete(d["serial"].(map[string]any), field)
-				delete(d["console"].(map[string]any), field)
-			}
+		"the consoles' optional fields spelled out": func(d map[string]any) {
+			d["serial"] = map[string]any{"file": nil, "mode": "Tty", "socket": nil}
+			d["console"] = map[string]any{"file": nil, "mode": "Off", "socket": nil, "pci_segment": float64(0)}
 		},
 	} {
 		document := savedDocument()

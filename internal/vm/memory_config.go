@@ -237,6 +237,13 @@ const (
 	// hypervisors off the same image, and mean nothing to the guest.
 	chLockByteRange = "ByteRange"
 	chLockFull      = "Full"
+	// The ids the hypervisor gives the devices this daemon leaves unnamed:
+	// a prefix of its own and a counter over the devices it names, in the
+	// order it makes them (vmm/src/device_manager.rs, next_device_name).
+	// This daemon's command line has it make the disk first and the
+	// vsock second.
+	chDiskID  = "_disk0"
+	chVsockID = "_vsock1"
 )
 
 // rewriteMemoryConfig reads an image's config.json and returns the
@@ -314,7 +321,7 @@ func (c chConfig) check(want memoryConfigWant) error {
 		(disk.LockGranularity != chLockByteRange && disk.LockGranularity != chLockFull) || disk.GuestBlockSize != nil {
 		return errors.New("the saved VM's disk is not the raw, direct, writable disk this daemon gives every VM")
 	}
-	if err := disk.plain(""); err != nil {
+	if err := disk.plain(chDiskID); err != nil {
 		return err
 	}
 	// The network device the run's tier gives, no more and no less, and
@@ -369,7 +376,7 @@ func (c chConfig) check(want memoryConfigWant) error {
 	if err := savedVMDir(c.Vsock.Socket, c.LandlockRules[0].Path, want.runtimeRoot); err != nil {
 		return err
 	}
-	return c.Vsock.plain("")
+	return c.Vsock.plain(chVsockID)
 }
 
 // savedVMDir checks that the saved vsock socket and the saved Landlock

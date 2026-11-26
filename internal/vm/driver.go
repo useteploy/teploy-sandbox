@@ -769,22 +769,32 @@ func (d *Driver) waitReady(ctx context.Context, machine Machine) error {
 	if timeout <= 0 {
 		timeout = DefaultBootTimeout
 	}
-	return d.waitAgent(ctx, machine, timeout)
+	return d.waitAgent(ctx, machine, timeout, pingTimeout)
 }
 
-// waitAgent is waitReady with its own timeout.
-func (d *Driver) waitAgent(ctx context.Context, machine Machine, timeout time.Duration) error {
+// pingTimeout bounds one ping to a booting guest's agent.
+const pingTimeout = 2 * time.Second
+
+// waitAgent is waitReady with its own timeout. unanswered, when given, is
+// told of each ping that was not answered, and how long it took: for a
+// guest that is expected to answer at once (a restored one), where every
+// unanswered ping is time lost.
+func (d *Driver) waitAgent(ctx context.Context, machine Machine, timeout, ping time.Duration, unanswered ...func(err error, took time.Duration)) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var last error
 	for {
-		attempt, cancelAttempt := context.WithTimeout(ctx, 2*time.Second)
+		attempt, cancelAttempt := context.WithTimeout(ctx, ping)
+		began := time.Now()
 		_, err := machine.Agent().Ping(attempt)
 		cancelAttempt()
 		if err == nil {
 			return nil
 		}
 		last = err
+		for _, tell := range unanswered {
+			tell(err, time.Since(began))
+		}
 		select {
 		case <-machine.Exited():
 			return fmt.Errorf("the hypervisor exited during boot (%s)", machine.Diagnostics())

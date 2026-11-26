@@ -384,6 +384,9 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 			_ = d.volumes.RemoveRun(cleanupCtx, name)
 		}
 	}()
+	steps := map[string]time.Duration{}
+	step := func(what string, began time.Time) { steps[what] = time.Since(began) }
+	began := time.Now()
 	result, err = d.hypervisor.Restore(ctx, RestoreConfig{
 		MachineConfig: MachineConfig{Name: name, Disk: device, CPUs: cpus, MemoryMB: memoryMB},
 		ImageDir:      img.dir,
@@ -391,6 +394,7 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 		Networked:     networked,
 		SavedMAC:      image.MAC,
 	})
+	step("hypervisor", began)
 	if err != nil {
 		if result == nil {
 			return nil, nil, fmt.Errorf("start the hypervisor: %w", err)
@@ -415,7 +419,9 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 	if network != nil {
 		request.NetFD = network.Tap
 	}
+	began = time.Now()
 	err = result.Restore(ctx, request)
+	step("vm.restore", began)
 	if network != nil {
 		// The hypervisor has its own copy now, or never will.
 		_ = network.Tap.Close()
@@ -429,23 +435,44 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 	if !result.MapsFile(filepath.Join(img.dir, imageMemoryFile)) {
 		return result, network, errors.New("the hypervisor did not map the image copy-on-write: it copied the memory instead")
 	}
+	began = time.Now()
 	if err = result.Resume(ctx); err != nil {
 		return result, network, fmt.Errorf("resume: %w", err)
 	}
-	if err = d.waitAgent(ctx, result, d.restoreTimeout()); err != nil {
+	step("vm.resume", began)
+	began = time.Now()
+	err = d.waitAgent(ctx, result, d.restoreTimeout(), pingTimeout, func(err error, took time.Duration) {
+		// A restored guest has all its processes already: what keeps it
+		// from answering is the pages it has to fault in from the image.
+		d.log.Info("vm restore: the guest's agent has not answered yet", "name", name, "after", time.Since(began).Round(time.Millisecond).String(), "ping", took.Round(time.Millisecond).String(), "error", err)
+	})
+	if err != nil {
 		return result, network, fmt.Errorf("the restored guest's agent: %w", err)
 	}
+	step("agent", began)
+	began = time.Now()
 	if err = d.restoreClock(ctx, result); err != nil {
 		return result, network, err
 	}
+	step("clock", began)
 	if network != nil {
+		began = time.Now()
 		if err = d.restoreNetwork(ctx, result, network, image.MAC); err != nil {
 			return result, network, err
 		}
+		step("network", began)
 	}
 	if err = result.Booted(); err != nil {
 		return result, network, fmt.Errorf("the run's disk limits: %w", err)
 	}
+	attrs := make([]any, 0, 2*len(steps)+2)
+	attrs = append(attrs, "name", name)
+	for _, what := range []string{"hypervisor", "vm.restore", "vm.resume", "agent", "clock", "network"} {
+		if took, ok := steps[what]; ok {
+			attrs = append(attrs, what, took.Round(time.Millisecond).String())
+		}
+	}
+	d.log.Info("vm restore steps", attrs...)
 	return result, network, nil
 }
 

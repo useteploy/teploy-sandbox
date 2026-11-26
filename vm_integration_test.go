@@ -177,6 +177,10 @@ func newVMManagerLogging(t *testing.T, config vm.Config, stateDir string, logs i
 	}
 	manager := run.NewManager(driver, log)
 	manager.SandboxUser = ""
+	if config.MemorySnapshots {
+		// What serve does for a driver that keeps memory images.
+		manager.MemoryImages = driver
+	}
 	if gateway, ok := driver.Gateway(); ok {
 		pool := &egress.Pool{Base: egress.DefaultAllowlist, Bind: gateway, Log: log, Private: true, Listen: driver.ProxyListener}
 		t.Cleanup(pool.Shutdown)
@@ -184,6 +188,12 @@ func newVMManagerLogging(t *testing.T, config vm.Config, stateDir string, logs i
 	}
 	if _, err := manager.LoadState(context.Background(), stateDir); err != nil {
 		t.Fatalf("load state: %v", err)
+	}
+	if config.MemorySnapshots {
+		// And serves no run before its images match the registry.
+		if _, err := manager.ReconcileMemoryImages(context.Background()); err != nil {
+			t.Fatalf("reconcile memory images: %v", err)
+		}
 	}
 	if len(config.Warm.Sizes) > 0 {
 		// A full pool, so that every create of a size it keeps is a

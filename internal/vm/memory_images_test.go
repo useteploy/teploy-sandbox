@@ -666,6 +666,25 @@ func TestImageKeysAndClassAreDerivedAsSpecified(t *testing.T) {
 	if cpu != "processor\t: 0\nvendor_id\t: GenuineIntel\nflags\t\t: fpu sse" {
 		t.Errorf("cpu identity %q", cpu)
 	}
+	// A processor's frequency is a reading, not what it is: two readings
+	// of one host differ by it, and must not make two host classes.
+	// (Measured on the test host: with "cpu MHz" in the identity no two
+	// daemon lives agreed on a class.)
+	stanza := "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 122\nstepping\t: 1\nmicrocode\t: 0x42\ncpu MHz\t\t: %s\ncache size\t: 4096 KB\nbogomips\t: %s\nflags\t\t: fpu sse vmx\nvmx flags\t: ept vpid\n"
+	low := fmt.Sprintf(stanza, "2624.603", "2188.80")
+	high := fmt.Sprintf(stanza, "812.144", "2188.80")
+	identity := cpuIdentity([]byte(low))
+	if other := cpuIdentity([]byte(high)); other != identity || strings.Contains(identity, "MHz") || strings.Contains(identity, "bogomips") {
+		t.Errorf("the frequency of the moment is part of the identity:\n%s\n%s", identity, other)
+	}
+	for _, what := range []string{"stepping\t: 1", "microcode\t: 0x42", "model\t\t: 122", "cache size\t: 4096 KB", "flags\t\t: fpu sse vmx", "vmx flags\t: ept vpid"} {
+		if !strings.Contains(identity, what) {
+			t.Errorf("the identity lacks %q:\n%s", what, identity)
+		}
+		if changed := cpuIdentity([]byte(strings.Replace(low, what+"\n", what+" and more\n", 1))); changed == identity {
+			t.Errorf("a processor whose %q differs has the same identity", what)
+		}
+	}
 	if version := hypervisorVersion([]byte("Cloud Hypervisor v54.1\nBuilt on something\n")); version != "Cloud Hypervisor v54.1" {
 		t.Errorf("hypervisor version %q", version)
 	}

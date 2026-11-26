@@ -51,8 +51,18 @@ func (p classParts) class() hostClass {
 	return hostClass{id: hex.EncodeToString(sum[:]), hypervisor: p.hypervisorVersion, kernel: p.guestKernel}
 }
 
-// cpuIdentity is the first processor's stanza of /proc/cpuinfo, as it
-// is written, with trailing blanks dropped.
+// volatileCPU is what /proc/cpuinfo says of a processor that changes
+// while nothing about it changed: its frequency from moment to moment,
+// and the calibration derived from it. None of it is an input to what
+// KVM puts in a guest.
+var volatileCPU = map[string]bool{"cpu MHz": true, "bogomips": true}
+
+// cpuIdentity is the first processor's stanza of /proc/cpuinfo, as it is
+// written, with trailing blanks dropped and without what is volatile.
+// It is what the host's CPU is as far as KVM is concerned: vendor,
+// family, model, stepping, microcode and flags. Measured on the test
+// host: with "cpu MHz" in it no two daemon lives agreed on a class, and
+// every image saved before a restart was refused as another host's.
 func cpuIdentity(cpuinfo []byte) string {
 	text := string(cpuinfo)
 	if end := strings.Index(text, "\n\n"); end >= 0 {
@@ -60,6 +70,9 @@ func cpuIdentity(cpuinfo []byte) string {
 	}
 	var lines []string
 	for line := range strings.SplitSeq(text, "\n") {
+		if key, _, _ := strings.Cut(line, ":"); volatileCPU[strings.TrimSpace(key)] {
+			continue
+		}
 		if line = strings.TrimRight(line, " \t"); line != "" {
 			lines = append(lines, line)
 		}

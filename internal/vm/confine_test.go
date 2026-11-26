@@ -1277,9 +1277,22 @@ func TestAVMWhoseDriverKeepsImagesGetsAnOutboxAndARestoredOneTheImage(t *testing
 	}
 	// A restored VM reads its image from three read-only files under a
 	// directory beside its own: the daemon's config.json, and the
-	// image's state.json and memory-ranges.
+	// image's state.json and memory-ranges. The directory is the
+	// daemon's, and made anew: whatever an earlier VM of the name left
+	// in it goes first.
 	inbox := dir + inboxSuffix
-	cell.setInbox(inbox, "/images/one")
+	if err := os.MkdirAll(filepath.Join(inbox, "stale"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := cell.setInbox(inbox, "/images/one"); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(inbox); err != nil || !info.IsDir() || info.Mode().Perm() != 0o755 {
+		t.Fatalf("the inbox: %v %v", info, err)
+	}
+	if _, err := os.Stat(filepath.Join(inbox, "stale")); !os.IsNotExist(err) {
+		t.Fatalf("what an earlier VM left in the inbox survived: %v", err)
+	}
 	if _, err := cell.command("/opt/ch", "/boot/Image", []string{"--api-socket", "x"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1296,9 +1309,6 @@ func TestAVMWhoseDriverKeepsImagesGetsAnOutboxAndARestoredOneTheImage(t *testing
 		if each.Write || each.Exec {
 			t.Errorf("a file of the image is writable or executable in the jail: %+v", each)
 		}
-	}
-	if err := os.Mkdir(inbox, 0o755); err != nil {
-		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(inbox, imageConfigFile), []byte("{}"), 0o444); err != nil {
 		t.Fatal(err)

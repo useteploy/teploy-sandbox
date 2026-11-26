@@ -530,13 +530,22 @@ func (c *cell) release(ctx context.Context) error {
 // the directory inbox beside the VM's runtime dir. The daemon's
 // rewritten config.json is written to inbox; the image's other two files
 // are bound from the sealed image's directory (imageDir).
-func (c *cell) setInbox(inbox, imageDir string) {
+func (c *cell) setInbox(inbox, imageDir string) error {
 	c.inbox = inbox
+	// Root's, beside the runtime dir (the VM's, and writable by it), and
+	// made anew: nothing of a previous restore's is left in it.
+	if err := os.RemoveAll(inbox); err != nil {
+		return err
+	}
+	if err := os.Mkdir(inbox, 0o755); err != nil {
+		return err
+	}
 	c.extra = []jailPath{
 		{Path: filepath.Join(inbox, imageConfigFile), Kind: jailFile},
 		{Path: filepath.Join(inbox, imageStateFile), Source: filepath.Join(imageDir, imageStateFile), Kind: jailFile},
 		{Path: filepath.Join(inbox, imageMemoryFile), Source: filepath.Join(imageDir, imageMemoryFile), Kind: jailFile},
 	}
+	return nil
 }
 
 // clearDir removes a VM's runtime dir: the filesystem mounted on it, with

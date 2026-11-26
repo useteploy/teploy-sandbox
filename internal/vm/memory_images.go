@@ -182,9 +182,12 @@ type image struct {
 	sealed bool
 
 	// Who wants it: held is the stop making it, then the registry of the
-	// stopped run it belongs to; mappers are the VMs restored from it,
-	// by name; opening counts restores under way. It is destroyed only
-	// when none of the three is left.
+	// stopped run it belongs to; mappers are the VMs that may hold its
+	// files, by name (one restored from it, or whose restore failed
+	// after its hypervisor was started: the jail binds two of the files
+	// before the hypervisor is asked for anything); opening counts
+	// restores under way up to that point. It is destroyed only when
+	// none of the three is left.
 	held    bool
 	mappers map[string]bool
 	opening int
@@ -500,9 +503,12 @@ func (s *memoryImages) changedSince(rec *run.MemoryImage) string {
 	}
 }
 
-// mapping says the VM named vm was restored from the image: it maps the
-// image's memory file for as long as it lives, and the image stays
-// until the VM is gone, whatever the registry says meanwhile.
+// mapping says the VM named vm may hold the image's files from now on:
+// its hypervisor was started for a restore from the image, and a VM
+// restored from it maps the memory file for as long as it lives. The
+// image stays until the VM is gone (vmGone), whatever the registry says
+// meanwhile. The restore's own hold (opening) ends here: the VM's is
+// what counts from now on.
 func (s *memoryImages) mapping(img *image, vm string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

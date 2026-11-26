@@ -11,6 +11,7 @@ import (
 	"maps"
 	"net"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -566,6 +567,10 @@ type fakeHypervisor struct {
 	// zfsCallsAtSweep is how many zfs mutations had happened when the
 	// process sweep ran.
 	zfsCallsAtSweep int
+	// restored are the restore starts, in order (Restore); startErr
+	// makes the next one fail before there is a machine.
+	restored   []RestoreConfig
+	restoreErr error
 }
 
 func newFakeHypervisor(z *fakeZFS) *fakeHypervisor {
@@ -591,6 +596,29 @@ func (h *fakeHypervisor) Start(_ context.Context, config MachineConfig) (Machine
 		machine.dead = true
 	}
 	h.bootErr, h.dieOnBoot = nil, false
+	if h.onStart != nil {
+		h.onStart(machine)
+	}
+	h.machines[config.Name] = machine
+	return machine, nil
+}
+
+// Restore is a hypervisor started for a restore: its API is up, and
+// its machine has no VM until Machine.Restore.
+func (h *fakeHypervisor) Restore(_ context.Context, config RestoreConfig) (Machine, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.restoreErr != nil {
+		err := h.restoreErr
+		h.restoreErr = nil
+		return nil, err
+	}
+	h.restored = append(h.restored, config)
+	machine := &fakeMachine{
+		config: config.MachineConfig, zfs: h.zfs, volume: strings.TrimPrefix(config.Disk, h.deviceDir+"/"),
+		exited: make(chan struct{}), up: true, hypervisor: h,
+		outbox: "/run/sbx/abc/" + config.Name + "/" + outboxName, inbox: "/run/sbx/abc/" + config.Name + inboxSuffix, imageDir: config.ImageDir,
+	}
 	if h.onStart != nil {
 		h.onStart(machine)
 	}
@@ -680,6 +708,27 @@ type fakeMachine struct {
 	// connectFunc answers a connect (guest protocol v2); nil is an agent
 	// older than v2.
 	connectFunc func(port int) (net.Conn, error)
+
+	// Memory images: where the VM's outbox and, for a restored VM, its
+	// image are; how its snapshot and restore answer.
+	outbox, inbox, imageDir     string
+	snapshotErr                 error
+	snapshotCalls, restoreCalls []string
+	restoreErr                  error
+	restoredRequests            []RestoreRequest
+	cowFallsBack, restoredGuest bool
+	mounts                      map[string]bool
+	// restoredOp answers the "restored" handshake op (guest protocol
+	// v3); nil is an agent older than v3.
+	restoredOp func(nowNs int64, entropy []byte) (guest.RestoredResult, error)
+	// entropySeen is what the restored op was given, in order.
+	entropySeen [][]byte
+	// handshake is each guest command the driver ran to bring a
+	// restored guest up to date (its clock and its network device).
+	handshake []string
+	// restoreHook answers those commands; nil succeeds and prints what
+	// a guest that did them would (restoreHookAnswers).
+	restoreHook func(script string, stdout, stderr io.Writer) (int, bool, error)
 }
 
 func (m *fakeMachine) Agent() Agent            { return (*fakeAgent)(m) }
@@ -789,6 +838,86 @@ func (m *fakeMachine) BootRead() int64 {
 	return m.bootRead
 }
 
+const fakeVMUID = 70123
+
+func (m *fakeMachine) UID() uint32    { return fakeVMUID }
+func (m *fakeMachine) Disk() string   { return m.config.Disk }
+func (m *fakeMachine) Outbox() string { return m.outbox }
+func (m *fakeMachine) Inbox() string  { return m.inbox }
+
+// Snapshot writes the three files of a snapshot into the directory the
+// daemon mounted for it, as the hypervisor does, and only while paused.
+func (m *fakeMachine) Snapshot(_ context.Context, destination string) error {
+	m.mu.Lock()
+	if m.dead || m.gone {
+		m.mu.Unlock()
+		return errors.New("connection refused: vm is gone")
+	}
+	m.snapshotCalls = append(m.snapshotCalls, destination)
+	if m.snapshotErr != nil {
+		err := m.snapshotErr
+		m.mu.Unlock()
+		return err
+	}
+	if !m.paused {
+		m.mu.Unlock()
+		return &hypervisorRefusal{action: "vm.snapshot", status: "500 Internal Server Error", body: "Trying to snapshot while VM is running"}
+	}
+	paused := m.paused
+	m.mu.Unlock()
+	if !paused {
+		return errors.New("not paused")
+	}
+	dir := strings.TrimPrefix(destination, "file://")
+	memory, err := os.OpenFile(filepath.Join(dir, imageMemoryFile), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_ = memory.Truncate(int64(m.config.MemoryMB) << 20)
+	memory.Close()
+	_ = os.WriteFile(filepath.Join(dir, imageConfigFile), []byte(`{"cpus":{"boot_vcpus":1}}`), 0o600)
+	_ = os.WriteFile(filepath.Join(dir, imageStateFile), []byte(`{}`), 0o600)
+	return nil
+}
+
+// Restore brings the VM back, paused, from its image; the device's tap
+// must be an open descriptor the hypervisor can take.
+func (m *fakeMachine) Restore(_ context.Context, request RestoreRequest) error {
+	m.event("restore")
+	m.mu.Lock()
+	if m.dead || m.gone {
+		m.mu.Unlock()
+		return errors.New("connection refused: vm is gone")
+	}
+	m.restoredRequests = append(m.restoredRequests, request)
+	if m.restoreErr != nil {
+		err := m.restoreErr
+		m.mu.Unlock()
+		return err
+	}
+	if request.NetFD != nil {
+		if _, err := request.NetFD.Stat(); err != nil {
+			m.mu.Unlock()
+			return &hypervisorRefusal{action: "vm.restore", status: "400 Bad Request", body: "the tap is not an open descriptor"}
+		}
+	}
+	m.restoredGuest, m.paused = true, true
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *fakeMachine) MapsFile(hostPath string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.restoredGuest && !m.cowFallsBack && m.imageDir != "" && filepath.Join(m.imageDir, imageMemoryFile) == hostPath
+}
+
+func (m *fakeMachine) HasMount(path string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.mounts[path]
+}
+
 func (m *fakeMachine) Kill(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -873,6 +1002,24 @@ func (a *fakeAgent) Connect(_ context.Context, port int) (net.Conn, error) {
 	return connect(port)
 }
 
+// Restored answers the "restored" handshake (guest protocol v3). The
+// machine's restoredOp says what the guest did; nil is an agent built
+// before version 3. Every call's entropy is kept, in order.
+func (a *fakeAgent) Restored(_ context.Context, nowNs int64, entropy []byte) (guest.RestoredResult, error) {
+	if err := a.alive(); err != nil {
+		return guest.RestoredResult{}, err
+	}
+	m := (*fakeMachine)(a)
+	m.mu.Lock()
+	op := m.restoredOp
+	a.entropySeen = append(a.entropySeen, bytes.Clone(entropy))
+	m.mu.Unlock()
+	if op == nil {
+		return guest.RestoredResult{}, &guest.Error{Code: guest.CodeUnsupportedVersion, Message: "protocol version 3 is not supported; this agent speaks 1 to 2"}
+	}
+	return op(nowNs, entropy)
+}
+
 func (a *fakeAgent) Sync(context.Context) error {
 	if a.syncErr != nil {
 		return a.syncErr
@@ -890,17 +1037,27 @@ func (a *fakeAgent) Exec(_ context.Context, cmd, cwd string, env map[string]stri
 	}
 	a.mu.Lock()
 	setup := strings.HasPrefix(cmd, guestSetupMark)
-	if setup {
+	handshake := strings.HasPrefix(cmd, restoreClockMark) || strings.HasPrefix(cmd, restoreNetMark)
+	switch {
+	case setup:
 		a.setups = append(a.setups, cmd)
-	} else {
+	case handshake:
+		a.handshake = append(a.handshake, cmd)
+	default:
 		a.execs = append(a.execs, maps.Clone(env))
 	}
-	execFunc := a.execFunc
+	execFunc, restoreHook := a.execFunc, a.restoreHook
 	a.mu.Unlock()
 	if setup && a.setupFunc != nil {
 		return a.setupFunc(cmd, stderr)
 	}
-	if setup {
+	if handshake && restoreHook != nil {
+		return restoreHook(cmd, stdout, stderr)
+	}
+	if setup || handshake {
+		if handshake {
+			restoreHookAnswers(cmd, stdout)
+		}
 		return 0, false, nil
 	}
 	if execFunc != nil {
@@ -1077,4 +1234,21 @@ func (z *fakeZFS) CheckKey(_ context.Context, name string, key []byte) error {
 		return fmt.Errorf("Key load error: Incorrect key provided for '%s'", name)
 	}
 	return nil
+}
+
+// restoreHookAnswers is what a guest that did the restore handshake
+// says: its clock as it now reads, and that its kernel has the VM
+// Generation ID device. Now is the time the script carries (it steps
+// the clock to that); a test that wants another answer supplies its own
+// hook.
+func restoreHookAnswers(script string, stdout io.Writer) {
+	if strings.HasPrefix(script, restoreClockMark) {
+		if at := strings.Index(script, "date -u -s @"); at >= 0 {
+			rest := script[at+len("date -u -s @"):]
+			if end := strings.IndexAny(rest, " \n"); end > 0 {
+				fmt.Fprintln(stdout, rest[:end])
+			}
+		}
+		fmt.Fprintln(stdout, "vmgenid")
+	}
 }

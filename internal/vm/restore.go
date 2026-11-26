@@ -395,21 +395,22 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 		SavedMAC:      image.MAC,
 	})
 	step("hypervisor", began)
+	if result != nil {
+		// From here the hypervisor is the caller's to give back, with
+		// the volume under it, and the image is that VM's until it is
+		// gone, whatever becomes of the restore: its jail holds two of
+		// the image's files from the moment it starts.
+		volume = false
+		d.images.mapping(img, name)
+		holding = false
+	}
 	if err != nil {
 		if result == nil {
 			return nil, nil, fmt.Errorf("start the hypervisor: %w", err)
 		}
-		// Started, and not killed: the caller gives it back, with the
-		// volume under it.
-		volume = false
+		// Started, and not killed: the caller gives it back.
 		return result, nil, fmt.Errorf("start the hypervisor: %w", err)
 	}
-	// From here the hypervisor is the caller's to give back, with the
-	// volume under it, and it may hold the image's files from now on:
-	// its jail holds two of them.
-	volume = false
-	d.images.mapping(img, name)
-	holding = false
 	if networked {
 		if network, err = d.network.Attach(ctx, name, spec.Network, proxyPort); err != nil {
 			return result, nil, fmt.Errorf("network device: %w", err)

@@ -569,9 +569,12 @@ type fakeHypervisor struct {
 	// process sweep ran.
 	zfsCallsAtSweep int
 	// restored are the restore starts, in order (Restore); startErr
-	// makes the next one fail before there is a machine.
+	// makes the next one fail before there is a machine, and
+	// startedErr makes it fail after one was started, which is handed
+	// back with the error.
 	restored   []RestoreConfig
 	restoreErr error
+	startedErr error
 	// outboxes: every booted VM's jail holds an outbox, at a directory
 	// under outboxRoot, as it does when the driver keeps memory images.
 	outboxes   bool
@@ -639,6 +642,11 @@ func (h *fakeHypervisor) Restore(_ context.Context, config RestoreConfig) (Machi
 		h.onStart(machine)
 	}
 	h.machines[config.Name] = machine
+	if h.startedErr != nil {
+		err := h.startedErr
+		h.startedErr = nil
+		return machine, errors.Join(errors.New("the hypervisor's API did not answer within 10s"), err)
+	}
 	return machine, nil
 }
 

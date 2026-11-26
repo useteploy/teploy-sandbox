@@ -837,6 +837,42 @@ func TestAResumeRefusedBeforeTheImageIsReachedKeepsItAndAnImageIsNeverShared(t *
 	assertPool(t, rig.zfs, append([]string{datasetOf(spec.Image), spec.Image}, memoryPristine...)...)
 }
 
+// A hypervisor started for a restore holds two of the image's files in
+// its jail from the moment it starts. If its API never answers and it
+// cannot be killed, the image is that VM's until the VM is gone: the
+// record lets go, the image stays, and the retry that kills the VM is
+// what makes it go.
+func TestAnImageWhoseRestoredHypervisorCannotBeKilledLivesUntilTheVMDoes(t *testing.T) {
+	rig := newMemoryRig(t, nil)
+	spec, record := savedForResume(t, rig, 1)
+	dataset := imageDataset(record.ID)
+	rig.hypervisor.startedErr = errors.New("the hypervisor exited before its API answered")
+	onRestored(rig, func(m *fakeMachine) { m.killErr = errors.New("hypervisor process did not exit") })
+	_, _, _, err := rig.driver.ResumeMemory(bg, "run-"+spec.Name, spec, &record)
+	if err == nil || !strings.Contains(err.Error(), "before its API answered") {
+		t.Fatalf("a restore whose hypervisor's API never answered: %v", err)
+	}
+	// The machine could not be given back: the driver keeps track of it
+	// for the removal the manager retries.
+	current, err := rig.driver.instance(spec.Name)
+	if err != nil || current == nil {
+		t.Fatalf("the hypervisor that could not be killed is not tracked: %v", err)
+	}
+	must(t, rig.driver.ReleaseMemory(bg, &record))
+	if !rig.zfs.has(t, dataset) {
+		t.Fatal("the image went while a hypervisor holds its files in its jail")
+	}
+	machine := rig.hypervisor.machine(spec.Name)
+	machine.mu.Lock()
+	machine.killErr = nil
+	machine.mu.Unlock()
+	must(t, rig.driver.Remove(bg, spec.Name))
+	if rig.zfs.has(t, dataset) || len(rig.driver.images.known) != 0 {
+		t.Fatalf("the image outlived the VM restored from it: %v", rig.imageIDs())
+	}
+	assertPool(t, rig.zfs, append([]string{datasetOf(spec.Image), spec.Image}, memoryPristine...)...)
+}
+
 // A daemon's next life keeps the images its registry names and sweeps
 // the rest, and a run whose image is not on this host resumes from its
 // disk.

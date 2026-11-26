@@ -311,7 +311,8 @@ func (z *fakeZFS) Destroy(_ context.Context, name string) error {
 		return nil
 	}
 	if _, ok := z.datasets[name]; !ok {
-		return fmt.Errorf("cannot open '%s': dataset does not exist", name)
+		// As the real one: a command's failure, which isMissing knows.
+		return zfsError(fmt.Sprintf("cannot open '%s': dataset does not exist", name))
 	}
 	for snapshot := range z.snapshots {
 		if datasetOf(snapshot) == name {
@@ -571,6 +572,10 @@ type fakeHypervisor struct {
 	// makes the next one fail before there is a machine.
 	restored   []RestoreConfig
 	restoreErr error
+	// outboxes: every booted VM's jail holds an outbox, at a directory
+	// under outboxRoot, as it does when the driver keeps memory images.
+	outboxes   bool
+	outboxRoot string
 }
 
 func newFakeHypervisor(z *fakeZFS) *fakeHypervisor {
@@ -587,6 +592,11 @@ func (h *fakeHypervisor) Start(_ context.Context, config MachineConfig) (Machine
 	machine := &fakeMachine{
 		config: config, zfs: h.zfs, volume: strings.TrimPrefix(config.Disk, h.deviceDir+"/"),
 		exited: make(chan struct{}), pingErr: h.bootErr, gate: h.bootGate, hypervisor: h,
+	}
+	if h.outboxes {
+		// The jail's outbox, made by the confinement on the host.
+		machine.outbox = filepath.Join(h.outboxRoot, config.Name, outboxName)
+		_ = os.MkdirAll(machine.outbox, 0o755)
 	}
 	h.booting++
 	h.peak = max(h.peak, h.booting)
@@ -617,7 +627,13 @@ func (h *fakeHypervisor) Restore(_ context.Context, config RestoreConfig) (Machi
 	machine := &fakeMachine{
 		config: config.MachineConfig, zfs: h.zfs, volume: strings.TrimPrefix(config.Disk, h.deviceDir+"/"),
 		exited: make(chan struct{}), up: true, hypervisor: h,
-		outbox: "/run/sbx/abc/" + config.Name + "/" + outboxName, inbox: "/run/sbx/abc/" + config.Name + inboxSuffix, imageDir: config.ImageDir,
+		inbox: "/run/sbx/abc/" + config.Name + inboxSuffix, imageDir: config.ImageDir,
+	}
+	if h.outboxes {
+		// A restored VM's jail has an outbox too: it may be stopped
+		// again with its memory saved.
+		machine.outbox = filepath.Join(h.outboxRoot, config.Name, outboxName)
+		_ = os.MkdirAll(machine.outbox, 0o755)
 	}
 	if h.onStart != nil {
 		h.onStart(machine)
@@ -634,6 +650,27 @@ func (h *fakeHypervisor) Sweep(context.Context) (int, error) {
 	h.zfsCallsAtSweep = len(h.zfs.calls)
 	h.zfs.mu.Unlock()
 	return 0, h.sweepErr
+}
+
+// mounted says that a mount under a VM's outbox appeared in its jail,
+// or went: what a slave bind of the outbox does on a real host.
+func (h *fakeHypervisor) mounted(target string, on bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, machine := range h.machines {
+		if machine.outbox != "" && strings.HasPrefix(target, machine.outbox+string(filepath.Separator)) {
+			machine.mu.Lock()
+			if on {
+				if machine.mounts == nil {
+					machine.mounts = map[string]bool{}
+				}
+				machine.mounts[target] = true
+			} else {
+				delete(machine.mounts, target)
+			}
+			machine.mu.Unlock()
+		}
+	}
 }
 
 func (h *fakeHypervisor) machine(name string) *fakeMachine {
@@ -669,6 +706,8 @@ type fakeMachine struct {
 	mu     sync.Mutex
 	dead   bool
 	paused bool
+	// resumeErr is what Resume answers; nil resumes.
+	resumeErr error
 	// gone: the process is dead and its sockets fail, while exited may
 	// not be closed yet (die).
 	gone     bool
@@ -711,8 +750,14 @@ type fakeMachine struct {
 
 	// Memory images: where the VM's outbox and, for a restored VM, its
 	// image are; how its snapshot and restore answer.
-	outbox, inbox, imageDir     string
-	snapshotErr                 error
+	outbox, inbox, imageDir string
+	snapshotErr             error
+	// snapshotHook runs once the snapshot's files are written, with the
+	// directory they were written to: what a hypervisor the guest took
+	// over may add. snapshotWhilePaused records that the hypervisor was
+	// asked for the memory of a paused VM.
+	snapshotHook                func(dir string)
+	snapshotWhilePaused         bool
 	snapshotCalls, restoreCalls []string
 	restoreErr                  error
 	restoredRequests            []RestoreRequest
@@ -803,8 +848,10 @@ func (m *fakeMachine) Resume(context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.events = append(m.events, "resume")
-	m.paused = false
-	return nil
+	if m.resumeErr == nil {
+		m.paused = false
+	}
+	return m.resumeErr
 }
 
 func (m *fakeMachine) AddNet(_ context.Context, tap *os.File, mac string) error {
@@ -863,9 +910,9 @@ func (m *fakeMachine) Snapshot(_ context.Context, destination string) error {
 		m.mu.Unlock()
 		return &hypervisorRefusal{action: "vm.snapshot", status: "500 Internal Server Error", body: "Trying to snapshot while VM is running"}
 	}
-	paused := m.paused
+	m.snapshotWhilePaused = m.paused
 	m.mu.Unlock()
-	if !paused {
+	if !m.paused {
 		return errors.New("not paused")
 	}
 	dir := strings.TrimPrefix(destination, "file://")
@@ -877,6 +924,9 @@ func (m *fakeMachine) Snapshot(_ context.Context, destination string) error {
 	memory.Close()
 	_ = os.WriteFile(filepath.Join(dir, imageConfigFile), []byte(`{"cpus":{"boot_vcpus":1}}`), 0o600)
 	_ = os.WriteFile(filepath.Join(dir, imageStateFile), []byte(`{}`), 0o600)
+	if m.snapshotHook != nil {
+		m.snapshotHook(dir)
+	}
 	return nil
 }
 

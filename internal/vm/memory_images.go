@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/useteploy/teploy-sandbox/internal/run"
@@ -207,6 +208,8 @@ type memoryImages struct {
 	mounts mountOps
 	// chown changes the owner of a path without following a link.
 	chown func(path string, uid, gid uint32) error
+	// chownFile changes the owner of an open file.
+	chownFile func(file *os.File, uid, gid uint32) error
 	// newID names a new image.
 	newID func() string
 	// sealedUID is who owns a sealed image's files: root.
@@ -239,8 +242,11 @@ func newMemoryImages(ctx context.Context, zfs imageFS, dataset, mountDir, owner 
 		zfs: zfs, root: strings.TrimSuffix(dataset, "/"), mountDir: mountDir, owner: owner, keys: keys, class: class, log: log,
 		mounts: realMountOps(),
 		chown:  func(path string, uid, gid uint32) error { return os.Lchown(path, int(uid), int(gid)) },
-		newID:  func() string { return strings.ToLower(run.NewULID(time.Now())) },
-		known:  map[string]*image{},
+		chownFile: func(file *os.File, uid, gid uint32) error {
+			return file.Chown(int(uid), int(gid))
+		},
+		newID: func() string { return strings.ToLower(run.NewULID(time.Now())) },
+		known: map[string]*image{},
 	}
 	// A directory of root's alone: an image's dataset is the VM's to
 	// write until it is sealed, and nothing else may even name it.
@@ -368,9 +374,11 @@ func (s *memoryImages) seal(ctx context.Context, img *image) error {
 		return fmt.Errorf("take the image out of the VM's outbox: %w", err)
 	}
 	for _, name := range imageFiles {
-		path := filepath.Join(img.dir, name)
-		_ = s.chown(path, s.sealedUID, s.sealedUID)
-		_ = os.Chmod(path, 0o444)
+		// Refused is not an error here: a file that cannot be made
+		// root's and read-only (it is not there, or it is not a plain
+		// file) is what verifyImage refuses the image for, once nothing
+		// can change it any more.
+		_ = s.ownFile(img.dir, name)
 	}
 	_ = s.chown(img.dir, s.sealedUID, s.sealedUID)
 	_ = os.Chmod(img.dir, 0o755)
@@ -382,6 +390,30 @@ func (s *memoryImages) seal(ctx context.Context, img *image) error {
 	}
 	img.sealed = true
 	return nil
+}
+
+// ownFile makes the file name of the image's directory root's and
+// read-only, through a descriptor that followed no link. The writer is
+// hostile: a link it planted where a file of the snapshot belongs would
+// have the daemon, which is root, change whatever the link names on the
+// host. A link is left as it is, for verifyImage to refuse the image.
+func (s *memoryImages) ownFile(dir, name string) error {
+	file, err := os.OpenFile(filepath.Join(dir, name), os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", name)
+	}
+	if err := s.chownFile(file, s.sealedUID, s.sealedUID); err != nil {
+		return err
+	}
+	return file.Chmod(0o444)
 }
 
 // abandon gives up an image the caller held: the stop it was made for
@@ -655,10 +687,20 @@ func verifyImage(dir string, memoryMB int, owner uint32) error {
 	if err != nil {
 		return err
 	}
+	if !info.IsDir() {
+		return fmt.Errorf("the image's directory is a %s", fileKind(info.Mode()))
+	}
 	if uid, _ := ownerAndLinks(info); uid != owner || info.Mode().Perm()&0o022 != 0 {
 		return fmt.Errorf("the image's directory belongs to uid %d with mode %04o, want uid %d and not writable by group or others", uid, info.Mode().Perm(), owner)
 	}
-	entries, err := os.ReadDir(dir)
+	// From here nothing of the image is reached by a path that could lead
+	// out of it: everything is read through the directory itself.
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	entries, err := fs.ReadDir(root.FS(), ".")
 	if err != nil {
 		return err
 	}
@@ -671,8 +713,7 @@ func verifyImage(dir string, memoryMB int, owner uint32) error {
 	}
 	limits := map[string]int64{imageConfigFile: imageConfigMaxBytes, imageStateFile: imageStateMaxBytes, imageMemoryFile: imageNeedsBytes(memoryMB)}
 	for _, name := range imageFiles {
-		path := filepath.Join(dir, name)
-		info, err := os.Lstat(path)
+		info, err := root.Lstat(name)
 		if err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}

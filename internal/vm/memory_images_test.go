@@ -48,6 +48,7 @@ func newTestImagesAt(t *testing.T, z *fakeZFS, mountDir string) *memoryImages {
 		// Only root hands a directory to another user; elsewhere the
 		// "hypervisor" is this user, and a sealed image is this user's.
 		s.chown = func(string, uint32, uint32) error { return nil }
+		s.chownFile = func(*os.File, uint32, uint32) error { return nil }
 		s.sealedUID = uint32(os.Geteuid())
 	}
 	s.mounts = mountOps{
@@ -278,6 +279,67 @@ func TestSealingRefusesWhatACompromisedHypervisorLeavesBehind(t *testing.T) {
 	}
 }
 
+// Sealing makes the image's files root's and read-only through paths
+// the writer chose. A link it planted where a file of the snapshot
+// belongs must not have the daemon, which is root, change whatever the
+// link names on the host: the link is left alone, and refuses the image.
+func TestSealingFollowsNoLinkTheWriterPlanted(t *testing.T) {
+	for name, plant := range map[string]func(t *testing.T, img *image, host string){
+		"a link to a host file where state.json belongs": func(t *testing.T, img *image, host string) {
+			path := filepath.Join(img.dir, imageStateFile)
+			must(t, os.Remove(path))
+			must(t, os.Symlink(host, path))
+		},
+		"a link to a host directory where the memory belongs": func(t *testing.T, img *image, host string) {
+			path := filepath.Join(img.dir, imageMemoryFile)
+			must(t, os.Remove(path))
+			must(t, os.Symlink(filepath.Dir(host), path))
+		},
+		"a chain of links to a host file": func(t *testing.T, img *image, host string) {
+			path := filepath.Join(img.dir, imageStateFile)
+			must(t, os.Remove(path))
+			must(t, os.Symlink("one", path))
+			must(t, os.Symlink("two", filepath.Join(img.dir, "one")))
+			must(t, os.Symlink(host, filepath.Join(img.dir, "two")))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			z := newFakeZFS()
+			s := newTestImages(t, z)
+			hostDir := t.TempDir()
+			host := filepath.Join(hostDir, "shadow")
+			must(t, os.WriteFile(host, []byte("root:x"), 0o600))
+			before, err := os.Stat(host)
+			must(t, err)
+			dirBefore, err := os.Stat(hostDir)
+			must(t, err)
+			img, err := s.begin(bg, 256, testVMUID)
+			must(t, err)
+			_, err = s.bind(img, t.TempDir())
+			must(t, err)
+			writeSnapshot(t, img)
+			plant(t, img, host)
+			if err := s.seal(bg, img); err == nil || img.sealed {
+				t.Fatalf("the image was sealed: %v", err)
+			}
+			after, err := os.Stat(host)
+			if err != nil || after.Mode() != before.Mode() || !os.SameFile(before, after) {
+				t.Fatalf("the host's file was changed by sealing: before %v, after %v (%v)", before.Mode(), after.Mode(), err)
+			}
+			if raw, _ := os.ReadFile(host); string(raw) != "root:x" {
+				t.Fatalf("the host's file reads %q", raw)
+			}
+			if info, err := os.Stat(hostDir); err != nil || info.Mode() != dirBefore.Mode() {
+				t.Fatalf("the host's directory was %v and is %v (%v)", dirBefore.Mode(), info.Mode(), err)
+			}
+			// And the rest of the image is root's and read-only all the same.
+			if info, err := os.Lstat(filepath.Join(img.dir, imageConfigFile)); err != nil || info.Mode().Perm() != 0o444 {
+				t.Fatalf("config.json: %v %v", info, err)
+			}
+		})
+	}
+}
+
 // Only root can give a file to another user; this is the check that an
 // image's files are root's, with a file a taken-over hypervisor left its
 // own after the daemon's pass.
@@ -288,6 +350,7 @@ func TestAnImageIsNotOpenedWhileAFileIsNotRoots(t *testing.T) {
 	z := newFakeZFS()
 	s := newTestImages(t, z)
 	s.chown = func(path string, uid, gid uint32) error { return os.Lchown(path, int(uid), int(gid)) }
+	s.chownFile = func(file *os.File, uid, gid uint32) error { return file.Chown(int(uid), int(gid)) }
 	s.sealedUID = 0
 	img, rec := savedImage(t, s, "run", 256)
 	must(t, os.Chown(filepath.Join(img.dir, imageStateFile), testVMUID, testVMUID))

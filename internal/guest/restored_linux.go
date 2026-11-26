@@ -1,7 +1,6 @@
 package guest
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"os"
@@ -75,22 +74,7 @@ func platformAddEntropy(entropy []byte) (reseeded bool, err error) {
 }
 
 // platformVMGenIDSeen reports whether the kernel's VM Generation ID
-// driver is bound to the device the hypervisor presents: the ACPI device
-// VMGENCTR, with a driver. The device is in the tables whether or not the
-// kernel has the driver (CONFIG_VMGENID); the driver is what reseeds.
+// driver is bound to the device the hypervisor presents (vmGenIDSeen).
 func platformVMGenIDSeen() bool {
-	devices, err := os.ReadDir("/sys/bus/acpi/devices")
-	if err != nil {
-		return false
-	}
-	for _, device := range devices {
-		name := device.Name()
-		if !bytes.HasPrefix([]byte(name), []byte("VMGENCTR")) {
-			continue
-		}
-		if _, err := os.Stat("/sys/bus/acpi/devices/" + name + "/driver"); err == nil {
-			return true
-		}
-	}
-	return false
+	return vmGenIDSeen("/sys/bus")
 }

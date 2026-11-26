@@ -76,8 +76,9 @@ func (d *Driver) restoreClock(ctx context.Context, machine Machine) error {
 
 func (d *Driver) restoreClockScript(ctx context.Context, machine Machine) error {
 	now := time.Now()
-	script := fmt.Sprintf("%s\nset -eu\ndate -u -s @%d.%09d >/dev/null\ndate +%%s.%%N\nif [ -e /sys/bus/acpi/devices/VMGENCTR:00/driver ]; then echo vmgenid; else echo vmgenid-absent; fi\n",
-		restoreClockMark, now.Unix(), now.Nanosecond())
+	// The clock to the nanosecond, and read back; then whether the
+	// guest's kernel reseeds its generator by itself.
+	script := fmt.Sprintf("%s\nset -eu\ndate -u -s @%d.%09d >/dev/null\ndate +%%s.%%N\n%s", restoreClockMark, now.Unix(), now.Nanosecond(), vmGenIDProbe("/sys/bus"))
 	var stdout, stderr strings.Builder
 	code, timedOut, err := machine.Agent().Exec(ctx, script, "/", nil, restoreHandshakeTimeout, &stdout, &stderr)
 	switch {
@@ -96,9 +97,28 @@ func (d *Driver) restoreClockScript(ctx context.Context, machine Machine) error 
 		return err
 	}
 	if !vmgenid {
-		return errors.New("the guest's kernel has no VM Generation ID device to reseed its random state with, and its agent is too old to")
+		return errors.New("the guest's kernel has no VM Generation ID driver bound to reseed its random state with, and its agent is too old to")
 	}
 	return nil
+}
+
+// vmGenIDProbe is shell for a guest whose agent is older than the
+// handshake op: it prints vmgenid when the kernel's VM Generation ID
+// driver is bound to the device the hypervisor presents, and
+// vmgenid-absent when it is not. The device is in the hypervisor's
+// tables whether or not the kernel has the driver, so what says the
+// driver is there is that it is bound, wherever the kernel bound it: to
+// the ACPI device, or to the platform device that is its physical node.
+// The kernel's own message that it reseeded because the VM was forked
+// says so too. bus is the system's /sys/bus.
+func vmGenIDProbe(bus string) string {
+	return fmt.Sprintf(`seen=-absent
+for d in %[1]s/*/devices/VMGENCTR*; do
+  if [ -e "$d/driver" ]; then seen=; fi
+  if node="$(readlink -f "$d/physical_node" 2>/dev/null)" && [ -n "$node" ] && [ -e "$node/driver" ]; then seen=; fi
+done
+if dmesg 2>/dev/null | grep -q 'crng reseeded due to virtual machine fork'; then seen=; fi
+echo "vmgenid$seen"`, bus)
 }
 
 func detailOf(text string) string {

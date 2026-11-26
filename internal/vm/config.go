@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/useteploy/teploy-sandbox/internal/hostsecret"
 )
 
 // Defaults for the serve flags. The pool and golden names are what
@@ -108,6 +110,23 @@ type Config struct {
 	// Warm is the warm pool: VMs booted ahead of creates. No sizes is
 	// no pool.
 	Warm WarmConfig
+	// MemorySnapshots: at a stop, also save each VM's memory into an
+	// encrypted image, so that a resume on this host restores the VM
+	// instead of booting it (restore.go). Off: every VM's jail is what
+	// it was, and stops and resumes are what they were.
+	MemorySnapshots bool
+	// ImageDataset is the ZFS dataset the images are created under
+	// (default <pool>/teploy-img), inside the pool; ImageMountDir is
+	// where they are mounted on the host (default DefaultImageMountDir).
+	ImageDataset  string
+	ImageMountDir string
+	// HostSecret is the file holding the host's secret, under which
+	// the images' keys are wrapped (default DefaultHostSecret).
+	HostSecret string
+	// PoolReserve is the share of the pool, in percent, kept free: an
+	// image is not saved into a pool below it, and images go from one
+	// (0 never).
+	PoolReserve int
 }
 
 // host is what Preflight asks of the machine; a struct of functions so the
@@ -243,6 +262,15 @@ func (c Config) withDefaults() Config {
 	if c.Subnet == "" {
 		c.Subnet = DefaultSubnet
 	}
+	if c.ImageDataset == "" {
+		c.ImageDataset = DefaultImageDataset(c.Pool)
+	}
+	if c.ImageMountDir == "" {
+		c.ImageMountDir = DefaultImageMountDir
+	}
+	if c.HostSecret == "" {
+		c.HostSecret = hostsecret.DefaultPath
+	}
 	for _, each := range []struct {
 		value    *int
 		fallback int
@@ -258,6 +286,30 @@ func (c Config) withDefaults() Config {
 func (c Config) diskLimits() diskLimits {
 	c = c.withDefaults()
 	return diskLimits{BytesPerSecond: int64(max(c.DiskMBPerSecond, 0)) << 20, IOPS: int64(max(c.DiskIOPS, 0))}
+}
+
+// newMemoryImagesFor sets the driver up to keep memory images: the
+// host's secret, the host's class, the image dataset and its mount
+// directory, and an outbox in every VM's jail.
+func newMemoryImagesFor(ctx context.Context, config Config, hypervisorPath string, zfs ZFS, confine *confinement, log *slog.Logger) (*memoryImages, error) {
+	secret, err := hostsecret.Load(config.HostSecret)
+	if err != nil {
+		return nil, fmt.Errorf("the host's secret (--remote-host-secret-file): %w", err)
+	}
+	// Everything an image depends on is measured once, here: a daemon
+	// that keeps images must know its own class before it saves one.
+	class, err := detectHostClass(ctx, config, hypervisorPath)
+	if err != nil {
+		return nil, err
+	}
+	images, err := newMemoryImages(ctx, zfs.(imageFS), config.ImageDataset, config.ImageMountDir, config.Owner, secret, class, log)
+	if err != nil {
+		return nil, err
+	}
+	confine.outboxes = true
+	log.Info("vm memory images enabled", "dataset", config.ImageDataset, "mountDir", config.ImageMountDir, "hostClass", class.id[:16],
+		"hypervisor", class.hypervisor, "poolReservePercent", config.PoolReserve)
+	return images, nil
 }
 
 // MachineCgroup is the cgroup of the VM with the given name, and
@@ -596,6 +648,15 @@ func preflight(ctx context.Context, config Config, zfs ZFS, host host) error {
 		miss("%v", err)
 	}
 
+	if config.MemorySnapshots {
+		switch {
+		case config.ImageDataset == config.Pool || !strings.HasPrefix(config.ImageDataset, strings.TrimSuffix(config.Pool, "/")+"/"):
+			miss("the image dataset inside the pool %q (--vm-image-dataset / SBX_VM_IMAGE_DATASET), got %q", config.Pool, config.ImageDataset)
+		case config.PoolReserve < 0 || config.PoolReserve > 90:
+			miss("--remote-pool-reserve between 0 and 90 with --vm-memory-snapshots, got %d", config.PoolReserve)
+		}
+	}
+
 	if len(missing) == 0 {
 		return nil
 	}
@@ -718,6 +779,14 @@ func New(ctx context.Context, config Config, log *slog.Logger) (*Driver, error) 
 	driver.MaxRuns = max(config.MaxRuns, 0)
 	driver.setWarm(config.Warm)
 	driver.owner = config.Owner
+	if config.MemorySnapshots {
+		images, err := newMemoryImagesFor(ctx, config, hypervisor, zfs, confine, log)
+		if err != nil {
+			return nil, fmt.Errorf("memory images: %w", err)
+		}
+		driver.images = images
+		driver.reservePercent = config.PoolReserve
+	}
 	for _, warning := range sizingWarnings(config, realSizingHost()) {
 		log.Warn("host sizing: "+warning.text, warning.attrs...)
 	}

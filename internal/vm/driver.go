@@ -82,6 +82,13 @@ type Driver struct {
 	// not come up read under the raised boot limits since its last boot
 	// that did, and when the next may start.
 	failedBoots map[string]bootBackoff
+	// images keeps the stopped runs' memory images (nil: the driver
+	// keeps none, and stops and resumes are what they were before
+	// images existed).
+	images *memoryImages
+	// reservePercent is the share of the pool kept free: an image is
+	// not saved into a pool below it, and images go from one.
+	reservePercent int
 }
 
 // bootBackoff is a snapshot whose last boots failed.
@@ -170,6 +177,10 @@ type instance struct {
 	// run's own container name, which is the VM's name unless the VM came
 	// from the warm pool.
 	network string
+	// mac is the address of the VM's network device ("" with none), and
+	// cpus and memoryMB its size: what a memory image of it records.
+	mac            string
+	cpus, memoryMB int
 }
 
 var (
@@ -223,6 +234,39 @@ func (d *Driver) AdmitCreate(req run.CreateRequest) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.fullLocked()
+}
+
+// checkCreate refuses a create this driver cannot honour, before
+// anything is allocated, and returns the port of an allowlist run's
+// proxy.
+func (d *Driver) checkCreate(spec run.CreateSpec) (int, error) {
+	networked := spec.Network != "" && spec.Network != run.NetworkNone
+	proxyPort := 0
+	switch {
+	case networked && d.network == nil:
+		return 0, unsupported("has no guest networking on this daemon: only network \"none\" is available, got %q", spec.Network)
+	case networked && spec.Network != run.NetworkAllowlist && spec.Network != run.NetworkOpen:
+		return 0, unsupported("has no network tier %q", spec.Network)
+	case spec.CacheHostPath != "" || spec.CachePath != "":
+		return 0, unsupported("has no warm repo cache yet")
+	case !spec.IsRoot():
+		// Every command runs as root in the guest in this slice. This is
+		// the answer the manager turns into its documented root fallback.
+		return 0, fmt.Errorf("%w %q: the vm driver runs every command as root", run.ErrNoSuchUser, spec.User)
+	case spec.MemoryMB <= 0:
+		return 0, unsupported("needs a memory limit")
+	case spec.Image != GoldenImage && !d.volumes.OwnsRef(spec.Image):
+		return 0, unsupported("boots its golden image (image %q) or one of its own snapshots; %q is neither", GoldenImage, spec.Image)
+	}
+	if spec.Network == run.NetworkAllowlist {
+		// The proxy is the tier: without one there is nothing to admit
+		// the run to, and it would be a run on "none" that says otherwise.
+		var err error
+		if proxyPort, err = d.proxyPort(spec.ProxyURL); err != nil {
+			return 0, err
+		}
+	}
+	return proxyPort, nil
 }
 
 // fullLocked is ErrAtCapacity when runs have as many VMs as they may.
@@ -283,36 +327,13 @@ func vcpus(limit float64) int {
 // error means something of that name could not be cleaned up (the Runtime
 // contract).
 func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error) {
-	networked := spec.Network != "" && spec.Network != run.NetworkNone
-	proxyPort := 0
-	switch {
-	case networked && d.network == nil:
-		return "", unsupported("has no guest networking on this daemon: only network \"none\" is available, got %q", spec.Network)
-	case networked && spec.Network != run.NetworkAllowlist && spec.Network != run.NetworkOpen:
-		return "", unsupported("has no network tier %q", spec.Network)
-	case spec.CacheHostPath != "" || spec.CachePath != "":
-		return "", unsupported("has no warm repo cache yet")
-	case !spec.IsRoot():
-		// Every command runs as root in the guest in this slice. This is
-		// the answer the manager turns into its documented root fallback.
-		return "", fmt.Errorf("%w %q: the vm driver runs every command as root", run.ErrNoSuchUser, spec.User)
-	case spec.MemoryMB <= 0:
-		return "", unsupported("needs a memory limit")
+	proxyPort, err := d.checkCreate(spec)
+	if err != nil {
+		return "", err
 	}
 	ref := ""
 	if spec.Image != GoldenImage {
-		if !d.volumes.OwnsRef(spec.Image) {
-			return "", unsupported("boots its golden image (image %q) or one of its own snapshots; %q is neither", GoldenImage, spec.Image)
-		}
 		ref = spec.Image
-	}
-	if spec.Network == run.NetworkAllowlist {
-		// The proxy is the tier: without one there is nothing to admit
-		// the run to, and it would be a run on "none" that says otherwise.
-		var err error
-		if proxyPort, err = d.proxyPort(spec.ProxyURL); err != nil {
-			return "", err
-		}
 	}
 	admitted, err := d.admit(spec.Name)
 	if err != nil {
@@ -358,12 +379,12 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 		// From here the VM is this run's, and only this run's: a VM that
 		// was claimed is never handed to another run, nor put back in the
 		// pool.
-		env, err := d.claim(ctx, name, machine, spec, proxyPort)
+		env, mac, err := d.claim(ctx, name, machine, spec, proxyPort)
 		if err == nil {
 			if source == sourcePool {
 				pool.claimed()
 			}
-			d.track(name, &instance{machine: machine, env: env, network: spec.Name})
+			d.track(name, &instance{machine: machine, env: env, network: spec.Name, mac: mac, cpus: cpus, memoryMB: spec.MemoryMB})
 			d.log.Info("vm handed to its run", "name", name, "run", spec.Name, "from", source, "tier", spec.Network,
 				"vm", booted.String(), "total", time.Since(start).String())
 			return name, nil
@@ -482,7 +503,7 @@ func exitedWithin(ctx context.Context, machine Machine, wait time.Duration) bool
 // allowlist run's proxy listens (Unplug), and the proxy itself, which the
 // manager holds.
 func (d *Driver) unclaim(ctx context.Context, name string, machine Machine, network string) error {
-	if err := machine.Kill(ctx); err != nil {
+	if err := d.kill(ctx, name, machine); err != nil {
 		return err
 	}
 	if d.network != nil {
@@ -568,7 +589,7 @@ func (d *Driver) boot(ctx context.Context, name, ref string, cpus, memoryMB int)
 	defer cancel()
 	var cleanupErr error
 	if machine != nil {
-		cleanupErr = machine.Kill(cleanupCtx)
+		cleanupErr = d.kill(cleanupCtx, name, machine)
 	}
 	if cleanupErr == nil {
 		cleanupErr = d.volumes.RemoveRun(cleanupCtx, name)
@@ -579,18 +600,30 @@ func (d *Driver) boot(ctx context.Context, name, ref string, cpus, memoryMB int)
 	return nil, false, err
 }
 
+// kill ends a VM's process and, once it is gone, lets its memory image
+// go: an image the VM was restored from loses the hold its mapping was.
+func (d *Driver) kill(ctx context.Context, name string, machine Machine) error {
+	if err := machine.Kill(ctx); err != nil {
+		return err
+	}
+	if d.images != nil {
+		d.images.vmGone(context.WithoutCancel(ctx), name)
+	}
+	return nil
+}
+
 // claim makes a booted VM the run's: its network device on the run's tier
 // in the run's own network namespace, handed to the running hypervisor;
 // then, in the guest, the clock and the device's address and routes. It
 // returns the environment every exec of the run starts from.
-func (d *Driver) claim(ctx context.Context, name string, machine Machine, spec run.CreateSpec, proxyPort int) (map[string]string, error) {
+func (d *Driver) claim(ctx context.Context, name string, machine Machine, spec run.CreateSpec, proxyPort int) (map[string]string, string, error) {
 	var guestNet *GuestNetwork
 	var attachTook, guestTook time.Duration
 	if spec.Network == run.NetworkAllowlist || spec.Network == run.NetworkOpen {
 		start := time.Now()
 		var err error
 		if guestNet, err = d.network.Attach(ctx, spec.Name, spec.Network, proxyPort); err != nil {
-			return nil, fmt.Errorf("network device for %s: %w", spec.Name, err)
+			return nil, "", fmt.Errorf("network device for %s: %w", spec.Name, err)
 		}
 		err = machine.AddNet(ctx, guestNet.Tap, guestNet.MAC)
 		// The hypervisor has its own copy now, or never will. The tap
@@ -604,25 +637,36 @@ func (d *Driver) claim(ctx context.Context, name string, machine Machine, spec r
 			if !errors.As(err, &refused) {
 				err = &vmUnreachable{err}
 			}
-			return nil, err
+			return nil, "", err
 		}
 	}
 	start := time.Now()
 	if err := prepareGuest(ctx, machine, guestNet); err != nil {
-		return nil, fmt.Errorf("vm %s: %w", name, err)
+		return nil, "", fmt.Errorf("vm %s: %w", name, err)
 	}
 	guestTook = time.Since(start)
-	env := maps.Clone(spec.Env)
-	if spec.Network == run.NetworkAllowlist {
-		// Under the caller's own, which may override it, as with Docker.
-		env = proxyEnv(spec.ProxyURL)
-		maps.Copy(env, spec.Env)
-	}
+	env := createEnv(spec, proxyPort)
 	if guestNet != nil {
 		d.log.Info("vm network device ready", "name", name, "run", spec.Name, "tier", spec.Network, "address", guestNet.Address.String(),
 			"hostSetup", attachTook.String(), "guestSetup", guestTook.String())
+		return env, guestNet.MAC, nil
 	}
-	return env, nil
+	return env, "", nil
+}
+
+// createEnv is the environment every exec of the run starts from: the
+// run's own, with the proxy's variables under it for an allowlist run
+// (the caller's own may override them, as with Docker).
+func createEnv(spec run.CreateSpec, proxyPort int) map[string]string {
+	env := maps.Clone(spec.Env)
+	if spec.Network == run.NetworkAllowlist {
+		if env == nil {
+			env = map[string]string{}
+		}
+		maps.Copy(env, proxyEnv(spec.ProxyURL))
+		maps.Copy(env, spec.Env)
+	}
+	return env
 }
 
 // discard removes a VM that is not, or no longer, a run's: its process,
@@ -630,7 +674,7 @@ func (d *Driver) claim(ctx context.Context, name string, machine Machine, spec r
 // be ""), and its volume. It can be repeated.
 func (d *Driver) discard(ctx context.Context, name string, machine Machine, network string) error {
 	if machine != nil {
-		if err := machine.Kill(ctx); err != nil {
+		if err := d.kill(ctx, name, machine); err != nil {
 			return err
 		}
 	}
@@ -722,6 +766,11 @@ func (d *Driver) waitReady(ctx context.Context, machine Machine) error {
 	if timeout <= 0 {
 		timeout = DefaultBootTimeout
 	}
+	return d.waitAgent(ctx, machine, timeout)
+}
+
+// waitAgent is waitReady with its own timeout.
+func (d *Driver) waitAgent(ctx context.Context, machine Machine, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var last error

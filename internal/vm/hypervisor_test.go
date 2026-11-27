@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -74,6 +75,16 @@ func TestSweepOnlyKillsVMsOfThisDaemonIdentity(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A restore's inbox, beside a VM's runtime dir (confine.go,
+	// setInbox): root's, with the daemon's rewritten configuration. A
+	// daemon that died around a restore leaves it, and it is nobody's.
+	inbox := filepath.Join(mine, "teploy-sbx-1"+inboxSuffix)
+	if err := os.MkdirAll(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inbox, imageConfigFile), []byte("{}"), 0o444); err != nil {
+		t.Fatal(err)
+	}
 	alive := map[int][]string{
 		10: {"cloud-hypervisor", "--kernel", "k", "--api-socket", filepath.Join(mine, "teploy-sbx-1", "api.sock")},
 		11: {"cloud-hypervisor", "--api-socket", filepath.Join(theirs, "teploy-sbx-2", "api.sock")},
@@ -121,6 +132,9 @@ func TestSweepOnlyKillsVMsOfThisDaemonIdentity(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(mine); len(entries) != 0 {
 		t.Fatalf("stale runtime dirs left: %v", entries)
+	}
+	if _, err := os.Lstat(inbox); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a stale restore inbox survived the sweep: %v", err)
 	}
 	// The leftover VM's cgroup went with it, killed rather than trusted
 	// to be empty.

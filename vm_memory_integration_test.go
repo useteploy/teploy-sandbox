@@ -163,6 +163,9 @@ const (
 	tickerPID    = "/work/ticker.pid"
 	tickerFile   = "/work/ticker.log"
 	serverPort   = "8099"
+	// tickerPattern is tickerScript as a grep pattern that is not the
+	// string itself (see tickerAlive).
+	tickerPattern = "/work/teploy-ticker-7f3a9[c]"
 )
 
 // tickerAlive prints process-alive when the guest runs the ticker it
@@ -170,7 +173,13 @@ const (
 // exactly. A boot from the disk reuses low pids, and this very check
 // runs in a shell whose command line names the script too, so the pid
 // alone says nothing: an argument must be the script's path and no less.
-const tickerAlive = `p="$(cat ` + tickerPID + ` 2>/dev/null)" && [ -n "$p" ] && tr "\000" "\n" < "/proc/$p/cmdline" 2>/dev/null | grep -qx "` + tickerScript + `" && echo process-alive
+// Nor is the path spelled out where the check's own grep could carry it
+// as an argument: a guest booted from the disk still has the stale pid in
+// its pid file, and when that pid is the one the check's own grep gets,
+// the grep finds itself. (Seen live once: a guest booted from the disk
+// answered process-alive.) The pattern is the path with its last letter
+// in brackets, which matches the path and is not the path.
+const tickerAlive = `p="$(cat ` + tickerPID + ` 2>/dev/null)" && [ -n "$p" ] && tr "\000" "\n" < "/proc/$p/cmdline" 2>/dev/null | grep -qx "` + tickerPattern + `" && echo process-alive
 `
 
 // guestStarts starts what a resume is to bring back: a file, a process
@@ -236,7 +245,9 @@ func guestCameBack(t *testing.T, r *memoryRig, id string, reseedsBefore int, res
 	if !restored {
 		got := vmRun(t, r.manager, id, tickerAlive+`curl -s -m 3 -o /dev/null -w 'server-%{http_code}' http://127.0.0.1:`+serverPort+`/kept || true`, "", nil, 30*time.Second)
 		if strings.Contains(got.stdout, "process-alive") || strings.Contains(got.stdout, "server-200") {
-			t.Fatalf("a guest booted from the disk still runs what ran before the stop: %+v", got)
+			// Who that is, with the pid the snapshot saved.
+			who := vmRun(t, r.manager, id, `p="$(cat `+tickerPID+` 2>/dev/null)"; echo "pid $p: $(tr "\000" " " < "/proc/$p/cmdline" 2>/dev/null)"`, "", nil, 30*time.Second)
+			t.Fatalf("a guest booted from the disk still runs what ran before the stop: %+v\n%s", got, who.stdout)
 		}
 		return
 	}

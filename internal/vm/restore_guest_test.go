@@ -1,6 +1,9 @@
 package vm
 
 import (
+	"bytes"
+	"context"
+	"log/slog"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -9,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/useteploy/teploy-sandbox/internal/guest"
 	"github.com/useteploy/teploy-sandbox/internal/run"
 )
 
@@ -167,6 +171,55 @@ func TestAClockThatDidNotTakeTheStepRefusesTheImage(t *testing.T) {
 		if err != nil && !strings.Contains(err.Error(), "not stepped") {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+}
+
+// A restored guest's handshake needs the kernel's own reseed: the VM
+// Generation ID driver bound, which reseeds the generator on the
+// hypervisor's notification before the guest has run again for long.
+// The agent's reseed is in addition to that, never instead of it: it
+// comes once the guest has run again for as long as its first answer
+// took, and whatever read the generator until then read the saved
+// stream over again. So an agent that reseeded a guest whose kernel has
+// no driver refuses the image; a kernel whose reseed request the agent
+// could not get honoured does not, and the daemon says so.
+func TestARestoredGuestsHandshakeNeedsTheKernelsOwnReseed(t *testing.T) {
+	for name, c := range map[string]struct {
+		result  guest.RestoredResult
+		refused bool
+	}{
+		"the kernel's driver, and the agent's reseed":            {guest.RestoredResult{VMGenIDSeen: true, Reseeded: true}, false},
+		"the kernel's driver, and a reseed request not honoured": {guest.RestoredResult{VMGenIDSeen: true}, false},
+		"the agent's reseed, and no driver bound in the kernel":  {guest.RestoredResult{Reseeded: true}, true},
+		"neither the kernel's driver nor the agent's reseed":     {guest.RestoredResult{}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var log bytes.Buffer
+			d := &Driver{log: slog.New(slog.NewTextHandler(&log, nil))}
+			machine := &fakeMachine{exited: make(chan struct{})}
+			machine.restoredOp = func(int64, []byte) (guest.RestoredResult, error) {
+				c.result.ClockNs = time.Now().UnixNano()
+				return c.result, nil
+			}
+			err := d.restoreClock(context.Background(), machine)
+			if c.refused {
+				if err == nil || !strings.Contains(err.Error(), "no driver bound to the VM Generation ID device") {
+					t.Fatalf("a guest nothing reseeded before it ran again was served from the image (%v)", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The entropy was the daemon's own, fresh for the guest.
+			if len(machine.entropySeen) != 1 || len(machine.entropySeen[0]) != guest.RestoredEntropyBytes || bytes.Equal(machine.entropySeen[0], make([]byte, guest.RestoredEntropyBytes)) {
+				t.Errorf("the entropy the handshake carried: %d bytes", len(machine.entropySeen[0]))
+			}
+			// A reseed request not honoured is said, not held against the image.
+			if said := strings.Contains(log.String(), "reseed request was not honoured"); said == c.result.Reseeded {
+				t.Errorf("the log says the request was not honoured: %t, for reseeded %t:\n%s", said, c.result.Reseeded, log.String())
+			}
+		})
 	}
 }
 

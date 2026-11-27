@@ -744,6 +744,19 @@ func TestAResumeWhoseMemoryImageCannotBeUsedBootsFromTheDisk(t *testing.T) {
 				}
 			})
 		},
+		"the agent reseeded the guest, but its kernel has no VM Generation ID driver": func(t *testing.T, rig *testRig, s *saved) {
+			// The agent's reseed comes once the guest has been running
+			// again for as long as its first answer took: whatever read
+			// the generator before that read the saved stream over
+			// again. Only the kernel's, on the hypervisor's notification
+			// before the guest runs again, is in time, and it needs the
+			// driver.
+			onRestored(rig, func(m *fakeMachine) {
+				m.restoredOp = func(int64, []byte) (guest.RestoredResult, error) {
+					return guest.RestoredResult{Reseeded: true, ClockNs: time.Now().UnixNano()}, nil
+				}
+			})
+		},
 		"the guest's handshake fails": func(t *testing.T, rig *testRig, s *saved) {
 			onRestored(rig, func(m *fakeMachine) {
 				m.restoredOp = func(int64, []byte) (guest.RestoredResult, error) {

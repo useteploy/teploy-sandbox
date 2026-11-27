@@ -325,8 +325,9 @@ it did before, and says so: the run's `resumedFrom` is `disk` rather than
 missing or damaged, was saved on another kind of host (CPU, host kernel,
 hypervisor or guest kernel) or beside another disk snapshot, has another
 size than the run, when the hypervisor cannot restore it or silently
-copies the memory instead of mapping it, or when the guest's clock could
-not be stepped or its random generator not reseeded. A stop never fails
+copies the memory instead of mapping it, when the guest's clock could
+not be stepped, or when the guest's kernel has no driver bound to the
+VM Generation ID device (below). A stop never fails
 because of memory: when no image could be saved the stop is the stop it
 always was, and the stopped run's `memory` says why
 (`docs/wire-contract.md`).
@@ -348,8 +349,19 @@ hypervisor is given is the daemon's own: the saved one is read under a
 strict schema, every value must be one this daemon configures, and
 whatever is not refuses the image. The restoring hypervisor is confined
 like a booting one, and the daemon checks that the memory really was
-mapped copy-on-write. The VM's random state is made new before the run
-gets it back, and the daemon checks that it was.
+mapped copy-on-write.
+
+A restored guest comes back with the random state it was saved with,
+which is in the image on disk. What makes it new is the guest's kernel:
+before the VM is let run again, the hypervisor changes its VM
+Generation ID and notifies the guest's device, and the kernel's driver
+for it reseeds the generator as soon as the guest runs. The daemon
+requires that driver to be bound, on both of its handshake paths, and
+refuses the image without it. The guest's agent adds entropy of the
+host's and asks for a reseed of its own on top; that is no evidence by
+itself, since it comes only once the guest has been running again for
+as long as its first answer took (seconds), and is logged, not relied
+on.
 
 What it costs, and what it does not do:
 
@@ -372,6 +384,10 @@ What it costs, and what it does not do:
 - Same host only. A run stopped on another host, or on this host before
   the CPU, kernel, hypervisor or guest kernel changed, resumes from its
   disk.
+- Not on arm64, as the command line stands: it has no `acpi=on`, so an
+  arm64 guest has no VM Generation ID device and no driver to reseed on,
+  and every resume there boots from the disk (a stop still saves an
+  image). None of this was run live on arm64.
 - Fork is not memory fork: a forked run boots its disk, as before.
 
 ### Host sizing

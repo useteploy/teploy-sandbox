@@ -4502,12 +4502,28 @@ added here runs, and a VM's jail and command line are what they were.
   the restore, `vm.restore` is asked for `CopyOnWrite` with the run's new
   tap, and the daemon verifies the mapping actually happened. The guest
   is then brought up to date: clock stepped to the nanosecond and
-  *checked* to have taken, random state replaced and *checked* (the
-  kernel's VM Generation ID driver bound, or the kernel's own reseed
-  message, or the agent's `RNDRESEEDCRNG`), and the saved network device
-  moved to the run's new address. Any failure boots a **fresh clone** of
-  the disk snapshot and records why; a clone a restored guest wrote to is
-  destroyed, never booted.
+  *checked* to have taken; random state *checked* to have been reseeded
+  by the guest's own kernel, which needs the VM Generation ID driver
+  bound; and the saved network device moved to the run's new address.
+  Any failure boots a **fresh clone** of the disk snapshot and records
+  why; a clone a restored guest wrote to is destroyed, never booted.
+- **The reseed is the kernel's, and its driver is required.** Before a
+  restored VM is let run again Cloud Hypervisor regenerates its VM
+  Generation ID and notifies the guest's ACPI device (`vm.restore`:
+  "Any restore may be a fork, so reseed before the guest runs"). The
+  guest kernel's driver for that device (notify-based since Linux 6.10)
+  reseeds the generator on that interrupt, as soon as the guest runs
+  again. The daemon requires the driver to be bound on both handshake
+  paths, the `restored` op and the script for older agents, and refuses
+  the image without it. The agent's own entropy and `RNDRESEEDCRNG` come
+  in addition and are not evidence: they land only once the guest has
+  been running again for as long as its first answer took (3–5 s on the
+  test host), and whatever read the generator before that read the saved
+  stream over again. That the agent's request was honoured is logged.
+  (A review of the first cut: on the op path the agent's `reseeded` had
+  been accepted instead of the driver.) The reseed is an interrupt after
+  `vm.resume`, so what was mid-flight in the guest at the stop runs out
+  first; that is the kernel's own design for a snapshot restore.
 - **`resumedFrom`** (`memory` | `disk`) on every resumed run, and
   `memory` on every stopped run, when the daemon keeps images.
 - **Lifetime.** An image is held by the run's record, by a restore under
@@ -4574,10 +4590,11 @@ has another size; the image has a network device and the run none; the
 hypervisor cannot start; refuses the restore; dies before it; copied the
 memory instead of mapping it; the VM will not resume; the agent never
 answers; the VM dies under the handshake; the clock was not stepped; the
-clock jumped ahead; the guest kept its random state; the handshake fails
-or has no answer; an old agent on a kernel without the driver, with the
-clock not stepped, with a failing or hanging script; the run's disk
-limits cannot be set.
+clock jumped ahead; the guest kept its random state; the agent reseeded
+the guest but its kernel has no VM Generation ID driver; the handshake
+fails or has no answer; an old agent on a kernel without the driver,
+with the clock not stepped, with a failing or hanging script; the run's
+disk limits cannot be set.
 
 At the stop (`TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk`):
 the VM is gone; the pool below its reserve; its space unreadable; the
@@ -4665,11 +4682,22 @@ also ran as root there, as CI's root job runs it: 310 pass, none skipped.
   jail has no second writable path, so the live suite shows only that the
   allowed one works (a restored VM is saved again). Upstream question
   from M0 (B1) stands: a `--landlock` that applies before the restore.
-- **arm64 was not run live.** The daemon's arm64 command line has no
-  `acpi=on`, so an arm64 guest has no VM Generation ID device: with an
-  agent older than v3 an image is refused there (no evidence of a reseed)
-  and the run boots from its disk; with a v3 agent the agent's own
-  reseed is the evidence.
+- **arm64: an image is never used there, as the command line stands.**
+  Not run live. The daemon's arm64 command line has no `acpi=on`, so an
+  arm64 guest has no VM Generation ID device and no driver to reseed on.
+  With the driver now required on both handshake paths, a stop there
+  still saves an image (and pauses the VM for it), but every resume boots
+  from the disk and the run says why; before this change a v3 agent's own
+  reseed was taken as evidence and the image was used. Giving the arm64
+  command line `acpi=on` would let the guest have the device; not tried,
+  there being no arm64 host to run it on, and it being a change to every
+  arm64 boot.
+- **A guest kernel older than 6.10** binds the same driver but has no
+  handler for the hypervisor's notification (it reseeded at boot and on
+  sleep events only): there the driver would be seen, and the reseed at a
+  restore would be the agent's own, late. The guest kernel is the
+  daemon's own (`SBX_VM_KERNEL`; 7.2.8 on the test host), and the live
+  suite checks that it reseeds at a restore (`TestVMMemoryResume`).
 - **The golden image in use on the test host predates protocol v3**, so
   the product path (the `restored` op: `clock_settime` to the nanosecond,
   `RNDADDENTROPY`, `RNDRESEEDCRNG`) ran only against a second golden

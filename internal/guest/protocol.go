@@ -175,12 +175,17 @@ type Result struct {
 
 // RestoredResult is what the agent did for a "restored" request.
 type RestoredResult struct {
-	// VMGenIDSeen: the guest kernel has the VM Generation ID device. Its
-	// driver mixes a new value into the random pool and forces a reseed
-	// every time the VM is restored, so /dev/urandom never continues the
-	// stream the saved memory held.
+	// VMGenIDSeen: the guest kernel has a driver bound to the VM
+	// Generation ID device. The hypervisor changes the ID and notifies
+	// the device before a restored VM runs again, and the driver
+	// reseeds the generator on that, so /dev/urandom never continues the
+	// stream the saved memory held. This is the reseed the daemon
+	// requires.
 	VMGenIDSeen bool `json:"vmgenidSeen"`
-	// Reseeded: the agent's own reseed request (RNDRESEEDCRNG) was honoured.
+	// Reseeded: the agent's own reseed request (RNDRESEEDCRNG) was
+	// honoured. In addition to the kernel's, and no evidence of one: it
+	// comes only once the guest has been running again for as long as
+	// its first answer took.
 	Reseeded bool `json:"reseeded"`
 	// ClockNs is the guest's wall clock just after it was set.
 	ClockNs int64 `json:"clockNs"`

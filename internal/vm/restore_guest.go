@@ -42,7 +42,19 @@ const (
 // the random state it was saved with: a guest left hours behind
 // verifies no certificate, and one left on the saved random state
 // continues a stream that is in the image on disk. So the step must be
-// seen to have taken, or the image is not used.
+// seen to have taken, and the kernel to have the driver that reseeds
+// the generator at the restore, or the image is not used.
+//
+// What makes the random state new is the kernel's, not the daemon's.
+// Before a restored VM is let run again, the hypervisor changes its VM
+// Generation ID and notifies the guest's device of it (Cloud
+// Hypervisor's vm.restore: "Any restore may be a fork, so reseed before
+// the guest runs"), and the kernel's driver for the device reseeds the
+// generator as soon as the guest runs again, on that interrupt. The
+// agent's own reseed comes later: once the guest has been running again
+// for as long as its first answer took, which is seconds. Whatever read
+// the generator before that read the saved stream over again, and read
+// it just as a second restore of the same image would.
 func (d *Driver) restoreClock(ctx context.Context, machine Machine) error {
 	ctx, cancel := context.WithTimeout(ctx, restoreHandshakeTimeout)
 	defer cancel()
@@ -56,8 +68,17 @@ func (d *Driver) restoreClock(ctx context.Context, machine Machine) error {
 		if err := clockStepped(result.ClockNs, sent, time.Now()); err != nil {
 			return err
 		}
-		if !result.VMGenIDSeen && !result.Reseeded {
-			return errors.New("the guest kept the random state it was saved with: neither its kernel's VM Generation ID device nor the agent's reseed gave it a new one")
+		// So it is the kernel's driver that is looked for, and only
+		// that: an agent that reseeded the guest is no evidence that
+		// nothing read the saved stream first. A guest whose kernel has
+		// no driver bound to the device gets no answer to the
+		// hypervisor's notification, and is not served from the image,
+		// whatever the agent could do.
+		if !result.VMGenIDSeen {
+			return errors.New("the guest's kernel has no driver bound to the VM Generation ID device, so nothing reseeded its random state at the restore")
+		}
+		if !result.Reseeded {
+			d.log.Info("restored guest: the agent's reseed request was not honoured; the kernel's own reseed at the restore is what counts", "why", "RNDRESEEDCRNG refused or unknown to the kernel")
 		}
 		return nil
 	}

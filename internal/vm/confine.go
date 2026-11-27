@@ -295,7 +295,11 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 // pages on top). The guest's own memory is all that group ever needs to
 // hold, the image included, so the raised limit covers an image of this
 // guest's size; and since the guest is paused for all of that moment, a
-// running guest never has the room.
+// running guest never has the room — with one exception, written where
+// it happens (SaveMemory): a hypervisor whose snapshot did not answer
+// in time may go on writing the image, and there the room lasts until
+// the VM has resumed. Where the hypervisor answered, the room is given
+// back before the VM resumes, as for a sealed image.
 //
 // Putting it back lowers memory.max below what the group holds, the
 // image's pages being still charged to it: the kernel reclaims them

@@ -186,10 +186,13 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 	// leave the VM paused for as long as that takes.
 	resumeWait := pauseTimeout
 	// resume is for a VM whose image is nobody's: none was begun, or
-	// the hypervisor's snapshot of it failed. The room, where any was
-	// asked for, is given back once the VM runs, not before: a snapshot
-	// that did not answer in time goes on writing until the resume
-	// queued behind it is served, and that writing must stay covered.
+	// the hypervisor went on writing it past the stop's patience, its
+	// snapshot not answering in time. The room, where any was asked
+	// for, is given back once the VM runs, not before: that writing ends
+	// only when the resume queued behind it is served, and it must stay
+	// covered. It is the one way out in which a running guest has the
+	// room, and only for the moment until the resume returns; where the
+	// hypervisor answered, the room is given back before the VM resumes.
 	resume := func() error {
 		defer putBack()
 		resumeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resumeWait)
@@ -236,8 +239,21 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 		}
 		if err != nil {
 			note = "the hypervisor's snapshot: " + err.Error()
-			resumeWait = snapshotTimeout(current.memoryMB)
 			giveBack()
+			if !errors.Is(err, context.DeadlineExceeded) {
+				// The hypervisor answered, and with its answer its
+				// writing ended: nothing writes the image now, and the
+				// room is the VM's own again before the VM runs.
+				return func() error {
+					putBack()
+					return resume()
+				}, nil
+			}
+			// It did not answer in time. It goes on writing until it is
+			// done, and the resume queued behind it must outwait it; the
+			// room stays until the VM has resumed (resume gives it back),
+			// since that writing must stay covered.
+			resumeWait = snapshotTimeout(current.memoryMB)
 			return resume, nil
 		}
 		return func() error {

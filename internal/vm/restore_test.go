@@ -514,13 +514,14 @@ func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
 	// only once the VM is paused and its image is where the hypervisor
 	// can write it — so where none was begun, or the image does not
 	// reach the jail, it is never asked for — and is taken back before
-	// the VM runs again. The two ways the hypervisor fails its snapshot
-	// once the image is bound are the exception, and the only one: it
-	// may go on writing, and the VM's resume is what waits for that, so
-	// there the room lasts until the VM has resumed.
+	// the VM runs again, the hypervisor's own failure included. The one
+	// exception is a snapshot that did not answer in time: the
+	// hypervisor may go on writing, and the VM's resume is what waits
+	// for that, so there the room lasts until the VM has resumed.
 	unraised := []string{"sync", "pause", "resume", "kill"}
 	snapshotted := []string{"sync", "pause", "raise-limit", "snapshot", "restore-limit", "resume", "kill"}
-	failedSnapshot := []string{"sync", "pause", "raise-limit", "resume", "restore-limit", "kill"}
+	refused := []string{"sync", "pause", "raise-limit", "restore-limit", "resume", "kill"}
+	unanswered := []string{"sync", "pause", "raise-limit", "resume", "restore-limit", "kill"}
 	limits := map[string]struct {
 		events          []string
 		widenedAtResume []int64
@@ -530,8 +531,8 @@ func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
 		"the pool's space cannot be read":                                 {unraised, []int64{0}},
 		"the image's dataset cannot be made":                              {unraised, []int64{0}},
 		"the image does not reach the VM's jail":                          {unraised, []int64{0}},
-		"the hypervisor refuses the snapshot":                             {failedSnapshot, []int64{imageNeedsBytes(256)}},
-		"the hypervisor's snapshot does not answer in time":               {failedSnapshot, []int64{imageNeedsBytes(256)}},
+		"the hypervisor refuses the snapshot":                             {refused, []int64{0}},
+		"the hypervisor's snapshot does not answer in time":               {unanswered, []int64{imageNeedsBytes(256)}},
 		"a hypervisor taken over leaves an extra file":                    {snapshotted, []int64{0}},
 		"a hypervisor taken over leaves a link to a host file":            {snapshotted, []int64{0}},
 		"a hypervisor taken over keeps the image busy until it is killed": {snapshotted, []int64{0}},

@@ -431,6 +431,7 @@ func TestAPoolBelowItsReserveLosesMemoryImagesOldestFirst(t *testing.T) {
 		asked++
 		return need > 0 && asked == 1, nil
 	}
+	clock.advance(time.Minute)
 	third := mustCreate(t, m, CreateRequest{})
 	mustStop(t, m, third.ID)
 	saved := memoryOf(t, m, third.ID)

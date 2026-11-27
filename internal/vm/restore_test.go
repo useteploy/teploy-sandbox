@@ -845,6 +845,191 @@ func TestAResumeWhoseMemoryImageCannotBeUsedBootsFromTheDisk(t *testing.T) {
 	})
 }
 
+// refusing is the fake pool refusing to destroy one dataset a number of
+// times, as zfs does while something still holds it.
+type refusing struct {
+	*fakeZFS
+	mu       sync.Mutex
+	dataset  string
+	refusals int
+}
+
+func (z *refusing) Destroy(ctx context.Context, name string) error {
+	z.mu.Lock()
+	refuse := name == z.dataset && z.refusals > 0
+	if refuse {
+		z.refusals--
+	}
+	z.mu.Unlock()
+	if refuse {
+		return errors.New("dataset is busy")
+	}
+	return z.fakeZFS.Destroy(ctx, name)
+}
+
+// A bad image always falls back to the disk, and what the failed
+// restore left behind must not be what fails the resume. The clone the
+// restore made that could not be removed at its first attempt (a
+// review's repro: the error of the restore's own removal was dropped,
+// and the disk boot collided with the clone); and a hypervisor started
+// for the restore that could not be given back the first time: each is
+// seen through, and the disk is booted on a fresh clone under the run's
+// name. (Found by auditing every way out of ResumeMemory for the class
+// the review found.)
+func TestAFailedRestoreNeverKeepsTheResumeFromTheDisk(t *testing.T) {
+	type saved struct {
+		spec   run.CreateSpec
+		record run.MemoryImage
+	}
+	for name, breakIt := range map[string]func(t *testing.T, rig *testRig, s *saved){
+		"the restore's clone could not be removed at first": func(t *testing.T, rig *testRig, s *saved) {
+			rig.hypervisor.restoreErr = errors.New("cannot drop privileges")
+			rig.driver.volumes.zfs = &refusing{fakeZFS: rig.zfs, dataset: testPool + "/" + s.spec.Name, refusals: 1}
+		},
+		"a hypervisor started for the restore could not be given back the first time": func(t *testing.T, rig *testRig, s *saved) {
+			rig.hypervisor.startedErr = errors.New("the hypervisor exited before its API answered")
+			rig.driver.volumes.zfs = &refusing{fakeZFS: rig.zfs, dataset: testPool + "/" + s.spec.Name, refusals: 1}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rig := newMemoryRig(t, nil)
+			spec, record := savedForResume(t, rig, 1)
+			s := saved{spec, record}
+			breakIt(t, rig, &s)
+			id, from, note, err := rig.driver.ResumeMemory(bg, "run-"+s.spec.Name, s.spec, &s.record)
+			if err != nil || from != run.ResumedFromDisk || id != s.spec.Name || note == "" {
+				t.Fatalf("resume: id %q from %q note %q err %v", id, from, note, err)
+			}
+			if !strings.HasPrefix(note, "resumed from the disk: ") {
+				t.Errorf("the note does not say the run came back from its disk: %q", note)
+			}
+			// The run has a VM booted from a fresh clone, and nothing of
+			// the restore or of its removal is left, tracked or owed.
+			if boot := rig.hypervisor.started; len(boot) != 2 || boot[1].Name != s.spec.Name || boot[1].Disk != "/dev/zvol/"+testPool+"/"+s.spec.Name {
+				t.Fatalf("boots: %+v", boot)
+			}
+			// Cloned twice from the stop snapshot: once for the restore,
+			// and once for the disk boot.
+			if clones := strings.Count(strings.Join(rig.zfs.calls, "\n"), "clone "+s.spec.Image+" "+testPool+"/"+s.spec.Name); clones != 2 {
+				t.Fatalf("the stop snapshot was cloned %d times: %v", clones, rig.zfs.calls)
+			}
+			if running := rig.hypervisor.running(); !slices.Equal(running, []string{s.spec.Name}) {
+				t.Fatalf("VMs running: %v", running)
+			}
+			must(t, rig.driver.ReleaseMemory(bg, &s.record))
+			assertBootedFromDisk(t, rig, s.spec)
+			must(t, rig.driver.Remove(bg, s.spec.Name))
+			assertPool(t, rig.zfs, append([]string{datasetOf(s.spec.Image), s.spec.Image}, memoryPristine...)...)
+		})
+	}
+}
+
+// The ways a resume that tried its image fails. The disk boot itself,
+// as any create's does, with nothing left behind: its start, or its
+// claim after so long that the rollback before it had spent a whole
+// deadline of its own (the rollback that undoes the claim starts with a
+// new one, or it would fail on a budget that is already gone, and leave
+// a VM behind). And a restore that cannot be given back however it is
+// tried, which is failed with the run's name so that the removal is
+// retried: the disk has nothing it can boot on meanwhile.
+func TestAResumeThatTriedItsImageFailsOnlyWithTheDiskOrWithTheRunsName(t *testing.T) {
+	pristineAfter := func(t *testing.T, rig *testRig, spec run.CreateSpec, record run.MemoryImage) {
+		t.Helper()
+		must(t, rig.driver.ReleaseMemory(bg, &record))
+		assertPool(t, rig.zfs, append([]string{datasetOf(spec.Image), spec.Image}, memoryPristine...)...)
+	}
+	t.Run("the disk boot fails", func(t *testing.T) {
+		rig := newMemoryRig(t, nil)
+		spec, record := savedForResume(t, rig, 1)
+		rig.hypervisor.restoreErr = errors.New("cannot drop privileges")
+		rig.hypervisor.startErr = errors.New("cannot fork")
+		id, from, note, err := rig.driver.ResumeMemory(bg, "run-"+spec.Name, spec, &record)
+		if err == nil || !strings.Contains(err.Error(), "cannot fork") || from != "" {
+			t.Fatalf("resume: from %q err %v", from, err)
+		}
+		if id != "" {
+			t.Errorf("nothing of the run is left, and the resume names %q as what could not be cleaned up", id)
+		}
+		if !strings.Contains(note, "cannot drop privileges") || !strings.Contains(note, "resumed from the disk: ") {
+			t.Errorf("note %q", note)
+		}
+		if current, err := rig.driver.instance(spec.Name); err == nil || current != nil {
+			t.Fatalf("a VM of the run is tracked: %+v %v", current, err)
+		}
+		// What the restore cloned went, and nothing was booted.
+		if len(rig.hypervisor.started) != 1 {
+			t.Fatalf("boots %+v", rig.hypervisor.started)
+		}
+		pristineAfter(t, rig, spec, record)
+	})
+
+	t.Run("the disk boot's claim fails after a rollback's budget was spent", func(t *testing.T) {
+		rig := newMemoryRig(t, nil)
+		spec, record := savedForResume(t, rig, 1)
+		rig.hypervisor.restoreErr = errors.New("cannot drop privileges")
+		// The pool as the zfs command is under a context: nothing starts
+		// once it has run out.
+		rig.driver.volumes.zfs = &cliZFS{fakeZFS: rig.zfs, after: map[string]func(){}}
+		// A rollback's budget a fiftieth of a second, and the disk
+		// boot's claim outlasting it before it fails.
+		rollbackTimeout = 20 * time.Millisecond
+		t.Cleanup(func() { rollbackTimeout = 30 * time.Second })
+		rig.hypervisor.onStart = func(m *fakeMachine) {
+			if m.inbox == "" {
+				m.setupFunc = func(string, io.Writer) (int, bool, error) {
+					time.Sleep(3 * rollbackTimeout)
+					return 1, false, nil
+				}
+			}
+		}
+		id, from, note, err := rig.driver.ResumeMemory(bg, "run-"+spec.Name, spec, &record)
+		if err == nil || !strings.Contains(err.Error(), "guest setup: exit 1") || from != "" {
+			t.Fatalf("resume: from %q err %v", from, err)
+		}
+		if !strings.Contains(note, "cannot drop privileges") {
+			t.Errorf("note %q", note)
+		}
+		// The claim's failure is the create's own. The VM it booted is
+		// gone with its volume, and nothing is left to have removed.
+		if id != "" {
+			t.Errorf("the VM was given back, and the resume names %q as what could not be", id)
+		}
+		if current, err := rig.driver.instance(spec.Name); err == nil || current != nil {
+			t.Fatalf("a VM of the run is tracked: %+v %v", current, err)
+		}
+		if running := rig.hypervisor.running(); len(running) != 0 {
+			t.Fatalf("VMs running: %v", running)
+		}
+		pristineAfter(t, rig, spec, record)
+	})
+
+	t.Run("the restore's clone will not go", func(t *testing.T) {
+		rig := newMemoryRig(t, nil)
+		spec, record := savedForResume(t, rig, 1)
+		rig.hypervisor.restoreErr = errors.New("cannot drop privileges")
+		// Refused to the last of the resume's attempts: two.
+		rig.driver.volumes.zfs = &refusing{fakeZFS: rig.zfs, dataset: testPool + "/" + spec.Name, refusals: 2}
+		id, from, note, err := rig.driver.ResumeMemory(bg, "run-"+spec.Name, spec, &record)
+		if err == nil || from != "" || id != spec.Name {
+			t.Fatalf("resume: id %q from %q err %v", id, from, err)
+		}
+		if !strings.Contains(err.Error(), "dataset is busy") || !strings.Contains(note, "cannot drop privileges") {
+			t.Fatalf("the error says %q and the note %q: both the restore's reason and the clone's are owed", err, note)
+		}
+		// No disk boot was tried on the clone a restored guest may have
+		// written to: it is still there, and it is all that is.
+		if len(rig.hypervisor.started) != 1 || !rig.zfs.has(t, testPool+"/"+spec.Name) {
+			t.Fatalf("boots %+v, pool %v", rig.hypervisor.started, rig.zfs.names())
+		}
+		if current, err := rig.driver.instance(spec.Name); err == nil || current != nil {
+			t.Fatalf("no VM was started, yet one is tracked: %+v %v", current, err)
+		}
+		// What the manager does with the name: the removal, retried.
+		must(t, rig.driver.Remove(bg, spec.Name))
+		pristineAfter(t, rig, spec, record)
+	})
+}
+
 // stepsToTheNanosecond says whether the clock script steps to a fraction
 // of a second, not to the whole second a boot's step settles for.
 func stepsToTheNanosecond(script string) bool {

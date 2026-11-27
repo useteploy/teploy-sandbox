@@ -423,8 +423,9 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 	}
 }
 
-// rollbackTimeout bounds giving back a VM whose claim failed.
-const rollbackTimeout = 30 * time.Second
+// rollbackTimeout bounds giving back a VM whose claim failed. A
+// variable for the tests, which make one rollback outlast it.
+var rollbackTimeout = 30 * time.Second
 
 // Where a run's VM came from, as the log says it.
 const (

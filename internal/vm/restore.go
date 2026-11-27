@@ -268,6 +268,18 @@ func (d *Driver) RetainMemory(ctx context.Context, images []*run.MemoryImage) ([
 // any failure the stop snapshot is booted, on a fresh clone, exactly as
 // a resume without an image boots it, and the note says why the image
 // was not used.
+//
+// The promise is that a bad image never fails a resume. The image's own
+// failure is never the error: what the failed restore left is given
+// back first (twice over if need be, each under a deadline of its own),
+// and the disk is booted on a fresh clone. The resume fails only for
+// what would fail any create — a request this daemon refuses before
+// anything is allocated (ErrMemoryNotTried: the record keeps the image),
+// a disk boot that does not come up, a claim that does not hold — and
+// for one thing more: a restore whose VM, or clone, cannot be given back
+// however it is tried, since the disk then has nothing it can boot on.
+// That one is failed with the run's name, so that the manager has the
+// removal retried.
 func (d *Driver) ResumeMemory(ctx context.Context, runID string, spec run.CreateSpec, image *run.MemoryImage) (string, string, string, error) {
 	// Refused before anything is allocated or the image is reached: the
 	// run's record keeps its image for a resume this daemon can serve.
@@ -296,29 +308,64 @@ func (d *Driver) ResumeMemory(ctx context.Context, runID string, spec run.Create
 	// it read nothing from the disk.
 	note := "resumed from the disk: " + restoreErr.Error()
 	d.log.Warn("vm memory image not used; booting from the disk", "name", spec.Name, "run", runID, "image", image.ID, "error", restoreErr)
-	// Rollbacks run under a deadline of their own, as a create's do.
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
-	defer cancel()
+	// Every rollback under a deadline of its own, starting where the
+	// rollback does: the one before it may have spent a whole one.
+	rollback := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+	}
 	if machine != nil {
-		if err := d.unclaim(cleanupCtx, spec.Name, machine, spec.Name); err != nil {
-			// Tracked, so the Remove the manager retries finds it.
-			d.track(spec.Name, &instance{machine: machine, network: spec.Name})
-			return spec.Name, "", note, errors.Join(restoreErr, err)
+		cleanupCtx, cancel := rollback()
+		giveBackErr := d.unclaim(cleanupCtx, spec.Name, machine, spec.Name)
+		cancel()
+		if giveBackErr != nil {
+			// Once more, with a deadline of its own: a process that was
+			// slow to end, or a clone busy for a moment, goes on the
+			// second try, and then the disk can still be booted.
+			cleanupCtx, cancel = rollback()
+			again := d.unclaim(cleanupCtx, spec.Name, machine, spec.Name)
+			cancel()
+			if again != nil {
+				// The VM holds the name, the UID, the device node and the
+				// runtime dir the disk boot would need. Tracked, so the
+				// Remove the manager retries finds it.
+				d.track(spec.Name, &instance{machine: machine, network: spec.Name})
+				return spec.Name, "", note, errors.Join(restoreErr, giveBackErr, again)
+			}
 		}
+	}
+	// Whatever clone is left goes before the disk is booted on a fresh
+	// one of the same name: the restore's own removal may have failed,
+	// and a clone a restored guest may have written to is never booted.
+	cleanupCtx, cancel := rollback()
+	removeErr := d.volumes.RemoveRun(cleanupCtx, spec.Name)
+	cancel()
+	if removeErr != nil {
+		return spec.Name, "", note, errors.Join(restoreErr, fmt.Errorf("remove the clone the restore left: %w", removeErr))
 	}
 	machine, leftover, err := d.boot(ctx, spec.Name, spec.Image, cpus, memoryMB)
 	if errors.Is(err, ErrNoSnapshot) {
 		err = fmt.Errorf("%w: %v", run.ErrBadRequest, err)
 	}
 	if err != nil {
-		if leftover && machine != nil {
-			d.track(spec.Name, &instance{machine: machine, network: spec.Name})
+		// The disk boot's own failure, as any create's is reported: with
+		// the run's name only while something of it is left.
+		if leftover {
+			if machine != nil {
+				d.track(spec.Name, &instance{machine: machine, network: spec.Name})
+			}
+			return spec.Name, "", note, err
 		}
-		return spec.Name, "", note, err
+		return "", "", note, err
 	}
 	env, mac, err := d.claim(ctx, spec.Name, machine, spec, proxyPort)
 	if err != nil {
-		if cleanupErr := d.discard(cleanupCtx, spec.Name, machine, spec.Name); cleanupErr != nil {
+		// The claim's failure is the disk boot's own, as in any create.
+		// Its budget is new: the boot and the claim before it can have
+		// taken longer than a whole one, and this rollback is not theirs.
+		cleanupCtx, cancel = rollback()
+		cleanupErr := d.discard(cleanupCtx, spec.Name, machine, spec.Name)
+		cancel()
+		if cleanupErr != nil {
 			d.track(spec.Name, &instance{machine: machine, network: spec.Name})
 			return spec.Name, "", note, errors.Join(err, cleanupErr)
 		}
@@ -334,7 +381,10 @@ func (d *Driver) ResumeMemory(ctx context.Context, runID string, spec run.Create
 //
 // A non-nil machine means a hypervisor process was started and is the
 // caller's to give back (unclaim); with a nil one, nothing is left
-// behind. guestNet is the device the VM was given, when there is one.
+// behind unless the error says the clone could not be removed. guestNet
+// is the device the VM was given, when there is one: it is made for a
+// hypervisor that was started, so it comes with a machine and never
+// alone.
 func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec, image *run.MemoryImage, proxyPort int) (result Machine, network *GuestNetwork, err error) {
 	if d.images == nil {
 		return nil, nil, errors.New("this daemon keeps no memory images")
@@ -379,9 +429,15 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 	volume := true
 	defer func() {
 		if volume {
+			// A clone a restored guest may have written to is never
+			// booted: it goes here and nowhere later. That it could not
+			// is said, not dropped: the caller sees to it before the disk
+			// is booted on a fresh clone under the same name.
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
-			_ = d.volumes.RemoveRun(cleanupCtx, name)
+			if removeErr := d.volumes.RemoveRun(cleanupCtx, name); removeErr != nil {
+				err = errors.Join(err, fmt.Errorf("remove the clone the restore made: %w", removeErr))
+			}
 		}
 	}()
 	steps := map[string]time.Duration{}

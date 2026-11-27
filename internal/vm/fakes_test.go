@@ -44,9 +44,10 @@ type fakeZFS struct {
 	// waits for it to close (or its context to end) and then fails.
 	blockClone chan struct{}
 	// hold makes the next call of a given name ("destroy pool/x",
-	// "createfs pool/x", "load-key pool/x", "mount pool/x") signal
-	// reached, then wait until release is closed: a host command that
-	// takes as long as a test likes.
+	// "createfs pool/x", "load-key pool/x", "check-key pool/x", "mount
+	// pool/x", "unmount pool/x") signal reached, then wait until
+	// release is closed: a host command that takes as long as a test
+	// likes.
 	hold map[string]holdPoint
 	// poolProps are the properties set on the pool, which a volume
 	// without its own value inherits.
@@ -392,6 +393,18 @@ func (z *fakeZFS) Property(_ context.Context, name, key string) (string, error) 
 		}
 	}
 	return z.poolProps[key], nil
+}
+
+func (z *fakeZFS) openStates(_ context.Context, root string) (map[string]imageOpen, error) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	states := map[string]imageOpen{}
+	for name, dataset := range z.datasets {
+		if strings.HasPrefix(name, root+"/") && dataset.filesystem && (dataset.fsMounted || dataset.fsKeyLoaded) {
+			states[name] = imageOpen{mounted: dataset.fsMounted, keyLoaded: dataset.fsKeyLoaded}
+		}
+	}
+	return states, nil
 }
 
 func (z *fakeZFS) SetProperty(_ context.Context, name, key, value string) error {
@@ -1324,6 +1337,7 @@ func (z *fakeZFS) Mount(_ context.Context, name string) error {
 }
 
 func (z *fakeZFS) Unmount(_ context.Context, name string) error {
+	z.pause("unmount " + name)
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.fsCalls = append(z.fsCalls, "unmount "+name)
@@ -1374,6 +1388,7 @@ func (z *fakeZFS) UnloadKey(_ context.Context, name string) error {
 }
 
 func (z *fakeZFS) CheckKey(_ context.Context, name string, key []byte) error {
+	z.pause("check-key " + name)
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.fsCalls = append(z.fsCalls, "check-key "+name)

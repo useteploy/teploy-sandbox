@@ -144,13 +144,15 @@ type MemoryKeeper interface {
 	ReleaseMemory(ctx context.Context, image *MemoryImage) error
 	// RetainMemory is called once the registry is loaded, before any run
 	// is served: every image of this daemon that no stopped run names is
-	// destroyed, and every image a run names that is not on this host is
-	// reported, so the record can stop claiming it.
+	// destroyed, every image a run names that is not on this host is
+	// reported (so the record can stop claiming it), and the images
+	// that are kept are closed, as one at rest is.
 	RetainMemory(ctx context.Context, images []*MemoryImage) (missing []string, err error)
 	// SweepMemory is called now and then while the daemon serves (by the
-	// reaper): an image that could not be destroyed when nothing wanted
-	// it any more is tried again, so that it goes without a restart. It
-	// answers with what still could not go.
+	// reaper): what could not be done when nothing wanted it any more is
+	// tried again — an image that would not go, a close the pool
+	// refused — so that it does without a restart. It answers with what
+	// still would not go.
 	SweepMemory(ctx context.Context) error
 	// MemoryShortBy reports how many bytes the pool is short of having
 	// need bytes plus its reserve free: 0 when it has room. An image is
@@ -374,10 +376,11 @@ func (m *Manager) evictableMemoryBytes() int64 {
 	return held
 }
 
-// sweepMemoryImages has the driver retry the images that could not be
-// destroyed when nothing wanted them any more (MemoryKeeper.SweepMemory),
-// so that they go without a restart. Under a deadline of its own: the
-// reaper's pass has runs waiting on it.
+// sweepMemoryImages has the driver retry what could not be done when
+// nothing wanted it any more (MemoryKeeper.SweepMemory): an image that
+// would not go, a close the pool refused, so that neither waits for a
+// restart. Under a deadline of its own: the reaper's pass has runs
+// waiting on it.
 func (m *Manager) sweepMemoryImages(ctx context.Context) {
 	if m.MemoryImages == nil {
 		return
@@ -385,7 +388,7 @@ func (m *Manager) sweepMemoryImages(ctx context.Context) {
 	sweepCtx, cancel := context.WithTimeout(ctx, memorySweepTimeout)
 	defer cancel()
 	if err := m.MemoryImages.SweepMemory(sweepCtx); err != nil {
-		m.log.Error("memory images could not be removed; they are tried again when their VM is gone, and by the reaper", "error", err)
+		m.log.Error("memory images could not be removed or closed; they are tried again when their VM is gone, and by the reaper", "error", err)
 	}
 }
 

@@ -264,6 +264,51 @@ type imageFS interface {
 	LoadKey(ctx context.Context, name string, key []byte) error
 	CheckKey(ctx context.Context, name string, key []byte) error
 	UnloadKey(ctx context.Context, name string) error
+	// openStates says of every filesystem under root that lies open
+	// which way it does, in one command: mounted, with its key loaded,
+	// or both. A closed one is not in the map.
+	openStates(ctx context.Context, root string) (map[string]imageOpen, error)
+}
+
+// imageOpen is how an image dataset lies open: mounted, its key loaded.
+type imageOpen struct {
+	mounted, keyLoaded bool
+}
+
+// openStates is imageFS.openStates: `zfs get` of mounted and keystatus,
+// one line per filesystem and property, down one level from root (the
+// images are its children; nothing is below them).
+func (z *zfsCLI) openStates(ctx context.Context, root string) (map[string]imageOpen, error) {
+	out, err := z.run(ctx, "get", "-H", "-p", "-d", "1", "-t", "filesystem", "-o", "name,property,value", propMounted+","+propKeyStatus, root)
+	if err != nil {
+		return nil, err
+	}
+	states := map[string]imageOpen{}
+	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+		columns := strings.Split(line, "\t")
+		if columns[0] == "" && len(columns) == 1 {
+			continue
+		}
+		if len(columns) != 3 {
+			return nil, fmt.Errorf("zfs get %s,%s %s: unexpected output %q", propMounted, propKeyStatus, root, strings.TrimSpace(line))
+		}
+		state := states[columns[0]]
+		switch property, value := columns[1], field(columns[2]); property {
+		case propMounted:
+			state.mounted = value == "yes"
+		case propKeyStatus:
+			state.keyLoaded = value == "available"
+		default:
+			return nil, fmt.Errorf("zfs get %s,%s %s: unexpected property %q", propMounted, propKeyStatus, root, property)
+		}
+		states[columns[0]] = state
+	}
+	for name, state := range states {
+		if !state.mounted && !state.keyLoaded {
+			delete(states, name)
+		}
+	}
+	return states, nil
 }
 
 // zfsCLI is ZFS over the zfs(8) command.

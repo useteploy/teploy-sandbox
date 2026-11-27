@@ -1413,8 +1413,10 @@ func (m *Manager) Reap(ctx context.Context) int {
 		}
 	}
 	// A pool below its reserve loses memory images, the oldest stop
-	// first: a cache, and the first thing to go.
+	// first: a cache, and the first thing to go. And the images that
+	// would not go are tried again.
 	m.evictMemoryUnderPressure(ctx)
+	m.sweepMemoryImages(ctx)
 	if m.Cache != nil {
 		m.Cache.Sweep(ctx)
 	}

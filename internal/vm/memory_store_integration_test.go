@@ -99,7 +99,7 @@ func TestVMMemoryImagesOnARealPool(t *testing.T) {
 	// --- an image begins as a dataset of its own: an encryption root with
 	// a key that reaches zfs on standard input, quota'd, and with the
 	// flags the jail keeps when the dataset reaches it through a bind.
-	first, err := s.begin(bg, 256, testVMUID)
+	first, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
 	must(t, err)
 	img := first
 	for name, want := range map[string]string{
@@ -208,7 +208,7 @@ func TestVMMemoryImagesOnARealPool(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			img, err := s.begin(bg, 256, testVMUID)
+			img, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
 			must(t, err)
 			dataset := img.dataset
 			_, err = s.bind(img, outbox)
@@ -233,7 +233,7 @@ func TestVMMemoryImagesOnARealPool(t *testing.T) {
 	// A hard link from an image's dataset to a file outside it, a host
 	// file's: the pool itself refuses it. The quota bounds the image: the
 	// guest's memory and 64 MiB, no more.
-	img, err = s.begin(bg, 256, testVMUID)
+	img, err = s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
 	must(t, err)
 	if err := os.Link(host, filepath.Join(img.dir, "state2.json")); err == nil {
 		t.Fatal("a hard link from an image's dataset to a file of the host's was made")
@@ -254,7 +254,7 @@ func TestVMMemoryImagesOnARealPool(t *testing.T) {
 	img = first
 
 	// --- the daemon's next life: nothing is mounted and no key is loaded.
-	second, err := s.begin(bg, 256, testVMUID)
+	second, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
 	must(t, err)
 	_, err = s.bind(second, outbox)
 	must(t, err)
@@ -263,7 +263,7 @@ func TestVMMemoryImagesOnARealPool(t *testing.T) {
 	rec2, err := s.handOver("run-2", second, run.MemoryImage{Disk: "7002", MemoryMB: 256, CPUs: 1})
 	must(t, err)
 	// An image no record names: a stop cut short before its record.
-	orphan, err := s.begin(bg, 256, testVMUID)
+	orphan, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
 	must(t, err)
 	for _, image := range []*image{img, second} {
 		must(t, zfs.Unmount(bg, image.dataset))

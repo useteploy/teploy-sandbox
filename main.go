@@ -541,7 +541,7 @@ func serve(args []string) error {
 		kept, err := manager.ReconcileMemoryImages(reconcileCtx)
 		cancel()
 		if err != nil {
-			log.Error("memory images: some the registry does not name could not be removed; they are tried again when the registry is next loaded", "error", err)
+			log.Error("memory images: some the registry does not name could not be removed; they are tried again when their VM is gone, and by the reaper", "error", err)
 		}
 		log.Info("vm memory images enabled", "kept", kept)
 	}

@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -456,7 +457,7 @@ func TestAStopsSealAndResumeDoNotHoldThePoolForOtherRuns(t *testing.T) {
 	must(t, rig.driver.ReleaseMemory(bg, &record))
 	must(t, rig.driver.ReleaseMemory(bg, saved))
 	must(t, rig.driver.Remove(bg, stopping))
-	if len(rig.driver.images.known) != 0 || len(rig.driver.images.dead) != 0 {
+	if len(rig.driver.images.known) != 0 || len(rig.driver.images.owed) != 0 {
 		t.Fatalf("images still known: %v", rig.imageIDs())
 	}
 	assertPool(t, rig.zfs, append([]string{datasetOf(spec.Image), spec.Image, datasetOf(ref), ref}, memoryPristine...)...)
@@ -515,6 +516,18 @@ func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
 				_ = os.Symlink("/etc/shadow", filepath.Join(dir, imageStateFile))
 			}
 		},
+		"a hypervisor taken over keeps the image busy until it is killed": func(t *testing.T, rig *testRig, machine *fakeMachine) {
+			// A descriptor it kept open in the dataset it wrote: the
+			// unmount out of the VM's outbox answers busy while the VM
+			// lives, and goes through once the stop has killed it.
+			inner := rig.driver.images.mounts.unbind
+			rig.driver.images.mounts.unbind = func(target string) error {
+				if !machine.isDead() {
+					return syscall.EBUSY
+				}
+				return inner(target)
+			}
+		},
 		"the image cannot be made read-only": func(t *testing.T, rig *testRig, machine *fakeMachine) {
 			rig.driver.images.newID = func() string { return refID(51) }
 			rig.zfs.fail["set readonly=on "+imageDataset(refID(51))] = zfsError("cannot set: dataset is busy")
@@ -539,7 +552,7 @@ func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
 			if images, _ := rig.zfs.Filesystems(bg, testPool+"/"+imageDatasetName); len(images) != 0 {
 				t.Fatalf("an image that could not be saved is still on the pool: %+v", images)
 			}
-			if len(rig.driver.images.known) != 0 || len(rig.driver.images.dead) != 0 {
+			if len(rig.driver.images.known) != 0 || len(rig.driver.images.owed) != 0 {
 				t.Fatalf("images still known: %v", rig.imageIDs())
 			}
 			if entries, _ := os.ReadDir(outbox); len(entries) != 0 {
@@ -635,7 +648,7 @@ func assertBootedFromDisk(t *testing.T, rig *testRig, spec run.CreateSpec) {
 	if len(booted.restoredRequests) != 0 || !booted.up {
 		t.Fatalf("the run's VM was not booted from the disk: %+v", booted.restoredRequests)
 	}
-	if len(rig.driver.images.known) != 0 || len(rig.driver.images.dead) != 0 {
+	if len(rig.driver.images.known) != 0 || len(rig.driver.images.owed) != 0 {
 		t.Fatalf("images still known: %v", rig.imageIDs())
 	}
 	assertPool(t, rig.zfs, append([]string{testPool + "/" + spec.Name, datasetOf(spec.Image), spec.Image}, memoryPristine...)...)
@@ -846,19 +859,24 @@ func TestAResumeWhoseMemoryImageCannotBeUsedBootsFromTheDisk(t *testing.T) {
 }
 
 // refusing is the fake pool refusing to destroy one dataset a number of
-// times, as zfs does while something still holds it.
+// times, as zfs does while something still holds it. attempts counts
+// every try, refused or not.
 type refusing struct {
 	*fakeZFS
 	mu       sync.Mutex
 	dataset  string
 	refusals int
+	attempts int
 }
 
 func (z *refusing) Destroy(ctx context.Context, name string) error {
 	z.mu.Lock()
 	refuse := name == z.dataset && z.refusals > 0
-	if refuse {
-		z.refusals--
+	if name == z.dataset {
+		z.attempts++
+		if refuse {
+			z.refusals--
+		}
 	}
 	z.mu.Unlock()
 	if refuse {
@@ -1157,7 +1175,7 @@ func TestARestartKeepsTheImagesTheRegistryNames(t *testing.T) {
 	}
 	// An interrupted stop: its dataset is made, its snapshot written, and
 	// no record names it.
-	interrupted, err := rig.driver.images.begin(bg, 256, testVMUID)
+	interrupted, err := rig.driver.images.begin(bg, containerName("interrupted"), 256, testVMUID)
 	if err != nil {
 		t.Fatal(err)
 	}

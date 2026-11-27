@@ -145,9 +145,13 @@ type MemoryKeeper interface {
 	// RetainMemory is called once the registry is loaded, before any run
 	// is served: every image of this daemon that no stopped run names is
 	// destroyed, and every image a run names that is not on this host is
-	// reported, so the record can stop claiming it. Also retries what
-	// could not be destroyed before.
+	// reported, so the record can stop claiming it.
 	RetainMemory(ctx context.Context, images []*MemoryImage) (missing []string, err error)
+	// SweepMemory is called now and then while the daemon serves (by the
+	// reaper): an image that could not be destroyed when nothing wanted
+	// it any more is tried again, so that it goes without a restart. It
+	// answers with what still could not go.
+	SweepMemory(ctx context.Context) error
 	// MemoryShortOf reports whether the pool has less than need bytes
 	// plus its reserve free. An image is not saved into a short pool,
 	// and images go from one, oldest stop first.
@@ -163,8 +167,12 @@ type MemoryKeeper interface {
 // daemon cannot serve. The image is as it was, and the record keeps it.
 var ErrMemoryNotTried = errors.New("the run's memory image was not tried")
 
-// memoryReleaseTimeout bounds letting one image go.
-const memoryReleaseTimeout = 30 * time.Second
+// memoryReleaseTimeout bounds letting one image go, and
+// memorySweepTimeout one reaper pass over the images that would not go.
+const (
+	memoryReleaseTimeout = 30 * time.Second
+	memorySweepTimeout   = 30 * time.Second
+)
 
 // memoryIDShape: an image's id is a lower-cased ULID.
 func memoryID(id string) bool {
@@ -243,7 +251,7 @@ func (m *Manager) releaseMemory(image *MemoryImage) {
 	ctx, cancel := context.WithTimeout(context.Background(), memoryReleaseTimeout)
 	defer cancel()
 	if err := m.MemoryImages.ReleaseMemory(ctx, image); err != nil {
-		m.log.Error("a memory image could not be released; it is tried again when the registry is next loaded", "image", image.ID, "error", err)
+		m.log.Error("a memory image could not be released; it is tried again when its VM is gone, and by the reaper", "image", image.ID, "error", err)
 	}
 }
 
@@ -319,6 +327,21 @@ func (m *Manager) hasMemoryImages() bool {
 	return false
 }
 
+// sweepMemoryImages has the driver retry the images that could not be
+// destroyed when nothing wanted them any more (MemoryKeeper.SweepMemory),
+// so that they go without a restart. Under a deadline of its own: the
+// reaper's pass has runs waiting on it.
+func (m *Manager) sweepMemoryImages(ctx context.Context) {
+	if m.MemoryImages == nil {
+		return
+	}
+	sweepCtx, cancel := context.WithTimeout(ctx, memorySweepTimeout)
+	defer cancel()
+	if err := m.MemoryImages.SweepMemory(sweepCtx); err != nil {
+		m.log.Error("memory images could not be removed; they are tried again when their VM is gone, and by the reaper", "error", err)
+	}
+}
+
 // evictOldestMemory drops the memory image of the stopped run that was
 // stopped longest ago, if any: under that run's exclusivity, so that a
 // resume under way is never racing it. It reports whether one went.
@@ -388,7 +411,7 @@ func (m *Manager) ReconcileMemoryImages(ctx context.Context) (kept int, err erro
 	m.mu.Unlock()
 	missing, err := keeper.RetainMemory(ctx, named)
 	if err != nil {
-		m.log.Error("memory images could not be reconciled with the registry; what could not be removed is tried again when the registry is next loaded", "error", err)
+		m.log.Error("memory images could not be reconciled with the registry; what could not be removed is tried again when its VM is gone, and by the reaper", "error", err)
 	}
 	sort.Strings(missing)
 	m.mu.Lock()

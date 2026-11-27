@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/useteploy/teploy-sandbox/internal/run"
 )
@@ -92,7 +94,7 @@ func writeSnapshot(t *testing.T, img *image) {
 // the record, and checks that nothing of the image stays in the outbox.
 func savedImage(t *testing.T, s *memoryImages, runID string, memoryMB int) (*image, run.MemoryImage) {
 	t.Helper()
-	img, err := s.begin(bg, memoryMB, testVMUID)
+	img, err := s.begin(bg, "teploy-sbx-writer", memoryMB, testVMUID)
 	must(t, err)
 	outbox := t.TempDir()
 	target, err := s.bind(img, outbox)
@@ -249,7 +251,7 @@ func TestSealingRefusesWhatACompromisedHypervisorLeavesBehind(t *testing.T) {
 	} {
 		z := newFakeZFS()
 		s := newTestImages(t, z)
-		img, err := s.begin(bg, 256, testVMUID)
+		img, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
 		must(t, err)
 		_, err = s.bind(img, t.TempDir())
 		must(t, err)
@@ -313,7 +315,7 @@ func TestSealingFollowsNoLinkTheWriterPlanted(t *testing.T) {
 			must(t, err)
 			dirBefore, err := os.Stat(hostDir)
 			must(t, err)
-			img, err := s.begin(bg, 256, testVMUID)
+			img, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
 			must(t, err)
 			_, err = s.bind(img, t.TempDir())
 			must(t, err)
@@ -553,7 +555,7 @@ func TestRetainKeepsWhatTheRegistryNamesAndSweepsTheRest(t *testing.T) {
 	_, a := savedImage(t, s, "run-a", 256)
 	_, b := savedImage(t, s, "run-b", 256)
 	// An interrupted stop: a dataset, a bind, no seal and no record.
-	interrupted, err := s.begin(bg, 256, testVMUID)
+	interrupted, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
 	must(t, err)
 	outbox := t.TempDir()
 	_, err = s.bind(interrupted, outbox)
@@ -606,11 +608,176 @@ func TestAnImageThatCouldNotBeDestroyedIsRetried(t *testing.T) {
 	}
 }
 
+// A review's repro, kept. A writer (a hypervisor treated as taken over)
+// that keeps a descriptor open in its image makes the unmount at seal
+// answer EBUSY. The image is abandoned and cannot be taken out of the
+// VM's outbox, so it is owed. What owed it is that VM: it is tried again
+// when the VM is gone, at the end of the stop. Before, it was owed to
+// retain alone, which runs once per daemon start, so every such stop
+// left a quota-sized dataset on the pool until the daemon restarted.
+func TestAnImageItsVMKeptBusyGoesWhenItsVMIsGone(t *testing.T) {
+	const writer = "teploy-sbx-00000000000000000000000042"
+	z := newFakeZFS()
+	s := newTestImages(t, z)
+	img, err := s.begin(bg, writer, 256, testVMUID)
+	must(t, err)
+	target, err := s.bind(img, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSnapshot(t, img)
+	realUnbind := s.mounts.unbind
+	busy := true
+	s.mounts.unbind = func(target string) error {
+		if busy {
+			return syscall.EBUSY
+		}
+		return realUnbind(target)
+	}
+	if err := s.seal(bg, img); err == nil {
+		t.Fatal("seal was set up to fail")
+	}
+	s.abandon(bg, img) // giveBack
+	if !z.has(t, img.dataset) || len(s.owed) != 1 || s.owed[0] != img {
+		t.Fatalf("an image its VM still holds: on the pool %t, owed %d", z.has(t, img.dataset), len(s.owed))
+	}
+	// The writer's VM is killed at the end of the stop: nothing is busy
+	// now.
+	busy = false
+	s.vmGone(bg, writer)
+	if z.has(t, img.dataset) {
+		t.Fatalf("the abandoned image %s is still on the pool after its writer is gone; owed %d, retried only at the next start", img.dataset, len(s.owed))
+	}
+	if len(s.known) != 0 || len(s.owed) != 0 {
+		t.Fatalf("after its writer is gone: known %v, owed %d", slices.Sorted(maps.Keys(s.known)), len(s.owed))
+	}
+	if _, err := os.Lstat(target); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the bind's mount point is still there: %v", err)
+	}
+}
+
+// An image its stop gives up can be one its VM still holds: a
+// hypervisor treated as taken over may keep a descriptor open in the
+// dataset it wrote, so the unmount out of the VM's outbox, or the
+// destroy, answers busy while the VM lives. The image is owed, and what
+// owed it is that VM: it goes when the VM does, at the end of the stop,
+// and not at the next start. Another VM's end is not what it waited
+// for: no VM's end waits behind a destroy that is not its own.
+func TestAnImageItsStopGaveUpGoesWhenItsVMIsGone(t *testing.T) {
+	const writer, other = "teploy-sbx-00000000000000000000000042", "teploy-sbx-00000000000000000000000043"
+	for name, busy := range map[string]func(t *testing.T, z *fakeZFS, s *memoryImages, img *image) (held *bool){
+		"the unmount out of the outbox": func(_ *testing.T, _ *fakeZFS, s *memoryImages, _ *image) *bool {
+			realUnbind := s.mounts.unbind
+			held := true
+			s.mounts.unbind = func(target string) error {
+				if held {
+					return syscall.EBUSY
+				}
+				return realUnbind(target)
+			}
+			return &held
+		},
+		"the destroy of the dataset": func(t *testing.T, z *fakeZFS, s *memoryImages, img *image) *bool {
+			// The seal refuses what the hypervisor left beside the
+			// snapshot; the destroy is busy for the stop's own attempt,
+			// and the dataset goes once the VM does.
+			must(t, os.WriteFile(filepath.Join(img.bound, "notes"), nil, 0o600))
+			s.zfs = &refusing{fakeZFS: z, dataset: img.dataset, refusals: 1}
+			return nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			z := newFakeZFS()
+			s := newTestImages(t, z)
+			img, err := s.begin(bg, writer, 256, testVMUID)
+			must(t, err)
+			target, err := s.bind(img, t.TempDir())
+			must(t, err)
+			writeSnapshot(t, img)
+			held := busy(t, z, s, img)
+			if err := s.seal(bg, img); err == nil {
+				t.Fatal("the seal was set up to fail")
+			}
+			s.abandon(bg, img) // the stop's giveBack
+			if !z.has(t, img.dataset) || len(s.owed) != 1 || s.owed[0] != img {
+				t.Fatalf("an image its VM still holds: on the pool %t, owed %d", z.has(t, img.dataset), len(s.owed))
+			}
+			if held != nil {
+				if _, err := os.Lstat(target); err != nil {
+					t.Fatalf("the bind's mount point went although the unmount was refused: %v", err)
+				}
+				// The writer's VM is killed at the end of the stop:
+				// nothing is busy now.
+				*held = false
+			}
+			s.vmGone(bg, other)
+			if !z.has(t, img.dataset) || len(s.owed) != 1 {
+				t.Fatal("another VM's end destroyed it, or forgot it: the test proves nothing")
+			}
+			s.vmGone(bg, writer)
+			if z.has(t, img.dataset) || len(s.known) != 0 || len(s.owed) != 0 {
+				t.Fatalf("after its writer is gone: on the pool %t, known %v, owed %d", z.has(t, img.dataset), slices.Sorted(maps.Keys(s.known)), len(s.owed))
+			}
+			if _, err := os.Lstat(target); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the bind's mount point is still there: %v", err)
+			}
+		})
+	}
+}
+
+// An image that could not be destroyed does not wait for a restart, nor
+// for its VM if it was not its VM that held it: the sweep tries it
+// again, no sooner than retryAfter after the attempt that failed, for as
+// long as it takes, and says what still would not go.
+func TestOwedImagesAreTriedAgainByTheSweep(t *testing.T) {
+	z := newFakeZFS()
+	s := newTestImages(t, z)
+	now := time.Unix(1700000000, 0)
+	s.now = func() time.Time { return now }
+	img, rec := savedImage(t, s, "run", 256)
+	// Busy for the release and for the sweep's first attempt.
+	busy := &refusing{fakeZFS: z, dataset: img.dataset, refusals: 2}
+	s.zfs = busy
+	attempts := func() int {
+		busy.mu.Lock()
+		defer busy.mu.Unlock()
+		return busy.attempts
+	}
+	if err := s.release(bg, rec.ID); err == nil || attempts() != 1 {
+		t.Fatalf("the destroy was set up to fail: %v, attempts %d", err, attempts())
+	}
+	// Too soon after the failure: nothing is tried.
+	if err := s.sweep(bg); err != nil || attempts() != 1 {
+		t.Fatalf("too soon: %v, attempts %d", err, attempts())
+	}
+	now = now.Add(s.retryAfter)
+	if err := s.sweep(bg); err == nil || attempts() != 2 {
+		t.Fatalf("still busy: %v, attempts %d", err, attempts())
+	}
+	if !z.has(t, img.dataset) || len(s.owed) != 1 {
+		t.Fatalf("an image that still would not go: on the pool %t, owed %d", z.has(t, img.dataset), len(s.owed))
+	}
+	// Paced from the attempt that failed, not from the first.
+	if err := s.sweep(bg); err != nil || attempts() != 2 {
+		t.Fatalf("too soon again: %v, attempts %d", err, attempts())
+	}
+	now = now.Add(s.retryAfter)
+	if err := s.sweep(bg); err != nil || attempts() != 3 {
+		t.Fatalf("the third attempt: %v, attempts %d", err, attempts())
+	}
+	if z.has(t, img.dataset) || len(s.known) != 0 || len(s.owed) != 0 {
+		t.Fatalf("after the sweep: on the pool %t, known %v, owed %d", z.has(t, img.dataset), slices.Sorted(maps.Keys(s.known)), len(s.owed))
+	}
+	if err := s.sweep(bg); err != nil {
+		t.Fatalf("nothing owed, and the sweep says %v", err)
+	}
+}
+
 // A stop that fails after its dataset was made leaves nothing.
 func TestAStopThatGivesUpItsImageLeavesNothing(t *testing.T) {
 	z := newFakeZFS()
 	s := newTestImages(t, z)
-	img, err := s.begin(bg, 256, testVMUID)
+	img, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
 	must(t, err)
 	target, err := s.bind(img, t.TempDir())
 	must(t, err)
@@ -625,7 +792,7 @@ func TestAStopThatGivesUpItsImageLeavesNothing(t *testing.T) {
 	// A dataset that cannot be made is no image at all.
 	s.newID = func() string { return "00000000000000000000000009" }
 	z.fail["createfs "+s.root+"/00000000000000000000000009"] = zfsError("cannot create: out of space")
-	if img, err := s.begin(bg, 256, testVMUID); err == nil {
+	if img, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID); err == nil {
 		t.Fatalf("an image was begun on a full pool: %+v", img)
 	}
 	if len(s.known) != 0 {

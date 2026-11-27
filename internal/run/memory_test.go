@@ -36,6 +36,10 @@ type fakeMemory struct {
 	released []string
 	retained [][]*MemoryImage
 	missing  []string
+	// sweeps counts the reaper's passes, and sweepErr is what the next
+	// one answers.
+	sweeps   int
+	sweepErr error
 	// short says whether the pool has less than need bytes plus its
 	// reserve free, or why it cannot say.
 	short func(need int64) (bool, error)
@@ -97,6 +101,15 @@ func (f *fakeMemory) RetainMemory(_ context.Context, images []*MemoryImage) ([]s
 	defer f.mu.Unlock()
 	f.retained = append(f.retained, images)
 	return slices.Clone(f.missing), nil
+}
+
+// SweepMemory is MemoryKeeper.SweepMemory: the reaper's pass over the
+// images that would not go.
+func (f *fakeMemory) SweepMemory(_ context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sweeps++
+	return f.sweepErr
 }
 
 func (f *fakeMemory) MemoryShortOf(_ context.Context, need int64) (bool, error) {
@@ -476,6 +489,32 @@ func TestAPoolBelowItsReserveLosesMemoryImagesOldestFirst(t *testing.T) {
 	if resumed, err := m.Resume(context.Background(), fourth.ID, 0); err != nil || resumed.ResumedFrom != ResumedFromDisk || len(keeper.resumes) != 0 {
 		t.Fatalf("resume: %q %v", resumed.ResumedFrom, err)
 	}
+}
+
+// The reaper's pass also has the driver retry the images that would not
+// go (MemoryKeeper.SweepMemory), so that one nothing wants does not
+// stay on the pool until the daemon restarts. A pass that still cannot
+// remove something loses nothing else: the next one tries again.
+func TestTheReaperHasTheImagesThatWouldNotGoTriedAgain(t *testing.T) {
+	m, _, keeper := memoryManager(t, t.TempDir())
+	clock := newTestClock(m)
+	m.Reap(context.Background())
+	if keeper.sweeps != 1 {
+		t.Fatalf("after a pass: sweeps %d", keeper.sweeps)
+	}
+	keeper.sweepErr = errors.New("destroy its dataset: dataset is busy")
+	m.Reap(context.Background())
+	// The rest of the pass is as it was: a stopped run past its
+	// retention is still deleted.
+	created := mustCreate(t, m, CreateRequest{})
+	mustStop(t, m, created.ID)
+	clock.advance(2 * m.StoppedRetention)
+	if reaped := m.Reap(context.Background()); reaped != 1 || keeper.sweeps != 3 {
+		t.Fatalf("a pass that could not remove an image: reaped %d, sweeps %d", reaped, keeper.sweeps)
+	}
+	// Without a driver that keeps images nothing is asked.
+	bare, _, _ := newTestManager(t)
+	bare.Reap(context.Background())
 }
 
 // Once the registry is loaded, the images it names are kept and the

@@ -173,6 +173,13 @@ type image struct {
 	// uid is the VM whose snapshot it is, until it is sealed; then its
 	// files are root's.
 	uid uint32
+	// writer is the VM whose snapshot it is, by name: the hypervisor
+	// that writes it runs below that VM's outbox, and being treated as
+	// taken over may keep a descriptor into the dataset open past the
+	// seal, which is what makes the unmount busy. So an image its stop
+	// gives up is tried again when its writer is gone. "" for an image
+	// this life did not begin.
+	writer string
 	// key is the dataset's raw key, in memory only while the daemon may
 	// still need it: from begin until the record is written, and from
 	// open until the dataset is mounted.
@@ -192,6 +199,15 @@ type image struct {
 	held    bool
 	mappers map[string]bool
 	opening int
+	// tried is when the last attempt to destroy it failed, which paces
+	// the sweep's next one.
+	tried time.Time
+}
+
+// wanted says whether something still wants the image: then it is not
+// destroyed, whatever its record says. Under memoryImages.mu.
+func (img *image) wanted() bool {
+	return img.held || len(img.mappers) > 0 || img.opening > 0
 }
 
 // memoryImages is the daemon's images on this host.
@@ -218,10 +234,20 @@ type memoryImages struct {
 	mu sync.Mutex
 	// known are the images on this host that something may still want.
 	known map[string]*image
-	// dead are images nothing wants whose dataset could not be
-	// destroyed: tried again by retain.
-	dead []*image
+	// owed are images nothing wants whose dataset could not be destroyed.
+	// Not forgotten: each is tried again when the VM that wrote or mapped
+	// it is gone, and by the sweep.
+	owed []*image
+	// retryAfter is how long an owed image waits between the sweep's
+	// attempts; its own VM's end does not wait. now is the clock that
+	// paces them.
+	retryAfter time.Duration
+	now        func() time.Time
 }
+
+// owedRetry is how long an image that could not be destroyed waits
+// between the sweep's attempts.
+const owedRetry = time.Minute
 
 // DefaultImageDataset is the image dataset under a pool.
 func DefaultImageDataset(pool string) string {
@@ -246,7 +272,7 @@ func newMemoryImages(ctx context.Context, zfs imageFS, dataset, mountDir, owner 
 			return file.Chown(int(uid), int(gid))
 		},
 		newID: func() string { return strings.ToLower(run.NewULID(time.Now())) },
-		known: map[string]*image{},
+		known: map[string]*image{}, retryAfter: owedRetry, now: time.Now,
 	}
 	// A directory of root's alone: an image's dataset is the VM's to
 	// write until it is sealed, and nothing else may even name it.
@@ -279,12 +305,12 @@ func (s *memoryImages) logger() *slog.Logger {
 	return s.log
 }
 
-// begin makes an image's dataset for a VM of memoryMB MiB running as
-// uid, which writes it as itself until it is sealed. The caller holds
-// it: the hold passes to the run's record (handOver) or is given up
-// (abandon).
-func (s *memoryImages) begin(ctx context.Context, memoryMB int, uid uint32) (*image, error) {
-	img := &image{id: s.newID(), memoryMB: memoryMB, uid: uid, held: true}
+// begin makes an image's dataset for a snapshot of the VM named vm: a
+// guest of memoryMB MiB whose hypervisor runs as uid, and writes the
+// image as itself until it is sealed. The caller holds it: the hold
+// passes to the run's record (handOver) or is given up (abandon).
+func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid uint32) (*image, error) {
+	img := &image{id: s.newID(), memoryMB: memoryMB, uid: uid, writer: vm, held: true}
 	img.key = make([]byte, 32)
 	if _, err := rand.Read(img.key); err != nil {
 		return nil, err
@@ -560,15 +586,27 @@ func (s *memoryImages) drop(ctx context.Context, img *image) {
 }
 
 // vmGone is called once a VM's process is: an image it was restored
-// from loses the hold its mapping was.
+// from loses the hold its mapping was, and an image its stop gave up
+// that could not be removed while the VM lived is tried again, since
+// whatever the VM kept open in it is closed now. Nothing of another VM's
+// is: that waits for the sweep.
 func (s *memoryImages) vmGone(ctx context.Context, vm string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var gone []*image
 	for _, img := range s.known {
 		if img.mappers[vm] {
 			delete(img.mappers, vm)
-			_ = s.settle(ctx, img)
+			gone = append(gone, img)
 		}
+	}
+	for _, img := range s.owed {
+		if img.writer == vm && !slices.Contains(gone, img) {
+			gone = append(gone, img)
+		}
+	}
+	for _, img := range gone {
+		_ = s.settle(ctx, img)
 	}
 }
 
@@ -598,15 +636,12 @@ func (s *memoryImages) handOver(runID string, img *image, what run.MemoryImage) 
 // goes; the images runs name are kept, whether or not they could be
 // opened today. An image two runs name is nobody's: an image is never
 // shared, so it goes and both records are told it is missing. Returns
-// the images that are not on this host.
+// the images that are not on this host, and what could not be destroyed
+// (which is owed from then on, as anywhere else).
 func (s *memoryImages) retain(ctx context.Context, records []*run.MemoryImage) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	retry := s.dead
-	s.dead = nil
-	for _, img := range retry {
-		_ = s.settle(ctx, img)
-	}
+	var failed error
 	datasets, err := s.zfs.Filesystems(ctx, s.root)
 	if err != nil {
 		return nil, err
@@ -631,7 +666,6 @@ func (s *memoryImages) retain(ctx context.Context, records []*run.MemoryImage) (
 		}
 		s.known[rec.ID] = &image{id: rec.ID, dataset: s.root + "/" + rec.ID, dir: filepath.Join(s.mountDir, rec.ID), sealed: true, held: true}
 	}
-	var failed error
 	for _, id := range slices.Sorted(maps.Keys(onHost)) {
 		if counts[id] == 1 {
 			continue
@@ -649,10 +683,11 @@ func (s *memoryImages) retain(ctx context.Context, records []*run.MemoryImage) (
 }
 
 // settle destroys an image nobody wants: not held, not mapped, not
-// being opened. An image that cannot be destroyed now is owed, and
-// tried again by retain. The caller holds mu.
+// being opened. An image that cannot be destroyed now is owed: it is
+// tried again when the VM that wrote or mapped it is gone (vmGone), and
+// by the sweep. The caller holds mu.
 func (s *memoryImages) settle(ctx context.Context, img *image) error {
-	if img.held || len(img.mappers) > 0 || img.opening > 0 {
+	if img.wanted() {
 		return nil
 	}
 	if err := s.unbind(img); err != nil {
@@ -665,15 +700,36 @@ func (s *memoryImages) settle(ctx context.Context, img *image) error {
 	}
 	_ = os.RemoveAll(img.dir)
 	delete(s.known, img.id)
+	s.owed = slices.DeleteFunc(s.owed, func(owed *image) bool { return owed == img })
 	s.logger().Info("memory image destroyed", "image", img.id)
 	return nil
 }
 
-func (s *memoryImages) owe(img *image, what string, err error) {
-	if !slices.Contains(s.dead, img) {
-		s.dead = append(s.dead, img)
+// sweep is SweepMemory: the images that could not be destroyed are
+// tried again, each no sooner than retryAfter after its last attempt.
+// Its own VM's end has tried an image at once already; this is for
+// whatever else held it, so that an image nothing wants does not stay
+// on the pool until the daemon restarts. It answers with what still
+// could not go. The caller holds mu.
+func (s *memoryImages) sweep(ctx context.Context) error {
+	var failed error
+	for _, img := range slices.Clone(s.owed) {
+		if s.now().Sub(img.tried) < s.retryAfter {
+			continue
+		}
+		failed = errors.Join(failed, s.settle(ctx, img))
 	}
-	s.logger().Error("memory image not removed; it is tried again when the registry is next loaded", "image", img.id, "failed", what, "error", err)
+	return failed
+}
+
+// owe notes an image that could not be destroyed, and when. The caller
+// holds mu.
+func (s *memoryImages) owe(img *image, what string, err error) {
+	if !slices.Contains(s.owed, img) {
+		s.owed = append(s.owed, img)
+	}
+	img.tried = s.now()
+	s.logger().Error("memory image not removed; it is tried again when its VM is gone, and by the reaper", "image", img.id, "failed", what, "error", err)
 }
 
 // verifyImage is what an image must be once nothing can change it any

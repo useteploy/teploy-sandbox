@@ -112,7 +112,7 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 			// Detached: a dataset a cancelled request leaves behind is
 			// nobody's until the next start.
 			beginCtx, cancel := detached()
-			img, err = d.images.begin(beginCtx, current.memoryMB, current.machine.UID())
+			img, err = d.images.begin(beginCtx, containerID, current.memoryMB, current.machine.UID())
 			cancel()
 			if err != nil {
 				note = "its dataset could not be made: " + err.Error()
@@ -261,6 +261,14 @@ func (d *Driver) RetainMemory(ctx context.Context, images []*run.MemoryImage) ([
 		return nil, errors.New("this daemon keeps no memory images")
 	}
 	return d.images.retain(ctx, images)
+}
+
+// SweepMemory is run.MemoryKeeper.SweepMemory.
+func (d *Driver) SweepMemory(ctx context.Context) error {
+	if d.images == nil {
+		return errors.New("this daemon keeps no memory images")
+	}
+	return d.images.sweep(ctx)
 }
 
 // ResumeMemory is run.MemoryKeeper.ResumeMemory: Create for a stopped

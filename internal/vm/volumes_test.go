@@ -737,6 +737,42 @@ func TestCaptureRollsBackAStepThatFailedAfterTakingEffect(t *testing.T) {
 	}
 }
 
+// The VM's resume between a capture's two storage steps is not on their
+// clock. After a hypervisor snapshot that did not answer, a stop's resume
+// waits for it (up to snapshotTimeout, two minutes and more): the clone
+// and the promote that follow still get a budget of their own, or the
+// disk snapshot would have been taken and thrown away.
+func TestACapturesCloneAndPromoteAreNotTimedOutByTheVMsResume(t *testing.T) {
+	volume := testPool + "/" + runName(1)
+	fake := newFakeZFS()
+	// The pool as the zfs command is under a context: nothing starts
+	// once it has run out.
+	z := &cliZFS{fakeZFS: fake, after: map[string]func(){}}
+	v := newTestVolumes(fake)
+	v.zfs = z
+	v.captureTimeout = 60 * time.Millisecond
+	mustCreate(t, v, runName(1), "")
+	ref := v.NewRef(refID(1))
+	resumed := 0
+	err := v.Capture(bg, runName(1), ref, func() (func() error, error) {
+		return func() error {
+			resumed++
+			time.Sleep(4 * v.captureTimeout)
+			return nil
+		}, nil
+	})
+	must(t, err)
+	if resumed != 1 {
+		t.Fatalf("resumed %d times", resumed)
+	}
+	// The reference is on the pool and usable, exactly as after any capture.
+	assertPool(t, fake, append([]string{volume, datasetOf(ref), ref}, pristine...)...)
+	if fake.originOf(volume) != ref {
+		t.Fatalf("the run volume's origin is %q", fake.originOf(volume))
+	}
+	mustCreate(t, v, runName(2), ref)
+}
+
 // A capture's quiesce can be long: with memory images the hypervisor
 // writes all of guest RAM while the VM is paused. It runs before the
 // pool's lock is taken, so that another run's volume can be made, or

@@ -204,8 +204,13 @@ func TestMapsFileSeesOnlyAWholeMappingOfTheMemoryFile(t *testing.T) {
 		maps string
 		want bool
 	}{
-		"the whole file, private":              {whole, true},
-		"the whole file, read-only":            {mapping(0, size, "r--p", "fd:01", "42", "/x/memory-ranges"), false},
+		"the whole file, private":    {whole, true},
+		"the whole file, read-only":  {mapping(0, size, "r--p", "fd:01", "42", "/x/memory-ranges"), false},
+		"the whole file, shared":     {mapping(0, size, "rw-s", "fd:01", "42", "/x/memory-ranges"), false},
+		"the whole file, write-only": {mapping(0, size, "-w-p", "fd:01", "42", "/x/memory-ranges"), false},
+		"the whole file, executable": {mapping(0, size, "rwxp", "fd:01", "42", "/x/memory-ranges"), false},
+		"half shared and half private": {mapping(0, size/2, "rw-s", "fd:01", "42", "/x/memory-ranges") +
+			mapping(size/2, size, "rw-p", "fd:01", "42", "/x/memory-ranges"), false},
 		"the whole file at another address":    {mapping(0x7f0000000000, 0x7f0000000000+size, "rw-p", "fd:01", "42", "/x/memory-ranges"), true},
 		"the first page only":                  {mapping(0, 4096, "rw-p", "fd:01", "42", "/x/memory-ranges"), false},
 		"all but one page":                     {mapping(4096, size, "rw-p", "fd:01", "42", "/x/memory-ranges"), false},
@@ -267,6 +272,25 @@ func TestMapsFileSeesOnlyAWholeMappingOfTheMemoryFile(t *testing.T) {
 	defer syscall.Munmap(rest)
 	if !machine.MapsFile(path) {
 		t.Fatal("the file mapped privately over its whole length was not seen")
+	}
+	// A shared mapping of the whole file is not a copy-on-write restore,
+	// whatever it covers: what the VM wrote would reach the image.
+	other := filepath.Join(t.TempDir(), imageMemoryFile)
+	if err := os.WriteFile(other, make([]byte, 3*4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := os.OpenFile(other, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	shared, err := syscall.Mmap(int(writer.Fd()), 0, 3*4096, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Munmap(shared)
+	if machine.MapsFile(other) {
+		t.Fatal("a file mapped shared over its whole length was taken for a copy-on-write restore")
 	}
 }
 

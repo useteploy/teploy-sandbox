@@ -700,15 +700,19 @@ func (m *chMachine) MapsFile(hostPath string) bool {
 
 // mapsFile says whether maps, a /proc/PID/maps, maps the file with the
 // device number dev (as the file spells it, "mm:nm") and the inode ino
-// over at least size bytes, summed over its mappings of that file. A
-// mapping the process can only read is not one: the hypervisor maps the
-// guest's memory to write it (copy-on-write).
+// over at least size bytes, summed over its mappings of that file. Only
+// a private read-write mapping counts (rw-p), which is how the
+// hypervisor maps the guest's memory for a copy-on-write restore. A
+// mapping the process can only read is not one: a restore that copied
+// the memory read the file and maps nothing it writes. A shared one is
+// not one either, and would be worse: what the VM wrote would reach
+// the image.
 func mapsFile(maps []byte, dev, ino string, size int64) bool {
 	var mapped int64
 	for line := range strings.SplitSeq(string(maps), "\n") {
 		fields := strings.Fields(line)
 		// addr perms offset dev inode [pathname]
-		if len(fields) < 5 || fields[3] != dev || fields[4] != ino || !strings.Contains(fields[1], "w") {
+		if len(fields) < 5 || fields[1] != "rw-p" || fields[3] != dev || fields[4] != ino {
 			continue
 		}
 		start, end, ok := strings.Cut(fields[0], "-")

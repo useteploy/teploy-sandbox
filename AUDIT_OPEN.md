@@ -4697,15 +4697,66 @@ also ran as root there, as CI's root job runs it: 310 pass, none skipped.
   small guests; `copy` for a guest that will touch most of its RAM anyway;
   `primarycache=all` on the image datasets (M0 kept `metadata` to avoid
   double caching). Measure on the bigger host before choosing.
-- **Landlock on restore is applied after the hypervisor has built the
-  VM's memory** (upstream order, so the memory file can be mapped). The
-  thread that loads the kernel into guest memory starts before the
-  ruleset and is not under it; it reads the kernel image the daemon bound
-  into the jail and nothing else. A restored hypervisor refusing a write
-  outside its rules was shown by M0 (U2, a decoy directory); the product
-  jail has no second writable path, so the live suite shows only that the
-  allowed one works (a restored VM is saved again). Upstream question
-  from M0 (B1) stands: a `--landlock` that applies before the restore.
+- **Landlock on a restore comes after the VM is built, and to one
+  thread of the hypervisor (upstream order and design).** Read from
+  Cloud Hypervisor v54.1, `vmm/src/lib.rs`, `Vmm::vm_restore` (lines
+  2081–2158). On `vm.restore` the VMM thread, in this order: parses
+  `config.json` (the daemon's own, rewritten; at most 4 MiB by the
+  daemon's check) and `state.json` (read whole by CH and parsed with
+  `serde_json`; the daemon's sealing bounds it at 64 MiB, and it is the
+  run's own: the image is sealed, per run, and its key opens only under
+  the run's record); checks the saved CPUID against the host's; creates
+  the console devices (for this daemon's configuration, the serial
+  console, which is the hypervisor's own stdout); and runs `Vm::new`,
+  which creates the KVM VM, maps the memory file copy-on-write, rebuilds
+  the devices from their saved state and the vCPUs with their saved
+  registers. **Only then**, if the configuration says `landlock_enable`,
+  `apply_landlock` builds the ruleset and the landlock crate's
+  `restrict_self` applies it to the calling thread, the VMM thread. Then
+  `vm.restore` runs: the disks are locked again, the VM Generation ID is
+  regenerated and the guest's device notified, and the vCPU threads are
+  started, paused. The guest does not run until `vm.resume`, which is
+  the daemon's call, made after its check that the memory was mapped.
+  So **no guest vCPU runs before the ruleset is in place**, and the vCPU
+  threads, started by the VMM thread after it, inherit its ruleset.
+- **Which threads of a restored hypervisor are not under the ruleset:
+  open, carried from M0.** The landlock crate's `restrict_self` is per
+  thread, and nothing is applied before `Vm::new` builds the VM. On a
+  restore these threads therefore run with no Landlock ruleset at all:
+  the HTTP API server, the event monitor and the signal handler, which
+  CH starts before any VM exists and restricts only when `--landlock` is
+  on the command line, which a restore-only start cannot carry (M0, U2:
+  CH refuses it without a payload); and the serial console's manager
+  thread, which `Vm::new` starts before the ruleset. (On a boot,
+  `vm_create` applies the ruleset before `Vm::new`, so everything the
+  VMM thread starts after it inherits it; the three earlier threads get a
+  ruleset of their own from the command line, an empty one, which denies
+  every path.) What holds those threads on a restore is everything but
+  Landlock: the jail (a mount namespace with three read-only file binds
+  and two sockets to its name), the per-run UID, CH's own seccomp filter
+  and the daemon's denylist. Of them only the HTTP server does work of
+  its own, which is to parse the daemon's requests off the API socket
+  and hand them to the VMM thread over a channel: the work of every
+  request (`vm.restore`, `vm.resume`, `vm.snapshot`, `vm.add-net`) runs
+  on the VMM thread, under the ruleset. Shown by M0 (U2: a `vm.snapshot`
+  into a decoy directory outside the rules was refused on a restored
+  VM); **not** shown per thread: that the HTTP API thread is outside the
+  ruleset is what the source says, and what a hypervisor taken over
+  could make of that was not tried live. The product jail has no second
+  writable path, so the live suite shows only that the allowed one works
+  (a restored VM is saved again).
+- **Suggested upstream issue for Cloud Hypervisor (not filed):**
+  "Restore: apply the Landlock ruleset before the VM is built, and to
+  every thread." A hypervisor started for a restore parses
+  snapshot-derived state (tens of MiB of JSON) and maps the memory file
+  before its Landlock ruleset is applied; three of its threads (the HTTP
+  API server, the event monitor, the signal handler) are never under it,
+  since `--landlock` cannot be given without a payload, and a fourth
+  (the serial manager) is started inside `Vm::new`, before it. Proposed:
+  in `vm_restore` (and `vm_receive_config`), apply the configuration's
+  ruleset before `Vm::new`, and have the threads that start before any
+  VM exists restrict themselves when the VM's configuration arrives, or
+  start them after it.
 - **arm64: an image is never used there, as the command line stands.**
   Not run live. The daemon's arm64 command line has no `acpi=on`, so an
   arm64 guest has no VM Generation ID device and no driver to reseed on.

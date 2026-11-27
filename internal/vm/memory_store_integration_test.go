@@ -7,7 +7,10 @@ package vm
 // slave bind keeps), the bind through which the hypervisor writes, the
 // sealing, the quota, and what is refused; an image closed at rest (and
 // what zfs then sends of it); then the same image opened by the daemon's
-// next life. It runs with the live suite:
+// next life, which closes what the last one left open; a close the pool
+// refuses (a descriptor held in the dataset), owed and closed by the
+// sweep once the descriptor is gone; and an open that fails, leaving the
+// image closed. It runs with the live suite:
 //
 //	CGO_ENABLED=0 go test -c -tags vmintegration -o vm-unit.test ./internal/vm/
 //	sudo ./vm-unit.test -test.run TestVMMemoryImagesOnARealPool -test.v
@@ -25,6 +28,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/useteploy/teploy-sandbox/internal/run"
 )
@@ -372,6 +376,139 @@ func TestVMMemoryImagesOnARealPool(t *testing.T) {
 	if _, err := os.Lstat(opened.dir); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("a released image's directory is still there: %v", err)
 	}
+
+	// --- the daemon's next life closes what its last one left open: a
+	// life that ended in the middle of a resume leaves its image mounted
+	// with its key loaded. retain reads how every image lies open in one
+	// zfs get, and closes them; the image is its run's still.
+	opened, err = restarted.open(bg, "run-2", &rec2)
+	must(t, err)
+	restarted.drop(bg, opened)
+	if got, _ := zfs.Property(bg, second.dataset, propMounted); got != "yes" {
+		t.Fatalf("the set-up: the image a resume left is mounted: %q", got)
+	}
+	states, err := zfs.openStates(bg, root)
+	must(t, err)
+	if state, open := states[second.dataset]; !open || state != (imageOpen{mounted: true, keyLoaded: true}) {
+		t.Fatalf("one zfs get says the image lies %+v (found %t), want mounted with its key loaded", state, open)
+	}
+	final, err := newMemoryImages(bg, zfs, root, mountDir, testOwner, testSecret, testClass, quietLog())
+	must(t, err)
+	missing, err = final.retain(bg, []*run.MemoryImage{&rec2})
+	must(t, err)
+	if len(missing) != 0 || len(final.unclosed) != 0 {
+		t.Fatalf("after the start: missing %v, %d closes owed", missing, len(final.unclosed))
+	}
+	if got, _ := zfs.Property(bg, second.dataset, propMounted); got != "no" {
+		t.Errorf("after the start the image is still mounted: %q", got)
+	}
+	if got, _ := zfs.Property(bg, second.dataset, propKeyStatus); got != "unavailable" {
+		t.Errorf("after the start the image's key is %q", got)
+	}
+	opened, err = final.open(bg, "run-2", &rec2)
+	must(t, err)
+	final.drop(bg, opened)
+
+	// --- a close the pool refuses is owed, and tried again (the re-check's
+	// F1). A descriptor kept open on a file of the dataset — a hypervisor
+	// taken over may keep one past the seal — makes zfs unmount refuse
+	// (measured on the test host: exit 1, the dataset mounted and its key
+	// loaded still, and zfs unload-key refusing under the mount). The
+	// hand-over owes the close; the writer's end tries it, and is refused
+	// for as long as the descriptor is held; once it is gone the sweep
+	// closes the image, a minute after the last attempt.
+	third, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
+	must(t, err)
+	_, err = s.bind(third, outbox)
+	must(t, err)
+	writeSnapshot(t, third)
+	must(t, s.seal(bg, third))
+	held, err := os.Open(filepath.Join(third.dir, imageMemoryFile))
+	must(t, err)
+	defer held.Close()
+	rec3, err := s.handOver("run-3", third, run.MemoryImage{Disk: "7003", MemoryMB: 256, CPUs: 1})
+	must(t, err)
+	if rec3.ID != third.id || len(s.unclosed) != 1 {
+		t.Fatalf("the hand-over of an image whose close the pool refused: %+v, %d closes owed", rec3, len(s.unclosed))
+	}
+	s.vmGone(bg, "teploy-sbx-writer")
+	if got, _ := zfs.Property(bg, third.dataset, propMounted); got != "yes" || len(s.unclosed) != 1 {
+		t.Fatalf("the writer's end: mounted %q, %d closes owed (the descriptor is held: the close must be refused, and still owed)", got, len(s.unclosed))
+	}
+	must(t, held.Close())
+	if err := s.sweep(bg); err != nil || s.unclosed[0] != third {
+		t.Fatalf("too soon for the sweep: %v, %d closes owed", err, len(s.unclosed))
+	}
+	s.now = func() time.Time { return time.Now().Add(time.Minute) }
+	if err := s.sweep(bg); err != nil {
+		t.Fatalf("the sweep, a minute on: %v", err)
+	}
+	if got, _ := zfs.Property(bg, third.dataset, propMounted); got != "no" {
+		t.Errorf("the descriptor is gone and the sweep left the image mounted: %q", got)
+	}
+	if got, _ := zfs.Property(bg, third.dataset, propKeyStatus); got != "unavailable" {
+		t.Errorf("the descriptor is gone and the sweep left the image's key %q", got)
+	}
+	if len(s.unclosed) != 0 {
+		t.Fatalf("a closed image is still owed its close: %d", len(s.unclosed))
+	}
+	// Its run's still, and as usable as before.
+	opened, err = s.open(bg, "run-3", &rec3)
+	must(t, err)
+	s.drop(bg, opened)
+	must(t, s.release(bg, rec3.ID))
+	if exists, _ := zfs.Exists(bg, third.dataset); exists {
+		t.Fatal("a released image is still on the pool")
+	}
+
+	// --- an open that fails once the pool has done part of it leaves the
+	// image as it found it (the re-check's F2): a file made writable again
+	// after the seal fails the check that follows the mount, and the key
+	// the open loaded and the dataset it mounted are gone again. Before,
+	// the key stayed loaded for as long as the run was stopped.
+	fourth, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
+	must(t, err)
+	_, err = s.bind(fourth, outbox)
+	must(t, err)
+	writeSnapshot(t, fourth)
+	must(t, s.seal(bg, fourth))
+	rec4, err := s.handOver("run-4", fourth, run.MemoryImage{Disk: "7004", MemoryMB: 256, CPUs: 1})
+	must(t, err)
+	// The defect is planted as only root can plant it: the dataset is
+	// made writable for a moment, a file of the image is made writable
+	// again, and it is sealed as it was. The image is open for that, and
+	// closed again around the defect, as a start leaves it (which names
+	// every image that must stay).
+	opened, err = s.open(bg, "run-4", &rec4)
+	must(t, err)
+	must(t, zfs.SetProperty(bg, fourth.dataset, propReadonly, "off"))
+	must(t, os.Chmod(filepath.Join(fourth.dir, imageStateFile), 0o644))
+	must(t, zfs.SetProperty(bg, fourth.dataset, propReadonly, "on"))
+	s.drop(bg, opened)
+	again, err := newMemoryImages(bg, zfs, root, mountDir, testOwner, testSecret, testClass, quietLog())
+	must(t, err)
+	missing, err = again.retain(bg, []*run.MemoryImage{&rec2, &rec4})
+	must(t, err)
+	if got, _ := zfs.Property(bg, fourth.dataset, propMounted); got != "no" {
+		t.Fatalf("the set-up: the image is mounted %q, want closed around the defect", got)
+	}
+	if _, err := s.open(bg, "run-4", &rec4); err == nil {
+		t.Fatal("an image with a writable file was opened")
+	}
+	if got, _ := zfs.Property(bg, fourth.dataset, propMounted); got != "no" {
+		t.Errorf("a failed open left the image mounted: %q", got)
+	}
+	if got, _ := zfs.Property(bg, fourth.dataset, propKeyStatus); got != "unavailable" {
+		t.Errorf("a failed open left the image's key %q", got)
+	}
+	if len(s.unclosed) != 0 {
+		t.Fatalf("an image a failed open closed again is owed its close: %d", len(s.unclosed))
+	}
+	must(t, s.release(bg, rec4.ID))
+	if exists, _ := zfs.Exists(bg, fourth.dataset); exists {
+		t.Fatal("a released image is still on the pool")
+	}
+
 	// What is left is the one image the registry still names.
 	filesystems, err := zfs.Filesystems(bg, root)
 	must(t, err)

@@ -10,6 +10,11 @@ there instead (see Persistent runs).
 teploy-sandbox serve            # 127.0.0.1:7439; token minted to /deployments/sandbox/token
 ```
 
+The first release is v0.1.0. The source is licensed under the
+[Functional Source License 1.1, MIT Future License](LICENSE) (FSL-1.1-MIT):
+you may use, modify and self-host it for anything except offering a competing
+product, and each version becomes MIT two years after its release.
+
 ## Releases
 
 Push a `vMAJOR.MINOR.PATCH` tag (an optional `-prerelease` is allowed).
@@ -48,7 +53,7 @@ stability promise — is [docs/wire-contract.md](docs/wire-contract.md).
 | `POST /v1/runs/{id}/fork` | `{ttlSec?, labels?, onExpire?}` → 201, a new run started from this one's filesystem and settings, with `forkedFrom` |
 | `GET /v1/capacity` | `{server, driver, runtime, cpus, memoryMb, runs: {running, stopped}, allocated: {cpus, memoryMb}, warmPool?, disk?}` — the host's size and the sum of running runs' limits (and of the VM driver's warm pool, when it has one); `disk: {kind, name, usedBytes, freeBytes}` is the ZFS pool (`zfs-pool`) or Docker's data root filesystem (`docker-data-dir`), absent when unknown. The Docker figure is a statfs of the data root's path (from `docker info`) on the daemon's own filesystem: only right for a daemon on the Docker host itself (as `serve` runs). Against a remote Docker, or a Docker VM such as Docker Desktop or colima, that path is the local one or missing, and the number is wrong or absent |
 | `GET /v1/remote/snapshots` | Only with remote storage: the caller snapshots in the bucket → `{snapshots: [{id, run?, createdAt, storedBytes}]}` — membership is the durability probe for a snapshot whose upload failed and is retried |
-| `POST /v1/remote/sync`, `POST /v1/remote/collect`, `POST /v1/remote/rotate`, `POST /v1/remote/scrub` | Only with remote storage (400 without): look for runs stopped on other daemons now → `{remote, changed}`; garbage-collect the bucket now → 204; re-wrap the bucket's keys under the current master → `{manifestsRewrapped, recordsRewrapped, …, previousKeyNeeded, previousKeyNeededFor: [...]}`; check now that every stopped run this daemon reports durable is whole in the bucket, and read the next `--remote-scrub-read-mb` of their chunks → `{checked, notWhole, unreachable, contentReadBytes, contentSnapshots, damaged}` |
+| `POST /v1/remote/sync`, `POST /v1/remote/collect`, `POST /v1/remote/rotate`, `POST /v1/remote/scrub` | Only with remote storage (400 without): look for runs stopped on other daemons now → `{remote, changed}`; garbage-collect the bucket now → 204; re-wrap the bucket's keys under the current master → `{manifestsRewrapped, recordsRewrapped, …, previousKeyNeeded, previousKeyNeededFor: [...]}`; check now that every stopped run this daemon reports durable is whole in the bucket, and read the next `--remote-scrub-read-mb` of their chunks → `{checked, notWhole, unreachable, contentReadBytes, contentSnapshots, damaged, rechecked}` |
 | `PUT/DELETE /v1/runs/{id}/ports/{port}`, `POST /v1/runs/{id}/access/revoke`, `GET/PUT /v1/access/config` | Only with access on (`--access-addr`): publish a port (`{visibility: "public"\|"private", protocol?: "http"\|"h2c"}`, at most 16 public) or drop it; revoke every access grant of the run and close its streams → the run with its new `access.epoch`; the access configuration `{audience, issuerKeys, edgeDenylist}` (see Access) |
 | `GET /v1/runs`, `GET /health` | List; `{status, version}` |
 
@@ -1909,12 +1914,14 @@ Docker configuration. See [gVisor filesystem configuration](https://gvisor.dev/d
 
 Verify the actual runtime, including repository metadata and uncommitted files:
 `SBX_TEST_RUNTIME=runsc go test -tags integration -run TestRealSnapshotRetainsWorkspace .`
-Set `SBX_TEST_IMAGE` to use a preinstalled image. Bind-mounted warm volumes remain
-outside image snapshots; callers must retain those containers across a pause.
+Set `SBX_TEST_IMAGE` to use a preinstalled image. A warm run's volume is
+bind-mounted, which `docker commit` alone does not see, so snapshot and stop
+copy the volume's bytes into the image themselves (see Stop above).
 
 ### Capture and streaming guarantees
 
-Build with Go 1.25 or newer. The daemon uses rooted filesystem operations to
+Build with Go 1.25 or newer (`go.mod`'s minimum; releases and CI use the
+`toolchain` pin, Go 1.26.11). The daemon uses rooted filesystem operations to
 keep cache reads inside each volume. Lockfiles are regular files of at most
 8 MiB; cache copies reject special files and cap files at 512 MiB, trees at
 8 GiB and 100,000 entries. Publication and reclamation are serialized. One

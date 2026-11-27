@@ -320,7 +320,7 @@ Limits and lifetime (constants, not configurable in this release):
 | `POST /v1/remote/sync` | 200 `{remote, changed}` |
 | `POST /v1/remote/collect` | 204 |
 | `POST /v1/remote/rotate` | 200 `{manifestsRewrapped, manifestsCurrent, manifestsSkipped, recordsRewrapped, recordsCurrent, recordsRunning, recordsConflicted, recordsUnfenced, recordsDestroyed, recordsRunningPrevious, recordsDestroyedPrevious, localKeysRewrapped, localKeysFailed, previousKeyNeeded, previousKeyNeededFor}` |
-| `POST /v1/remote/scrub` | 200 `{checked, notWhole, unreachable}` |
+| `POST /v1/remote/scrub` | 200 `{checked, notWhole, unreachable, contentReadBytes, contentSnapshots, damaged, rechecked}` |
 
 ## Access
 

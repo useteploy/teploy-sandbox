@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/useteploy/teploy-sandbox/internal/run"
@@ -73,7 +72,8 @@ func snapshotTimeout(memoryMB int) time.Duration {
 // disk snapshot's. An image that could not be saved is no error: the
 // image is nil and the note says why, and the stop goes on as it did
 // before images existed. While the image is written the VM's memory
-// limit covers it (cell.raiseMemoryLimit), and is put back after.
+// limit covers it (cell.raiseMemoryLimit): from the pause until the
+// image is sealed, and no longer (see below).
 func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef string) (*run.MemoryImage, string, error) {
 	d.mu.Lock()
 	current, ok := d.machines[containerID]
@@ -122,25 +122,42 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 		}
 	}
 
-	// For as long as the image is written the VM's memory limit covers
+	// For the moment the image is written the VM's memory limit covers
 	// it (cell.raiseMemoryLimit): the image goes through the page cache
 	// of the VM's own memory group, and a guest with most of its memory
 	// in use otherwise has its hypervisor killed by that limit midway
-	// through the snapshot. Best effort both ways, and said: without the
-	// room the stop is the stop it was, and a limit left raised goes
-	// with the VM's group.
-	putBack := func() {}
-	if img != nil {
-		if err := current.machine.RaiseMemoryLimit(imageNeedsBytes(current.memoryMB)); err != nil {
-			d.log.Warn("the VM's memory limit could not cover its image; the stop goes on", "name", containerID, "error", err)
-		} else {
-			putBack = sync.OnceFunc(func() {
-				if err := current.machine.RestoreMemoryLimit(); err != nil {
-					d.log.Warn("the VM's memory limit was not put back; it goes with the VM's group", "name", containerID, "error", err)
-				}
-			})
+	// through the snapshot. The guest's own memory is all that group
+	// ever needs to hold, the image included, so the raised limit covers
+	// an image of this guest's size.
+	//
+	// The room is the hypervisor's for exactly as long as it writes the
+	// image, and no longer. It is asked for once the VM is paused and
+	// its image is about to be written — a running guest never has it —
+	// and given back once the image is sealed (or given up), before the
+	// VM resumes (see resume, and the closure Capture runs). Best effort
+	// both ways, and said: without the room the stop is the stop it was,
+	// and a limit that could not be put back goes with the VM's group.
+	var raised bool
+	putBack := func() {
+		if !raised {
+			return
+		}
+		raised = false
+		if err := current.machine.RestoreMemoryLimit(); err != nil {
+			d.log.Warn("the VM's memory limit was not put back; it goes with the VM's group", "name", containerID, "error", err)
 		}
 	}
+	raise := func() {
+		if err := current.machine.RaiseMemoryLimit(imageNeedsBytes(current.memoryMB)); err != nil {
+			d.log.Warn("the VM's memory limit could not cover its image; the stop goes on", "name", containerID, "error", err)
+			return
+		}
+		raised = true
+	}
+	// A net under every way out. Each path out already puts the limit
+	// back where nothing writes the image any more, so this finds
+	// nothing to do; it is here so that no way out can leave a running
+	// guest with the room.
 	defer putBack()
 
 	if !alive {
@@ -168,7 +185,13 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 	// and the resume queued behind it must outwait it, or a stop would
 	// leave the VM paused for as long as that takes.
 	resumeWait := pauseTimeout
+	// resume is for a VM whose image is nobody's: none was begun, or
+	// the hypervisor's snapshot of it failed. The room, where any was
+	// asked for, is given back once the VM runs, not before: a snapshot
+	// that did not answer in time goes on writing until the resume
+	// queued behind it is served, and that writing must stay covered.
 	resume := func() error {
+		defer putBack()
 		resumeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resumeWait)
 		defer cancel()
 		if err := current.machine.Resume(resumeCtx); err != nil {
@@ -203,6 +226,10 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 			err = errors.New("the mount did not reach the VM's jail")
 		}
 		if err == nil {
+			// Paused, with the image in reach of the jail: from here
+			// until the seal the limit covers the image. Only the
+			// hypervisor runs meanwhile, never the guest.
+			raise()
 			snapshotCtx, cancel := detached()
 			err = current.machine.Snapshot(snapshotCtx, "file://"+target)
 			cancel()
@@ -225,12 +252,24 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 				note = "the image was not sealed: " + err.Error()
 				giveBack()
 			}
+			// Sealed or given up, nothing writes the image now. The
+			// limit is the VM's own again before the VM runs: a running
+			// guest never has the room. The write lowers memory.max
+			// below what the group holds (the image's pages are still
+			// charged to it), so the kernel reclaims against the new
+			// limit before the write returns (cgroups.memoryLimit), and
+			// the pause lasts as long as that takes. It cannot come to
+			// an OOM kill of an honest hypervisor: the guest has been
+			// paused since before the room was asked for and holds what
+			// it held under its own limit, and all the group holds
+			// beyond that is the image's page cache, which is reclaimed.
+			// What a hypervisor taken over may have made of the room
+			// while its VM was paused is what the kill is for; its VM
+			// goes with the stop.
+			putBack()
 			return resume()
 		}, nil
 	})
-	// The image is written (or will not be): the VM's memory limit is
-	// its own again, before anything else is done with it.
-	putBack()
 	if err != nil {
 		// The disk capture failed: nothing has changed, and the image is
 		// nobody's.

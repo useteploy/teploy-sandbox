@@ -812,6 +812,13 @@ type fakeMachine struct {
 	limitsRestored                 int
 	widened                        int64
 	limitRaiseErr, limitRestoreErr error
+	// raisedUnpaused counts the raises the daemon asked for while the
+	// VM ran: the room is for a paused VM only. widenedAtResume is how
+	// far the limit stood raised at each resume, in order.
+	raisedUnpaused  int
+	widenedAtResume []int64
+	// events also names each raise and putting back of the limit, and
+	// each snapshot, in their place: the order of a stop is read there.
 	// snapshotHook runs once the snapshot's files are written, with the
 	// directory they were written to: what a hypervisor the guest took
 	// over may add. snapshotWhilePaused records that the hypervisor was
@@ -908,6 +915,7 @@ func (m *fakeMachine) Resume(context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.events = append(m.events, "resume")
+	m.widenedAtResume = append(m.widenedAtResume, m.widened)
 	if m.resumeErr == nil {
 		m.paused = false
 	}
@@ -961,7 +969,11 @@ func (m *fakeMachine) RaiseMemoryLimit(bytes int64) error {
 	if m.limitRaiseErr != nil {
 		return m.limitRaiseErr
 	}
+	if !m.paused {
+		m.raisedUnpaused++
+	}
 	m.widened += bytes
+	m.events = append(m.events, "raise-limit")
 	return nil
 }
 
@@ -973,6 +985,7 @@ func (m *fakeMachine) RestoreMemoryLimit() error {
 		return m.limitRestoreErr
 	}
 	m.widened = 0
+	m.events = append(m.events, "restore-limit")
 	return nil
 }
 
@@ -1003,6 +1016,7 @@ func (m *fakeMachine) Snapshot(_ context.Context, destination string) error {
 		return &hypervisorRefusal{action: "vm.snapshot", status: "500 Internal Server Error", body: "Trying to snapshot while VM is running"}
 	}
 	m.snapshotWhilePaused = m.paused
+	m.events = append(m.events, "snapshot")
 	m.mu.Unlock()
 	if !m.paused {
 		return errors.New("not paused")

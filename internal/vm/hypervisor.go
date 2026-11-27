@@ -103,9 +103,10 @@ type Machine interface {
 	// Inbox is the directory a VM restored from a memory image reads it
 	// from, as its jail names it; "" for a booted VM.
 	Inbox() string
-	// RaiseMemoryLimit raises the VM's memory limit by bytes for as long
-	// as its memory image is written, and RestoreMemoryLimit puts it
-	// back (cell.raiseMemoryLimit).
+	// RaiseMemoryLimit raises the VM's memory limit by bytes for the
+	// moment a stop writes the VM's memory image — from the pause until
+	// the image is sealed, and no longer — and RestoreMemoryLimit puts
+	// it back (cell.raiseMemoryLimit).
 	RaiseMemoryLimit(bytes int64) error
 	RestoreMemoryLimit() error
 	// MapsFile reports whether the hypervisor process maps the whole of

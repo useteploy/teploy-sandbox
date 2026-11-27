@@ -283,16 +283,33 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 // raiseMemoryLimit raises the VM's memory limit by bytes, and
 // restoreMemoryLimit puts it back where it was.
 //
-// It is for the moment a stop writes the VM's memory image. The image
-// goes through the page cache, which is charged to the VM's own group,
-// and dirty pages there are not reclaimed without I/O: a guest with most
-// of its memory in use had its hypervisor killed by its own limit in the
-// middle of its snapshot (seen live, as a VM restored from an image was
-// stopped again: 465 MiB resident against the 584 MiB allowed, the new
-// image's pages on top). The guest's own memory is all that group ever
-// needs to hold, the image included, so for as long as the image is
-// written the limit covers an image of this guest's size, and after that
-// it does not.
+// It is for the moment a stop writes the VM's memory image, and for that
+// moment only (SaveMemory): the stop asks for the room once the VM is
+// paused and its image is about to be written, and gives it back once
+// the image is sealed, before the VM resumes. The image goes through
+// the page cache, which is charged to the VM's own group, and dirty
+// pages there are not reclaimed without I/O: a guest with most of its
+// memory in use had its hypervisor killed by its own limit in the middle
+// of its snapshot (seen live, as a VM restored from an image was stopped
+// again: 465 MiB resident against the 584 MiB allowed, the new image's
+// pages on top). The guest's own memory is all that group ever needs to
+// hold, the image included, so the raised limit covers an image of this
+// guest's size; and since the guest is paused for all of that moment, a
+// running guest never has the room.
+//
+// Putting it back lowers memory.max below what the group holds, the
+// image's pages being still charged to it: the kernel reclaims them
+// before the write returns, and the pause lasts as long as their
+// write-back (cgroups.memoryLimit). That cannot come to an OOM kill of
+// an honest hypervisor: the VM has been paused since before the room was
+// asked for, so it holds no more than it held under its own limit, and
+// all the group holds beyond that is the image's page cache, which is
+// reclaimed. What a hypervisor taken over may have made of the room
+// while its VM was paused is what the kill is for. The one way a stop
+// leaves its VM running on — the capture succeeded and the container
+// could not be removed after it — finds the limit the VM's own again
+// already: it was put back while the VM was paused, and nothing is
+// lowered under a running guest.
 func (c *cell) raiseMemoryLimit(bytes int64) error {
 	return c.owner.cgroups.memoryLimit(c.name, c.memoryLimit+bytes)
 }
@@ -943,10 +960,25 @@ func (c *cgroups) missingControllers(dir string) ([]string, error) {
 
 func (c *cgroups) path(name string) string { return filepath.Join(c.dir, name) }
 
-// memoryLimit sets the memory limit of a VM's group, raised or lowered,
-// which the kernel does at once. A limit below what the group holds
-// kills nothing: the kernel reclaims against it (page cache), and what
-// is left is charged against the group's next allocation.
+// memoryLimit sets the memory limit of a VM's group, raised or lowered.
+// The kernel takes the new limit at once, and the group answers for it
+// before the write returns (memory_max_write; read in 6.12, the test
+// host's kernel, and the same in 7.4). Raised, that is nothing: the
+// group has more room than it uses.
+//
+// Lowered below what the group holds, it is not "charged against the
+// group's next allocation": the write does not return until the group
+// fits. Meanwhile the kernel reclaims against the new limit — page
+// cache, written back where it is dirty, and mapped pages unmapped — a
+// round for the whole shortfall for as long as each round frees
+// something; so the write can take as long as the reclaim's I/O. After
+// five rounds in a row that free nothing, it kills in the group (and the
+// group is one to the OOM killer, memory.oom.group: the VM), and goes on
+// until the group fits or nothing is left to kill. What the group cannot
+// give up — its anonymous memory, with no swap to send it to — must fit
+// the new limit before it is written. A signal pending in the writing
+// thread ends the rounds and returns, with the limit set and the group
+// still over it.
 func (c *cgroups) memoryLimit(name string, bytes int64) error {
 	return c.fs.write(filepath.Join(c.path(name), "memory.max"), strconv.FormatInt(bytes, 10))
 }

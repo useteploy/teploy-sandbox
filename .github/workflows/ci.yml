@@ -1,9 +1,14 @@
 name: ci
 
+# push and pull_request as before. workflow_call lets the release workflow
+# run this whole file on a tagged commit and wait for it, so a tag cannot
+# publish while an integration test fails.
 on:
   push:
   pull_request:
+  workflow_call:
 
+# Least privilege by default (audit T61): CI only needs to read the repo.
 permissions:
   contents: read
 
@@ -11,10 +16,21 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # Pinned by commit like the release workflow's, which runs this file:
+      # a floating tag here would be an unpinned action in a release.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          go-version: "1.26.x"
+          # No step here pushes or reads anything private: the token is
+          # not left in the checkout, and the integration tests run as root.
+          persist-credentials: false
+      # The same exact patch release the release workflow builds with
+      # (go.mod's toolchain line). setup-go v6 makes `go` use the one it
+      # installed (GOTOOLCHAIN=local). The module has no dependencies, so
+      # there is nothing to cache.
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.11"
+          cache: false
       - name: Tests and vet
         run: go test ./... && go vet ./... && go vet -tags vmintegration ./... && go test -race ./...
       - name: Build
@@ -43,10 +59,13 @@ jobs:
   vm-root:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          go-version: "1.26.x"
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.11"
+          cache: false
       - name: Unit tests of the vm driver, as root
         run: |
           # The tests' output goes through a pipe, and a step's shell is

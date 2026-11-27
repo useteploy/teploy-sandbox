@@ -163,9 +163,12 @@ const (
 	serverPort   = "8099"
 )
 
-// tickerAlive prints process-alive when the guest runs the ticker it was
-// started with: the process whose command line names its script.
-const tickerAlive = `p="$(cat ` + tickerPID + ` 2>/dev/null)" && [ -n "$p" ] && tr "\000" " " < "/proc/$p/cmdline" 2>/dev/null | grep -q "` + tickerName + `" && echo process-alive
+// tickerAlive prints process-alive when the guest runs the ticker it
+// was started with: the process one of whose arguments is its script,
+// exactly. A boot from the disk reuses low pids, and this very check
+// runs in a shell whose command line names the script too, so the pid
+// alone says nothing: an argument must be the script's path and no less.
+const tickerAlive = `p="$(cat ` + tickerPID + ` 2>/dev/null)" && [ -n "$p" ] && tr "\000" "\n" < "/proc/$p/cmdline" 2>/dev/null | grep -qx "` + tickerScript + `" && echo process-alive
 `
 
 // guestStarts starts what a resume is to bring back: a file, a process
@@ -478,10 +481,22 @@ func TestVMMemoryResume(t *testing.T) {
 	if !slices.Contains(poolListing(t, config.ImageDataset), dataset) {
 		t.Fatal("the image went before the VM restored from it")
 	}
+	// A VM restored from an image can be saved again: its hypervisor,
+	// whose sandbox came from the daemon's rewritten configuration,
+	// writes its snapshot where that configuration allows, and nowhere
+	// else. If it had not been allowed to, the stop would say so.
+	if again := stop(id); again == dataset {
+		t.Fatal("the second stop saved the same image")
+	} else if image := memoryImage(t, r, id); image.State != run.MemorySaved {
+		t.Fatalf("a VM restored from its memory could not be saved again: %+v\n%s", image, r.log.String())
+	}
+	if slices.Contains(poolListing(t, config.ImageDataset), dataset) {
+		t.Fatal("the first image outlived the VM restored from it, which is gone now")
+	}
 	destroy(id)
 	ids = nil
-	if slices.Contains(poolListing(t, config.ImageDataset), dataset) {
-		t.Fatal("the image outlived the VM restored from it")
+	if left := poolListing(t, config.ImageDataset); !slices.Equal(left, []string{config.ImageDataset}) {
+		t.Fatalf("images left on the pool: %v", left)
 	}
 
 	// --- every image that cannot be used boots the disk: the same guest,

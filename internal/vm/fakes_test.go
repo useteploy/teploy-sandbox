@@ -43,6 +43,11 @@ type fakeZFS struct {
 	// blockClone, when not nil, is consumed by the next Clone, which
 	// waits for it to close (or its context to end) and then fails.
 	blockClone chan struct{}
+	// hold makes the next call of a given name ("destroy pool/x",
+	// "createfs pool/x", "load-key pool/x", "mount pool/x") signal
+	// reached, then wait until release is closed: a host command that
+	// takes as long as a test likes.
+	hold map[string]holdPoint
 	// poolProps are the properties set on the pool, which a volume
 	// without its own value inherits.
 	poolProps map[string]string
@@ -90,13 +95,37 @@ const (
 
 // newFakeZFS has a pool with an unowned golden volume and snapshot.
 func newFakeZFS() *fakeZFS {
-	z := &fakeZFS{datasets: map[string]*fakeDataset{}, snapshots: map[string]*fakeSnapshot{}, fail: map[string]error{}, poolProps: map[string]string{propVolmode: volmodeDev}}
+	z := &fakeZFS{datasets: map[string]*fakeDataset{}, snapshots: map[string]*fakeSnapshot{}, fail: map[string]error{}, poolProps: map[string]string{propVolmode: volmodeDev}, hold: map[string]holdPoint{}}
 	z.datasets[testPool+"/golden"] = &fakeDataset{props: map[string]string{}, files: map[string][]byte{}}
 	z.snapshots[testGolden] = &fakeSnapshot{txg: z.tick(), guid: z.newGUID(), props: map[string]string{}, files: map[string][]byte{}}
 	return z
 }
 
 func (z *fakeZFS) tick() int { z.txg++; return z.txg }
+
+// holdPoint is where a held call is: reached is closed once it has
+// begun, and it goes on when release is closed.
+type holdPoint struct{ reached, release chan struct{} }
+
+func newHoldPoint() holdPoint {
+	return holdPoint{reached: make(chan struct{}), release: make(chan struct{})}
+}
+
+// pause is what a held call does: nothing, unless the next call of this
+// name is held.
+func (z *fakeZFS) pause(call string) {
+	z.mu.Lock()
+	point, held := z.hold[call]
+	if held {
+		delete(z.hold, call)
+	}
+	z.mu.Unlock()
+	if !held {
+		return
+	}
+	close(point.reached)
+	<-point.release
+}
 
 // newGUID is unique to a pool: guidBase tells two fake pools apart.
 func (z *fakeZFS) newGUID() string {
@@ -298,6 +327,7 @@ func (z *fakeZFS) Promote(_ context.Context, name string) error {
 }
 
 func (z *fakeZFS) Destroy(_ context.Context, name string) error {
+	z.pause("destroy " + name)
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	if err := z.record("destroy " + name); err != nil {
@@ -1204,6 +1234,7 @@ func (z *fakeZFS) liveRefs() []string {
 // their own encryption root, as zfs has them.
 
 func (z *fakeZFS) CreateFilesystem(_ context.Context, name string, props map[string]string, key []byte) error {
+	z.pause("createfs " + name)
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	if err := z.record("createfs " + name); err != nil {
@@ -1233,6 +1264,7 @@ func (z *fakeZFS) CreateFilesystem(_ context.Context, name string, props map[str
 }
 
 func (z *fakeZFS) Mount(_ context.Context, name string) error {
+	z.pause("mount " + name)
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.fsCalls = append(z.fsCalls, "mount "+name)
@@ -1263,6 +1295,7 @@ func (z *fakeZFS) Unmount(_ context.Context, name string) error {
 }
 
 func (z *fakeZFS) LoadKey(_ context.Context, name string, key []byte) error {
+	z.pause("load-key " + name)
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	z.fsCalls = append(z.fsCalls, "load-key "+name)

@@ -773,6 +773,150 @@ func TestOwedImagesAreTriedAgainByTheSweep(t *testing.T) {
 	}
 }
 
+// The images lock is held for bookkeeping and never across a host's
+// command: every VM's end comes through the store (vmGone), and a
+// destroy that waits on a busy dataset can wait for seconds. So each of
+// a stop's begin, a resume's open and a VM's end is made to wait as
+// long as a test likes, and the other two go on meanwhile.
+func TestNoHostCommandRunsUnderTheImagesLock(t *testing.T) {
+	t.Run("a destroy", func(t *testing.T) {
+		z := newFakeZFS()
+		s := newTestImages(t, z)
+		img, rec := savedImage(t, s, "run", 256)
+		opened, err := s.open(bg, "run", &rec)
+		must(t, err)
+		s.mapping(opened, "teploy-sbx-vm")
+		must(t, s.release(bg, rec.ID))
+		point := newHoldPoint()
+		z.mu.Lock()
+		z.hold["destroy "+img.dataset] = point
+		z.mu.Unlock()
+		gone := make(chan struct{})
+		go func() {
+			s.vmGone(bg, "teploy-sbx-vm")
+			close(gone)
+		}()
+		<-point.reached
+		// A stop begins another image while the destroy waits.
+		begun := make(chan error, 1)
+		go func() {
+			_, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
+			begun <- err
+		}()
+		select {
+		case err := <-begun:
+			must(t, err)
+		case <-time.After(2 * time.Second):
+			close(point.release)
+			t.Fatal("a stop's begin waited behind a destroy: the images lock is held across a host's command")
+		}
+		close(point.release)
+		<-gone
+		if z.has(t, img.dataset) || len(s.known) != 1 {
+			t.Fatalf("after the VM's end: on the pool %t, known %v", z.has(t, img.dataset), slices.Sorted(maps.Keys(s.known)))
+		}
+	})
+
+	t.Run("a dataset's creation", func(t *testing.T) {
+		z := newFakeZFS()
+		s := newTestImages(t, z)
+		other, rec := savedImage(t, s, "other", 256)
+		opened, err := s.open(bg, "other", &rec)
+		must(t, err)
+		s.mapping(opened, "teploy-sbx-vm")
+		must(t, s.release(bg, rec.ID))
+		// The next image's dataset takes as long as the test likes.
+		s.newID = func() string { return refID(50) }
+		point := newHoldPoint()
+		z.mu.Lock()
+		z.hold["createfs "+s.root+"/"+refID(50)] = point
+		z.mu.Unlock()
+		begun := make(chan error, 1)
+		go func() {
+			_, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
+			begun <- err
+		}()
+		<-point.reached
+		gone := make(chan struct{})
+		go func() {
+			s.vmGone(bg, "teploy-sbx-vm")
+			close(gone)
+		}()
+		select {
+		case <-gone:
+		case <-time.After(2 * time.Second):
+			close(point.release)
+			t.Fatal("a VM's end waited behind a dataset's creation: the images lock is held across a host's command")
+		}
+		if z.has(t, other.dataset) {
+			t.Fatal("the VM's end did not destroy its image")
+		}
+		close(point.release)
+		must(t, <-begun)
+	})
+
+	t.Run("a key load", func(t *testing.T) {
+		z := newFakeZFS()
+		s := newTestImages(t, z)
+		slow, slowRec := savedImage(t, s, "slow", 256)
+		must(t, z.Unmount(bg, slow.dataset))
+		z.mu.Lock()
+		z.datasets[slow.dataset].fsKeyLoaded = false
+		z.hold["load-key "+slow.dataset] = newHoldPoint()
+		point := z.hold["load-key "+slow.dataset]
+		z.mu.Unlock()
+		opening := make(chan error, 1)
+		go func() {
+			_, err := s.open(bg, "slow", &slowRec)
+			opening <- err
+		}()
+		<-point.reached
+		// A second restore of the same image is refused while the first
+		// is under way, lock or no lock.
+		second := make(chan error, 1)
+		go func() {
+			_, err := s.open(bg, "slow", &slowRec)
+			second <- err
+		}()
+		select {
+		case err := <-second:
+			if err == nil {
+				t.Error("an image being opened was opened again")
+			}
+		case <-time.After(2 * time.Second):
+			close(point.release)
+			t.Fatal("a second restore of the image being opened waited for it: the images lock is held across a host's command")
+		}
+		other, rec := savedImage(t, s, "other", 256)
+		opened, err := s.open(bg, "other", &rec)
+		must(t, err)
+		s.mapping(opened, "teploy-sbx-vm")
+		must(t, s.release(bg, rec.ID))
+		gone := make(chan struct{})
+		go func() {
+			s.vmGone(bg, "teploy-sbx-vm")
+			close(gone)
+		}()
+		select {
+		case <-gone:
+		case <-time.After(2 * time.Second):
+			close(point.release)
+			t.Fatal("a VM's end waited behind an image being opened: the images lock is held across a host's command")
+		}
+		if z.has(t, other.dataset) {
+			t.Fatal("the VM's end did not destroy its image")
+		}
+		close(point.release)
+		if err := <-opening; err != nil {
+			t.Fatalf("the image being opened: %v", err)
+		}
+		must(t, s.release(bg, slowRec.ID))
+		if len(s.known) != 0 || len(s.owed) != 0 {
+			t.Fatalf("images still known: %v, owed %d", slices.Sorted(maps.Keys(s.known)), len(s.owed))
+		}
+	})
+}
+
 // A stop that fails after its dataset was made leaves nothing.
 func TestAStopThatGivesUpItsImageLeavesNothing(t *testing.T) {
 	z := newFakeZFS()

@@ -167,6 +167,15 @@ type mountOps struct {
 }
 
 // image is one memory image.
+//
+// Everything the daemon's threads do to an image goes under
+// memoryImages.mu, with one exception. bind and seal, which set bound
+// and sealed, are the stop's alone: from begin until handOver or abandon
+// no other path can reach the image (it is in no record, and every other
+// path reaches an image through a record or through a VM's going, and
+// settle stands aside while the image is held). So those two fields are
+// that one goroutine's to write, and are read under mu only after it is
+// done: by handOver, and by settle's unbind once the stop has let go.
 type image struct {
 	id       string
 	memoryMB int
@@ -199,9 +208,11 @@ type image struct {
 	held    bool
 	mappers map[string]bool
 	opening int
-	// tried is when the last attempt to destroy it failed, which paces
-	// the sweep's next one.
-	tried time.Time
+	// settling: a destroy of the image is under way, so another settle
+	// of it stands aside. tried is when the last attempt to destroy it
+	// failed, which paces the sweep's next one.
+	settling bool
+	tried    time.Time
 }
 
 // wanted says whether something still wants the image: then it is not
@@ -231,6 +242,10 @@ type memoryImages struct {
 	// sealedUID is who owns a sealed image's files: root.
 	sealedUID uint32
 
+	// mu guards the maps and, through them, every image's fields. It is
+	// held for bookkeeping only, never across a host's command: every
+	// VM's end comes through here (vmGone), and a destroy that waits on
+	// a busy dataset can wait for seconds (see settle).
 	mu sync.Mutex
 	// known are the images on this host that something may still want.
 	known map[string]*image
@@ -310,7 +325,10 @@ func (s *memoryImages) logger() *slog.Logger {
 // image as itself until it is sealed. The caller holds it: the hold
 // passes to the run's record (handOver) or is given up (abandon).
 func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid uint32) (*image, error) {
-	img := &image{id: s.newID(), memoryMB: memoryMB, uid: uid, writer: vm, held: true}
+	s.mu.Lock()
+	id := s.newID()
+	s.mu.Unlock()
+	img := &image{id: id, memoryMB: memoryMB, uid: uid, writer: vm, held: true}
 	img.key = make([]byte, 32)
 	if _, err := rand.Read(img.key); err != nil {
 		return nil, err
@@ -331,8 +349,6 @@ func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid u
 		"encryption": "aes-256-gcm", "keyformat": "raw", "keylocation": "prompt",
 		propOwner: s.owner, propKind: kindImage,
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := s.zfs.CreateFilesystem(ctx, img.dataset, props, img.key); err != nil {
 		return nil, fmt.Errorf("create the image dataset: %w", err)
 	}
@@ -345,13 +361,16 @@ func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid u
 		_ = s.settle(ctx, img)
 		return nil, fmt.Errorf("hand the image dataset to the VM: %w", err)
 	}
+	s.mu.Lock()
 	s.known[img.id] = img
+	s.mu.Unlock()
 	return img, nil
 }
 
 // bind mounts the image below a VM's outbox, where its jail's slave
 // bind of the outbox makes it appear, and returns the path the
-// hypervisor is told to write to (the same inside the jail).
+// hypervisor is told to write to (the same inside the jail). The stop's
+// alone, while it holds the image (see image).
 func (s *memoryImages) bind(img *image, outbox string) (string, error) {
 	if img.bound != "" {
 		return "", fmt.Errorf("the image %s is bound below %s already", img.id, img.bound)
@@ -449,19 +468,19 @@ func (s *memoryImages) abandon(ctx context.Context, img *image) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	img.held = false
+	s.mu.Unlock()
 	_ = s.settle(ctx, img)
 }
 
 // release is ReleaseMemory: the run's record no longer names the image.
 func (s *memoryImages) release(ctx context.Context, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !imageID(id) {
 		return fmt.Errorf("%q is not the name of a memory image", id)
 	}
+	s.mu.Lock()
 	img, known := s.known[id]
+	s.mu.Unlock()
 	if !known {
 		// Nothing has touched it since the daemon started. Its dataset
 		// may still be on the host, and is only destroyed if it is an
@@ -478,74 +497,102 @@ func (s *memoryImages) release(ctx context.Context, id string) error {
 			return fmt.Errorf("refusing to destroy %s: not a memory image of this daemon", img.dataset)
 		}
 	}
+	s.mu.Lock()
 	img.held = false
+	s.mu.Unlock()
 	return s.settle(ctx, img)
 }
 
 // open makes the image of a stopped run's record ready to restore
 // from, and holds it for the restore: the caller ends with mapping (the
 // VM was restored from it) or drop (it was not).
+//
+// The lock is taken to claim the image and left while the host's
+// commands run; the claim (opening) is what keeps a second restore of
+// the same image out while they do.
 func (s *memoryImages) open(ctx context.Context, runID string, rec *run.MemoryImage) (*image, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !imageID(rec.ID) {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("%q is not the name of a memory image", rec.ID)
 	}
 	if rec.Class != s.class.id {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("saved under another host class (%s)", s.changedSince(rec))
 	}
 	img, known := s.known[rec.ID]
 	if !known {
 		img = &image{id: rec.ID, dataset: s.root + "/" + rec.ID, dir: filepath.Join(s.mountDir, rec.ID), sealed: true}
+		// Known from now on, so that a second restore of this image,
+		// were one to come while this one is under way, finds it spoken
+		// for.
+		s.known[rec.ID] = img
 	}
-	if len(img.mappers) > 0 || img.opening > 0 {
+	if len(img.mappers) > 0 || img.opening > 0 || img.settling {
 		// One image, one VM: an image a VM is restored from is never
 		// restored from again while that VM lives.
+		s.mu.Unlock()
 		return nil, fmt.Errorf("a VM is restored from the image %s already: an image is never shared", rec.ID)
 	}
-	dataset, err := s.zfs.Dataset(ctx, img.dataset)
-	if errors.Is(err, ErrNoDataset) {
-		return nil, fmt.Errorf("the image %s is not on this host", rec.ID)
-	}
+	img.opening++
+	s.mu.Unlock()
+
+	err := s.ready(ctx, img, runID, rec)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	img.opening--
 	if err != nil {
-		return nil, err
-	}
-	if dataset.Owner != s.owner || dataset.Kind != kindImage {
-		return nil, fmt.Errorf("%s is not a memory image of this daemon", img.dataset)
-	}
-	if sealed, err := s.zfs.Property(ctx, img.dataset, propReadonly); err != nil {
-		return nil, err
-	} else if sealed != "on" {
-		return nil, fmt.Errorf("the image %s is not sealed (its dataset is not read-only)", rec.ID)
-	}
-	key, err := s.keys.unwrap(runID, rec.ID, rec.Key)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.zfs.CheckKey(ctx, img.dataset, key); err != nil {
-		return nil, fmt.Errorf("its key does not open the dataset (wrong key): %w", err)
-	}
-	if status, err := s.zfs.Property(ctx, img.dataset, propKeyStatus); err != nil {
-		return nil, err
-	} else if status == "unavailable" {
-		if err := s.zfs.LoadKey(ctx, img.dataset, key); err != nil {
-			return nil, fmt.Errorf("load its key: %w", err)
+		if !known && !img.wanted() {
+			delete(s.known, rec.ID)
 		}
-	}
-	if mounted, err := s.zfs.Property(ctx, img.dataset, propMounted); err != nil {
-		return nil, err
-	} else if mounted != "yes" {
-		if err := s.zfs.Mount(ctx, img.dataset); err != nil {
-			return nil, fmt.Errorf("mount its dataset: %w", err)
-		}
-	}
-	if err := verifyImage(img.dir, rec.MemoryMB, s.sealedUID); err != nil {
 		return nil, err
 	}
 	img.key, img.sealed = nil, true
-	img.opening++
-	s.known[rec.ID] = img
 	return img, nil
+}
+
+// ready is the host's half of opening: the dataset is there, this
+// daemon's and sealed; the record's key opens it; it is mounted; and it
+// is what a sealed image must be.
+func (s *memoryImages) ready(ctx context.Context, img *image, runID string, rec *run.MemoryImage) error {
+	dataset, err := s.zfs.Dataset(ctx, img.dataset)
+	if errors.Is(err, ErrNoDataset) {
+		return fmt.Errorf("the image %s is not on this host", rec.ID)
+	}
+	if err != nil {
+		return err
+	}
+	if dataset.Owner != s.owner || dataset.Kind != kindImage {
+		return fmt.Errorf("%s is not a memory image of this daemon", img.dataset)
+	}
+	if sealed, err := s.zfs.Property(ctx, img.dataset, propReadonly); err != nil {
+		return err
+	} else if sealed != "on" {
+		return fmt.Errorf("the image %s is not sealed (its dataset is not read-only)", rec.ID)
+	}
+	key, err := s.keys.unwrap(runID, rec.ID, rec.Key)
+	if err != nil {
+		return err
+	}
+	if err := s.zfs.CheckKey(ctx, img.dataset, key); err != nil {
+		return fmt.Errorf("its key does not open the dataset (wrong key): %w", err)
+	}
+	if status, err := s.zfs.Property(ctx, img.dataset, propKeyStatus); err != nil {
+		return err
+	} else if status == "unavailable" {
+		if err := s.zfs.LoadKey(ctx, img.dataset, key); err != nil {
+			return fmt.Errorf("load its key: %w", err)
+		}
+	}
+	if mounted, err := s.zfs.Property(ctx, img.dataset, propMounted); err != nil {
+		return err
+	} else if mounted != "yes" {
+		if err := s.zfs.Mount(ctx, img.dataset); err != nil {
+			return fmt.Errorf("mount its dataset: %w", err)
+		}
+	}
+	return verifyImage(img.dir, rec.MemoryMB, s.sealedUID)
 }
 
 // changedSince says what differs between an image's host class and this
@@ -580,8 +627,8 @@ func (s *memoryImages) mapping(img *image, vm string) {
 // drop gives up a restore that did not get as far as mapping the image.
 func (s *memoryImages) drop(ctx context.Context, img *image) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	img.opening = max(img.opening-1, 0)
+	s.mu.Unlock()
 	_ = s.settle(ctx, img)
 }
 
@@ -589,10 +636,10 @@ func (s *memoryImages) drop(ctx context.Context, img *image) {
 // from loses the hold its mapping was, and an image its stop gave up
 // that could not be removed while the VM lived is tried again, since
 // whatever the VM kept open in it is closed now. Nothing of another VM's
-// is: that waits for the sweep.
+// is: an image held by something else waits for the sweep, and no VM's
+// end waits behind a destroy.
 func (s *memoryImages) vmGone(ctx context.Context, vm string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	var gone []*image
 	for _, img := range s.known {
 		if img.mappers[vm] {
@@ -605,6 +652,7 @@ func (s *memoryImages) vmGone(ctx context.Context, vm string) {
 			gone = append(gone, img)
 		}
 	}
+	s.mu.Unlock()
 	for _, img := range gone {
 		_ = s.settle(ctx, img)
 	}
@@ -630,18 +678,17 @@ func (s *memoryImages) handOver(runID string, img *image, what run.MemoryImage) 
 	return what, nil
 }
 
-// retain is RetainMemory, called once the registry is loaded: every
-// image of this daemon's that no stopped run names is an orphan (a stop
-// cut short before its record was written, a registry rolled back) and
-// goes; the images runs name are kept, whether or not they could be
-// opened today. An image two runs name is nobody's: an image is never
-// shared, so it goes and both records are told it is missing. Returns
-// the images that are not on this host, and what could not be destroyed
-// (which is owed from then on, as anywhere else).
+// retain is RetainMemory, called once the registry is loaded, before
+// any run is served: every image of this daemon's that no stopped run
+// names is an orphan (a stop cut short before its record was written, a
+// registry rolled back) and goes; the images runs name are kept,
+// whether or not they could be opened today. An image two runs name is
+// nobody's: an image is never shared, so it goes and both records are
+// told it is missing. Returns the images that are not on this host, and
+// what could not be destroyed (which is owed from then on, as anywhere
+// else). Nothing is owed when it runs, so nothing of that is retried
+// here.
 func (s *memoryImages) retain(ctx context.Context, records []*run.MemoryImage) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var failed error
 	datasets, err := s.zfs.Filesystems(ctx, s.root)
 	if err != nil {
 		return nil, err
@@ -659,6 +706,9 @@ func (s *memoryImages) retain(ctx context.Context, records []*run.MemoryImage) (
 		counts[rec.ID]++
 	}
 	var missing []string
+	var orphans []*image
+	var failed error
+	s.mu.Lock()
 	for _, rec := range records {
 		if !imageID(rec.ID) || !onHost[rec.ID] || counts[rec.ID] > 1 {
 			missing = append(missing, rec.ID)
@@ -676,6 +726,10 @@ func (s *memoryImages) retain(ctx context.Context, records []*run.MemoryImage) (
 			s.known[id] = img
 		}
 		img.held = false
+		orphans = append(orphans, img)
+	}
+	s.mu.Unlock()
+	for _, img := range orphans {
 		failed = errors.Join(failed, s.settle(ctx, img))
 	}
 	slices.Sort(missing)
@@ -683,26 +737,57 @@ func (s *memoryImages) retain(ctx context.Context, records []*run.MemoryImage) (
 }
 
 // settle destroys an image nobody wants: not held, not mapped, not
-// being opened. An image that cannot be destroyed now is owed: it is
-// tried again when the VM that wrote or mapped it is gone (vmGone), and
-// by the sweep. The caller holds mu.
+// being opened. Nothing can make it wanted again.
+//
+// The lock is taken for the bookkeeping and left while the host's
+// commands run, as it is in every other method: every VM's end comes
+// through here (vmGone), and a destroy that waits on a busy dataset can
+// wait for seconds. A stop's begin and a resume's open must not wait
+// behind that, nor it behind them. Only one settle of an image runs at a
+// time. A second finds the first and stands aside, whatever the first's
+// outcome turns out to be: an image that could not be destroyed is
+// owed, and owed images are never forgotten.
+//
+// An image that cannot be destroyed now is owed: it is tried again when
+// the VM that wrote or mapped it is gone (vmGone), and by the sweep.
 func (s *memoryImages) settle(ctx context.Context, img *image) error {
-	if img.wanted() {
+	s.mu.Lock()
+	if img.settling || img.wanted() {
+		s.mu.Unlock()
 		return nil
 	}
+	img.settling = true
+	s.mu.Unlock()
+
+	what, err := s.remove(ctx, img)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	img.settling = false
+	if err == nil {
+		delete(s.known, img.id)
+		s.owed = slices.DeleteFunc(s.owed, func(owed *image) bool { return owed == img })
+		s.logger().Info("memory image destroyed", "image", img.id)
+		return nil
+	}
+	s.owe(img, what, err)
+	return err
+}
+
+// remove is the host's half of a destroy: the dataset out of whatever
+// VM's outbox it was bound into, the dataset itself, and the directory
+// it was mounted at. The caller holds no lock. Its unbind is the one
+// place outside the stop that writes img.bound, and comes only after
+// the stop has let the image go (see image).
+func (s *memoryImages) remove(ctx context.Context, img *image) (what string, err error) {
 	if err := s.unbind(img); err != nil {
-		s.owe(img, "take it out of the VM's outbox", err)
-		return err
+		return "take it out of the VM's outbox", err
 	}
 	if err := s.zfs.Destroy(ctx, img.dataset); err != nil && !isMissing(err) {
-		s.owe(img, "destroy its dataset", err)
-		return err
+		return "destroy its dataset", err
 	}
 	_ = os.RemoveAll(img.dir)
-	delete(s.known, img.id)
-	s.owed = slices.DeleteFunc(s.owed, func(owed *image) bool { return owed == img })
-	s.logger().Info("memory image destroyed", "image", img.id)
-	return nil
+	return "", nil
 }
 
 // sweep is SweepMemory: the images that could not be destroyed are
@@ -710,20 +795,24 @@ func (s *memoryImages) settle(ctx context.Context, img *image) error {
 // Its own VM's end has tried an image at once already; this is for
 // whatever else held it, so that an image nothing wants does not stay
 // on the pool until the daemon restarts. It answers with what still
-// could not go. The caller holds mu.
+// could not go.
 func (s *memoryImages) sweep(ctx context.Context) error {
-	var failed error
-	for _, img := range slices.Clone(s.owed) {
-		if s.now().Sub(img.tried) < s.retryAfter {
-			continue
+	s.mu.Lock()
+	var due []*image
+	for _, img := range s.owed {
+		if s.now().Sub(img.tried) >= s.retryAfter {
+			due = append(due, img)
 		}
+	}
+	s.mu.Unlock()
+	var failed error
+	for _, img := range due {
 		failed = errors.Join(failed, s.settle(ctx, img))
 	}
 	return failed
 }
 
-// owe notes an image that could not be destroyed, and when. The caller
-// holds mu.
+// owe notes an image that could not be destroyed. The caller holds mu.
 func (s *memoryImages) owe(img *image, what string, err error) {
 	if !slices.Contains(s.owed, img) {
 		s.owed = append(s.owed, img)

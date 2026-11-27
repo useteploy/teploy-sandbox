@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/useteploy/teploy-sandbox/internal/run"
@@ -71,7 +72,8 @@ func snapshotTimeout(memoryMB int) time.Duration {
 // also saves the VM's memory beside the disk snapshot. The error is the
 // disk snapshot's. An image that could not be saved is no error: the
 // image is nil and the note says why, and the stop goes on as it did
-// before images existed.
+// before images existed. While the image is written the VM's memory
+// limit covers it (cell.raiseMemoryLimit), and is put back after.
 func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef string) (*run.MemoryImage, string, error) {
 	d.mu.Lock()
 	current, ok := d.machines[containerID]
@@ -119,6 +121,27 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 			}
 		}
 	}
+
+	// For as long as the image is written the VM's memory limit covers
+	// it (cell.raiseMemoryLimit): the image goes through the page cache
+	// of the VM's own memory group, and a guest with most of its memory
+	// in use otherwise has its hypervisor killed by that limit midway
+	// through the snapshot. Best effort both ways, and said: without the
+	// room the stop is the stop it was, and a limit left raised goes
+	// with the VM's group.
+	putBack := func() {}
+	if img != nil {
+		if err := current.machine.RaiseMemoryLimit(imageNeedsBytes(current.memoryMB)); err != nil {
+			d.log.Warn("the VM's memory limit could not cover its image; the stop goes on", "name", containerID, "error", err)
+		} else {
+			putBack = sync.OnceFunc(func() {
+				if err := current.machine.RestoreMemoryLimit(); err != nil {
+					d.log.Warn("the VM's memory limit was not put back; it goes with the VM's group", "name", containerID, "error", err)
+				}
+			})
+		}
+	}
+	defer putBack()
 
 	if !alive {
 		// Nothing is asked of a VM that is not there, as for every capture
@@ -205,6 +228,9 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 			return resume()
 		}, nil
 	})
+	// The image is written (or will not be): the VM's memory limit is
+	// its own again, before anything else is done with it.
+	putBack()
 	if err != nil {
 		// The disk capture failed: nothing has changed, and the image is
 		// nobody's.

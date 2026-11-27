@@ -545,6 +545,19 @@ func TestEnterGivesAVMItsOwnUserDeviceAndCgroup(t *testing.T) {
 	if got := cgroupFile(t, c.cgroups.path(config.Name), "memory.max"); got != fmt.Sprint(int64(MemoryLimitMB(1024))<<20) {
 		t.Fatalf("memory.max %q", got)
 	}
+	// Raised by an image's size while the image is written, and put back.
+	if err := first.raiseMemoryLimit(1088 << 20); err != nil {
+		t.Fatal(err)
+	}
+	if got := cgroupFile(t, c.cgroups.path(config.Name), "memory.max"); got != fmt.Sprint(int64(MemoryLimitMB(1024)+1088)<<20) {
+		t.Fatalf("memory.max raised %q", got)
+	}
+	if err := first.restoreMemoryLimit(); err != nil {
+		t.Fatal(err)
+	}
+	if got := cgroupFile(t, c.cgroups.path(config.Name), "memory.max"); got != fmt.Sprint(int64(MemoryLimitMB(1024))<<20) {
+		t.Fatalf("memory.max put back %q", got)
+	}
 	if _, err := first.command("/opt/ch", "/boot/Image", []string{"--landlock"}); err != nil {
 		t.Fatal(err)
 	}

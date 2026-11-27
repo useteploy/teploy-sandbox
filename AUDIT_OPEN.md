@@ -4564,9 +4564,10 @@ added here runs, and a VM's jail and command line are what they were.
   UID, both seccomp filters (no new allowed syscall: the daemon's denylist
   is unchanged and `userfaultfd` is never asked for), Landlock, cgroups,
   and KSM off (`mergeable=off`, and a saved configuration with
-  `mergeable` on is refused). Measured live: no `type=1326` in the kernel
-  log across the suite, no Landlock denial, no mergeable mapping in a
-  restored hypervisor.
+  `mergeable` on is refused). One cgroup limit moves, and only for the
+  length of a stop that writes an image: fault 10 below. Measured live:
+  no `type=1326` in the kernel log across the suite, no Landlock denial,
+  no mergeable mapping in a restored hypervisor.
 
 ### Faults found on the way, and what showed them
 
@@ -4575,7 +4576,9 @@ stood could not see. Four were shown by running the real hypervisor on
 the x86-64 laptop, where each time the fallback did what it is for (the
 run came back from its disk, the reason in its record and the log); the
 others by reading the hypervisor's source against the code, or by a new
-unit test. Each is fixed here with a test that fails without it.
+unit test. A tenth showed only after the reviews' fixes, in the kernel's
+own log of a later live run. Each is fixed here with a test that fails
+without it.
 
 | # | Fault | Found by | Fix and test |
 |---|---|---|---|
@@ -4588,6 +4591,7 @@ unit test. Each is fixed here with a test that fails without it.
 | 7 | A stop whose VM was gone asked the VM for a sync, where the snapshot path asks nothing | A new unit test | `SaveMemory` captures a gone VM's disk as it is. The fake case "the VM's process is gone" |
 | 8 | The manager's half of "a resume refused before it reaches the image keeps the image" was missing (the driver marked it; the manager released anyway) | A new unit test in `internal/run`: the driver's own test could not see it, since releasing is the manager's to do | `ResumeWith` honours `ErrMemoryNotTried`. `TestAResumeRefusedBeforeTheImageIsReachedKeepsIt` |
 | 9 | `Volumes.Capture` held the driver's volume lock across the quiesce, which with an image is the whole memory write: one run's stop would have stalled every other run's create, resume and destroy | Reading the capture path | The quiesce runs before the lock. `TestACapturesQuiesceDoesNotHoldThePool` |
+| 10 | **A stop could have its hypervisor killed by the VM's own memory limit midway through the snapshot.** The image is written through the page cache, charged to the VM's group; its dirty pages are not reclaimed without I/O, so with a guest's resident memory near its limit there was no room for them | Live, once in six runs of the suite after the reviews' fixes: `Memory cgroup out of memory: Killed process (cloud-hypervisor)`, a VM restored from an image and stopped again, 476392 kB resident (465 MiB) against the 584 MiB allowed; the stop failed ("resume vm after snapshot: connection refused") and the run was left claiming to run | `SaveMemory` raises the VM's `memory.max` by an image's size for as long as the image is written and puts it back after (`cell.raiseMemoryLimit`); best effort, and said when either fails. The guest's memory is all that group ever needs to hold, so the raised limit covers any image; what a hypervisor taken over could make of the room is bounded by the stop, after which its VM is removed. `TestAStopCoversItsImageInTheVMsMemoryLimitAndNeverFailsForIt`, the stop tests (raised at the snapshot, the VM's own after, for every way a stop goes); live: `TestVMMemoryResume` reads `memory.max` across two stops |
 
 In every case the fallback did what it is for: the run came back from
 its disk, with the reason in its record and the daemon's log.

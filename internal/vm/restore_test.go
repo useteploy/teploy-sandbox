@@ -3,10 +3,12 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -167,9 +169,17 @@ func TestAStopSavesTheVMsMemoryAndAResumeRestoresTheVMFromIt(t *testing.T) {
 	if machine.outbox == "" {
 		t.Fatal("the VM's jail has no outbox")
 	}
+	// While the image is written the VM's memory limit covers it, by the
+	// image's size; after the stop it is the VM's own again.
+	var widenedAtSnapshot int64
+	machine.snapshotHook = func(string) { widenedAtSnapshot = machine.widenedBy() }
 
 	if _, err := rig.manager.Stop(bg, created.ID); err != nil {
 		t.Fatalf("stop: %v", err)
+	}
+	machine.snapshotHook = nil
+	if widenedAtSnapshot != imageNeedsBytes(256) || machine.widenedBy() != 0 {
+		t.Fatalf("the VM's memory limit was raised by %d at the snapshot and by %d after the stop, want %d and 0", widenedAtSnapshot, machine.widenedBy(), imageNeedsBytes(256))
 	}
 	saved := memoryView(t, rig.manager, created.ID)
 	if saved.State != run.MemorySaved || saved.Error != "" || !imageID(saved.Image) {
@@ -491,6 +501,12 @@ func (z *snapFails) Snapshot(context.Context, string) error {
 // cannot be saved: the stop goes on from the disk, the run says why it
 // has no memory image, and nothing of the image is left behind.
 func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
+	// The cases in which no image is begun, so the VM's memory limit is
+	// never raised.
+	noImage := map[string]bool{
+		"the VM's process is gone": true, "the pool is below its reserve": true,
+		"the pool's space cannot be read": true, "the image's dataset cannot be made": true,
+	}
 	for name, breakIt := range map[string]func(t *testing.T, rig *testRig, machine *fakeMachine){
 		"the VM's process is gone": func(t *testing.T, rig *testRig, machine *fakeMachine) {
 			must(t, machine.Kill(bg))
@@ -574,6 +590,11 @@ func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
 			if machine.snapshotErr != nil && !slices.Contains(machine.events, "resume") {
 				t.Fatal("the VM was not resumed after its snapshot failed")
 			}
+			// Whatever became of the image, the VM's memory limit is its
+			// own again; and where none was begun, none was raised.
+			if by := machine.widenedBy(); by != 0 || (noImage[name] && len(machine.limitsRaised) > 0) {
+				t.Fatalf("the VM's memory limit: raised %v, put back %d times (no image begun: %t)", machine.limitsRaised, machine.limitsRestored, noImage[name])
+			}
 			// The disk snapshot is what the run has, and it resumes from it.
 			resumed, err := rig.manager.Resume(bg, created.ID, 0)
 			if err != nil || resumed.ResumedFrom != run.ResumedFromDisk || len(rig.hypervisor.restored) != 0 {
@@ -596,6 +617,9 @@ func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
 		rig.driver.volumes.zfs = &snapFails{rig.zfs}
 		if _, err := rig.manager.Stop(bg, created.ID); err == nil {
 			t.Fatal("a stop whose disk snapshot failed succeeded")
+		}
+		if by := machine.widenedBy(); by != 0 || len(machine.limitsRaised) != 1 || machine.limitsRestored != 1 {
+			t.Fatalf("the VM's memory limit: raised %v, put back %d times", machine.limitsRaised, machine.limitsRestored)
 		}
 		if current, _ := rig.manager.Get(created.ID); current.State != run.StateRunning {
 			t.Fatalf("the run is %s", current.State)
@@ -879,6 +903,52 @@ func TestAResumeWhoseMemoryImageCannotBeUsedBootsFromTheDisk(t *testing.T) {
 		must(t, rig.driver.Remove(bg, id))
 		assertPool(t, rig.zfs, append([]string{datasetOf(spec.Image), spec.Image}, memoryPristine...)...)
 	})
+}
+
+// A stop covers its image in the VM's memory limit, and puts the limit
+// back; neither is allowed to fail the stop, and both are said when
+// they fail. Seen live before this: a VM restored from an image and
+// stopped again, 465 MiB resident against the 584 MiB allowed, had its
+// hypervisor killed by its own group's limit in the middle of the
+// snapshot, with the new image's pages on top.
+func TestAStopCoversItsImageInTheVMsMemoryLimitAndNeverFailsForIt(t *testing.T) {
+	for name, breakIt := range map[string]struct {
+		machine func(*fakeMachine)
+		said    string
+		restore bool
+	}{
+		"the limit cannot be raised":   {func(m *fakeMachine) { m.limitRaiseErr = errors.New("set memory.max: no such file or directory") }, "could not cover its image", false},
+		"the limit cannot be put back": {func(m *fakeMachine) { m.limitRestoreErr = errors.New("set memory.max: no such file or directory") }, "was not put back", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rig := newMemoryRig(t, nil)
+			speaksV3(rig)
+			var log bytes.Buffer
+			rig.driver.log = slog.New(slog.NewTextHandler(&log, nil))
+			created, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Limits: &run.Limits{MemoryMB: 256}})
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			machine := rig.hypervisor.machine(containerName(created.ID))
+			breakIt.machine(machine)
+			if _, err := rig.manager.Stop(bg, created.ID); err != nil {
+				t.Fatalf("a stop failed because of the memory limit: %v", err)
+			}
+			// The image is saved as it would have been, and nothing is
+			// asked back that was not given.
+			if view := memoryView(t, rig.manager, created.ID); view.State != run.MemorySaved || view.Error != "" {
+				t.Fatalf("the stopped run says %+v", view)
+			}
+			if len(machine.limitsRaised) != 1 || (machine.limitsRestored == 1) != breakIt.restore {
+				t.Fatalf("raised %v, put back %d times", machine.limitsRaised, machine.limitsRestored)
+			}
+			if said := log.String(); !strings.Contains(said, breakIt.said) || strings.Contains(said, "level=ERROR") {
+				t.Errorf("the daemon did not say it, as a warning:\n%s", said)
+			}
+			must(t, rig.manager.Destroy(bg, created.ID))
+			assertPool(t, rig.zfs, memoryPristine...)
+		})
+	}
 }
 
 // refusing is the fake pool refusing to destroy one dataset a number of

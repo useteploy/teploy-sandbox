@@ -103,6 +103,11 @@ type Machine interface {
 	// Inbox is the directory a VM restored from a memory image reads it
 	// from, as its jail names it; "" for a booted VM.
 	Inbox() string
+	// RaiseMemoryLimit raises the VM's memory limit by bytes for as long
+	// as its memory image is written, and RestoreMemoryLimit puts it
+	// back (cell.raiseMemoryLimit).
+	RaiseMemoryLimit(bytes int64) error
+	RestoreMemoryLimit() error
 	// MapsFile reports whether the hypervisor process maps the whole of
 	// the file at the host path from the file (a private file mapping,
 	// MAP_PRIVATE): what a copy-on-write restore leaves, and a restore
@@ -651,6 +656,9 @@ func (m *chMachine) UID() uint32    { return m.cell.uid }
 func (m *chMachine) Disk() string   { return m.cell.disk }
 func (m *chMachine) Outbox() string { return m.cell.outbox }
 func (m *chMachine) Inbox() string  { return m.inbox }
+
+func (m *chMachine) RaiseMemoryLimit(bytes int64) error { return m.cell.raiseMemoryLimit(bytes) }
+func (m *chMachine) RestoreMemoryLimit() error          { return m.cell.restoreMemoryLimit() }
 
 // waitAPI waits for the hypervisor's API socket to answer vmm.ping.
 func (m *chMachine) waitAPI(ctx context.Context) error {

@@ -158,6 +158,9 @@ type cell struct {
 
 	// device is the number of the VM's disk, as io.max names it.
 	device uint64
+	// memoryLimit is the VM's memory limit as it was given (limitsFor):
+	// what raiseMemoryLimit puts back.
+	memoryLimit int64
 
 	mu       sync.Mutex
 	cgroup   *os.File
@@ -266,6 +269,7 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 	limits := limitsFor(config)
 	limits.DiskRead, limits.Disk, limits.DiskDevice = c.disk.forBoot(), c.disk, dev
 	current.boosted = c.disk.forBoot() != c.disk
+	current.memoryLimit = limits.MemoryBytes
 	group, err := c.cgroups.create(ctx, config.Name, limits)
 	if err != nil {
 		return nil, fmt.Errorf("cgroup: %w", err)
@@ -274,6 +278,27 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 		return nil, fmt.Errorf("cgroup: %w", err)
 	}
 	return current, nil
+}
+
+// raiseMemoryLimit raises the VM's memory limit by bytes, and
+// restoreMemoryLimit puts it back where it was.
+//
+// It is for the moment a stop writes the VM's memory image. The image
+// goes through the page cache, which is charged to the VM's own group,
+// and dirty pages there are not reclaimed without I/O: a guest with most
+// of its memory in use had its hypervisor killed by its own limit in the
+// middle of its snapshot (seen live, as a VM restored from an image was
+// stopped again: 465 MiB resident against the 584 MiB allowed, the new
+// image's pages on top). The guest's own memory is all that group ever
+// needs to hold, the image included, so for as long as the image is
+// written the limit covers an image of this guest's size, and after that
+// it does not.
+func (c *cell) raiseMemoryLimit(bytes int64) error {
+	return c.owner.cgroups.memoryLimit(c.name, c.memoryLimit+bytes)
+}
+
+func (c *cell) restoreMemoryLimit() error {
+	return c.owner.cgroups.memoryLimit(c.name, c.memoryLimit)
 }
 
 // command is the VM's process, not yet started: the hypervisor bin with
@@ -917,6 +942,14 @@ func (c *cgroups) missingControllers(dir string) ([]string, error) {
 }
 
 func (c *cgroups) path(name string) string { return filepath.Join(c.dir, name) }
+
+// memoryLimit sets the memory limit of a VM's group, raised or lowered,
+// which the kernel does at once. A limit below what the group holds
+// kills nothing: the kernel reclaims against it (page cache), and what
+// is left is charged against the group's next allocation.
+func (c *cgroups) memoryLimit(name string, bytes int64) error {
+	return c.fs.write(filepath.Join(c.path(name), "memory.max"), strconv.FormatInt(bytes, 10))
+}
 
 // create makes a VM's group with its limits and returns its directory. A
 // group of that name left by an earlier VM is removed first.

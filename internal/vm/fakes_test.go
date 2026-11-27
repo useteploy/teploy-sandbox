@@ -790,6 +790,15 @@ type fakeMachine struct {
 	// image are; how its snapshot and restore answer.
 	outbox, inbox, imageDir string
 	snapshotErr             error
+	// limitsRaised is every number of bytes the daemon asked to add to
+	// the VM's memory limit, in order, limitsRestored how often it asked
+	// for the limit back, and widened is by how much the limit stands
+	// raised now; limitRaiseErr and limitRestoreErr are what the next of
+	// each answers.
+	limitsRaised                   []int64
+	limitsRestored                 int
+	widened                        int64
+	limitRaiseErr, limitRestoreErr error
 	// snapshotHook runs once the snapshot's files are written, with the
 	// directory they were written to: what a hypervisor the guest took
 	// over may add. snapshotWhilePaused records that the hypervisor was
@@ -929,6 +938,38 @@ func (m *fakeMachine) UID() uint32    { return fakeVMUID }
 func (m *fakeMachine) Disk() string   { return m.config.Disk }
 func (m *fakeMachine) Outbox() string { return m.outbox }
 func (m *fakeMachine) Inbox() string  { return m.inbox }
+
+// RaiseMemoryLimit is Machine.RaiseMemoryLimit on a group that takes
+// the limit it is given, unless limitRaiseErr says otherwise.
+func (m *fakeMachine) RaiseMemoryLimit(bytes int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.limitsRaised = append(m.limitsRaised, bytes)
+	if m.limitRaiseErr != nil {
+		return m.limitRaiseErr
+	}
+	m.widened += bytes
+	return nil
+}
+
+func (m *fakeMachine) RestoreMemoryLimit() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.limitsRestored++
+	if m.limitRestoreErr != nil {
+		return m.limitRestoreErr
+	}
+	m.widened = 0
+	return nil
+}
+
+// widenedBy is by how much the VM's memory limit is raised at this
+// moment.
+func (m *fakeMachine) widenedBy() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.widened
+}
 
 // Snapshot writes the three files of a snapshot into the directory the
 // daemon mounted for it, as the hypervisor does, and only while paused.

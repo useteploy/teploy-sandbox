@@ -404,6 +404,13 @@ What it costs, and what it does not do:
   arm64 guest has no VM Generation ID device and no driver to reseed on,
   and every resume there boots from the disk (a stop still saves an
   image). None of this was run live on arm64.
+- While a stop writes the image, the VM's memory limit covers it: raised
+  by the image's size (the guest's memory plus 64 MiB) for the length
+  of the stop, and put back after. The image goes through the page
+  cache of the VM's own memory group, and a guest with most of its
+  memory in use otherwise has its hypervisor killed by that limit in
+  the middle of the snapshot (seen live). What the room holds is page
+  cache, which the host can reclaim.
 - Fork is not memory fork: a forked run boots its disk, as before.
 
 ### Host sizing
@@ -541,7 +548,9 @@ The layers are independent; each is checked by the live suite.
   what listens there before it sends anything.
 - **Its own cgroup**, entered at the moment the process is created:
   `memory.max` is the guest's size plus 64 MiB plus 8 MiB per GiB of
-  guest (`memory.swap.max` 0), `pids.max` is 128 plus 4 per vCPU,
+  guest (`memory.swap.max` 0; and, for as long as a stop writes the
+  VM's memory image, another image's size on top, see "Memory stop and
+  resume"), `pids.max` is 128 plus 4 per vCPU,
   `cpu.max` is the VM's vCPUs, and `io.max` on the VM's volume is
   `--vm-disk-mbps` (default 256 MiB/s) and `--vm-disk-iops` (default
   16000), each for reads and for writes separately; 0 turns one off.

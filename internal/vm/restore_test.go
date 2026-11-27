@@ -1182,6 +1182,79 @@ func TestAResumeThatTriedItsImageFailsOnlyWithTheDiskOrWithTheRunsName(t *testin
 	})
 }
 
+// oneErr is a pool that answers one ask with an error, as zfs does when
+// the pool is busy for a moment, and then as itself.
+type oneErr struct {
+	*fakeZFS
+	mu      sync.Mutex
+	pending map[string]error
+}
+
+func (z *oneErr) take(call string) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	err := z.pending[call]
+	delete(z.pending, call)
+	return err
+}
+
+func (z *oneErr) Property(ctx context.Context, name, key string) (string, error) {
+	if err := z.take("get " + key + " " + name); err != nil {
+		return "", err
+	}
+	return z.fakeZFS.Property(ctx, name, key)
+}
+
+func (z *oneErr) Dataset(ctx context.Context, name string) (Dataset, error) {
+	if err := z.take("list " + name); err != nil {
+		return Dataset{}, err
+	}
+	return z.fakeZFS.Dataset(ctx, name)
+}
+
+// A resume whose restore fails before any clone is made boots from the
+// disk, and does not ask the pool to remove what was never there. That
+// removal of nothing was asked all the same, and a transient error of
+// the pool's there — one moment after the error that failed the restore
+// — failed a resume that could have booted (the re-check's nit).
+func TestAResumeThatClonedNothingAsksThePoolToRemoveNothing(t *testing.T) {
+	rig := newMemoryRig(t, nil)
+	spec, record := savedForResume(t, rig, 1)
+	// The pool answers badly once to the restore's own question, and
+	// would once more to a removal of the run's volume, which is never
+	// cloned.
+	pool := &oneErr{fakeZFS: rig.zfs, pending: map[string]error{
+		"get guid " + spec.Image:             zfsError("cannot get: pool is busy"),
+		"list " + testPool + "/" + spec.Name: zfsError("cannot open: pool is busy"),
+	}}
+	rig.driver.volumes.zfs = pool
+	id, from, note, err := rig.driver.ResumeMemory(bg, "run-"+spec.Name, spec, &record)
+	if err != nil || from != run.ResumedFromDisk || id != spec.Name {
+		t.Fatalf("resume: id %q from %q err %v", id, from, err)
+	}
+	if !strings.HasPrefix(note, "resumed from the disk: ") || !strings.Contains(note, "pool is busy") {
+		t.Errorf("the note does not say that the run came back from its disk, and why not from its memory: %q", note)
+	}
+	// Cloned once, for the disk boot alone; and the removal of nothing
+	// was never asked, its bad answer still waiting.
+	if clones := strings.Count(strings.Join(rig.zfs.calls, "\n"), "clone "+spec.Image+" "+testPool+"/"+spec.Name); clones != 1 {
+		t.Fatalf("the stop snapshot was cloned %d times: %v", clones, rig.zfs.calls)
+	}
+	pool.mu.Lock()
+	_, waiting := pool.pending["list "+testPool+"/"+spec.Name]
+	// It must not answer the run's removal below, which has a clone to
+	// remove: the booted VM's.
+	delete(pool.pending, "list "+testPool+"/"+spec.Name)
+	pool.mu.Unlock()
+	if !waiting {
+		t.Fatal("the pool was asked to remove a clone the restore never made")
+	}
+	must(t, rig.driver.ReleaseMemory(bg, &record))
+	assertBootedFromDisk(t, rig, spec)
+	must(t, rig.driver.Remove(bg, spec.Name))
+	assertPool(t, rig.zfs, append([]string{datasetOf(spec.Image), spec.Image}, memoryPristine...)...)
+}
+
 // stepsToTheNanosecond says whether the clock script steps to a fraction
 // of a second, not to the whole second a boot's step settles for.
 func stepsToTheNanosecond(script string) bool {

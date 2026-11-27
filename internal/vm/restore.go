@@ -369,7 +369,7 @@ func (d *Driver) ResumeMemory(ctx context.Context, runID string, spec run.Create
 
 	began := time.Now()
 	cpus, memoryMB := vcpus(spec.CPUs), spec.MemoryMB
-	machine, guestNet, restoreErr := d.restore(ctx, runID, spec, image, proxyPort)
+	machine, guestNet, cloned, restoreErr := d.restore(ctx, runID, spec, image, proxyPort)
 	if restoreErr == nil {
 		d.track(spec.Name, &instance{machine: machine, env: createEnv(spec, proxyPort), network: spec.Name, mac: macOf(guestNet), cpus: cpus, memoryMB: memoryMB})
 		d.log.Info("vm restored from its memory image", "name", spec.Name, "run", runID, "image", image.ID, "memory", time.Since(began).String())
@@ -410,11 +410,18 @@ func (d *Driver) ResumeMemory(ctx context.Context, runID string, spec run.Create
 	// Whatever clone is left goes before the disk is booted on a fresh
 	// one of the same name: the restore's own removal may have failed,
 	// and a clone a restored guest may have written to is never booted.
-	cleanupCtx, cancel := rollback()
-	removeErr := d.volumes.RemoveRun(cleanupCtx, spec.Name)
-	cancel()
-	if removeErr != nil {
-		return spec.Name, "", note, errors.Join(restoreErr, fmt.Errorf("remove the clone the restore left: %w", removeErr))
+	// Only where the restore came as far as cloning. Before that there
+	// is nothing of the run's on the pool to remove, and the removal of
+	// nothing is one more ask of a pool that has just answered badly —
+	// a transient error there failed a resume that could boot from the
+	// disk.
+	if cloned {
+		cleanupCtx, cancel := rollback()
+		removeErr := d.volumes.RemoveRun(cleanupCtx, spec.Name)
+		cancel()
+		if removeErr != nil {
+			return spec.Name, "", note, errors.Join(restoreErr, fmt.Errorf("remove the clone the restore left: %w", removeErr))
+		}
 	}
 	machine, leftover, err := d.boot(ctx, spec.Name, spec.Image, cpus, memoryMB)
 	if errors.Is(err, ErrNoSnapshot) {
@@ -436,7 +443,7 @@ func (d *Driver) ResumeMemory(ctx context.Context, runID string, spec run.Create
 		// The claim's failure is the disk boot's own, as in any create.
 		// Its budget is new: the boot and the claim before it can have
 		// taken longer than a whole one, and this rollback is not theirs.
-		cleanupCtx, cancel = rollback()
+		cleanupCtx, cancel := rollback()
 		cleanupErr := d.discard(cleanupCtx, spec.Name, machine, spec.Name)
 		cancel()
 		if cleanupErr != nil {
@@ -458,32 +465,34 @@ func (d *Driver) ResumeMemory(ctx context.Context, runID string, spec run.Create
 // behind unless the error says the clone could not be removed. guestNet
 // is the device the VM was given, when there is one: it is made for a
 // hypervisor that was started, so it comes with a machine and never
-// alone.
-func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec, image *run.MemoryImage, proxyPort int) (result Machine, network *GuestNetwork, err error) {
+// alone. cloned says whether the restore came as far as asking for the
+// run's clone: until then nothing of the run's is on the pool, and the
+// caller has nothing to remove before it boots the disk.
+func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec, image *run.MemoryImage, proxyPort int) (result Machine, network *GuestNetwork, cloned bool, err error) {
 	if d.images == nil {
-		return nil, nil, errors.New("this daemon keeps no memory images")
+		return nil, nil, false, errors.New("this daemon keeps no memory images")
 	}
 	name := spec.Name
 	cpus, memoryMB := vcpus(spec.CPUs), spec.MemoryMB
 	networked := spec.Network == run.NetworkAllowlist || spec.Network == run.NetworkOpen
 	switch {
 	case image.CPUs != cpus || image.MemoryMB != memoryMB:
-		return nil, nil, fmt.Errorf("saved from a VM of %d vCPUs and %d MiB, and the run's is %d and %d", image.CPUs, image.MemoryMB, cpus, memoryMB)
+		return nil, nil, false, fmt.Errorf("saved from a VM of %d vCPUs and %d MiB, and the run's is %d and %d", image.CPUs, image.MemoryMB, cpus, memoryMB)
 	case networked != (image.MAC != "") || image.DiskNode == "":
-		return nil, nil, errors.New("saved with another network device, or none, than the run has")
+		return nil, nil, false, errors.New("saved with another network device, or none, than the run has")
 	}
 	// Paired with this disk snapshot by its guid: an image is only ever
 	// restored with the disk it was saved beside.
 	guid, err := d.volumes.zfs.Property(ctx, spec.Image, "guid")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	if guid != image.Disk {
-		return nil, nil, fmt.Errorf("saved beside disk snapshot %s, and this run's stop snapshot is %s", image.Disk, guid)
+		return nil, nil, false, fmt.Errorf("saved beside disk snapshot %s, and this run's stop snapshot is %s", image.Disk, guid)
 	}
 	img, err := d.images.open(ctx, runID, image)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	// The restore holds the image from open until either a hypervisor
 	// exists that may hold its files (mapping: from then the VM's own
@@ -495,10 +504,13 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 		}
 	}()
 	// A fresh clone of the stop snapshot: a guest that was restored and
-	// wrote to its disk never has that disk booted under it.
+	// wrote to its disk never has that disk booted under it. From here a
+	// clone is on the pool, or may be: a clone that was killed at the
+	// caller's deadline may still have happened.
+	cloned = true
 	device, err := d.volumes.CreateRun(ctx, name, spec.Image)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, cloned, err
 	}
 	volume := true
 	defer func() {
@@ -536,14 +548,14 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 	}
 	if err != nil {
 		if result == nil {
-			return nil, nil, fmt.Errorf("start the hypervisor: %w", err)
+			return nil, nil, cloned, fmt.Errorf("start the hypervisor: %w", err)
 		}
 		// Started, and not killed: the caller gives it back.
-		return result, nil, fmt.Errorf("start the hypervisor: %w", err)
+		return result, nil, cloned, fmt.Errorf("start the hypervisor: %w", err)
 	}
 	if networked {
 		if network, err = d.network.Attach(ctx, name, spec.Network, proxyPort); err != nil {
-			return result, nil, fmt.Errorf("network device: %w", err)
+			return result, nil, cloned, fmt.Errorf("network device: %w", err)
 		}
 	}
 	request := RestoreRequest{SourceURL: "file://" + result.Inbox(), NetDevice: netDeviceID}
@@ -558,17 +570,17 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 		_ = network.Tap.Close()
 	}
 	if err != nil {
-		return result, network, err
+		return result, network, cloned, err
 	}
 	// The hypervisor copies the memory silently when it will not map it
 	// (a configuration that is not eligible); nothing it says tells the
 	// two apart, so the daemon looks at what it mapped.
 	if !result.MapsFile(filepath.Join(img.dir, imageMemoryFile)) {
-		return result, network, errors.New("the hypervisor did not map the image copy-on-write: it copied the memory instead")
+		return result, network, cloned, errors.New("the hypervisor did not map the image copy-on-write: it copied the memory instead")
 	}
 	began = time.Now()
 	if err = result.Resume(ctx); err != nil {
-		return result, network, fmt.Errorf("resume: %w", err)
+		return result, network, cloned, fmt.Errorf("resume: %w", err)
 	}
 	step("vm.resume", began)
 	began = time.Now()
@@ -578,23 +590,23 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 		d.log.Info("vm restore: the guest's agent has not answered yet", "name", name, "after", time.Since(began).Round(time.Millisecond).String(), "ping", took.Round(time.Millisecond).String(), "error", err)
 	})
 	if err != nil {
-		return result, network, fmt.Errorf("the restored guest's agent: %w", err)
+		return result, network, cloned, fmt.Errorf("the restored guest's agent: %w", err)
 	}
 	step("agent", began)
 	began = time.Now()
 	if err = d.restoreClock(ctx, result); err != nil {
-		return result, network, err
+		return result, network, cloned, err
 	}
 	step("clock", began)
 	if network != nil {
 		began = time.Now()
 		if err = d.restoreNetwork(ctx, result, network, image.MAC); err != nil {
-			return result, network, err
+			return result, network, cloned, err
 		}
 		step("network", began)
 	}
 	if err = result.Booted(); err != nil {
-		return result, network, fmt.Errorf("the run's disk limits: %w", err)
+		return result, network, cloned, fmt.Errorf("the run's disk limits: %w", err)
 	}
 	attrs := make([]any, 0, 2*len(steps)+2)
 	attrs = append(attrs, "name", name)
@@ -604,7 +616,7 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 		}
 	}
 	d.log.Info("vm restore steps", attrs...)
-	return result, network, nil
+	return result, network, cloned, nil
 }
 
 // poolName is the ZFS pool the run volumes are in (the first component

@@ -359,6 +359,10 @@ type Manager struct {
 	// and then a stop and a resume are what they were before images
 	// existed. Set before the registry is loaded.
 	MemoryImages MemoryKeeper
+	// MemorySettle bounds how long a stop that dropped a memory image
+	// for room waits for the pool to show it when the pool's reading
+	// has not moved (memory.go); zero is DefaultMemorySettle.
+	MemorySettle time.Duration
 
 	mu   sync.Mutex
 	runs map[string]*Run

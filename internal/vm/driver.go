@@ -604,8 +604,13 @@ func (d *Driver) boot(ctx context.Context, name, ref string, cpus, memoryMB int)
 	return nil, false, err
 }
 
-// kill ends a VM's process and, once it is gone, lets its memory image
-// go: an image the VM was restored from loses the hold its mapping was.
+// kill ends a VM's process and, once it is gone, lets its memory images
+// go: an image the VM was restored from loses the hold its mapping was,
+// and what the VM still owed for its images — a destroy, a close,
+// refused while it lived — is tried again. That is done synchronously
+// (memoryImages.vmGone), so a VM's removal waits for its own images'
+// destroys and closes, and for nothing of another VM's: those are the
+// sweep's.
 func (d *Driver) kill(ctx context.Context, name string, machine Machine) error {
 	if err := machine.Kill(ctx); err != nil {
 		return err

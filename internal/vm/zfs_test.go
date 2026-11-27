@@ -90,6 +90,43 @@ func TestZFSCLIRefusesAListingItDoesNotUnderstand(t *testing.T) {
 	}
 }
 
+// How every image lies open is one read, a level down from the images'
+// dataset: mounted and keystatus, a line per filesystem and property.
+// A closed image is not in the answer; a line that is not understood is
+// an error, never an image taken for closed.
+func TestZFSCLIReadsHowEveryImageLiesOpenInOneCommand(t *testing.T) {
+	cmd := &scriptedCommander{answer: func(string) ([]byte, error) {
+		return []byte("p/img\tmounted\t-\np/img\tkeystatus\t-\n" +
+			"p/img/a\tmounted\tyes\np/img/a\tkeystatus\tavailable\n" +
+			"p/img/b\tmounted\tno\np/img/b\tkeystatus\tunavailable\n" +
+			"p/img/c\tmounted\tno\np/img/c\tkeystatus\tavailable\n"), nil
+	}}
+	z := newZFSCLI("", cmd)
+	states, err := z.openStates(context.Background(), "p/img")
+	want := map[string]imageOpen{"p/img/a": {mounted: true, keyLoaded: true}, "p/img/c": {keyLoaded: true}}
+	if err != nil || len(states) != len(want) {
+		t.Fatalf("states: %+v %v", states, err)
+	}
+	for name, want := range want {
+		if states[name] != want {
+			t.Errorf("%s: %+v, want %+v", name, states[name], want)
+		}
+	}
+	if got := cmd.calls[0]; got != "zfs get -H -p -d 1 -t filesystem -o name,property,value mounted,keystatus p/img" {
+		t.Fatalf("command: %s", got)
+	}
+
+	for name, out := range map[string]string{
+		"two columns":      "p/img/a\tyes\n",
+		"another property": "p/img/a\tcompression\tlz4\n",
+	} {
+		cmd.answer = func(string) ([]byte, error) { return []byte(out), nil }
+		if states, err := z.openStates(context.Background(), "p/img"); err == nil || states != nil {
+			t.Errorf("%s: read as %+v, %v", name, states, err)
+		}
+	}
+}
+
 func TestZFSCLITellsMissingFromBroken(t *testing.T) {
 	missing := &scriptedCommander{answer: func(string) ([]byte, error) {
 		return nil, zfsError("cannot open 'p/x': dataset does not exist")

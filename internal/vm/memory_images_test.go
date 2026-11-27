@@ -250,8 +250,9 @@ func TestAMemoryImageIsAnEncryptedDatasetSealedReadOnlyAndNamedByTheRecord(t *te
 // resume opens it again (its key loaded, then mounted) and it stays
 // open while the VM restored from it lives, since that VM reads its
 // memory through the mount. An image nothing restores is destroyed as
-// it lies. A close the pool refuses is said and costs nothing: the
-// image stays open, and is as usable so.
+// it lies. A close the pool refuses costs the stop nothing: said, the
+// image is kept, and is as usable as before, and its close is owed from
+// then on (memory_recheck_test.go).
 func TestASealedImageIsClosedAtRestAndOpenedByAResume(t *testing.T) {
 	z := newFakeZFS()
 	s := newTestImages(t, z)
@@ -290,7 +291,8 @@ func TestASealedImageIsClosedAtRestAndOpenedByAResume(t *testing.T) {
 	}
 
 	// A close the pool refuses, as for a descriptor still open in the
-	// dataset: said, and the image is kept, and as usable as before.
+	// dataset: said, and the image is kept, and as usable as before
+	// (what it is owed from here is memory_recheck_test.go's).
 	refusing := &unmountRefused{newFakeZFS()}
 	stubborn := newTestImages(t, refusing.fakeZFS)
 	stubborn.zfs = refusing

@@ -144,13 +144,15 @@ type MemoryKeeper interface {
 	ReleaseMemory(ctx context.Context, image *MemoryImage) error
 	// RetainMemory is called once the registry is loaded, before any run
 	// is served: every image of this daemon that no stopped run names is
-	// destroyed, and every image a run names that is not on this host is
-	// reported, so the record can stop claiming it.
+	// destroyed, every image a run names that is not on this host is
+	// reported (so the record can stop claiming it), and the images
+	// that are kept are closed, as one at rest is.
 	RetainMemory(ctx context.Context, images []*MemoryImage) (missing []string, err error)
 	// SweepMemory is called now and then while the daemon serves (by the
-	// reaper): an image that could not be destroyed when nothing wanted
-	// it any more is tried again, so that it goes without a restart. It
-	// answers with what still could not go.
+	// reaper): what could not be done when nothing wanted it any more is
+	// tried again — an image that would not go, a close the pool
+	// refused — so that it does without a restart. It answers with what
+	// still would not go.
 	SweepMemory(ctx context.Context) error
 	// MemoryShortBy reports how many bytes the pool is short of having
 	// need bytes plus its reserve free: 0 when it has room. An image is
@@ -289,34 +291,101 @@ func (m *Manager) memorySpent(id string, image *MemoryImage, note string) {
 	m.persist()
 }
 
+// A reading of the pool taken the moment after an image went is not
+// taken at its word until it has moved. A destroy's freeing is the
+// pool's to finish: a command that ended at its deadline has left it
+// going on, and a pool may show the room of a destroyed dataset only in
+// its own time. A reading from before that still shows the pool short
+// by all it was, and another image evicted on the strength of it is
+// gone for nothing. (Measured on the test host, zfs 2.3.9, for image
+// datasets of 256 MiB and of 1.5 GiB: by the time `zfs destroy` returns
+// — 70 to 190 ms — the whole of the space is in the pool's available,
+// and the very next reading shows it. So this costs a stop there
+// nothing; where a pool is slower the wait is bounded, and costs it no
+// image.)
+//
+// Nor is what went counted by what an image may hold while the reading
+// moves: an image is compressed, and usually takes a good deal less than
+// that, so the pool's own word is the only account that evicts no more
+// and no fewer. Only a reading that has not moved by the end of the
+// wait is set aside: then another image does not go for a reading that
+// is still the one from before the destroy, but for what the images
+// that went cannot cover even at the most.
+const (
+	// DefaultMemorySettle bounds the wait of one stop for the pool to
+	// show what went: a ZFS transaction group's timeout.
+	DefaultMemorySettle = 5 * time.Second
+	// memorySettleEvery is how often the pool is asked meanwhile.
+	memorySettleEvery = 250 * time.Millisecond
+)
+
+func (m *Manager) memorySettle() time.Duration {
+	if m.MemorySettle > 0 {
+		return m.MemorySettle
+	}
+	return DefaultMemorySettle
+}
+
 // makeMemoryRoom drops memory images, the oldest stop first, until the
 // pool has need bytes plus its reserve free: an image is kept while the
 // pool has room, and never at the cost of a new one.
 //
 // Only while dropping them can make the room. The pool is asked how
 // much it is short by, and another image goes only while what the
-// images that could still go hold, at the most, covers it; then the
-// pool is asked again. A pool that is short for other reasons (run
-// volumes, snapshots) does not lose its images for a new one that
-// cannot be saved either way.
+// images that could still go hold, at the most, covers it; once one has
+// gone, the pool is asked again and taken at its word once it has shown
+// what went (memoryRoomShown, and the note above DefaultMemorySettle).
+// A pool that is short for other reasons (run volumes, snapshots) does
+// not lose its images for a new one that cannot be saved either way.
 func (m *Manager) makeMemoryRoom(ctx context.Context, need int64) error {
-	for {
-		short, err := m.MemoryImages.MemoryShortBy(ctx, need)
-		if err != nil || short <= 0 {
-			return err
-		}
+	reading, err := m.MemoryImages.MemoryShortBy(ctx, need)
+	if err != nil || reading <= 0 {
+		return err
+	}
+	// short is what there is still to make: the pool's word while its
+	// reading moves, and what the images that went may hold when it
+	// does not. The wait for the pool to show what went is one for the
+	// whole stop.
+	short, deadline := reading, time.Now().Add(m.memorySettle())
+	for short > 0 {
 		if m.evictableMemoryBytes() < short {
 			return nil
 		}
-		if !m.evictOldestMemory(ctx, MemoryEvicted, evictedForRoom) {
+		freed, ok := m.evictOldestMemory(ctx, MemoryEvicted, evictedForRoom)
+		if !ok {
+			return nil
+		}
+		after, moved, err := m.memoryRoomShown(ctx, need, reading, deadline)
+		if err != nil {
+			return err
+		}
+		reading = after
+		if after <= 0 {
+			return nil
+		}
+		if moved {
+			short = after
+			continue
+		}
+		if short -= freed; short <= 0 {
 			return nil
 		}
 	}
+	return nil
 }
 
 // evictMemoryUnderPressure drops memory images, the oldest stop first,
-// while the pool is below its reserve. Images go from a pool under
-// pressure before any local copy of a disk snapshot does.
+// while the pool is below its reserve, and stops as soon as it is not.
+// Images go from a pool under pressure before any local copy of a disk
+// snapshot does.
+//
+// Unlike a stop making room (makeMemoryRoom) it does not wait for the
+// pool's reading to move after an image goes, nor set a reading that did
+// not move aside: it goes on asking while the pool says it is short,
+// whatever made it so. That is the reaper's bargain: a pool below its
+// reserve costs every run on the host, and an image dropped for a
+// reading that had not caught up with the last destroy is a price it
+// pays where a stop, which can go on without its image, does not.
 func (m *Manager) evictMemoryUnderPressure(ctx context.Context) {
 	if m.MemoryImages == nil {
 		return
@@ -329,7 +398,7 @@ func (m *Manager) evictMemoryUnderPressure(ctx context.Context) {
 		if err != nil || short <= 0 {
 			return
 		}
-		if !m.evictOldestMemory(ctx, MemoryEvicted, evictedForPressure) {
+		if _, ok := m.evictOldestMemory(ctx, MemoryEvicted, evictedForPressure); !ok {
 			return
 		}
 	}
@@ -344,6 +413,48 @@ func (m *Manager) hasMemoryImages() bool {
 		}
 	}
 	return false
+}
+
+// memoryRoomShown asks the pool again once an image went, and waits, as
+// far as deadline allows, for the reading to show it. It answers with
+// the last reading, and with whether the pool has shown any of what
+// went: a reading below the one before.
+//
+// Once the reading has moved, it is still not taken at its word until it
+// holds still: ZFS frees a big dataset over several transaction groups
+// (the pool's `freeing`), so the first reading to move may show only
+// part of what went, and taking the rest as still missing would evict
+// another image for room already on its way. A reading is settled when
+// the next one, a poll later, is no lower, or when the deadline comes.
+func (m *Manager) memoryRoomShown(ctx context.Context, need, before int64, deadline time.Time) (short int64, moved bool, err error) {
+	for {
+		short, err = m.MemoryImages.MemoryShortBy(ctx, need)
+		if err != nil || short <= 0 {
+			return short, short < before, err
+		}
+		if short < before {
+			moved = true
+		}
+		if !time.Now().Before(deadline) {
+			return short, moved, nil
+		}
+		select {
+		case <-ctx.Done():
+			return short, moved, ctx.Err()
+		case <-time.After(memorySettleEvery):
+		}
+		if moved {
+			next, err := m.MemoryImages.MemoryShortBy(ctx, need)
+			if err != nil || next <= 0 || next >= short {
+				if err == nil && next < short {
+					short = next
+				}
+				return short, true, err
+			}
+			// Still going down: the pool is still freeing. Ask again.
+			before = next
+		}
+	}
 }
 
 // memoryEvictable says whether the run's memory image can be dropped
@@ -374,10 +485,11 @@ func (m *Manager) evictableMemoryBytes() int64 {
 	return held
 }
 
-// sweepMemoryImages has the driver retry the images that could not be
-// destroyed when nothing wanted them any more (MemoryKeeper.SweepMemory),
-// so that they go without a restart. Under a deadline of its own: the
-// reaper's pass has runs waiting on it.
+// sweepMemoryImages has the driver retry what could not be done when
+// nothing wanted it any more (MemoryKeeper.SweepMemory): an image that
+// would not go, a close the pool refused, so that neither waits for a
+// restart. Under a deadline of its own: the reaper's pass has runs
+// waiting on it.
 func (m *Manager) sweepMemoryImages(ctx context.Context) {
 	if m.MemoryImages == nil {
 		return
@@ -385,14 +497,16 @@ func (m *Manager) sweepMemoryImages(ctx context.Context) {
 	sweepCtx, cancel := context.WithTimeout(ctx, memorySweepTimeout)
 	defer cancel()
 	if err := m.MemoryImages.SweepMemory(sweepCtx); err != nil {
-		m.log.Error("memory images could not be removed; they are tried again when their VM is gone, and by the reaper", "error", err)
+		m.log.Error("memory images could not be removed or closed; they are tried again when their VM is gone, and by the reaper", "error", err)
 	}
 }
 
 // evictOldestMemory drops the memory image of the stopped run that was
 // stopped longest ago, if any: under that run's exclusivity, so that a
-// resume under way is never racing it. It reports whether one went.
-func (m *Manager) evictOldestMemory(ctx context.Context, state, why string) bool {
+// resume under way is never racing it. It answers with whether one
+// went, and with the most that what went may hold on the pool (an upper
+// bound: the image is compressed, and usually takes less).
+func (m *Manager) evictOldestMemory(ctx context.Context, state, why string) (freed int64, ok bool) {
 	m.mu.Lock()
 	var oldestID string
 	var oldest *Run
@@ -407,19 +521,19 @@ func (m *Manager) evictOldestMemory(ctx context.Context, state, why string) bool
 	}
 	m.mu.Unlock()
 	if oldest == nil {
-		return false
+		return 0, false
 	}
 	current, release, err := m.beginStopped(oldestID)
 	if err != nil {
-		return false
+		return 0, false
 	}
 	defer release()
 	if current.memory == nil || current.memory != oldest.memory {
 		// Dropped, or taken by a resume, since.
-		return false
+		return 0, false
 	}
 	m.dropMemory(current.ID, current.memory, &memoryNote{State: state, Reason: why})
-	return true
+	return m.MemoryImages.MemoryNeedsBytes(current.memory.MemoryMB), true
 }
 
 // dropMemory takes a stopped run's memory image from its record and

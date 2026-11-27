@@ -170,7 +170,8 @@ func TestAStopSavesTheVMsMemoryAndAResumeRestoresTheVMFromIt(t *testing.T) {
 		t.Fatal("the VM's jail has no outbox")
 	}
 	// While the image is written the VM's memory limit covers it, by the
-	// image's size; after the stop it is the VM's own again.
+	// image's size: from the pause until the image is sealed, and no
+	// longer. A running guest never has the room.
 	var widenedAtSnapshot int64
 	machine.snapshotHook = func(string) { widenedAtSnapshot = machine.widenedBy() }
 
@@ -186,10 +187,16 @@ func TestAStopSavesTheVMsMemoryAndAResumeRestoresTheVMFromIt(t *testing.T) {
 		t.Fatalf("after the stop: %+v", saved)
 	}
 	// The memory was taken in the pause the disk snapshot was: the VM
-	// was flushed, paused, written, and ran again until the run was
+	// was flushed, paused, and only then given the room; it wrote its
+	// image, had the room taken back, and ran again until the run was
 	// removed.
-	if want := []string{"sync", "pause", "resume", "kill"}; !slices.Equal(machine.events, want) {
+	want := []string{"sync", "pause", "raise-limit", "snapshot", "restore-limit", "resume", "kill"}
+	if !slices.Equal(machine.events, want) {
 		t.Fatalf("stop sequence: %v, want %v", machine.events, want)
+	}
+	// Never with the VM running, on either side of the pause.
+	if machine.raisedUnpaused != 0 || !slices.Equal(machine.widenedAtResume, []int64{0}) {
+		t.Fatalf("the room was asked of a running VM %d times, and stood raised by %v at the VM's resumes", machine.raisedUnpaused, machine.widenedAtResume)
 	}
 	if want := []string{"file://" + machine.outbox + "/" + saved.Image}; !slices.Equal(machine.snapshotCalls, want) {
 		t.Fatalf("snapshot destinations: %v, want %v", machine.snapshotCalls, want)
@@ -501,11 +508,37 @@ func (z *snapFails) Snapshot(context.Context, string) error {
 // cannot be saved: the stop goes on from the disk, the run says why it
 // has no memory image, and nothing of the image is left behind.
 func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
-	// The cases in which no image is begun, so the VM's memory limit is
-	// never raised.
-	noImage := map[string]bool{
-		"the VM's process is gone": true, "the pool is below its reserve": true,
-		"the pool's space cannot be read": true, "the image's dataset cannot be made": true,
+	// What the VM was put through, in order, in each case, and how far
+	// its memory limit stood raised when it was resumed (the stop ends
+	// by killing the VM, as every stop does). The room is asked for
+	// only once the VM is paused and its image is where the hypervisor
+	// can write it — so where none was begun, or the image does not
+	// reach the jail, it is never asked for — and is taken back before
+	// the VM runs again, the hypervisor's own failure included. The one
+	// exception is a snapshot that did not answer in time: the
+	// hypervisor may go on writing, and the VM's resume is what waits
+	// for that, so there the room lasts until the VM has resumed.
+	unraised := []string{"sync", "pause", "resume", "kill"}
+	snapshotted := []string{"sync", "pause", "raise-limit", "snapshot", "restore-limit", "resume", "kill"}
+	refused := []string{"sync", "pause", "raise-limit", "restore-limit", "resume", "kill"}
+	unanswered := []string{"sync", "pause", "raise-limit", "resume", "restore-limit", "kill"}
+	limits := map[string]struct {
+		events          []string
+		widenedAtResume []int64
+	}{
+		"the VM's process is gone":                                        {[]string{"kill"}, nil},
+		"the pool is below its reserve":                                   {unraised, []int64{0}},
+		"the pool's space cannot be read":                                 {unraised, []int64{0}},
+		"the image's dataset cannot be made":                              {unraised, []int64{0}},
+		"the image does not reach the VM's jail":                          {unraised, []int64{0}},
+		"the hypervisor refuses the snapshot":                             {refused, []int64{0}},
+		"the hypervisor's snapshot does not answer in time":               {unanswered, []int64{imageNeedsBytes(256)}},
+		"the hypervisor's socket times out under the snapshot":            {unanswered, []int64{imageNeedsBytes(256)}},
+		"the hypervisor's socket drops under the snapshot":                {unanswered, []int64{imageNeedsBytes(256)}},
+		"a hypervisor taken over leaves an extra file":                    {snapshotted, []int64{0}},
+		"a hypervisor taken over leaves a link to a host file":            {snapshotted, []int64{0}},
+		"a hypervisor taken over keeps the image busy until it is killed": {snapshotted, []int64{0}},
+		"the image cannot be made read-only":                              {snapshotted, []int64{0}},
 	}
 	for name, breakIt := range map[string]func(t *testing.T, rig *testRig, machine *fakeMachine){
 		"the VM's process is gone": func(t *testing.T, rig *testRig, machine *fakeMachine) {
@@ -532,6 +565,16 @@ func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
 		},
 		"the hypervisor's snapshot does not answer in time": func(t *testing.T, rig *testRig, machine *fakeMachine) {
 			machine.snapshotErr = context.DeadlineExceeded
+		},
+		// What the real request returns when its socket deadline passes:
+		// a net timeout, not a context's. The hypervisor may still be
+		// writing, so the room stays until the VM has resumed.
+		"the hypervisor's socket times out under the snapshot": func(t *testing.T, rig *testRig, machine *fakeMachine) {
+			machine.snapshotErr = fmt.Errorf("hypervisor vm.snapshot: %w", os.ErrDeadlineExceeded)
+		},
+		// No answer at all is not an answer either.
+		"the hypervisor's socket drops under the snapshot": func(t *testing.T, rig *testRig, machine *fakeMachine) {
+			machine.snapshotErr = fmt.Errorf("hypervisor vm.snapshot: %w", io.ErrUnexpectedEOF)
 		},
 		"a hypervisor taken over leaves an extra file": func(t *testing.T, rig *testRig, machine *fakeMachine) {
 			machine.snapshotHook = func(dir string) { _ = os.WriteFile(filepath.Join(dir, "notes"), nil, 0o600) }
@@ -591,9 +634,14 @@ func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
 				t.Fatal("the VM was not resumed after its snapshot failed")
 			}
 			// Whatever became of the image, the VM's memory limit is its
-			// own again; and where none was begun, none was raised.
-			if by := machine.widenedBy(); by != 0 || (noImage[name] && len(machine.limitsRaised) > 0) {
-				t.Fatalf("the VM's memory limit: raised %v, put back %d times (no image begun: %t)", machine.limitsRaised, machine.limitsRestored, noImage[name])
+			// own again, and the room was never the VM's while it ran:
+			// the whole sequence is the one the case says.
+			if by := machine.widenedBy(); by != 0 || machine.raisedUnpaused != 0 {
+				t.Fatalf("the VM's memory limit: raised %v, put back %d times, standing raised by %d, raised unpaused %d times", machine.limitsRaised, machine.limitsRestored, by, machine.raisedUnpaused)
+			}
+			want := limits[name]
+			if !slices.Equal(machine.events, want.events) || !slices.Equal(machine.widenedAtResume, want.widenedAtResume) {
+				t.Fatalf("the VM's sequence: %v, want %v; the limit stood raised by %v at the resume, want %v", machine.events, want.events, machine.widenedAtResume, want.widenedAtResume)
 			}
 			// The disk snapshot is what the run has, and it resumes from it.
 			resumed, err := rig.manager.Resume(bg, created.ID, 0)
@@ -620,6 +668,12 @@ func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
 		}
 		if by := machine.widenedBy(); by != 0 || len(machine.limitsRaised) != 1 || machine.limitsRestored != 1 {
 			t.Fatalf("the VM's memory limit: raised %v, put back %d times", machine.limitsRaised, machine.limitsRestored)
+		}
+		// The image was sealed before the disk snapshot failed: the room
+		// was taken back before the VM resumed, as for a kept image, and
+		// the VM runs on under its own limit.
+		if want := []string{"sync", "pause", "raise-limit", "snapshot", "restore-limit", "resume"}; !slices.Equal(machine.events, want) || !slices.Equal(machine.widenedAtResume, []int64{0}) {
+			t.Fatalf("the VM's sequence: %v, want %v; the limit stood raised by %v at the resume", machine.events, want, machine.widenedAtResume)
 		}
 		if current, _ := rig.manager.Get(created.ID); current.State != run.StateRunning {
 			t.Fatalf("the run is %s", current.State)
@@ -1139,6 +1193,79 @@ func TestAResumeThatTriedItsImageFailsOnlyWithTheDiskOrWithTheRunsName(t *testin
 		must(t, rig.driver.Remove(bg, spec.Name))
 		pristineAfter(t, rig, spec, record)
 	})
+}
+
+// oneErr is a pool that answers one ask with an error, as zfs does when
+// the pool is busy for a moment, and then as itself.
+type oneErr struct {
+	*fakeZFS
+	mu      sync.Mutex
+	pending map[string]error
+}
+
+func (z *oneErr) take(call string) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	err := z.pending[call]
+	delete(z.pending, call)
+	return err
+}
+
+func (z *oneErr) Property(ctx context.Context, name, key string) (string, error) {
+	if err := z.take("get " + key + " " + name); err != nil {
+		return "", err
+	}
+	return z.fakeZFS.Property(ctx, name, key)
+}
+
+func (z *oneErr) Dataset(ctx context.Context, name string) (Dataset, error) {
+	if err := z.take("list " + name); err != nil {
+		return Dataset{}, err
+	}
+	return z.fakeZFS.Dataset(ctx, name)
+}
+
+// A resume whose restore fails before any clone is made boots from the
+// disk, and does not ask the pool to remove what was never there. That
+// removal of nothing was asked all the same, and a transient error of
+// the pool's there — one moment after the error that failed the restore
+// — failed a resume that could have booted (the re-check's nit).
+func TestAResumeThatClonedNothingAsksThePoolToRemoveNothing(t *testing.T) {
+	rig := newMemoryRig(t, nil)
+	spec, record := savedForResume(t, rig, 1)
+	// The pool answers badly once to the restore's own question, and
+	// would once more to a removal of the run's volume, which is never
+	// cloned.
+	pool := &oneErr{fakeZFS: rig.zfs, pending: map[string]error{
+		"get guid " + spec.Image:             zfsError("cannot get: pool is busy"),
+		"list " + testPool + "/" + spec.Name: zfsError("cannot open: pool is busy"),
+	}}
+	rig.driver.volumes.zfs = pool
+	id, from, note, err := rig.driver.ResumeMemory(bg, "run-"+spec.Name, spec, &record)
+	if err != nil || from != run.ResumedFromDisk || id != spec.Name {
+		t.Fatalf("resume: id %q from %q err %v", id, from, err)
+	}
+	if !strings.HasPrefix(note, "resumed from the disk: ") || !strings.Contains(note, "pool is busy") {
+		t.Errorf("the note does not say that the run came back from its disk, and why not from its memory: %q", note)
+	}
+	// Cloned once, for the disk boot alone; and the removal of nothing
+	// was never asked, its bad answer still waiting.
+	if clones := strings.Count(strings.Join(rig.zfs.calls, "\n"), "clone "+spec.Image+" "+testPool+"/"+spec.Name); clones != 1 {
+		t.Fatalf("the stop snapshot was cloned %d times: %v", clones, rig.zfs.calls)
+	}
+	pool.mu.Lock()
+	_, waiting := pool.pending["list "+testPool+"/"+spec.Name]
+	// It must not answer the run's removal below, which has a clone to
+	// remove: the booted VM's.
+	delete(pool.pending, "list "+testPool+"/"+spec.Name)
+	pool.mu.Unlock()
+	if !waiting {
+		t.Fatal("the pool was asked to remove a clone the restore never made")
+	}
+	must(t, rig.driver.ReleaseMemory(bg, &record))
+	assertBootedFromDisk(t, rig, spec)
+	must(t, rig.driver.Remove(bg, spec.Name))
+	assertPool(t, rig.zfs, append([]string{datasetOf(spec.Image), spec.Image}, memoryPristine...)...)
 }
 
 // stepsToTheNanosecond says whether the clock script steps to a fraction

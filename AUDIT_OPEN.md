@@ -4664,7 +4664,15 @@ milliseconds (min–max), to the first exec after `resume`:
 Two earlier runs of the same test, before the last fixes (none of which
 touch the timing), agree: 3583 (3396–4794) and 3162 (3138–5704) from
 memory, 4732 and 4692 from the disk. `TestVMMemoryResume` passed whole
-with both goldens on the final tree.
+with both goldens on the tree before the reviews.
+
+After the reviews' fixes (2026-11-27), on the same host, one run of ten
+each: resume from memory 3.6 s (3.4–5.4) with the original golden and
+3.6 s (3.2–4.8) with the v3 golden; from the disk 5.0 s (4.8–5.9) and
+5.0 s (4.6–5.5); a stop with memory 6.4 s (3.7–11.4) and 6.6 s
+(3.6–9.1). Closing the image after a stop adds four `zfs` commands
+outside the VM's pause, and the limit that covers the image is written
+before the pause: neither shows in the pause.
 
 What a restore is made of, from the daemon's log (`vm restore steps`),
 across the runs: starting the hypervisor 42–113 ms; `vm.restore` 95–148 ms;
@@ -4698,7 +4706,8 @@ protocol v2 (they pass against the golden with this release's agent);
 and the two warm-pool tests, which wait for the pool to refill on a host
 with 3.7 GiB and timed out after 10 minutes each (Target 3, Ready 2,
 Booting 0: the host-memory gate). The driver's whole unit-test binary
-also ran as root there, as CI's root job runs it: 310 pass, none skipped.
+also ran as root there, as CI's root job runs it: 310 pass, none skipped;
+after the reviews' fixes, 326 pass, none skipped.
 
 ### Not done, and open
 
@@ -4840,3 +4849,37 @@ also ran as root there, as CI's root job runs it: 310 pass, none skipped.
   (M0, U6). W3a's recoverable execs would need an opt-out.
 - **Userspace generators are not reseeded** (design 5.5): the kernel's
   generator is, and the daemon checks it was.
+
+### Two independent reviews of the first cut (A and B), and what each finding changed
+
+Both reviews were adversarial and run separately on the first cut of the
+branch; where one came with a failing test, that test is in the tree
+under its own name and failed before the fix. Review B's two off-host
+tests passed when written and are kept as evidence
+(`TestAMemoryImageIsNotResumedAfterTheRunMovedHosts`,
+`TestAMemoryImageGoesWhenTheRunIsDestroyedElsewhere`).
+
+| Finding | What changed | Test |
+|---|---|---|
+| **The pool's lock was held across a capture's resume** (A and B, same repro). After the first fix the quiesce ran outside `Volumes.mu`, but what it returned ran inside: for a stop that saves memory that is the image's seal and the VM's resume, which after a `vm.snapshot` that did not answer waits up to `snapshotTimeout` (two minutes and more). Every other run's create, resume and destroy waited behind it. | `Capture` holds the lock for the storage only: the flush and the snapshot, then the clone and the promote, with every rollback; the resume runs between them with no lock (`volumes.go`). In that gap the run's volume holds a snapshot that is nobody's reference; only a removal of that volume could meet it, which the manager never asks for while it holds the run, and which would fail the capture at its clone and roll back. | Both reviews' repro, kept: `TestACapturesResumeDoesNotHoldThePool`. Through the driver: `TestAStopsSealAndResumeDoNotHoldThePoolForOtherRuns`. The gap: `TestACaptureWhoseVolumeIsRemovedInTheGapFailsAndLeavesNothing`. |
+| **One budget for the whole capture** (found with the last). A resume that outlasted it left none for the clone, and the stop failed after its disk snapshot was taken. | Each visit to the storage has a budget of its own. | `TestACapturesCloneAndPromoteAreNotTimedOutByTheVMsResume` |
+| **A restore's clone that could not be removed failed the resume** (B, repro). The deferred removal's error was dropped, the clone stayed, and the disk boot collided with it. Every other way out of `ResumeMemory` was then audited for the class: a hypervisor that could not be given back at once, a rollback on a deadline an earlier one had spent, a disk boot that failed reported with the run's name although nothing was left. | The restore says when its clone would not go; the clone is seen gone before the disk is booted under the same name; a hypervisor that could not be given back is tried once more under a new deadline; every rollback has a deadline of its own; the resume fails with the run's name only when something of it is really left. | Review B's repro, kept: `TestAFailedRestoreNeverKeepsTheResumeFromTheDisk`. The ways such a resume fails: `TestAResumeThatTriedItsImageFailsOnlyWithTheDiskOrWithTheRunsName`. |
+| **Images whose unmount or destroy was refused stayed until a restart** (A, repro). Only `retain`, once per start, retried what was owed. | Each image remembers the VM whose snapshot it is; an owed image is tried again at that VM's end and by the reaper, a minute apart. | Review A's repro, kept: `TestAnImageItsStopGaveUpGoesWhenItsVMIsGone`, and `TestAnImageItsVMKeptBusyGoesWhenItsVMIsGone`; the pacing: `TestOwedImagesAreTriedAgainByTheSweep`; the reaper: `TestTheReaperHasTheImagesThatWouldNotGoTriedAgain`. |
+| **The images' lock was held across the host's commands** (found with the last). Every VM's end comes through the store, and a destroy that waits on a busy dataset waits for seconds. | The lock is taken for bookkeeping only, in every method; the claim (`opening`) keeps two restores of one image apart, and a settling mark keeps two destroys of one image from interleaving. One exception, written on the `image` struct: `bind` and `seal` set `bound` and `sealed`, and are the stop's alone while it holds the image. | `TestNoHostCommandRunsUnderTheImagesLock` |
+| **`makeMemoryRoom` evicted images for one the pool had no room for** (B, repro): with the pool short by more than every image together, the stop dropped all of them and saved none. | The driver says by how many bytes the pool is short (`MemoryShortBy`); another image goes only while the images that could still go cover it, and the pool is asked again after each. The reason an evicted run carries is corrected with it. | Review B's repro, kept: `TestAStopDoesNotEvictImagesItCannotUse`. On the driver's own pool numbers: `TestAStopEvictsNoImageForANewOneThePoolHasNoRoomFor`. With bytes to the pool: `TestAStopEvictsJustEnoughImagesToMakeRoomForItsOwn`. |
+| **The handshake op took the agent's reseed instead of the kernel's driver** (a should-fix). On the v3 path `VMGenIDSeen || Reseeded` was accepted; the agent's reseed lands seconds after the guest runs again. | The kernel's driver is required on both paths. | `TestARestoredGuestsHandshakeNeedsTheKernelsOwnReseed`; the fake case "the agent reseeded the guest, but its kernel has no VM Generation ID driver". |
+| **`mapsFile` accepted any writable mapping**, where its comment said a private one is what a copy-on-write restore is. | Only `rw-p` counts. | `TestMapsFileSeesOnlyAWholeMappingOfTheMemoryFile` |
+| **The live suite's reseed check could not fail.** A reading before the stop and one after it differ regardless; the kernel's message was looked for, not counted. | The kernel's count is compared across the restore; and one image restored twice must give two different first readings of the stream. | Live: `TestVMMemoryResume`, `TestVMMemoryRestoresOfOneImageReadTwoRandomStreams`. |
+| **Nits.** The raw key stayed in memory after the daemon dropped it; a sealed image stayed mounted with its key loaded at rest; a stale restore inbox was not shown to be swept; the proxy environment of restored processes was not written down; the flag off on a host that ran with it on was not written down. | The key is zeroed where it lay; an image is closed at rest; the rest is above. | `TestAMemoryImageIsAnEncryptedDatasetSealedReadOnlyAndNamedByTheRecord`, `TestASealedImageIsClosedAtRestAndOpenedByAResume`, `TestSweepOnlyKillsVMsOfThisDaemonIdentity`, `TestWithTheFlagOffARegistryThatNamesImagesStaysSane`. |
+
+Live, on the laptop, on the tree with all of the above (2026-11-27):
+`TestVMMemoryImagesOnARealPool` passed as root (the image closed at rest,
+the plain send refused "dataset key must be loaded", the raw one
+accepted, the next life opening it); `TestVMMemoryResume` and
+`TestVMMemoryRestoresOfOneImageReadTwoRandomStreams` passed with both
+goldens, the kernel's count of reseeds growing by one at every restore
+from memory and the run's `memory.max` an image's size wider across two
+stops and the VM's own after. Two things were found on the way and
+fixed: the suite's own check that tells a guest booted from the disk
+from a restored one took its own `grep` for the saved process when their
+pids coincided, and fault 10 above, the memory limit.

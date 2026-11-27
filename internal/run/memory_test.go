@@ -613,6 +613,10 @@ func TestAStopEvictsJustEnoughImagesToMakeRoomForItsOwn(t *testing.T) {
 	// evicts nothing, for all that the pool is below its reserve. Its
 	// own image could not be saved into such a pool either, so nothing
 	// would have been gained by dropping the others for it.
+	// A minute on, so that this stop is the later of the two: two stops
+	// at one instant have no oldest between them, and which the reaper
+	// drops first is then the map's to say.
+	clock.advance(time.Minute)
 	keeper.memoryMB = 1024
 	free = 0
 	doomed := mustCreate(t, m, CreateRequest{Limits: &Limits{MemoryMB: 1024}})

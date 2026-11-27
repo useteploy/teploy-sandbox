@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 var bg = context.Background()
@@ -734,4 +735,174 @@ func TestCaptureRollsBackAStepThatFailedAfterTakingEffect(t *testing.T) {
 			t.Errorf("%s: run volume origin changed to %q", step, fake.originOf(volume))
 		}
 	}
+}
+
+// The VM's resume between a capture's two storage steps is not on their
+// clock. After a hypervisor snapshot that did not answer, a stop's resume
+// waits for it (up to snapshotTimeout, two minutes and more): the clone
+// and the promote that follow still get a budget of their own, or the
+// disk snapshot would have been taken and thrown away.
+func TestACapturesCloneAndPromoteAreNotTimedOutByTheVMsResume(t *testing.T) {
+	volume := testPool + "/" + runName(1)
+	fake := newFakeZFS()
+	// The pool as the zfs command is under a context: nothing starts
+	// once it has run out.
+	z := &cliZFS{fakeZFS: fake, after: map[string]func(){}}
+	v := newTestVolumes(fake)
+	v.zfs = z
+	v.captureTimeout = 60 * time.Millisecond
+	mustCreate(t, v, runName(1), "")
+	ref := v.NewRef(refID(1))
+	resumed := 0
+	err := v.Capture(bg, runName(1), ref, func() (func() error, error) {
+		return func() error {
+			resumed++
+			time.Sleep(4 * v.captureTimeout)
+			return nil
+		}, nil
+	})
+	must(t, err)
+	if resumed != 1 {
+		t.Fatalf("resumed %d times", resumed)
+	}
+	// The reference is on the pool and usable, exactly as after any capture.
+	assertPool(t, fake, append([]string{volume, datasetOf(ref), ref}, pristine...)...)
+	if fake.originOf(volume) != ref {
+		t.Fatalf("the run volume's origin is %q", fake.originOf(volume))
+	}
+	mustCreate(t, v, runName(2), ref)
+}
+
+// A capture's quiesce can be long: with memory images the hypervisor
+// writes all of guest RAM while the VM is paused. It runs before the
+// pool's lock is taken, so that another run's volume can be made, or
+// removed, meanwhile; the storage steps, and they alone, are under the
+// lock (the resume between them is the next test).
+func TestACapturesQuiesceDoesNotHoldThePool(t *testing.T) {
+	z := newFakeZFS()
+	v := newTestVolumes(z)
+	if _, err := v.CreateRun(bg, runName(1), ""); err != nil {
+		t.Fatal(err)
+	}
+	ref := v.NewRef(refID(1))
+	inQuiesce, release := make(chan struct{}), make(chan struct{})
+	captured := make(chan error, 1)
+	go func() {
+		captured <- v.Capture(bg, runName(1), ref, func() (func() error, error) {
+			close(inQuiesce)
+			<-release
+			return func() error { return nil }, nil
+		})
+	}()
+	<-inQuiesce
+	// Another run's volume comes and goes while the first is held still.
+	done := make(chan error, 1)
+	go func() {
+		_, err := v.CreateRun(bg, runName(2), "")
+		if err == nil {
+			err = v.RemoveRun(bg, runName(2))
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		must(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("another run's volume waited for a capture's quiesce: the pool's lock is held while the VM is quiesced")
+	}
+	close(release)
+	must(t, <-captured)
+	assertPool(t, z, testPool+"/golden", testGolden, testPool+"/"+runName(1), datasetOf(ref), ref)
+}
+
+// A capture's resume can be as long as its quiesce. A stop that saves
+// the VM's memory seals the image there and then wakes the VM, which
+// after a vm.snapshot that did not answer waits for the snapshot still
+// being written, for minutes. The resume runs with the pool's lock let
+// go: only the storage is under it, and another run's volume comes and
+// goes while the first run's is being resumed. (Found independently by
+// two reviews of the first cut, together with the quiesce.)
+func TestACapturesResumeDoesNotHoldThePool(t *testing.T) {
+	z := newFakeZFS()
+	v := newTestVolumes(z)
+	if _, err := v.CreateRun(bg, runName(1), ""); err != nil {
+		t.Fatal(err)
+	}
+	ref := v.NewRef(refID(1))
+	inResume, release := make(chan struct{}), make(chan struct{})
+	captured := make(chan error, 1)
+	go func() {
+		captured <- v.Capture(bg, runName(1), ref, func() (func() error, error) {
+			return func() error {
+				close(inResume)
+				<-release
+				return nil
+			}, nil
+		})
+	}()
+	<-inResume
+	// The gap as it is on the pool: the snapshot is on the run's volume,
+	// and the holder is not made yet.
+	if !z.has(t, testPool+"/"+runName(1)+"@"+refID(1)) || z.has(t, datasetOf(ref)) {
+		t.Fatalf("the pool holds %v in the gap", z.names())
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := v.CreateRun(bg, runName(2), "")
+		if err == nil {
+			err = v.RemoveRun(bg, runName(2))
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		must(t, err)
+	case <-time.After(2 * time.Second):
+		close(release)
+		<-captured
+		t.Fatal("another run's volume waited for a capture's resume (seal + vm.resume, up to snapshotTimeout after a stalled snapshot): the pool's lock is held across it")
+	}
+	close(release)
+	must(t, <-captured)
+	assertPool(t, z, testPool+"/golden", testGolden, testPool+"/"+runName(1), datasetOf(ref), ref)
+}
+
+// The one thing that would meet the gap's snapshot is a removal of the
+// run's own volume. The manager never asks for one while it holds the run
+// for a capture; were one to come, the capture fails at its clone and
+// leaves nothing, which is what a removal during a capture means.
+func TestACaptureWhoseVolumeIsRemovedInTheGapFailsAndLeavesNothing(t *testing.T) {
+	z := newFakeZFS()
+	v := newTestVolumes(z)
+	if _, err := v.CreateRun(bg, runName(1), ""); err != nil {
+		t.Fatal(err)
+	}
+	ref := v.NewRef(refID(1))
+	inResume, release := make(chan struct{}), make(chan struct{})
+	captured := make(chan error, 1)
+	go func() {
+		captured <- v.Capture(bg, runName(1), ref, func() (func() error, error) {
+			return func() error {
+				close(inResume)
+				<-release
+				return nil
+			}, nil
+		})
+	}()
+	<-inResume
+	removed := make(chan error, 1)
+	go func() { removed <- v.RemoveRun(bg, runName(1)) }()
+	select {
+	case err := <-removed:
+		must(t, err)
+	case <-time.After(2 * time.Second):
+		close(release)
+		<-captured
+		t.Fatal("the run's own volume could not be removed in a capture's gap")
+	}
+	close(release)
+	if err := <-captured; err == nil {
+		t.Fatal("a capture whose volume was removed before its clone succeeded")
+	}
+	assertPool(t, z, pristine...)
 }

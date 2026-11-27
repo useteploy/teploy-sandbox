@@ -11,6 +11,7 @@ import (
 	"maps"
 	"net"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -42,6 +43,11 @@ type fakeZFS struct {
 	// blockClone, when not nil, is consumed by the next Clone, which
 	// waits for it to close (or its context to end) and then fails.
 	blockClone chan struct{}
+	// hold makes the next call of a given name ("destroy pool/x",
+	// "createfs pool/x", "load-key pool/x", "mount pool/x") signal
+	// reached, then wait until release is closed: a host command that
+	// takes as long as a test likes.
+	hold map[string]holdPoint
 	// poolProps are the properties set on the pool, which a volume
 	// without its own value inherits.
 	poolProps map[string]string
@@ -51,6 +57,9 @@ type fakeZFS struct {
 	// dataset it was asked about.
 	available, used int64
 	spaceAsked      string
+	// fsCalls are the mounts and key loads of filesystems: they change
+	// nothing in the pool, so they are not among calls.
+	fsCalls []string
 	// receiveAnything turns off Receive's check of a stream's first
 	// record: for tests of what holds when that check is not there.
 	receiveAnything bool
@@ -60,8 +69,14 @@ type fakeDataset struct {
 	origin string
 	props  map[string]string
 	files  map[string][]byte
-	// filesystem: not a volume. The driver makes none; a stream can.
+	// filesystem: not a volume. The driver makes only memory images;
+	// a stream can.
 	filesystem bool
+	// For a filesystem that is an encryption root: its raw key, whether
+	// the kernel has it (LoadKey), and whether it is mounted.
+	fsKey       []byte
+	fsKeyLoaded bool
+	fsMounted   bool
 }
 
 type fakeSnapshot struct {
@@ -80,13 +95,37 @@ const (
 
 // newFakeZFS has a pool with an unowned golden volume and snapshot.
 func newFakeZFS() *fakeZFS {
-	z := &fakeZFS{datasets: map[string]*fakeDataset{}, snapshots: map[string]*fakeSnapshot{}, fail: map[string]error{}, poolProps: map[string]string{propVolmode: volmodeDev}}
+	z := &fakeZFS{datasets: map[string]*fakeDataset{}, snapshots: map[string]*fakeSnapshot{}, fail: map[string]error{}, poolProps: map[string]string{propVolmode: volmodeDev}, hold: map[string]holdPoint{}}
 	z.datasets[testPool+"/golden"] = &fakeDataset{props: map[string]string{}, files: map[string][]byte{}}
 	z.snapshots[testGolden] = &fakeSnapshot{txg: z.tick(), guid: z.newGUID(), props: map[string]string{}, files: map[string][]byte{}}
 	return z
 }
 
 func (z *fakeZFS) tick() int { z.txg++; return z.txg }
+
+// holdPoint is where a held call is: reached is closed once it has
+// begun, and it goes on when release is closed.
+type holdPoint struct{ reached, release chan struct{} }
+
+func newHoldPoint() holdPoint {
+	return holdPoint{reached: make(chan struct{}), release: make(chan struct{})}
+}
+
+// pause is what a held call does: nothing, unless the next call of this
+// name is held.
+func (z *fakeZFS) pause(call string) {
+	z.mu.Lock()
+	point, held := z.hold[call]
+	if held {
+		delete(z.hold, call)
+	}
+	z.mu.Unlock()
+	if !held {
+		return
+	}
+	close(point.reached)
+	<-point.release
+}
 
 // newGUID is unique to a pool: guidBase tells two fake pools apart.
 func (z *fakeZFS) newGUID() string {
@@ -288,6 +327,7 @@ func (z *fakeZFS) Promote(_ context.Context, name string) error {
 }
 
 func (z *fakeZFS) Destroy(_ context.Context, name string) error {
+	z.pause("destroy " + name)
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	if err := z.record("destroy " + name); err != nil {
@@ -301,7 +341,8 @@ func (z *fakeZFS) Destroy(_ context.Context, name string) error {
 		return nil
 	}
 	if _, ok := z.datasets[name]; !ok {
-		return fmt.Errorf("cannot open '%s': dataset does not exist", name)
+		// As the real one: a command's failure, which isMissing knows.
+		return zfsError(fmt.Sprintf("cannot open '%s': dataset does not exist", name))
 	}
 	for snapshot := range z.snapshots {
 		if datasetOf(snapshot) == name {
@@ -327,6 +368,27 @@ func (z *fakeZFS) Property(_ context.Context, name, key string) (string, error) 
 		}
 		if value, ok := dataset.props[key]; ok {
 			return value, nil
+		}
+		// What zfs reports of an encrypted filesystem, as zfs get does.
+		if dataset.filesystem {
+			switch key {
+			case propMounted:
+				if dataset.fsKey == nil {
+					return "-", nil
+				}
+				if dataset.fsMounted {
+					return "yes", nil
+				}
+				return "no", nil
+			case propKeyStatus:
+				if dataset.fsKey == nil {
+					return "-", nil
+				}
+				if dataset.fsKeyLoaded {
+					return "available", nil
+				}
+				return "unavailable", nil
+			}
 		}
 	}
 	return z.poolProps[key], nil
@@ -536,6 +598,17 @@ type fakeHypervisor struct {
 	// zfsCallsAtSweep is how many zfs mutations had happened when the
 	// process sweep ran.
 	zfsCallsAtSweep int
+	// restored are the restore starts, in order (Restore); startErr
+	// makes the next one fail before there is a machine, and
+	// startedErr makes it fail after one was started, which is handed
+	// back with the error.
+	restored   []RestoreConfig
+	restoreErr error
+	startedErr error
+	// outboxes: every booted VM's jail holds an outbox, at a directory
+	// under outboxRoot, as it does when the driver keeps memory images.
+	outboxes   bool
+	outboxRoot string
 }
 
 func newFakeHypervisor(z *fakeZFS) *fakeHypervisor {
@@ -553,6 +626,11 @@ func (h *fakeHypervisor) Start(_ context.Context, config MachineConfig) (Machine
 		config: config, zfs: h.zfs, volume: strings.TrimPrefix(config.Disk, h.deviceDir+"/"),
 		exited: make(chan struct{}), pingErr: h.bootErr, gate: h.bootGate, hypervisor: h,
 	}
+	if h.outboxes {
+		// The jail's outbox, made by the confinement on the host.
+		machine.outbox = filepath.Join(h.outboxRoot, config.Name, outboxName)
+		_ = os.MkdirAll(machine.outbox, 0o755)
+	}
 	h.booting++
 	h.peak = max(h.peak, h.booting)
 	if h.dieOnBoot {
@@ -568,6 +646,40 @@ func (h *fakeHypervisor) Start(_ context.Context, config MachineConfig) (Machine
 	return machine, nil
 }
 
+// Restore is a hypervisor started for a restore: its API is up, and
+// its machine has no VM until Machine.Restore.
+func (h *fakeHypervisor) Restore(_ context.Context, config RestoreConfig) (Machine, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.restoreErr != nil {
+		err := h.restoreErr
+		h.restoreErr = nil
+		return nil, err
+	}
+	h.restored = append(h.restored, config)
+	machine := &fakeMachine{
+		config: config.MachineConfig, zfs: h.zfs, volume: strings.TrimPrefix(config.Disk, h.deviceDir+"/"),
+		exited: make(chan struct{}), up: true, hypervisor: h,
+		inbox: "/run/sbx/abc/" + config.Name + inboxSuffix, imageDir: config.ImageDir,
+	}
+	if h.outboxes {
+		// A restored VM's jail has an outbox too: it may be stopped
+		// again with its memory saved.
+		machine.outbox = filepath.Join(h.outboxRoot, config.Name, outboxName)
+		_ = os.MkdirAll(machine.outbox, 0o755)
+	}
+	if h.onStart != nil {
+		h.onStart(machine)
+	}
+	h.machines[config.Name] = machine
+	if h.startedErr != nil {
+		err := h.startedErr
+		h.startedErr = nil
+		return machine, errors.Join(errors.New("the hypervisor's API did not answer within 10s"), err)
+	}
+	return machine, nil
+}
+
 func (h *fakeHypervisor) Sweep(context.Context) (int, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -576,6 +688,27 @@ func (h *fakeHypervisor) Sweep(context.Context) (int, error) {
 	h.zfsCallsAtSweep = len(h.zfs.calls)
 	h.zfs.mu.Unlock()
 	return 0, h.sweepErr
+}
+
+// mounted says that a mount under a VM's outbox appeared in its jail,
+// or went: what a slave bind of the outbox does on a real host.
+func (h *fakeHypervisor) mounted(target string, on bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, machine := range h.machines {
+		if machine.outbox != "" && strings.HasPrefix(target, machine.outbox+string(filepath.Separator)) {
+			machine.mu.Lock()
+			if on {
+				if machine.mounts == nil {
+					machine.mounts = map[string]bool{}
+				}
+				machine.mounts[target] = true
+			} else {
+				delete(machine.mounts, target)
+			}
+			machine.mu.Unlock()
+		}
+	}
 }
 
 func (h *fakeHypervisor) machine(name string) *fakeMachine {
@@ -611,6 +744,8 @@ type fakeMachine struct {
 	mu     sync.Mutex
 	dead   bool
 	paused bool
+	// resumeErr is what Resume answers; nil resumes.
+	resumeErr error
 	// gone: the process is dead and its sockets fail, while exited may
 	// not be closed yet (die).
 	gone     bool
@@ -650,6 +785,42 @@ type fakeMachine struct {
 	// connectFunc answers a connect (guest protocol v2); nil is an agent
 	// older than v2.
 	connectFunc func(port int) (net.Conn, error)
+
+	// Memory images: where the VM's outbox and, for a restored VM, its
+	// image are; how its snapshot and restore answer.
+	outbox, inbox, imageDir string
+	snapshotErr             error
+	// limitsRaised is every number of bytes the daemon asked to add to
+	// the VM's memory limit, in order, limitsRestored how often it asked
+	// for the limit back, and widened is by how much the limit stands
+	// raised now; limitRaiseErr and limitRestoreErr are what the next of
+	// each answers.
+	limitsRaised                   []int64
+	limitsRestored                 int
+	widened                        int64
+	limitRaiseErr, limitRestoreErr error
+	// snapshotHook runs once the snapshot's files are written, with the
+	// directory they were written to: what a hypervisor the guest took
+	// over may add. snapshotWhilePaused records that the hypervisor was
+	// asked for the memory of a paused VM.
+	snapshotHook                func(dir string)
+	snapshotWhilePaused         bool
+	snapshotCalls, restoreCalls []string
+	restoreErr                  error
+	restoredRequests            []RestoreRequest
+	cowFallsBack, restoredGuest bool
+	mounts                      map[string]bool
+	// restoredOp answers the "restored" handshake op (guest protocol
+	// v3); nil is an agent older than v3.
+	restoredOp func(nowNs int64, entropy []byte) (guest.RestoredResult, error)
+	// entropySeen is what the restored op was given, in order.
+	entropySeen [][]byte
+	// handshake is each guest command the driver ran to bring a
+	// restored guest up to date (its clock and its network device).
+	handshake []string
+	// restoreHook answers those commands; nil succeeds and prints what
+	// a guest that did them would (restoreHookAnswers).
+	restoreHook func(script string, stdout, stderr io.Writer) (int, bool, error)
 }
 
 func (m *fakeMachine) Agent() Agent            { return (*fakeAgent)(m) }
@@ -724,8 +895,10 @@ func (m *fakeMachine) Resume(context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.events = append(m.events, "resume")
-	m.paused = false
-	return nil
+	if m.resumeErr == nil {
+		m.paused = false
+	}
+	return m.resumeErr
 }
 
 func (m *fakeMachine) AddNet(_ context.Context, tap *os.File, mac string) error {
@@ -757,6 +930,121 @@ func (m *fakeMachine) BootRead() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.bootRead
+}
+
+const fakeVMUID = 70123
+
+func (m *fakeMachine) UID() uint32    { return fakeVMUID }
+func (m *fakeMachine) Disk() string   { return m.config.Disk }
+func (m *fakeMachine) Outbox() string { return m.outbox }
+func (m *fakeMachine) Inbox() string  { return m.inbox }
+
+// RaiseMemoryLimit is Machine.RaiseMemoryLimit on a group that takes
+// the limit it is given, unless limitRaiseErr says otherwise.
+func (m *fakeMachine) RaiseMemoryLimit(bytes int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.limitsRaised = append(m.limitsRaised, bytes)
+	if m.limitRaiseErr != nil {
+		return m.limitRaiseErr
+	}
+	m.widened += bytes
+	return nil
+}
+
+func (m *fakeMachine) RestoreMemoryLimit() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.limitsRestored++
+	if m.limitRestoreErr != nil {
+		return m.limitRestoreErr
+	}
+	m.widened = 0
+	return nil
+}
+
+// widenedBy is by how much the VM's memory limit is raised at this
+// moment.
+func (m *fakeMachine) widenedBy() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.widened
+}
+
+// Snapshot writes the three files of a snapshot into the directory the
+// daemon mounted for it, as the hypervisor does, and only while paused.
+func (m *fakeMachine) Snapshot(_ context.Context, destination string) error {
+	m.mu.Lock()
+	if m.dead || m.gone {
+		m.mu.Unlock()
+		return errors.New("connection refused: vm is gone")
+	}
+	m.snapshotCalls = append(m.snapshotCalls, destination)
+	if m.snapshotErr != nil {
+		err := m.snapshotErr
+		m.mu.Unlock()
+		return err
+	}
+	if !m.paused {
+		m.mu.Unlock()
+		return &hypervisorRefusal{action: "vm.snapshot", status: "500 Internal Server Error", body: "Trying to snapshot while VM is running"}
+	}
+	m.snapshotWhilePaused = m.paused
+	m.mu.Unlock()
+	if !m.paused {
+		return errors.New("not paused")
+	}
+	dir := strings.TrimPrefix(destination, "file://")
+	memory, err := os.OpenFile(filepath.Join(dir, imageMemoryFile), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_ = memory.Truncate(int64(m.config.MemoryMB) << 20)
+	memory.Close()
+	_ = os.WriteFile(filepath.Join(dir, imageConfigFile), []byte(`{"cpus":{"boot_vcpus":1}}`), 0o600)
+	_ = os.WriteFile(filepath.Join(dir, imageStateFile), []byte(`{}`), 0o600)
+	if m.snapshotHook != nil {
+		m.snapshotHook(dir)
+	}
+	return nil
+}
+
+// Restore brings the VM back, paused, from its image; the device's tap
+// must be an open descriptor the hypervisor can take.
+func (m *fakeMachine) Restore(_ context.Context, request RestoreRequest) error {
+	m.event("restore")
+	m.mu.Lock()
+	if m.dead || m.gone {
+		m.mu.Unlock()
+		return errors.New("connection refused: vm is gone")
+	}
+	m.restoredRequests = append(m.restoredRequests, request)
+	if m.restoreErr != nil {
+		err := m.restoreErr
+		m.mu.Unlock()
+		return err
+	}
+	if request.NetFD != nil {
+		if _, err := request.NetFD.Stat(); err != nil {
+			m.mu.Unlock()
+			return &hypervisorRefusal{action: "vm.restore", status: "400 Bad Request", body: "the tap is not an open descriptor"}
+		}
+	}
+	m.restoredGuest, m.paused = true, true
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *fakeMachine) MapsFile(hostPath string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.restoredGuest && !m.cowFallsBack && m.imageDir != "" && filepath.Join(m.imageDir, imageMemoryFile) == hostPath
+}
+
+func (m *fakeMachine) HasMount(path string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.mounts[path]
 }
 
 func (m *fakeMachine) Kill(ctx context.Context) error {
@@ -843,6 +1131,24 @@ func (a *fakeAgent) Connect(_ context.Context, port int) (net.Conn, error) {
 	return connect(port)
 }
 
+// Restored answers the "restored" handshake (guest protocol v3). The
+// machine's restoredOp says what the guest did; nil is an agent built
+// before version 3. Every call's entropy is kept, in order.
+func (a *fakeAgent) Restored(_ context.Context, nowNs int64, entropy []byte) (guest.RestoredResult, error) {
+	if err := a.alive(); err != nil {
+		return guest.RestoredResult{}, err
+	}
+	m := (*fakeMachine)(a)
+	m.mu.Lock()
+	op := m.restoredOp
+	a.entropySeen = append(a.entropySeen, bytes.Clone(entropy))
+	m.mu.Unlock()
+	if op == nil {
+		return guest.RestoredResult{}, &guest.Error{Code: guest.CodeUnsupportedVersion, Message: "protocol version 3 is not supported; this agent speaks 1 to 2"}
+	}
+	return op(nowNs, entropy)
+}
+
 func (a *fakeAgent) Sync(context.Context) error {
 	if a.syncErr != nil {
 		return a.syncErr
@@ -860,17 +1166,27 @@ func (a *fakeAgent) Exec(_ context.Context, cmd, cwd string, env map[string]stri
 	}
 	a.mu.Lock()
 	setup := strings.HasPrefix(cmd, guestSetupMark)
-	if setup {
+	handshake := strings.HasPrefix(cmd, restoreClockMark) || strings.HasPrefix(cmd, restoreNetMark)
+	switch {
+	case setup:
 		a.setups = append(a.setups, cmd)
-	} else {
+	case handshake:
+		a.handshake = append(a.handshake, cmd)
+	default:
 		a.execs = append(a.execs, maps.Clone(env))
 	}
-	execFunc := a.execFunc
+	execFunc, restoreHook := a.execFunc, a.restoreHook
 	a.mu.Unlock()
 	if setup && a.setupFunc != nil {
 		return a.setupFunc(cmd, stderr)
 	}
-	if setup {
+	if handshake && restoreHook != nil {
+		return restoreHook(cmd, stdout, stderr)
+	}
+	if setup || handshake {
+		if handshake {
+			restoreHookAnswers(cmd, stdout)
+		}
 		return 0, false, nil
 	}
 	if execFunc != nil {
@@ -953,4 +1269,137 @@ func (z *fakeZFS) liveRefs() []string {
 	}
 	sort.Strings(refs)
 	return refs
+}
+
+// The memory images' half of the fake pool: filesystems that are each
+// their own encryption root, as zfs has them.
+
+func (z *fakeZFS) CreateFilesystem(_ context.Context, name string, props map[string]string, key []byte) error {
+	z.pause("createfs " + name)
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	if err := z.record("createfs " + name); err != nil {
+		return err
+	}
+	parent := name[:strings.LastIndex(name, "/")]
+	if _, ok := z.datasets[parent]; !ok && parent != testPool && parent != "tank" {
+		return fmt.Errorf("cannot create '%s': parent '%s' does not exist", name, parent)
+	}
+	if _, exists := z.datasets[name]; exists {
+		return fmt.Errorf("cannot create '%s': dataset already exists", name)
+	}
+	if key != nil && len(key) != 32 {
+		return errors.New("Raw key too short (expected 32)")
+	}
+	// As zfs does: created mounted at its mountpoint, which it makes.
+	if props["mountpoint"] != "none" {
+		if err := os.MkdirAll(props["mountpoint"], 0o755); err != nil {
+			return err
+		}
+	}
+	z.datasets[name] = &fakeDataset{
+		props: maps.Clone(props), files: map[string][]byte{}, filesystem: true,
+		fsKey: bytes.Clone(key), fsKeyLoaded: key != nil, fsMounted: props["mountpoint"] != "none",
+	}
+	return nil
+}
+
+func (z *fakeZFS) Mount(_ context.Context, name string) error {
+	z.pause("mount " + name)
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.fsCalls = append(z.fsCalls, "mount "+name)
+	dataset, ok := z.datasets[name]
+	if !ok || !dataset.filesystem {
+		return fmt.Errorf("cannot mount '%s': not a filesystem", name)
+	}
+	if dataset.fsMounted {
+		return fmt.Errorf("cannot mount '%s': filesystem already mounted", name)
+	}
+	if dataset.fsKey != nil && !dataset.fsKeyLoaded {
+		return fmt.Errorf("cannot mount '%s': encryption key not loaded", name)
+	}
+	dataset.fsMounted = true
+	return nil
+}
+
+func (z *fakeZFS) Unmount(_ context.Context, name string) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.fsCalls = append(z.fsCalls, "unmount "+name)
+	dataset, ok := z.datasets[name]
+	if !ok || !dataset.fsMounted {
+		return fmt.Errorf("cannot unmount '%s': not currently mounted", name)
+	}
+	dataset.fsMounted = false
+	return nil
+}
+
+func (z *fakeZFS) LoadKey(_ context.Context, name string, key []byte) error {
+	z.pause("load-key " + name)
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.fsCalls = append(z.fsCalls, "load-key "+name)
+	dataset, ok := z.datasets[name]
+	if !ok || dataset.fsKey == nil {
+		return fmt.Errorf("cannot load key for '%s': not an encryption root", name)
+	}
+	if !bytes.Equal(dataset.fsKey, key) {
+		return fmt.Errorf("Key load error: Incorrect key provided for '%s'", name)
+	}
+	if dataset.fsKeyLoaded {
+		return fmt.Errorf("Key load error: Key already loaded for '%s'", name)
+	}
+	dataset.fsKeyLoaded = true
+	return nil
+}
+
+func (z *fakeZFS) UnloadKey(_ context.Context, name string) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.fsCalls = append(z.fsCalls, "unload-key "+name)
+	dataset, ok := z.datasets[name]
+	if !ok || dataset.fsKey == nil {
+		return fmt.Errorf("cannot unload key for '%s': not an encryption root", name)
+	}
+	// As zfs: a dataset with its key loaded has to be unmounted first.
+	if dataset.fsMounted {
+		return fmt.Errorf("cannot unload-key '%s': dataset is mounted", name)
+	}
+	if !dataset.fsKeyLoaded {
+		return fmt.Errorf("Key unload error: Key not loaded for '%s'", name)
+	}
+	dataset.fsKeyLoaded = false
+	return nil
+}
+
+func (z *fakeZFS) CheckKey(_ context.Context, name string, key []byte) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.fsCalls = append(z.fsCalls, "check-key "+name)
+	dataset, ok := z.datasets[name]
+	if !ok || dataset.fsKey == nil {
+		return fmt.Errorf("Key load error: '%s' is not encrypted", name)
+	}
+	if !bytes.Equal(dataset.fsKey, key) {
+		return fmt.Errorf("Key load error: Incorrect key provided for '%s'", name)
+	}
+	return nil
+}
+
+// restoreHookAnswers is what a guest that did the restore handshake
+// says: its clock as it now reads, and that its kernel has the VM
+// Generation ID device. Now is the time the script carries (it steps
+// the clock to that); a test that wants another answer supplies its own
+// hook.
+func restoreHookAnswers(script string, stdout io.Writer) {
+	if strings.HasPrefix(script, restoreClockMark) {
+		if at := strings.Index(script, "date -u -s @"); at >= 0 {
+			rest := script[at+len("date -u -s @"):]
+			if end := strings.IndexAny(rest, " \n"); end > 0 {
+				fmt.Fprintln(stdout, rest[:end])
+			}
+		}
+		fmt.Fprintln(stdout, "vmgenid")
+	}
 }

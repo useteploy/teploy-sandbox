@@ -76,6 +76,16 @@ type jailPath struct {
 	Exec  bool `json:"exec,omitempty"`
 	// Target is what a symlink points to.
 	Target string `json:"target,omitempty"`
+	// Slave keeps the bind a slave of the host's mount of the same
+	// directory: what the daemon mounts below that directory afterwards
+	// appears in the jail too, while nothing below it in the jail reaches
+	// the host (a slave receives; it has no peers of its own). It is for
+	// a directory whose content is mounted while the VM runs: a VM's
+	// outbox, where the daemon mounts each of its memory images for the
+	// moment of the snapshot and takes it away again. A directory only,
+	// and the daemon must have made the host's mount shared
+	// (mountSharedDir) or nothing arrives.
+	Slave bool `json:"slave,omitempty"`
 }
 
 // jailSpec is everything the helper is told.
@@ -127,6 +137,12 @@ func (s jailSpec) validate() error {
 			}
 		default:
 			return fmt.Errorf("%s: no such kind of path: %q", each.Path, each.Kind)
+		}
+		if each.Slave && each.Kind != jailDir {
+			// Only a directory has anything mounted below it, and a file
+			// bound as a slave would be a way to hand the jail a file the
+			// daemon never looked at.
+			return fmt.Errorf("%s: only a directory can be a slave of the host's mount", each.Path)
 		}
 	}
 	return nil

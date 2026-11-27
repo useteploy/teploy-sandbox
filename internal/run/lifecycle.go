@@ -149,7 +149,7 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool, pu
 	if due != nil && !due(current) {
 		return nil, errNotDue
 	}
-	ref, err := m.capture(ctx, current)
+	ref, image, memoryNote, err := m.captureWithMemory(ctx, current)
 	if err != nil {
 		return nil, err
 	}
@@ -173,6 +173,9 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool, pu
 		m.runs[id].accessClosing = false
 		m.mu.Unlock()
 		m.removeImage(ref)
+		// The image was saved beside a snapshot that is thrown away, of a
+		// VM that runs on: nobody's.
+		m.releaseMemory(image)
 		return nil, fmt.Errorf("stop run %s: container not removed, run left running: %w", id, err)
 	}
 	// Only now, with the container provably gone, give back what it held.
@@ -201,6 +204,9 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool, pu
 	live.StoppedAt = &now
 	live.RetainUntil = &retainUntil
 	live.snapshot = ref
+	// What the stop saved of the VM's memory, if anything (memory.go).
+	live.memory, live.memoryNote = image, memoryNote
+	live.resumedFrom = ""
 	released := live.images
 	live.images = nil
 	if m.OffHost != nil {
@@ -217,7 +223,11 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool, pu
 	// Whatever the old container was created from is free to go.
 	m.releaseImages(released)
 	m.persist()
-	m.log.Info("run stopped", "id", id, "snapshot", ref, "retainUntil", retainUntil)
+	if image != nil {
+		m.log.Info("run stopped", "id", id, "snapshot", ref, "retainUntil", retainUntil, "memory", image.ID)
+	} else {
+		m.log.Info("run stopped", "id", id, "snapshot", ref, "retainUntil", retainUntil, "memory", "none", "memoryWhy", memoryNote.reason())
+	}
 	if m.OffHost != nil && publish {
 		// Its outcome is in the run, not in the error: the run is
 		// stopped either way. Detached from the caller: a client that
@@ -335,7 +345,15 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 		limits:  current.limits,
 		user:    current.User,
 		warm:    current.warmReq,
+		memory:  current.memory,
 	})
+	// The image was the record's while the run was stopped; a resume
+	// that tried it, whichever way it went, leaves it released (a VM
+	// restored from it keeps it until it is gone). A resume refused
+	// before it reached the image leaves the image for the next one.
+	if !errors.Is(err, ErrMemoryNotTried) {
+		m.memorySpent(id, current.memory, res.memoryNote)
+	}
 	if err != nil {
 		if leftover != "" {
 			// The container name derives from the run ID, so this one
@@ -363,6 +381,14 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 	live.StoppedAt = nil
 	live.RetainUntil = nil
 	live.runningSince = now
+	// A running run has no memory image; it says how it came back. A
+	// daemon that keeps images says it of every resume, and one that had
+	// no image for this run booted it from its disk like any other.
+	live.memory, live.memoryNote = nil, nil
+	live.resumedFrom = res.resumedFrom
+	if live.resumedFrom == "" && m.MemoryImages != nil {
+		live.resumedFrom = ResumedFromDisk
+	}
 	// The new container was created from the stop snapshot, so the ref
 	// moves from "this run's filesystem" to "an image this run holds".
 	live.snapshot = ""
@@ -403,7 +429,13 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 			m.persist()
 		}
 	}
-	m.log.Info("run resumed", "id", id, "user", res.user, "expiresAt", now.Add(ttl))
+	if res.resumedFrom != "" && res.memoryNote != "" {
+		m.log.Info("run resumed", "id", id, "user", res.user, "expiresAt", now.Add(ttl), "from", res.resumedFrom, "memoryWhy", res.memoryNote)
+	} else if res.resumedFrom != "" {
+		m.log.Info("run resumed", "id", id, "user", res.user, "expiresAt", now.Add(ttl), "from", res.resumedFrom)
+	} else {
+		m.log.Info("run resumed", "id", id, "user", res.user, "expiresAt", now.Add(ttl))
+	}
 	return m.Get(id)
 }
 
@@ -663,6 +695,7 @@ func (m *Manager) destroyStopped(ctx context.Context, current *Run) error {
 	m.mu.Unlock()
 	m.execLog.dropRun(current.ID)
 	m.releaseImages([]string{current.snapshot, current.base})
+	m.releaseMemory(current.memory)
 	m.persist()
 	m.log.Info("stopped run deleted", "id", current.ID, "snapshot", current.snapshot)
 	return nil

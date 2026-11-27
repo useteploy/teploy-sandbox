@@ -21,12 +21,22 @@
 // make one. The client reads that result with MaxV2Frame as its limit,
 // allocating only what has arrived, under ConnectResultTimeout.
 //
+// Version 3 adds op "restored" (Request.V must be 3), for a VM the daemon
+// has just restored from a memory image: the agent sets the guest's wall
+// clock to Request.NowNs, mixes Request.Entropy into the kernel's random
+// pool and reseeds its generator, and answers one 'X' JSON(Result) whose
+// Restored says what it did: whether the guest kernel has the VM
+// Generation ID device (which reseeds the generator on every restore),
+// whether the agent's own reseed worked, and the guest's clock just after
+// it was set, so the daemon can check the step took.
+//
 // Request.V names the protocol version. A server answers a version it
 // does not speak with CodeUnsupportedVersion and its own version, so
-// either side can be upgraded first. A version 2 server still answers
-// every version 1 request as before; a version 1 server refuses
-// "connect" (as a version 2 request), which the daemon reports as a guest
-// agent too old for access.
+// either side can be upgraded first. A version 3 server still answers
+// every version 1 and 2 request as before; an older server refuses
+// "restored" (as a version 3 request) and "connect" (as a version 2
+// request) the same way, which the daemon reports as a guest agent too
+// old for what it asked.
 package guest
 
 import (
@@ -41,13 +51,16 @@ import (
 // ProtocolVersion is the newest version this package speaks. Requests of
 // version 1 are still sent for, and answered for, every op version 1 had,
 // so a daemon with this package drives an agent built before version 2.
-const ProtocolVersion = 2
+const ProtocolVersion = 3
 
 // requestVersion is the version a request for op is sent as: the oldest
 // version that has the op.
 func requestVersion(op string) int {
-	if op == OpConnect {
+	switch op {
+	case OpConnect:
 		return 2
+	case OpRestored:
+		return 3
 	}
 	return 1
 }
@@ -58,6 +71,11 @@ const (
 	MaxV2Frame           = 64 << 10
 	ConnectResultTimeout = 5 * time.Second
 )
+
+// RestoredEntropyBytes is how much entropy a "restored" request carries:
+// 64 bytes of the host's randomness, more than the kernel's generator
+// needs for a reseed.
+const RestoredEntropyBytes = 64
 
 // Port is the vsock port the agent listens on inside the guest.
 const Port = 7440
@@ -93,6 +111,8 @@ const (
 	OpSync  = "sync"
 	// OpConnect is version 2.
 	OpConnect = "connect"
+	// OpRestored is version 3.
+	OpRestored = "restored"
 )
 
 // Request is the first frame of every connection.
@@ -112,6 +132,12 @@ type Request struct {
 
 	// connect: the guest TCP port, 1-65535.
 	Port int `json:"port,omitempty"`
+
+	// restored: the host's wall clock, in nanoseconds since the epoch, and
+	// RestoredEntropyBytes of the host's randomness (JSON carries it as
+	// base64).
+	NowNs   int64  `json:"nowNs,omitempty"`
+	Entropy []byte `json:"entropy,omitempty"`
 }
 
 // Error codes carried in Result.Code.
@@ -142,6 +168,27 @@ type Result struct {
 
 	// ping
 	Agent string `json:"agent,omitempty"`
+
+	// restored
+	Restored *RestoredResult `json:"restored,omitempty"`
+}
+
+// RestoredResult is what the agent did for a "restored" request.
+type RestoredResult struct {
+	// VMGenIDSeen: the guest kernel has a driver bound to the VM
+	// Generation ID device. The hypervisor changes the ID and notifies
+	// the device before a restored VM runs again, and the driver
+	// reseeds the generator on that, so /dev/urandom never continues the
+	// stream the saved memory held. This is the reseed the daemon
+	// requires.
+	VMGenIDSeen bool `json:"vmgenidSeen"`
+	// Reseeded: the agent's own reseed request (RNDRESEEDCRNG) was
+	// honoured. In addition to the kernel's, and no evidence of one: it
+	// comes only once the guest has been running again for as long as
+	// its first answer took.
+	Reseeded bool `json:"reseeded"`
+	// ClockNs is the guest's wall clock just after it was set.
+	ClockNs int64 `json:"clockNs"`
 }
 
 // Error is a failure the agent reported (as opposed to a broken stream).

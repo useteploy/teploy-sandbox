@@ -4564,3 +4564,423 @@ Review of 2026-11-26 (PR #16):
 - Not published: `cmd/teploy-guestd` (the vm driver's guest agent). It is
   still built from source for `scripts/build-golden.sh`.
 - No tag has been pushed.
+
+## 2026-11-26 — VM driver: memory stop and resume (M1 of the fast-resume design), off by default
+
+`--vm-memory-snapshots` has a stop save a VM's memory beside its disk
+snapshot, and a resume on the same host restore the VM from it instead of
+booting it. The design is `FAST_RESUME_FORK_DESIGN_2026-11-21.md` (M1);
+the M0 spike results (`M0_SPIKE_RESULTS_2026-11-24.md`) override it where
+they conflict. Scope is M1 only: no memory fork, no cross-host or off-host
+image, no paused grace. The disk stays the durable truth and every failure
+of an image boots the disk. The flag is off by default; with it off no code
+added here runs, and a VM's jail and command line are what they were.
+
+### What is done
+
+- **The image.** One ZFS filesystem per image under `<pool>/teploy-img`,
+  its own encryption root (`aes-256-gcm`, raw key, `keylocation=prompt`:
+  the key reaches `zfs` on standard input and is written nowhere),
+  `compression=lz4`, `primarycache=metadata`, `quota` = guest + 64 MiB,
+  `exec=off,setuid=off,devices=off`. The registry keeps the key wrapped
+  (AES-256-GCM under `HKDF(host secret, "teploy-sandbox/v2/local-image-wrap")`,
+  AAD `…/v2/local-image/<tenant>/<run>/<image>`), so a registry copied to
+  another host opens none of its images. Per run, never shared. The raw
+  key is zeroed wherever the daemon held it (at the hand-over, when a
+  stop gives an image up, once an open has it mounted; the host's
+  secret once the wrapping key is derived).
+- **An image at rest is closed.** From the hand-over that gives it to
+  the run's record, a sealed image is unmounted and its key unloaded
+  (`memory_images.go`: `handOver` → `close`), as a host's reboot leaves
+  it; a resume opens it again (`ready`: key loaded, then mounted) and it
+  stays open while the VM restored from it lives, which reads its memory
+  through the mount. A sealed image is a guest's memory in clear for
+  whoever can read its mount, and with its key loaded a plain `zfs send`
+  of the image alone carries that clear text off. Closed, zfs refuses
+  that send for want of the key and a raw send (`-w`) goes encrypted:
+  measured on the real pool (`TestVMMemoryImagesOnARealPool`). So the
+  pool is backed up raw either way: a recursive `zfs send -R` of it
+  refuses any encrypted dataset in the tree unless `-w`, its key loaded
+  or not (measured by hand on the test host, ZFS 2.3.9). A close the
+  pool refuses (a descriptor still open in the dataset) is logged and
+  costs nothing: the image stays open and is as usable so. (A review's
+  nit: unload the key after the seal. Done after the seal rather than in
+  it, so the VM's pause is not lengthened by four `zfs` commands.)
+- **Sealing.** After `vm.snapshot` and before the VM runs again, the
+  daemon takes the image out of the VM's outbox, makes its files root's
+  and `0444` through descriptors that follow no link, sets `readonly=on`,
+  and only then looks: exactly the three plain files, one link each,
+  within size limits. Anything else refuses the image and the dataset goes.
+- **The stop.** Agent sync, pause, the hypervisor's `vm.snapshot` into
+  the image (bound under the VM's outbox, where the jail's slave bind
+  shows it), the ZFS snapshot, the seal, resume. Memory and disk are as
+  of one pause. A stop never fails because of memory: no image is a note
+  on the run (`memory: {state: failed, error}`), and only the disk
+  snapshot's error is the stop's.
+- **The resume ladder.** The image is checked (there, sealed, this host
+  class, beside this disk snapshot by guid, the run's size, its key
+  opening under this host's secret), a confined hypervisor is started for
+  the restore, `vm.restore` is asked for `CopyOnWrite` with the run's new
+  tap, and the daemon verifies the mapping actually happened. The guest
+  is then brought up to date: clock stepped to the nanosecond and
+  *checked* to have taken; random state *checked* to have been reseeded
+  by the guest's own kernel, which needs the VM Generation ID driver
+  bound; and the saved network device moved to the run's new address.
+  Any failure boots a **fresh clone** of the disk snapshot and records
+  why; a clone a restored guest wrote to is destroyed, never booted.
+- **The reseed is the kernel's, and its driver is required.** Before a
+  restored VM is let run again Cloud Hypervisor regenerates its VM
+  Generation ID and notifies the guest's ACPI device (`vm.restore`:
+  "Any restore may be a fork, so reseed before the guest runs"). The
+  guest kernel's driver for that device (notify-based since Linux 6.10)
+  reseeds the generator on that interrupt, as soon as the guest runs
+  again. The daemon requires the driver to be bound on both handshake
+  paths, the `restored` op and the script for older agents, and refuses
+  the image without it. The agent's own entropy and `RNDRESEEDCRNG` come
+  in addition and are not evidence: they land only once the guest has
+  been running again for as long as its first answer took (3–5 s on the
+  test host), and whatever read the generator before that read the saved
+  stream over again. That the agent's request was honoured is logged.
+  (A review of the first cut: on the op path the agent's `reseeded` had
+  been accepted instead of the driver.) The reseed is an interrupt after
+  `vm.resume`, so what was mid-flight in the guest at the stop runs out
+  first; that is the kernel's own design for a snapshot restore.
+- **`resumedFrom`** (`memory` | `disk`) on every resumed run, and
+  `memory` on every stopped run, when the daemon keeps images.
+- **Lifetime.** An image is held by the run's record, by a restore under
+  way, and by the VM restored from it; destroyed at zero and only then
+  (the reference count is the only guard, per M0). An image whose
+  unmount or destroy is refused is owed and never forgotten: it is
+  tried again when the VM that wrote or mapped it is gone (`vmGone`, at
+  the end of the stop that made it), and by the reaper, no sooner than a
+  minute after its last attempt (`SweepMemory`). Eviction: no image into
+  a pool below `--remote-pool-reserve`; images leave such a pool
+  oldest-stop-first, before any local copy of a disk snapshot, and a
+  stop makes room for its own image the same way only while dropping
+  images can cover the shortfall. At start the registry names what is
+  kept, the rest goes, and a run whose image is not here stops claiming
+  it.
+- **Invariants kept.** The jail (one more bind, the outbox, a slave of a
+  shared mount; three read-only file binds for an inbox), the per-run
+  UID, both seccomp filters (no new allowed syscall: the daemon's denylist
+  is unchanged and `userfaultfd` is never asked for), Landlock, cgroups,
+  and KSM off (`mergeable=off`, and a saved configuration with
+  `mergeable` on is refused). One cgroup limit moves, and only for the
+  length of a stop that writes an image: fault 10 below. Measured live:
+  no `type=1326` in the kernel log across the suite, no Landlock denial,
+  no mergeable mapping in a restored hypervisor.
+
+### Faults found on the way, and what showed them
+
+Nine faults in the first cut of this branch, which the fakes as they
+stood could not see. Four were shown by running the real hypervisor on
+the x86-64 laptop, where each time the fallback did what it is for (the
+run came back from its disk, the reason in its record and the log); the
+others by reading the hypervisor's source against the code, or by a new
+unit test. A tenth showed only after the reviews' fixes, in the kernel's
+own log of a later live run. Each is fixed here with a test that fails
+without it.
+
+| # | Fault | Found by | Fix and test |
+|---|---|---|---|
+| 1 | The copy-on-write check wanted a **shared** mapping. CH maps the memory file `MAP_PRIVATE`, so every restore that worked would have been refused and the run sent to its disk | CH's source (`mmap_cow_saved_regions`), confirmed live by the restored hypervisor's `rw-p` mapping | `mapsFile` (hypervisor.go) accepts a whole private read-write mapping. `TestMapsFileSeesOnlyAWholeMappingOfTheMemoryFile`, and the fake case "the hypervisor copied the memory instead of mapping it" |
+| 2 | The strict schema of the saved `config.json` did not match what CH v54.1 writes: the debug console's `iobase` (x86_64), the disk's `lock_granularity` (`ByteRange`, the command line's default), and the ids CH gives unnamed devices (`_disk0`, `_vsock1`) | CH's source for the first two; the live run for the ids (the daemon logged the file it refused) | `memory_config.go`; the fixture is now the file CH wrote on the test host. `TestASavedConfigurationIsRewrittenForTheVMThatRestoresIt` |
+| 3 | The VM Generation ID driver was looked for on the ACPI device. The guest kernel (7.2.8) binds a **platform** driver, to the ACPI device's physical node: the agent's handshake op reported it unseen, and the script path for older agents refused every image | Live: every resume from memory was refused with "the guest's kernel has no VM Generation ID device" | `internal/guest/vmgenid.go` looks on the device and its physical node, on every bus; the script also takes the kernel's "crng reseeded due to virtual machine fork" as evidence. `TestVMGenIDIsSeenWhereverTheKernelBindsItsDriver`, `TestTheGuestsProbeSeesTheVMGenerationIDDriverWhereverItIsBound` |
+| 4 | The **host class** was the whole first `/proc/cpuinfo` stanza, which holds `cpu MHz`: no two daemon lives agreed, so every image saved before a restart was refused as another host's (and masked the wrong-key case, since the class is checked first) | Live: a different class at every daemon start | `cpuIdentity` drops the frequency and `bogomips`. `TestImageKeysAndClassAreDerivedAsSpecified` |
+| 5 | Sealing `chmod`ed the image's files **by path**, and chmod follows links. A link the hypervisor left where `state.json` belongs, naming a host file, would have had the daemon (root) change that file's mode | Reading the sealing code | `ownFile` opens with `O_NOFOLLOW` and works through the descriptor; the check reads through an `os.Root`. `TestSealingFollowsNoLinkTheWriterPlanted`; as root on a real dataset in `TestVMMemoryImagesOnARealPool` |
+| 6 | A resume on the `none` tier dereferenced a missing network device | Reading | `macOf`. `TestAStopSavesTheVMsMemoryAndAResumeRestoresTheVMFromIt` |
+| 7 | A stop whose VM was gone asked the VM for a sync, where the snapshot path asks nothing | A new unit test | `SaveMemory` captures a gone VM's disk as it is. The fake case "the VM's process is gone" |
+| 8 | The manager's half of "a resume refused before it reaches the image keeps the image" was missing (the driver marked it; the manager released anyway) | A new unit test in `internal/run`: the driver's own test could not see it, since releasing is the manager's to do | `ResumeWith` honours `ErrMemoryNotTried`. `TestAResumeRefusedBeforeTheImageIsReachedKeepsIt` |
+| 9 | `Volumes.Capture` held the driver's volume lock across the quiesce, which with an image is the whole memory write: one run's stop would have stalled every other run's create, resume and destroy | Reading the capture path | The quiesce runs before the lock. `TestACapturesQuiesceDoesNotHoldThePool` |
+| 10 | **A stop could have its hypervisor killed by the VM's own memory limit midway through the snapshot.** The image is written through the page cache, charged to the VM's group; its dirty pages are not reclaimed without I/O, so with a guest's resident memory near its limit there was no room for them | Live, once in six runs of the suite after the reviews' fixes: `Memory cgroup out of memory: Killed process (cloud-hypervisor)`, a VM restored from an image and stopped again, 476392 kB resident (465 MiB) against the 584 MiB allowed; the stop failed ("resume vm after snapshot: connection refused") and the run was left claiming to run | `SaveMemory` raises the VM's `memory.max` by an image's size for as long as the image is written and puts it back after (`cell.raiseMemoryLimit`); best effort, and said when either fails. The guest's memory is all that group ever needs to hold, so the raised limit covers any image; what a hypervisor taken over could make of the room is bounded by the stop, after which its VM is removed. `TestAStopCoversItsImageInTheVMsMemoryLimitAndNeverFailsForIt`, the stop tests (raised at the snapshot, the VM's own after, for every way a stop goes); live: `TestVMMemoryResume` reads `memory.max` across two stops |
+
+In every case the fallback did what it is for: the run came back from
+its disk, with the reason in its record and the daemon's log.
+
+### The M0-required changes: where, and what covers them
+
+| M0 change | Where | Test |
+|---|---|---|
+| The restoring CH starts without `--landlock`; Landlock comes from the rewritten `config.json` | `CloudHypervisor.Restore` (hypervisor.go): `--api-socket --seccomp true` only; `rewriteMemoryConfig` forces `landlock_enable: true` and one rule, the new outbox | `TestAHypervisorStartedForARestoreIsConfinedAndGivenTheDaemonsConfiguration` (a stand-in process: its command line has no `--landlock`; the inbox holds the rewritten file, root's `0444`); live: a restored VM is stopped again and its hypervisor writes a new snapshot where that configuration allows (`TestVMMemoryResume`) |
+| A slave-mount option in the jail helper, for image datasets only, created with `exec=off,setuid=off,devices=off` | `jailPath.Slave` (jail.go, jail_linux.go: rslave, then non-slave binds back to private); the outbox is a shared bind (confine.go, memory_mount_linux.go); the dataset properties in `begin` (memory_images.go) | `TestJailOutboxReceivesWhatTheHostMountsAndSendsNothingBack` (root, CI's vm-root job); `TestAVMWhoseDriverKeepsImagesGetsAnOutboxAndARestoredOneTheImage`; `TestAMemoryImageIsAnEncryptedDatasetSealedReadOnlyAndNamedByTheRecord`; live on a real pool: the mount shows `nosuid,nodev,noexec`, the outbox is `shared:`, the image appears under it |
+| A precise sub-second guest clock step in the restore handshake | `platformSetClock` (`clock_settime` to the nanosecond, internal/guest/restored_linux.go); `restoreClock` sends the host's time and `clockStepped` checks the guest's reading (restore_guest.go); older agents get `date -u -s @sec.nsec` | `internal/guest/restored_test.go`; `TestTheClockAnswerIsReadStrictly`; `TestAClockThatDidNotTakeTheStepRefusesTheImage`; the fake cases "the guest's clock was not stepped" and "jumped ahead" boot the disk; live: a process in the restored guest writes the time every 0.2 s and its last tick is within 5 s of the host's |
+| No tmpfs staging | An image is only ever a ZFS dataset (`begin` → `zfs create`); there is no other destination | (Absence; the image's dataset is what `TestAMemoryImageIsAnEncryptedDataset…` checks exists) |
+| The restore inbox is three file binds, because the image is sealed | `cell.setInbox` (confine.go): the daemon's `config.json` in a root directory beside the runtime dir, `state.json` and `memory-ranges` bound from the image | `TestAVMWhoseDriverKeepsImagesGetsAnOutboxAndARestoredOneTheImage` (made anew each time, nothing writable or executable); `TestAHypervisorStartedForARestore…` |
+| Verify the copy-on-write mapping happened | `Machine.MapsFile` → `mapsFile`; `restore` refuses the image without it | `TestMapsFileSeesOnlyAWholeMappingOfTheMemoryFile` (against this process's real mappings); the fake case; live: `/proc/<pid>/maps` of the restored hypervisor has the memory file `rw-p` over its whole length |
+| A reference count as the only guard against unmounting a mapped image | `image.held`, `mappers`, `opening`; `settle` destroys at zero only (`memory_images.go`); `kill` → `vmGone` | `TestAnImageLivesWhileItsRecordOrAVMWantsItAndNotAfter`; `TestAResumeRefusedBeforeTheImageIsReachedKeepsItAndAnImageIsNeverShared`; `TestARestartKeepsTheImagesTheRegistryNames`; live: the image outlives the record's release while its VM lives and goes when the VM is destroyed |
+| KSM stays off | `--memory size=…,mergeable=off` (unchanged); the saved configuration's `mergeable` must be off; the jail helper's `PR_SET_MEMORY_MERGE, 0` (unchanged) | `TestMachineArgsAreTheProvenCommandLine`; "mergeable memory" is refused; live: `mergeableMappings` of the restored hypervisor is empty |
+
+### The fallbacks, and their tests
+
+Every one boots a fresh clone of the disk snapshot and records why. With
+the fakes (`internal/vm/restore_test.go`), each a case of
+`TestAResumeWhoseMemoryImageCannotBeUsedBootsFromTheDisk`: the image is
+not on the host; the key is another host's; another host class; saved
+beside another disk; not sealed; a file changed since sealing; the run
+has another size; the image has a network device and the run none; the
+hypervisor cannot start; refuses the restore; dies before it; copied the
+memory instead of mapping it; the VM will not resume; the agent never
+answers; the VM dies under the handshake; the clock was not stepped; the
+clock jumped ahead; the guest kept its random state; the agent reseeded
+the guest but its kernel has no VM Generation ID driver; the handshake
+fails or has no answer; an old agent on a kernel without the driver,
+with the clock not stepped, with a failing or hanging script; the run's
+disk limits cannot be set.
+
+At the stop (`TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk`):
+the VM is gone; the pool below its reserve; its space unreadable; the
+dataset cannot be made; the image does not reach the jail; the hypervisor
+refuses or does not answer; a taken-over hypervisor leaves an extra file
+or a link to a host file; the image cannot be made read-only. And when the
+disk snapshot fails the stop fails, as before, and the image is nobody's.
+
+In the manager (`internal/run/memory_test.go`): a stop without an image
+says why and the run resumes from its disk; a resume that does not use
+the image says why and releases it; one refused before the image keeps
+it; one that fails after trying it leaves the run stopped with the reason.
+
+Live (`TestVMMemoryResume`, on the laptop): a corrupted `state.json`, a
+truncated `memory-ranges`, a missing dataset, the key of another host (a
+daemon restart under another secret), and a registry that claims another
+host class: each resumes from the disk, with the file and without what
+ran before; and after a restart under the same secret, from memory. The
+guest's kernel reseeds at each of those restores from memory (its
+message is counted across the restore). `TestVMMemoryRestoresOfOneImageReadTwoRandomStreams`
+restores one image twice through the driver and gets two different
+first readings of the guest's random stream.
+
+### What was measured (x86-64 test laptop, not representative)
+
+Pentium Silver N5000 (4 cores), 3.7 GiB, eMMC, kernel 6.12.117, ZFS 2.3.9,
+`zfs_arc_max` 256 MiB, Cloud Hypervisor v54.1 static, guest kernel
+7.2.8. One VM of 512 MiB and 1 vCPU at a time. Medians of five, in
+milliseconds (min–max), to the first exec after `resume`:
+
+| | Original golden (agent v1: the script path) | Golden with this release's agent (v3: the op) |
+|---|---|---|
+| **Resume from memory** | **3331** (3215–5224) | **3299** (3234–4842) |
+| Resume from disk (same run, its image removed) | 4790 (4382–5329) | 4415 (4325–5535) |
+| Stop with memory | 3894 (2478–6396) | 4441 (2883–12409) |
+
+Two earlier runs of the same test, before the last fixes (none of which
+touch the timing), agree: 3583 (3396–4794) and 3162 (3138–5704) from
+memory, 4732 and 4692 from the disk. `TestVMMemoryResume` passed whole
+with both goldens on the tree before the reviews.
+
+After the reviews' fixes (2026-11-27), on the same host, one run of ten
+each: resume from memory 3.6 s (3.4–5.4) with the original golden and
+3.6 s (3.2–4.8) with the v3 golden; from the disk 5.0 s (4.8–5.9) and
+5.0 s (4.6–5.5); a stop with memory 6.4 s (3.7–11.4) and 6.6 s
+(3.6–9.1). Closing the image after a stop adds four `zfs` commands
+outside the VM's pause, and the limit that covers the image is written
+before the pause: neither shows in the pause.
+
+What a restore is made of, from the daemon's log (`vm restore steps`),
+across the runs: starting the hypervisor 42–113 ms; `vm.restore` 95–148 ms;
+`vm.resume` 2 ms; **the guest's agent's first answer 2.9–4.7 s**; the clock
+step 0.3–1.3 s as a script, 0.08–0.5 s through the op.
+
+- The restore proper is about 0.15 s. Nearly all of a resume here is the
+  first contact with the restored guest, which pays its page faults read
+  from the image: the dataset is encrypted with `primarycache=metadata`,
+  so nothing of a freshly written image is cached, and every first touch
+  is a read from the eMMC. Checked: the first ping always ran into its
+  2 s deadline; with a single 10 s allowance it completed by itself in
+  3.3–4.6 s, so the connection is slow, not stuck, and the deadline is
+  left at 2 s (a second ping finds the pages partly in). This matches
+  M0's cold outliers (2.4–2.9 s) where its medians (≈0.7 s) were warm.
+- So on this host memory resume is 1.3–1.4× faster than disk to first
+  exec, not the 5× of M0's warm figures. The design's targets (≤150 ms
+  `none`, ≤250 ms networked) are not met here and were set for a bigger
+  host; whether faster storage closes the gap is unmeasured.
+- A stop with memory pauses the VM for the write: 3–10 s for 512 MiB here
+  (encrypted; M0 measured 1.5–1.8× over lz4 alone on this CPU).
+- A networked run (open tier) is restored onto a new device and reaches
+  the network (`curl http://deb.debian.org/` 200) without a PCI rescan.
+
+The rest of the live suite on this branch (pool off, the original golden,
+off-host tests skipped): 30 pass (lifecycle, confinement, the cgroup
+limits, limits, destroy, network isolation, tiers, fails-closed and
+after a crash, recoverable execs, usage). Three fail for reasons that are
+not this branch's: the two access tests, whose golden there predates
+protocol v2 (they pass against the golden with this release's agent);
+and the two warm-pool tests, which wait for the pool to refill on a host
+with 3.7 GiB and timed out after 10 minutes each (Target 3, Ready 2,
+Booting 0: the host-memory gate). The driver's whole unit-test binary
+also ran as root there, as CI's root job runs it: 310 pass, none skipped;
+after the reviews' fixes, 326 pass, none skipped.
+
+### Not done, and open
+
+- **Resume latency against the targets.** Not met on this host; unmeasured
+  on faster storage. Candidates, none tried: `prefault`-style touching of
+  small guests; `copy` for a guest that will touch most of its RAM anyway;
+  `primarycache=all` on the image datasets (M0 kept `metadata` to avoid
+  double caching). Measure on the bigger host before choosing.
+- **Landlock on a restore comes after the VM is built, and to one
+  thread of the hypervisor (upstream order and design).** Read from
+  Cloud Hypervisor v54.1, `vmm/src/lib.rs`, `Vmm::vm_restore` (lines
+  2081–2158). On `vm.restore` the VMM thread, in this order: parses
+  `config.json` (the daemon's own, rewritten; at most 4 MiB by the
+  daemon's check) and `state.json` (read whole by CH and parsed with
+  `serde_json`; the daemon's sealing bounds it at 64 MiB, and it is the
+  run's own: the image is sealed, per run, and its key opens only under
+  the run's record); checks the saved CPUID against the host's; creates
+  the console devices (for this daemon's configuration, the serial
+  console, which is the hypervisor's own stdout); and runs `Vm::new`,
+  which creates the KVM VM, maps the memory file copy-on-write, rebuilds
+  the devices from their saved state and the vCPUs with their saved
+  registers. **Only then**, if the configuration says `landlock_enable`,
+  `apply_landlock` builds the ruleset and the landlock crate's
+  `restrict_self` applies it to the calling thread, the VMM thread. Then
+  `vm.restore` runs: the disks are locked again, the VM Generation ID is
+  regenerated and the guest's device notified, and the vCPU threads are
+  started, paused. The guest does not run until `vm.resume`, which is
+  the daemon's call, made after its check that the memory was mapped.
+  So **no guest vCPU runs before the ruleset is in place**, and the vCPU
+  threads, started by the VMM thread after it, inherit its ruleset.
+- **Which threads of a restored hypervisor are not under the ruleset:
+  open, carried from M0.** The landlock crate's `restrict_self` is per
+  thread, and nothing is applied before `Vm::new` builds the VM. On a
+  restore these threads therefore run with no Landlock ruleset at all:
+  the HTTP API server, the event monitor and the signal handler, which
+  CH starts before any VM exists and restricts only when `--landlock` is
+  on the command line, which a restore-only start cannot carry (M0, U2:
+  CH refuses it without a payload); and the serial console's manager
+  thread, which `Vm::new` starts before the ruleset. (On a boot,
+  `vm_create` applies the ruleset before `Vm::new`, so everything the
+  VMM thread starts after it inherits it; the three earlier threads get a
+  ruleset of their own from the command line, an empty one, which denies
+  every path.) What holds those threads on a restore is everything but
+  Landlock: the jail (a mount namespace with three read-only file binds
+  and two sockets to its name), the per-run UID, CH's own seccomp filter
+  and the daemon's denylist. Of them only the HTTP server does work of
+  its own, which is to parse the daemon's requests off the API socket
+  and hand them to the VMM thread over a channel: the work of every
+  request (`vm.restore`, `vm.resume`, `vm.snapshot`, `vm.add-net`) runs
+  on the VMM thread, under the ruleset. Shown by M0 (U2: a `vm.snapshot`
+  into a decoy directory outside the rules was refused on a restored
+  VM); **not** shown per thread: that the HTTP API thread is outside the
+  ruleset is what the source says, and what a hypervisor taken over
+  could make of that was not tried live. The product jail has no second
+  writable path, so the live suite shows only that the allowed one works
+  (a restored VM is saved again).
+- **Suggested upstream issue for Cloud Hypervisor (not filed):**
+  "Restore: apply the Landlock ruleset before the VM is built, and to
+  every thread." A hypervisor started for a restore parses
+  snapshot-derived state (tens of MiB of JSON) and maps the memory file
+  before its Landlock ruleset is applied; three of its threads (the HTTP
+  API server, the event monitor, the signal handler) are never under it,
+  since `--landlock` cannot be given without a payload, and a fourth
+  (the serial manager) is started inside `Vm::new`, before it. Proposed:
+  in `vm_restore` (and `vm_receive_config`), apply the configuration's
+  ruleset before `Vm::new`, and have the threads that start before any
+  VM exists restrict themselves when the VM's configuration arrives, or
+  start them after it.
+- **arm64: an image is never used there, as the command line stands.**
+  Not run live. The daemon's arm64 command line has no `acpi=on`, so an
+  arm64 guest has no VM Generation ID device and no driver to reseed on.
+  With the driver now required on both handshake paths, a stop there
+  still saves an image (and pauses the VM for it), but every resume boots
+  from the disk and the run says why; before this change a v3 agent's own
+  reseed was taken as evidence and the image was used. Giving the arm64
+  command line `acpi=on` would let the guest have the device; not tried,
+  there being no arm64 host to run it on, and it being a change to every
+  arm64 boot.
+- **A guest kernel older than 6.10** binds the same driver but has no
+  handler for the hypervisor's notification (it reseeded at boot and on
+  sleep events only): there the driver would be seen, and the reseed at a
+  restore would be the agent's own, late. The guest kernel is the
+  daemon's own (`SBX_VM_KERNEL`; 7.2.8 on the test host), and the live
+  suite checks that it reseeds at a restore, two ways that can fail: the
+  kernel's reseed message is counted before the stop and after the
+  restore and must have grown (`TestVMMemoryResume`), and one image
+  restored twice must give two different first readings of the random
+  stream (`TestVMMemoryRestoresOfOneImageReadTwoRandomStreams`). The
+  earlier check compared one reading before the stop with one after it,
+  which differ whether or not anything reseeded (a review of the first
+  cut), and looked for the message without counting it.
+- **The golden image in use on the test host predates protocol v3**, so
+  the product path (the `restored` op: `clock_settime` to the nanosecond,
+  `RNDADDENTROPY`, `RNDRESEEDCRNG`) ran only against a second golden
+  built from this release's `teploy-guestd` for the occasion. Rebuild
+  the golden when this ships.
+- **`zfs destroy` of a dataset a jailed VM maps was not tried.** The
+  reference count is what keeps the daemon from asking, and it is all
+  that does: M0 (U9) measured that an unmount of an image two jailed VMs
+  had mapped succeeded. A destroy that fails (busy) is owed and never
+  forgotten: tried again when the VM that wrote or mapped the image is
+  gone, and by the reaper once a minute; at a start nothing is owed.
+- **Restored guests' background processes keep the proxy they were
+  started with.** On the allowlist tier a run's egress proxy is opened
+  anew at every resume, with a new port and a new credential
+  (`egress.Pool.OpenFor`: port 0, a random secret), and closed at the
+  stop. The daemon gives the new one to every exec of the run after the
+  resume (`createEnv`), but a process that was saved with the old
+  `HTTP_PROXY`/`HTTPS_PROXY` in its environment is brought back with
+  it: after a restore from memory its egress goes to the run's gateway
+  on a port nothing listens on, or with a credential the proxy no longer
+  knows, and is refused. Closed, not open: only the run's own guest can
+  reach its gateway, and the proxy answers nothing but its own
+  credential. It stays so until the process is started again from an
+  exec of the run; a guest booted from the disk has no such processes.
+  Not measured live (the live suite resumes no allowlist run from memory
+  with a background process of its own). Candidates, none tried: keep
+  the proxy's port and credential across a stop, so that a resume
+  reopens the same and the saved environment works again; a restored
+  guest cannot be made to re-read what its processes inherited.
+- **With the flag off, the images of a host that ran with it on stay on
+  the pool.** A daemon started without `--vm-memory-snapshots` touches
+  none of it: no code of the flag's runs. The registry stays sane, as
+  with the flag on: nothing claims an image once its run has resumed,
+  been stopped again or been destroyed, and a stopped run that still
+  names one goes on naming it, for a later life with the flag on
+  (`TestWithTheFlagOffARegistryThatNamesImagesStaysSane`). But the
+  datasets of the runs that moved on are nobody's until a daemon with
+  the flag on next starts, whose start destroys every image no stopped
+  run names. So turning the flag off never loses an image a stopped run
+  can still use, and costs pool space (what the orphaned images hold)
+  until the flag is on again for one start. **Open:** reclaiming them
+  from a life with the flag off would mean code of the flag running with
+  it off (the driver knowing the image dataset without keeping images);
+  documented in the README instead.
+- **In-flight execs do not survive a stop.** A stop needs an idle run, as
+  before; after a restore the hypervisor resets the guest's vsock
+  connections, and guestd ends the processes of a connection that is gone
+  (M0, U6). W3a's recoverable execs would need an opt-out.
+- **Userspace generators are not reseeded** (design 5.5): the kernel's
+  generator is, and the daemon checks it was.
+
+### Two independent reviews of the first cut (A and B), and what each finding changed
+
+Both reviews were adversarial and run separately on the first cut of the
+branch; where one came with a failing test, that test is in the tree
+under its own name and failed before the fix. Review B's two off-host
+tests passed when written and are kept as evidence
+(`TestAMemoryImageIsNotResumedAfterTheRunMovedHosts`,
+`TestAMemoryImageGoesWhenTheRunIsDestroyedElsewhere`).
+
+| Finding | What changed | Test |
+|---|---|---|
+| **The pool's lock was held across a capture's resume** (A and B, same repro). After the first fix the quiesce ran outside `Volumes.mu`, but what it returned ran inside: for a stop that saves memory that is the image's seal and the VM's resume, which after a `vm.snapshot` that did not answer waits up to `snapshotTimeout` (two minutes and more). Every other run's create, resume and destroy waited behind it. | `Capture` holds the lock for the storage only: the flush and the snapshot, then the clone and the promote, with every rollback; the resume runs between them with no lock (`volumes.go`). In that gap the run's volume holds a snapshot that is nobody's reference; only a removal of that volume could meet it, which the manager never asks for while it holds the run, and which would fail the capture at its clone and roll back. | Both reviews' repro, kept: `TestACapturesResumeDoesNotHoldThePool`. Through the driver: `TestAStopsSealAndResumeDoNotHoldThePoolForOtherRuns`. The gap: `TestACaptureWhoseVolumeIsRemovedInTheGapFailsAndLeavesNothing`. |
+| **One budget for the whole capture** (found with the last). A resume that outlasted it left none for the clone, and the stop failed after its disk snapshot was taken. | Each visit to the storage has a budget of its own. | `TestACapturesCloneAndPromoteAreNotTimedOutByTheVMsResume` |
+| **A restore's clone that could not be removed failed the resume** (B, repro). The deferred removal's error was dropped, the clone stayed, and the disk boot collided with it. Every other way out of `ResumeMemory` was then audited for the class: a hypervisor that could not be given back at once, a rollback on a deadline an earlier one had spent, a disk boot that failed reported with the run's name although nothing was left. | The restore says when its clone would not go; the clone is seen gone before the disk is booted under the same name; a hypervisor that could not be given back is tried once more under a new deadline; every rollback has a deadline of its own; the resume fails with the run's name only when something of it is really left. | Review B's repro, kept: `TestAFailedRestoreNeverKeepsTheResumeFromTheDisk`. The ways such a resume fails: `TestAResumeThatTriedItsImageFailsOnlyWithTheDiskOrWithTheRunsName`. |
+| **Images whose unmount or destroy was refused stayed until a restart** (A, repro). Only `retain`, once per start, retried what was owed. | Each image remembers the VM whose snapshot it is; an owed image is tried again at that VM's end and by the reaper, a minute apart. | Review A's repro, kept: `TestAnImageItsStopGaveUpGoesWhenItsVMIsGone`, and `TestAnImageItsVMKeptBusyGoesWhenItsVMIsGone`; the pacing: `TestOwedImagesAreTriedAgainByTheSweep`; the reaper: `TestTheReaperHasTheImagesThatWouldNotGoTriedAgain`. |
+| **The images' lock was held across the host's commands** (found with the last). Every VM's end comes through the store, and a destroy that waits on a busy dataset waits for seconds. | The lock is taken for bookkeeping only, in every method; the claim (`opening`) keeps two restores of one image apart, and a settling mark keeps two destroys of one image from interleaving. One exception, written on the `image` struct: `bind` and `seal` set `bound` and `sealed`, and are the stop's alone while it holds the image. | `TestNoHostCommandRunsUnderTheImagesLock` |
+| **`makeMemoryRoom` evicted images for one the pool had no room for** (B, repro): with the pool short by more than every image together, the stop dropped all of them and saved none. | The driver says by how many bytes the pool is short (`MemoryShortBy`); another image goes only while the images that could still go cover it, and the pool is asked again after each. The reason an evicted run carries is corrected with it. | Review B's repro, kept: `TestAStopDoesNotEvictImagesItCannotUse`. On the driver's own pool numbers: `TestAStopEvictsNoImageForANewOneThePoolHasNoRoomFor`. With bytes to the pool: `TestAStopEvictsJustEnoughImagesToMakeRoomForItsOwn`. |
+| **The handshake op took the agent's reseed instead of the kernel's driver** (a should-fix). On the v3 path `VMGenIDSeen || Reseeded` was accepted; the agent's reseed lands seconds after the guest runs again. | The kernel's driver is required on both paths. | `TestARestoredGuestsHandshakeNeedsTheKernelsOwnReseed`; the fake case "the agent reseeded the guest, but its kernel has no VM Generation ID driver". |
+| **`mapsFile` accepted any writable mapping**, where its comment said a private one is what a copy-on-write restore is. | Only `rw-p` counts. | `TestMapsFileSeesOnlyAWholeMappingOfTheMemoryFile` |
+| **The live suite's reseed check could not fail.** A reading before the stop and one after it differ regardless; the kernel's message was looked for, not counted. | The kernel's count is compared across the restore; and one image restored twice must give two different first readings of the stream. | Live: `TestVMMemoryResume`, `TestVMMemoryRestoresOfOneImageReadTwoRandomStreams`. |
+| **Nits.** The raw key stayed in memory after the daemon dropped it; a sealed image stayed mounted with its key loaded at rest; a stale restore inbox was not shown to be swept; the proxy environment of restored processes was not written down; the flag off on a host that ran with it on was not written down. | The key is zeroed where it lay; an image is closed at rest; the rest is above. | `TestAMemoryImageIsAnEncryptedDatasetSealedReadOnlyAndNamedByTheRecord`, `TestASealedImageIsClosedAtRestAndOpenedByAResume`, `TestSweepOnlyKillsVMsOfThisDaemonIdentity`, `TestWithTheFlagOffARegistryThatNamesImagesStaysSane`. |
+
+Live, on the laptop, on the tree with all of the above (2026-11-27):
+`TestVMMemoryImagesOnARealPool` passed as root (the image closed at rest,
+the plain send refused "dataset key must be loaded", the raw one
+accepted, the next life opening it); `TestVMMemoryResume` and
+`TestVMMemoryRestoresOfOneImageReadTwoRandomStreams` passed with both
+goldens, the kernel's count of reseeds growing by one at every restore
+from memory and the run's `memory.max` an image's size wider across two
+stops and the VM's own after. Two things were found on the way and
+fixed: the suite's own check that tells a guest booted from the disk
+from a restored one took its own `grep` for the saved process when their
+pids coincided, and fault 10 above, the memory limit.

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -30,6 +31,10 @@ type Agent interface {
 	Exec(ctx context.Context, cmd, cwd string, env map[string]string, timeout time.Duration, stdout, stderr io.Writer) (int, bool, error)
 	WriteFile(ctx context.Context, path string, data io.Reader) error
 	ReadFile(ctx context.Context, path string) ([]byte, error)
+	// Restored is the handshake of a VM restored from a memory image
+	// (guest protocol version 3: the clock stepped, the random state
+	// replaced). An agent older than that answers CodeUnsupportedVersion.
+	Restored(ctx context.Context, nowNs int64, entropy []byte) (guest.RestoredResult, error)
 }
 
 // MachineConfig is one VM to start.
@@ -75,6 +80,42 @@ type Machine interface {
 	// limits (diskLimits.forBoot): what a failed boot cost at the raised
 	// rate. It is for the driver to call before the VM is killed.
 	BootRead() int64
+
+	// The rest is for memory images (memory_images.go), and only a
+	// driver keeping them calls it.
+
+	// Snapshot saves the VM, which must be paused, to the directory at
+	// destination (a file:// URL, as its jail names it): the three
+	// files a memory image is made of.
+	Snapshot(ctx context.Context, destination string) error
+	// Restore brings the VM back from the memory image its hypervisor
+	// was started for. The guest is left paused.
+	Restore(ctx context.Context, request RestoreRequest) error
+	// UID is the user the VM's hypervisor runs as: an image is the
+	// hypervisor's to write until the daemon seals it.
+	UID() uint32
+	// Disk is the VM's disk as its jail names it: the private device
+	// node the saved configuration must name.
+	Disk() string
+	// Outbox is where the daemon mounts the VM's memory images, as its
+	// jail names it; "" when the driver keeps none.
+	Outbox() string
+	// Inbox is the directory a VM restored from a memory image reads it
+	// from, as its jail names it; "" for a booted VM.
+	Inbox() string
+	// RaiseMemoryLimit raises the VM's memory limit by bytes for as long
+	// as its memory image is written, and RestoreMemoryLimit puts it
+	// back (cell.raiseMemoryLimit).
+	RaiseMemoryLimit(bytes int64) error
+	RestoreMemoryLimit() error
+	// MapsFile reports whether the hypervisor process maps the whole of
+	// the file at the host path from the file (a private file mapping,
+	// MAP_PRIVATE): what a copy-on-write restore leaves, and a restore
+	// that copied the memory does not.
+	MapsFile(hostPath string) bool
+	// HasMount reports whether path is a mount point in the
+	// hypervisor's mount namespace.
+	HasMount(path string) bool
 }
 
 // MachineExit is how a VM process ended: killed by Signal, or, when
@@ -128,6 +169,39 @@ type Hypervisor interface {
 	// Sweep kills every VM process this daemon identity owns and clears
 	// their runtime dirs. Returns the number of processes killed.
 	Sweep(ctx context.Context) (int, error)
+	// Restore starts a hypervisor for a VM to be brought back from a
+	// memory image, with nothing of a VM yet but the image's
+	// configuration in its jail, and returns once the hypervisor's API
+	// answers. It is the caller's that calls Machine.Restore.
+	Restore(ctx context.Context, config RestoreConfig) (Machine, error)
+}
+
+// RestoreConfig is one VM to bring back from a memory image.
+type RestoreConfig struct {
+	MachineConfig
+	// ImageDir is where the sealed image's dataset is mounted on the
+	// host. Its state.json and memory-ranges are bound into the VM's
+	// jail, and its config.json is read, checked and rewritten.
+	ImageDir string
+	// SavedDisk is the private device node the saved VM had its disk
+	// at, which the image's configuration must name.
+	SavedDisk string
+	// Networked says the run has a network device, whose address when
+	// the VM was saved was SavedMAC.
+	Networked bool
+	SavedMAC  string
+}
+
+// RestoreRequest is a VM's restore from its memory image.
+type RestoreRequest struct {
+	// SourceURL is the directory the hypervisor reads the image from
+	// (a file:// URL), as its jail names it.
+	SourceURL string
+	// NetFD is the network device's tap, handed over with the request;
+	// nil for a VM without a network device. NetDevice is the
+	// hypervisor's id of the device it belongs to.
+	NetFD     *os.File
+	NetDevice string
 }
 
 // CloudHypervisor runs VMs as cloud-hypervisor processes.
@@ -205,8 +279,8 @@ func (h *CloudHypervisor) machineDir(name string) string { return filepath.Join(
 // VM boots without one, and a run that has a network is given its device
 // afterwards (AddNet), whether its VM was booted for it or kept booted in
 // the warm pool. One way for both, so that a run cannot tell which it got.
-func (h *CloudHypervisor) machineArgs(config MachineConfig, dir string, cid uint32) []string {
-	return []string{
+func (h *CloudHypervisor) machineArgs(config MachineConfig, dir string, cid uint32, outbox string) []string {
+	args := []string{
 		// The kernel as the jail holds it, not as the host does (see
 		// JailKernel): the hypervisor opens it from inside, and its
 		// Landlock rules are made from this path.
@@ -245,6 +319,15 @@ func (h *CloudHypervisor) machineArgs(config MachineConfig, dir string, cid uint
 		"--seccomp", "true",
 		"--landlock",
 	}
+	if outbox != "" {
+		// And the outbox, read-write: the hypervisor writes its memory
+		// snapshots there (the daemon mounts each image below it), and
+		// nowhere else. It is an option of the payload group, so it is
+		// only ever given with a payload: a restore takes its rules from
+		// the rewritten configuration instead.
+		args = append(args, "--landlock-rules", "path="+outbox+",access=rw")
+	}
+	return args
 }
 
 func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Machine, error) {
@@ -274,10 +357,91 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 	cid := 3 + h.nextCID.Add(1)
 	// Not a CommandContext: the VM outlives the request that created it.
 	// It is handed no descriptor beyond its standard three.
-	cmd, err := confined.command(h.Bin, h.Kernel, h.machineArgs(config, dir, cid))
+	cmd, err := confined.command(h.Bin, h.Kernel, h.machineArgs(config, dir, cid, confined.outbox))
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("start hypervisor: %w", err), confined.release(cleanupCtx))
 	}
+	return h.spawn(ctx, cmd, confined, dir, "")
+}
+
+// restoreAPITimeout is how long a hypervisor started for a restore has
+// to open its API socket: it has no VM to boot, only itself to start.
+const restoreAPITimeout = 10 * time.Second
+
+// Restore is Hypervisor.Restore. The hypervisor is started with its API
+// socket and its seccomp filter only: no kernel, disk or memory, since
+// the VM comes from the image, and no --landlock, which Cloud Hypervisor
+// refuses without a payload (measured, M0). The hypervisor's Landlock
+// ruleset comes from the configuration instead, which is why that is
+// the daemon's own, rewritten (rewriteMemoryConfig): landlock_enable
+// on, and one rule, the new VM's outbox.
+func (h *CloudHypervisor) Restore(ctx context.Context, config RestoreConfig) (Machine, error) {
+	if h.confine == nil {
+		return nil, errors.New("refusing to start an unconfined hypervisor")
+	}
+	dir := h.machineDir(config.Name)
+	if len(filepath.Join(dir, vsockSocketName)) > maxSocketPath {
+		return nil, fmt.Errorf("runtime dir %s is too long for a unix socket path", dir)
+	}
+	if err := h.confine.clearDir(dir); err != nil {
+		return nil, err
+	}
+	cleanupCtx := context.WithoutCancel(ctx)
+	confined, err := h.confine.enter(cleanupCtx, config.MachineConfig, dir)
+	if err != nil {
+		return nil, fmt.Errorf("confine hypervisor: %w", err)
+	}
+	if confined.outbox == "" {
+		return nil, errors.Join(errors.New("a VM cannot be restored from a memory image: this driver keeps no memory images"), confined.release(cleanupCtx))
+	}
+	inbox := dir + inboxSuffix
+	if err := confined.setInbox(inbox, config.ImageDir); err != nil {
+		return nil, errors.Join(fmt.Errorf("the restore's inbox: %w", err), confined.release(cleanupCtx))
+	}
+	raw, err := os.ReadFile(filepath.Join(config.ImageDir, imageConfigFile))
+	if err == nil {
+		var rewritten []byte
+		rewritten, err = rewriteMemoryConfig(raw, memoryConfigWant{
+			cpus: config.CPUs, memoryMB: config.MemoryMB, cmdline: h.Cmdline,
+			savedDisk: config.SavedDisk, runtimeRoot: h.RunDir,
+			networked: config.Networked, savedMAC: config.SavedMAC,
+			disk: confined.disk, vsockSocket: filepath.Join(dir, vsockSocketName), outbox: confined.outbox,
+		})
+		if err == nil {
+			// Root's and read-only: the hypervisor reads it through the
+			// jail's bind of it.
+			err = os.WriteFile(filepath.Join(inbox, imageConfigFile), rewritten, 0o444)
+		}
+	}
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("the memory image's configuration: %w", err), confined.release(cleanupCtx))
+	}
+	// Not a CommandContext: the VM outlives the request that restored
+	// it. It is handed no descriptor beyond its standard three.
+	cmd, err := confined.command(h.Bin, h.Kernel, []string{"--api-socket", filepath.Join(dir, apiSocketName), "--seccomp", "true"})
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("start hypervisor: %w", err), confined.release(cleanupCtx))
+	}
+	machine, err := h.spawn(ctx, cmd, confined, dir, inbox)
+	if err != nil {
+		return nil, err
+	}
+	if err := machine.waitAPI(ctx); err != nil {
+		if killErr := machine.Kill(cleanupCtx); killErr != nil {
+			// Still there: handed back, for the caller to keep track of.
+			return machine, errors.Join(err, killErr)
+		}
+		return nil, err
+	}
+	return machine, nil
+}
+
+// spawn starts the hypervisor process of a confined VM and returns its
+// machine. inbox is the directory the image of a restored VM is read
+// from, "" for a booted VM. Whatever was allocated is given back if the
+// process cannot be started.
+func (h *CloudHypervisor) spawn(ctx context.Context, cmd *exec.Cmd, confined *cell, dir, inbox string) (*chMachine, error) {
+	cleanupCtx := context.WithoutCancel(ctx)
 	serial, output := &tailBuffer{limit: outputTail}, &tailBuffer{limit: outputTail}
 	cmd.Stdout, cmd.Stderr = serial, output
 	// Nothing of the daemon's: not its environment, which may hold
@@ -287,7 +451,7 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 	// Should anything else ever hold the output pipes open, the process
 	// exiting still counts as the VM being gone.
 	cmd.WaitDelay = 5 * time.Second
-	err = cmd.Start()
+	err := cmd.Start()
 	confined.started()
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("start hypervisor: %w", err), confined.release(cleanupCtx))
@@ -300,6 +464,7 @@ func (h *CloudHypervisor) Start(ctx context.Context, config MachineConfig) (Mach
 		exited:  make(chan struct{}),
 		serial:  serial,
 		output:  output,
+		inbox:   inbox,
 		agent: &guest.Client{Dial: func(ctx context.Context) (net.Conn, error) {
 			return dialVsockWith(ctx, func(ctx context.Context) (net.Conn, error) {
 				return confined.dial(ctx, filepath.Join(dir, vsockSocketName))
@@ -334,6 +499,9 @@ type chMachine struct {
 	// serial is the end of the guest's console, output the end of what
 	// the hypervisor itself printed.
 	serial, output *tailBuffer
+	// inbox is the directory, as its jail names it, that a VM restored
+	// from a memory image reads it from; "" for a booted VM.
+	inbox string
 
 	killOnce sync.Once
 }
@@ -346,7 +514,11 @@ func (m *chMachine) Resume(ctx context.Context) error { return m.call(ctx, "vm.r
 
 // call makes one request to the hypervisor's REST API on its unix socket.
 func (m *chMachine) call(ctx context.Context, action string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://localhost/api/v1/"+action, nil)
+	return m.callMethod(ctx, http.MethodPut, action)
+}
+
+func (m *chMachine) callMethod(ctx context.Context, method, action string) error {
+	req, err := http.NewRequestWithContext(ctx, method, "http://localhost/api/v1/"+action, nil)
 	if err != nil {
 		return err
 	}
@@ -362,65 +534,232 @@ func (m *chMachine) call(ctx context.Context, action string) error {
 	return nil
 }
 
-// AddNet hot-plugs the VM's network device: the open tap goes to the
-// hypervisor with its add-net request, as an SCM_RIGHTS message on its API
-// socket, the way the hypervisor's own client hands it descriptors. The
-// hypervisor gets a descriptor and never a name, as before: it is in a
-// network namespace that has no interfaces, and it neither creates nor
-// configures one. The guest finds the device on its PCI bus.
-func (m *chMachine) AddNet(ctx context.Context, tap *os.File, mac string) error {
+// request makes one request to the hypervisor's REST API on its unix
+// socket, handing it the open files with the first byte of the request
+// (an SCM_RIGHTS message, the way the hypervisor's own client hands it
+// descriptors), and reads the answer. timeout bounds the answer, and
+// the caller's deadline does too where it is nearer. What answers is
+// the VM's own process, which a guest may have taken over: the
+// connection is made through cell.dial, which checks who listens there,
+// and the answer's status line and headers are read whole with a bound
+// (64 KiB).
+func (m *chMachine) request(ctx context.Context, timeout time.Duration, action string, body any, files ...*os.File) error {
 	conn, err := m.cell.dial(ctx, filepath.Join(m.dir, apiSocketName))
 	if err != nil {
-		return fmt.Errorf("hypervisor vm.add-net: %w", err)
+		return fmt.Errorf("hypervisor %s: %w", action, err)
 	}
 	defer conn.Close()
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
-		return errors.New("hypervisor vm.add-net: the API socket is not a unix socket")
+		return fmt.Errorf("hypervisor %s: the API socket is not a unix socket", action)
 	}
-	deadline := time.Now().Add(pauseTimeout)
+	deadline := time.Now().Add(timeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
 	}
 	_ = conn.SetDeadline(deadline)
-	body, err := json.Marshal(map[string]string{"id": netDeviceID, "mac": mac})
+	payload, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return fmt.Errorf("hypervisor %s: %w", action, err)
 	}
-	request := fmt.Appendf(nil, "PUT /api/v1/vm.add-net HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
-	raw, err := tap.SyscallConn()
+	request := fmt.Appendf(nil, "PUT /api/v1/%s HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", action, len(payload), payload)
+	raw, err := unixConn.SyscallConn()
 	if err != nil {
-		return err
+		return fmt.Errorf("hypervisor %s: %w", action, err)
 	}
 	var written int
 	var writeErr error
-	// The descriptor travels with the first byte of the request: the
-	// hypervisor takes the files a request arrived with.
-	if err := raw.Control(func(fd uintptr) {
-		written, _, writeErr = unixConn.WriteMsgUnix(request, syscall.UnixRights(int(fd)), nil)
-	}); err != nil {
-		return err
+	if len(files) == 0 {
+		if err := raw.Control(func(fd uintptr) {
+			written, writeErr = unixConn.Write(request)
+		}); err != nil {
+			return fmt.Errorf("hypervisor %s: %w", action, err)
+		}
+	} else {
+		fds := make([]int, len(files))
+		for i, file := range files {
+			fds[i] = int(file.Fd())
+		}
+		// The descriptors travel with the first byte of the request: the
+		// hypervisor takes the files a request arrived with. The daemon
+		// keeps its own descriptor; the caller closes it when it likes.
+		if err := raw.Control(func(fd uintptr) {
+			written, _, writeErr = unixConn.WriteMsgUnix(request, syscall.UnixRights(fds...), nil)
+		}); err != nil {
+			return fmt.Errorf("hypervisor %s: %w", action, err)
+		}
 	}
 	if writeErr != nil {
-		return fmt.Errorf("hypervisor vm.add-net: %w", writeErr)
+		return fmt.Errorf("hypervisor %s: %w", action, writeErr)
 	}
 	if written != len(request) {
-		return fmt.Errorf("hypervisor vm.add-net: wrote %d of %d bytes", written, len(request))
+		return fmt.Errorf("hypervisor %s: wrote %d of %d bytes", action, written, len(request))
 	}
-	// Bounded: what answers is the VM's own process, which a guest may
-	// have taken over, and an answer's status line and headers are read
-	// whole. Without a bound, a line that never ends is the daemon's
-	// memory for as long as the deadline lasts.
+	// Bounded: a line that never ends must not be the daemon's memory
+	// for as long as the deadline lasts.
 	resp, err := http.ReadResponse(bufio.NewReader(io.LimitReader(conn, apiAnswerLimit)), nil)
 	if err != nil {
-		return fmt.Errorf("hypervisor vm.add-net: %w", err)
+		return fmt.Errorf("hypervisor %s: %w", action, err)
 	}
 	defer resp.Body.Close()
 	answer, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return &hypervisorRefusal{action: "vm.add-net", status: resp.Status, body: strings.TrimSpace(string(answer))}
+		return &hypervisorRefusal{action: action, status: resp.Status, body: strings.TrimSpace(string(answer))}
 	}
 	return nil
+}
+
+// AddNet hot-plugs the VM's network device: the open tap goes to the
+// hypervisor with its add-net request, as an SCM_RIGHTS message on its
+// API socket, the way the hypervisor's own client hands it descriptors.
+// The hypervisor gets a descriptor and never a name, as before: it is in
+// a network namespace that has no interfaces, and it neither creates nor
+// configures one. The guest finds the device on its PCI bus.
+func (m *chMachine) AddNet(ctx context.Context, tap *os.File, mac string) error {
+	if _, err := tap.Stat(); err != nil {
+		return err
+	}
+	return m.request(ctx, pauseTimeout, "vm.add-net", map[string]string{"id": netDeviceID, "mac": mac}, tap)
+}
+
+// Snapshot has the hypervisor write the paused VM to destination. The
+// hypervisor writes the whole of guest memory, which takes as long as
+// the guest is big: the request is given the caller's whole deadline
+// (the driver's snapshotTimeout), not a pause's.
+func (m *chMachine) Snapshot(ctx context.Context, destination string) error {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return errors.New("a snapshot needs a deadline")
+	}
+	return m.request(ctx, time.Until(deadline), "vm.snapshot", map[string]string{"destination_url": destination})
+}
+
+// Restore brings the VM back from its memory image, copy-on-write, with
+// the network device on the descriptor handed over. The hypervisor
+// falls back to copying the memory silently when a configuration is not
+// eligible; the caller checks what was mapped (MapsFile).
+func (m *chMachine) Restore(ctx context.Context, request RestoreRequest) error {
+	body := map[string]any{
+		"source_url":          request.SourceURL,
+		"memory_restore_mode": "CopyOnWrite",
+		"prefault":            false,
+	}
+	var files []*os.File
+	if request.NetFD != nil {
+		body["net_fds"] = []map[string]any{{"id": request.NetDevice, "num_fds": 1}}
+		files = append(files, request.NetFD)
+	}
+	return m.request(ctx, pauseTimeout, "vm.restore", body, files...)
+}
+
+func (m *chMachine) UID() uint32    { return m.cell.uid }
+func (m *chMachine) Disk() string   { return m.cell.disk }
+func (m *chMachine) Outbox() string { return m.cell.outbox }
+func (m *chMachine) Inbox() string  { return m.inbox }
+
+func (m *chMachine) RaiseMemoryLimit(bytes int64) error { return m.cell.raiseMemoryLimit(bytes) }
+func (m *chMachine) RestoreMemoryLimit() error          { return m.cell.restoreMemoryLimit() }
+
+// waitAPI waits for the hypervisor's API socket to answer vmm.ping.
+func (m *chMachine) waitAPI(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, restoreAPITimeout)
+	defer cancel()
+	var last error
+	for {
+		attempt, cancelAttempt := context.WithTimeout(ctx, time.Second)
+		err := m.callMethod(attempt, http.MethodGet, "vmm.ping")
+		cancelAttempt()
+		if err == nil {
+			return nil
+		}
+		last = err
+		select {
+		case <-m.exited:
+			return fmt.Errorf("the hypervisor exited before its API answered (%s)", m.Diagnostics())
+		case <-ctx.Done():
+			return fmt.Errorf("the hypervisor's API did not answer within %s: %v (%s)", restoreAPITimeout, last, m.Diagnostics())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// MapsFile reports whether the hypervisor's process maps the file at
+// hostPath over its whole length: found by device and inode, so that it
+// holds however the kernel spells the path inside the jail. A
+// copy-on-write restore maps the memory file, privately (MAP_PRIVATE:
+// guest writes never reach the file), where a restore that copied the
+// memory read the file and maps nothing of it.
+func (m *chMachine) MapsFile(hostPath string) bool {
+	info, err := os.Stat(hostPath)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", m.process.Pid))
+	if err != nil {
+		return false
+	}
+	wantDev := fmt.Sprintf("%02x:%02x", deviceMajor(uint64(stat.Dev)), deviceMinor(uint64(stat.Dev)))
+	return mapsFile(raw, wantDev, strconv.FormatUint(uint64(stat.Ino), 10), info.Size())
+}
+
+// mapsFile says whether maps, a /proc/PID/maps, maps the file with the
+// device number dev (as the file spells it, "mm:nm") and the inode ino
+// over at least size bytes, summed over its mappings of that file. Only
+// a private read-write mapping counts (rw-p), which is how the
+// hypervisor maps the guest's memory for a copy-on-write restore. A
+// mapping the process can only read is not one: a restore that copied
+// the memory read the file and maps nothing it writes. A shared one is
+// not one either, and would be worse: what the VM wrote would reach
+// the image.
+func mapsFile(maps []byte, dev, ino string, size int64) bool {
+	var mapped int64
+	for line := range strings.SplitSeq(string(maps), "\n") {
+		fields := strings.Fields(line)
+		// addr perms offset dev inode [pathname]
+		if len(fields) < 5 || fields[1] != "rw-p" || fields[3] != dev || fields[4] != ino {
+			continue
+		}
+		start, end, ok := strings.Cut(fields[0], "-")
+		if !ok {
+			continue
+		}
+		from, err := strconv.ParseInt(start, 16, 64)
+		if err != nil {
+			continue
+		}
+		to, err := strconv.ParseInt(end, 16, 64)
+		if err != nil {
+			continue
+		}
+		if to > from {
+			mapped += to - from
+		}
+	}
+	return mapped >= size
+}
+
+// deviceMajor and deviceMinor are a device number's parts, as
+// /proc/PID/maps spells them (the same packing as deviceKey).
+func deviceMajor(device uint64) uint64 { return device>>8&0xfff | device>>32&^uint64(0xfff) }
+func deviceMinor(device uint64) uint64 { return device&0xff | device>>12&^uint64(0xff) }
+
+// HasMount reports whether path is a mount point in the hypervisor's
+// mount namespace.
+func (m *chMachine) HasMount(path string) bool {
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/mountinfo", m.process.Pid))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if fields := strings.Fields(line); len(fields) > 4 && fields[4] == path {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *chMachine) Booted() error   { return m.cell.booted() }

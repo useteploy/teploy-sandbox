@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -70,6 +71,9 @@ func init() {
 		os.Exit(0)
 	case "fill":
 		probeFill(os.Getenv(jailProbeEnv + "_DIR"))
+		os.Exit(0)
+	case "outbox":
+		probeOutbox(os.Getenv(jailProbeEnv + "_DIR"))
 		os.Exit(0)
 	}
 	report := jailReport{UID: os.Getuid(), GID: os.Getgid(), PID: os.Getpid(), Sockets: map[string]string{}, Writes: map[string]string{}}
@@ -482,4 +486,239 @@ func TestJailNamesAMissingKernelByItsPathInTheJail(t *testing.T) {
 	if strings.Contains(err.Error(), host) || strings.Contains(err.Error(), "/var/lib") || !strings.Contains(err.Error(), JailKernel) {
 		t.Fatalf("the error for a missing kernel: %q, want it to name %s and not the host's path", err, JailKernel)
 	}
+}
+
+// probeOutbox is the jailed program of the outbox test. It says whether
+// it can put anything in its outbox itself (it must not be able to: the
+// outbox is the daemon's), then that it is up, then waits for what the
+// host mounts below the outbox, reads it, and waits for it to go.
+func probeOutbox(dir string) {
+	if file, err := os.Create(filepath.Join(dir, "planted")); err == nil {
+		file.Close()
+		fmt.Println("planted")
+	} else {
+		fmt.Println("refused")
+	}
+	fmt.Println("ready")
+	here := filepath.Join(dir, "probe", "here")
+	wait(20*time.Second, func() bool {
+		raw, err := os.ReadFile(here)
+		if err != nil {
+			return false
+		}
+		fmt.Printf("saw %s\n", strings.TrimSpace(string(raw)))
+		return true
+	})
+	// The file goes with the mount (the empty directory the host made
+	// for it stays until the host removes it).
+	wait(20*time.Second, func() bool {
+		if _, err := os.Stat(here); !os.IsNotExist(err) {
+			return false
+		}
+		fmt.Println("gone")
+		return true
+	})
+}
+
+func wait(limit time.Duration, until func() bool) {
+	deadline := time.Now().Add(limit)
+	for !until() {
+		if time.Now().After(deadline) {
+			fmt.Println("timed out")
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// mountTags says of a line of mountinfo whether the mount is shared and
+// whether it is a slave: the kernel's own record of how mounts propagate.
+func mountTags(line string) (shared, slave bool) {
+	head, _, _ := strings.Cut(line, " - ")
+	fields := strings.Fields(head)
+	for _, field := range fields[min(6, len(fields)):] {
+		shared = shared || strings.HasPrefix(field, "shared:")
+		slave = slave || strings.HasPrefix(field, "master:")
+	}
+	return
+}
+
+// A VM's outbox is bound into its jail as a slave of the host's mount
+// (jailPath.Slave): what the daemon mounts below it while the VM runs
+// appears in the jail, and goes again when the daemon takes it away,
+// which is how a memory image reaches the hypervisor for its snapshot.
+// Nothing goes the other way (the bind is a slave and has no peers of
+// its own), nothing else in the jail receives anything from the host,
+// and the VM cannot put anything in the outbox itself.
+func TestJailOutboxReceivesWhatTheHostMountsAndSendsNothingBack(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("building a jail needs root")
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if libraries, err := hypervisorLibraries(self); err != nil || len(libraries) != 0 {
+		t.Skip("this test binary is not statically linked (build it with CGO_ENABLED=0)")
+	}
+	const uid = 70123
+	base, err := os.MkdirTemp("/tmp", "jail-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(base)
+	if err := os.Chmod(base, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	root, dir, kernel := filepath.Join(base, "mine"+jailRootSuffix), filepath.Join(base, "mine"), filepath.Join(base, "Image")
+	outbox := filepath.Join(dir, outboxName)
+	for _, each := range []string{root, dir} {
+		if err := os.Mkdir(each, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chown(dir, uid, uid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(kernel, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// As the driver makes an outbox: a directory of root's inside the
+	// VM's own directory, made a shared mount.
+	if err := os.Mkdir(outbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := mountSharedDir(outbox); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Unmount(outbox, mntDetach)
+
+	spec := jailFor(root, uid, nil, self, kernel, "/dev/null", dir, nil)
+	for i := range spec.Paths {
+		if spec.Paths[i].Path == kvmDevice {
+			spec.Paths[i].Path = "/dev/zero"
+		}
+	}
+	spec.Paths = append(spec.Paths, jailPath{Path: outbox, Kind: jailDir, Write: true, Slave: true})
+	cmd, err := jailCommand(spec, jailTestCgroup(t), self, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Env = []string{jailProbeEnv + "=outbox", jailProbeEnv + "_DIR=" + outbox}
+	cmd.Dir = "/"
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("jailed probe: %v", err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	lines := bufio.NewReader(pipe)
+	says := func(want string) {
+		t.Helper()
+		got := make(chan string, 1)
+		go func() {
+			line, _ := lines.ReadString('\n')
+			got <- strings.TrimSpace(line)
+		}()
+		select {
+		case line := <-got:
+			if line != want {
+				t.Fatalf("the jailed program said %q, want %q (%s)", line, want, stderr.String())
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("the jailed program did not say %q (%s)", want, stderr.String())
+		}
+	}
+	says("refused")
+	says("ready")
+
+	// The control: on the host the outbox is a shared mount, and the
+	// mount the daemon makes below it is the daemon's own.
+	mine, _ := os.ReadFile("/proc/self/mountinfo")
+	if shared, _ := mountTags(hostMount(mine, outbox)); !shared {
+		t.Fatalf("on the host %s is not a shared mount:\n%s", outbox, mine)
+	}
+	probe := filepath.Join(outbox, "probe")
+	if err := os.Mkdir(probe, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mount("tmpfs", probe, "tmpfs", 0, "mode=0755,size=64k"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(probe, "here"), []byte("from the host"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	says("saw from the host")
+
+	// How the kernel says the jail's mounts propagate, read from the
+	// jailed process's own mountinfo: the outbox a slave and no more,
+	// the image's mount under it a slave, and nothing else shared or
+	// bound to the host.
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/mountinfo", cmd.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outboxLines, probeLines, leaking []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if fields := strings.Fields(line); len(fields) > 4 {
+			switch fields[4] {
+			case outbox:
+				outboxLines = append(outboxLines, line)
+				continue
+			case probe:
+				probeLines = append(probeLines, line)
+				continue
+			}
+		}
+		if line == "" {
+			continue
+		}
+		if shared, slave := mountTags(line); shared || slave {
+			leaking = append(leaking, line)
+		}
+	}
+	if len(outboxLines) != 1 || len(probeLines) != 1 {
+		t.Fatalf("in the jail: outbox %v, the mount below it %v\n%s", outboxLines, probeLines, raw)
+	}
+	if shared, slave := mountTags(outboxLines[0]); shared || !slave {
+		t.Errorf("the jail's outbox is shared %t slave %t, want a slave and nothing more: has it peers, what it mounts would reach the host", shared, slave)
+	}
+	if shared, slave := mountTags(probeLines[0]); shared || !slave {
+		t.Errorf("the mount the host put below the outbox is, in the jail, shared %t slave %t", shared, slave)
+	}
+	if len(leaking) > 0 {
+		t.Errorf("mounts of the jail that still share with or receive from the host:\n  %s", strings.Join(leaking, "\n  "))
+	}
+	t.Logf("in the jail: %s\n          %s", outboxLines[0], probeLines[0])
+
+	// Taking it away reaches the jail too, as the daemon takes an image
+	// back: a plain unmount (measured on Linux 6.12; a lazy one reaches
+	// the jail as well).
+	if err := syscall.Unmount(probe, 0); err != nil {
+		t.Fatal(err)
+	}
+	says("gone")
+	// And the VM put nothing in the outbox: once the host has removed
+	// the mount point it made, there is nothing but that.
+	if err := os.Remove(probe); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(outbox); err != nil || len(entries) != 0 {
+		t.Fatalf("the outbox on the host holds %v (%v)", entries, err)
+	}
+}
+
+// hostMount is the line of a mountinfo for the mount at path.
+func hostMount(mountinfo []byte, path string) string {
+	for _, line := range strings.Split(string(mountinfo), "\n") {
+		if fields := strings.Fields(line); len(fields) > 4 && fields[4] == path {
+			return line
+		}
+	}
+	return ""
 }

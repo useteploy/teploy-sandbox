@@ -139,6 +139,9 @@ func (m *Manager) remotePayloadLocked(current *Run) []byte {
 	// Whether the run moved is this daemon's to know; wherever the record
 	// is read it has moved.
 	record.AccessMoved, record.AccessDirty, record.FirstRecordTried = false, false, false
+	// A memory image is this host's own (memory.go): under this host's
+	// secret, in this host's pool. Another daemon has no use for it.
+	record.Memory = nil
 	payload, err := json.Marshal(record)
 	if err != nil {
 		// A run that was built from validated parts always marshals.
@@ -595,6 +598,9 @@ func (m *Manager) notDurable(id, ref string, known, actual uint64, reason string
 // evictUnderPressure drops local copies of durable stopped runs, the
 // longest stopped first, while the pool is short of space.
 func (m *Manager) evictUnderPressure(ctx context.Context) {
+	// A memory image is the first thing a pool under pressure loses:
+	// before any local copy of a disk snapshot, which is a run's.
+	m.evictMemoryUnderPressure(ctx)
 	pressed, err := m.OffHost.Pressure(ctx)
 	if err != nil || !pressed {
 		return
@@ -656,6 +662,9 @@ func (m *Manager) adopt(ctx context.Context, record RemoteRecord, held bool) (*R
 	stored.State = StateStopped
 	stored.Snapshot = record.Snapshot
 	stored.Images, stored.Base = nil, ""
+	// Never from a record (memory.go); said again here, where a record is
+	// taken, so that one that carries an image still cannot bring one.
+	stored.Memory = nil
 	if held || stored.StoppedAt == nil || stored.RetainUntil == nil {
 		// Stopped as of now, as far as this daemon can say.
 		retain := now.Add(m.StoppedRetention)
@@ -761,11 +770,12 @@ func (m *Manager) forgetHeld(id string) {
 		m.mu.Unlock()
 		return
 	}
-	refs := []string{live.snapshot, live.base}
+	refs, memory := []string{live.snapshot, live.base}, live.memory
 	delete(m.runs, id)
 	m.mu.Unlock()
 	m.execLog.dropRun(id)
 	m.releaseImages(refs)
+	m.releaseMemory(memory)
 	m.persist()
 }
 
@@ -1092,10 +1102,13 @@ func (m *Manager) replaceHeld(id string, adopted *Run) (ahead bool) {
 		}
 		adopted.accessEpoch, adopted.accessPorts, adopted.accessDirty = old.accessEpoch, old.accessPorts, old.accessDirty
 	}
-	released := []string{old.snapshot, old.base}
+	released, memory := []string{old.snapshot, old.base}, old.memory
 	m.runs[id] = adopted
 	m.mu.Unlock()
 	m.releaseImages(released)
+	// The new view is of another stop: the old one's image is paired
+	// with a snapshot the run no longer holds.
+	m.releaseMemory(memory)
 	m.persist()
 	return ahead
 }

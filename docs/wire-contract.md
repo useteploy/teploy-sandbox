@@ -91,6 +91,8 @@ Returned by create, stop, resume and fork, and in `GET /v1/runs`.
 | `lease` | object | Only while a lease is held: `{holder, generation, expiresAt}` |
 | `remote` | object | Only with remote storage, on a stopped run: `{state, generation?, snapshot?, local, storedBytes?, uploadMs?, incremental?, durableAt?, error?}`, `state` one of `pending`, `durable`, `failed`, `superseded` |
 | `access` | object | Only when the daemon has access on (`--access-addr`): `{epoch, ports: [{port, visibility, protocol}], streams}`. See [Access](#access) |
+| `memory` | object | Only when the daemon keeps memory images (`--vm-memory-snapshots`, vm driver), on a stopped run: `{state, image?, error?}`. `state` is `saved` (there is an image, and `image` names it), `failed` (the stop saved none; `error` says why), `evicted` (there was one and it was dropped, or a resume did not use it; `error` says why) or `none` (there is none and this daemon did not record why). An image is a cache: a resume that cannot use it boots the disk, as without one |
+| `resumedFrom` | string | Only when the daemon keeps memory images, on a run that daemon resumed: `memory` (the VM was restored from its image) or `disk` (it was booted from its disk snapshot). Absent on a run that was never resumed |
 
 ### `usage`
 

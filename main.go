@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy-sandbox/internal/egress"
+	"github.com/useteploy/teploy-sandbox/internal/hostsecret"
 	"github.com/useteploy/teploy-sandbox/internal/offhost"
 	"github.com/useteploy/teploy-sandbox/internal/run"
 	"github.com/useteploy/teploy-sandbox/internal/server"
@@ -69,6 +70,7 @@ Usage:
                        [--vm-subnet 10.209.0.0/16] [--vm-dns 192.0.2.53,...] [--vm-open-private]
                        [--vm-disk-mbps 256] [--vm-disk-iops 16000] [--vm-net-mbit 200] [--vm-net-connections 4096]
                        [--vm-max-runs 0] [--vm-warm 2x2048=3,...] [--vm-warm-boots 2] [--vm-warm-headroom-mb 1024]
+                       [--vm-memory-snapshots [--vm-image-dataset POOL/teploy-img] [--remote-host-secret-file PATH]]
                        [--remote-endpoint https://s3.example.com --remote-bucket NAME --remote-key-file PATH
                         [--remote-prefix P] [--remote-region us-east-1] [--remote-path-style]
                         [--remote-access-key ID] [--remote-secret-key-file PATH]
@@ -147,6 +149,12 @@ func serve(args []string) error {
 		"vm driver: host memory (MemAvailable, MiB) the warm pool leaves free beyond a new VM's limit before it boots one; 0 is none")
 	vmBootTimeout := flags.Duration("vm-boot-timeout", envDuration("SBX_VM_BOOT_TIMEOUT", vm.DefaultBootTimeout),
 		"vm driver: how long a new VM may take to answer")
+	vmMemorySnapshots := flags.Bool("vm-memory-snapshots", envBool("SBX_VM_MEMORY_SNAPSHOTS"),
+		"vm driver: at a stop, also save each VM's memory into an encrypted image of its own on the pool, so that a resume on this host restores the VM instead of booting it; the disk snapshot is still taken, and is what a resume falls back to whenever the image cannot be used. Images go from a pool below its reserve, oldest stop first (the --remote-pool-reserve share). Off, nothing is saved")
+	vmImageDataset := flags.String("vm-image-dataset", envOr("SBX_VM_IMAGE_DATASET", ""),
+		"vm driver with --vm-memory-snapshots: the ZFS dataset the memory images are created under, inside the pool (default <vm-pool>/teploy-img)")
+	hostSecretFile := flags.String("remote-host-secret-file", envOr("SBX_REMOTE_HOST_SECRET_FILE", hostsecret.DefaultPath),
+		"a file holding this host's secret (32 random bytes, made 0600 the first time it is needed): what is sealed for this host alone, today the keys of the vm driver's memory images. Keep it outside --state-dir and out of backups; losing it loses nothing durable (every memory image becomes unusable, and the runs resume from their disks)")
 	usageInterval := flags.Duration("usage-interval", envDuration("SBX_USAGE_INTERVAL", 0),
 		"how often each running run's CPU, network and disk usage is sampled into its usage field; 0 (default) samples nothing")
 	recoverableMax := flags.Duration("exec-recoverable-max-timeout", envDuration("SBX_EXEC_RECOVERABLE_MAX_TIMEOUT", run.DefaultRecoverableMaxTimeout),
@@ -175,6 +183,16 @@ func serve(args []string) error {
 	}
 	if *vmUIDBase > 1<<31 {
 		return fmt.Errorf("vm-uid-base: %d is not a usable UID", *vmUIDBase)
+	}
+	if *vmMemorySnapshots {
+		if *driverName != driverVM {
+			return errors.New("vm-memory-snapshots: memory images are the vm driver's (--driver vm)")
+		}
+		// A secret in the state directory would be copied and backed up
+		// with it.
+		if err := hostsecret.Outside(*hostSecretFile, *stateDir); err != nil {
+			return fmt.Errorf("remote-host-secret-file: %w", err)
+		}
 	}
 	if *driverName == driverVM && *cacheRoot != "" {
 		// The warm repo cache is bind-mounted host directories, which a VM
@@ -284,6 +302,9 @@ func serve(args []string) error {
 	// always was; the VM branch replaces every Docker call with a VM.
 	var backend run.Runtime
 	var docker *run.DockerRuntime
+	// memoryKeeper is the driver's keeping of memory images, for one
+	// that keeps them (the vm driver with --vm-memory-snapshots).
+	var memoryKeeper run.MemoryKeeper
 	// snapshots is the driver's snapshots as streams, for remote
 	// storage; nil for a driver that cannot send them anywhere.
 	var snapshots offhost.Snapshots
@@ -317,6 +338,10 @@ func serve(args []string) error {
 				Boots:      *vmWarmBoots,
 				HeadroomMB: vmLimit(*vmWarmHeadroom),
 			},
+			MemorySnapshots: *vmMemorySnapshots,
+			ImageDataset:    *vmImageDataset,
+			HostSecret:      *hostSecretFile,
+			PoolReserve:     *remote.reserve,
 		}, log)
 		if err != nil {
 			return err
@@ -353,6 +378,9 @@ func serve(args []string) error {
 		backend = driver
 		snapshots = driver.Transfer()
 		runtimeName = "cloud-hypervisor"
+		if *vmMemorySnapshots {
+			memoryKeeper = driver
+		}
 		log.Warn("vm driver is experimental: runs run as root in the guest, and warm caches are unavailable",
 			"pool", *vmPool, "golden", *vmGolden, "kernel", *vmKernel, "subnet", *vmSubnet, "openPrivate", *vmOpenPrivate,
 			"diskMBps", *vmDiskMBps, "diskIOPS", *vmDiskIOPS, "netMbit", *vmNetMbit, "netConnections", *vmNetConnections,
@@ -420,6 +448,7 @@ func serve(args []string) error {
 	}
 
 	manager := run.NewManager(backend, log)
+	manager.MemoryImages = memoryKeeper
 	// Access is checked and opened before any run exists: a daemon told
 	// to serve it and unable to refuses to start rather than run without.
 	accessSetup, err := accessFlags.prepare(*driverName, *vmMaxRuns, *vmNetMbit, *stateDir, manager, log)
@@ -503,6 +532,18 @@ func serve(args []string) error {
 		log.Warn("default state dir is not writable: stopped runs do not survive a daemon restart (set --state-dir)", "error", stateDirSkipped)
 	} else {
 		log.Warn("no state dir: stopped runs do not survive a daemon restart")
+	}
+	if memoryKeeper != nil {
+		// Before any run is served, with the registry as it now stands:
+		// the images it names are kept and the rest go (a stop cut short,
+		// a previous life's runs that did not come back).
+		reconcileCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		kept, err := manager.ReconcileMemoryImages(reconcileCtx)
+		cancel()
+		if err != nil {
+			log.Error("memory images: some the registry does not name could not be removed; they are tried again when their VM is gone, and by the reaper", "error", err)
+		}
+		log.Info("vm memory images enabled", "kept", kept)
 	}
 
 	hostname, _ := os.Hostname()

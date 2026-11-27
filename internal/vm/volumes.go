@@ -56,6 +56,10 @@ type Volumes struct {
 	// short; correctness is worth more than interleaving them.
 	mu sync.Mutex
 
+	// captureTimeout bounds each of a capture's two visits to the
+	// storage; zero is defaultCaptureTimeout.
+	captureTimeout time.Duration
+
 	// bases remembers, by guid, the base images found by walking a
 	// volume's origins (see Transfer.BaseOf): a golden image that is no
 	// longer the configured one still has runs descending from it.
@@ -74,12 +78,13 @@ type Volumes struct {
 func NewVolumes(zfs ZFS, root, golden, owner string, log *slog.Logger) *Volumes {
 	return &Volumes{
 		zfs: zfs, root: strings.TrimSuffix(root, "/"), golden: golden, owner: owner, log: log,
-		deviceDir:   "/dev/zvol",
-		waitDevice:  waitForPath,
-		flushDevice: fsyncPath,
-		checkDevice: partitionsHidden,
-		bases:       map[string]string{},
-		receiving:   map[string]int{},
+		deviceDir:      "/dev/zvol",
+		waitDevice:     waitForPath,
+		flushDevice:    fsyncPath,
+		checkDevice:    partitionsHidden,
+		captureTimeout: defaultCaptureTimeout,
+		bases:          map[string]string{},
+		receiving:      map[string]int{},
 	}
 }
 
@@ -225,10 +230,12 @@ func (v *Volumes) liveRef(ctx context.Context, ref string) (bool, error) {
 	return false, nil
 }
 
-// captureTimeout bounds the storage half of a capture, and
-// captureCleanupTimeout the rollback of one that failed.
+// captureTimeout bounds each of a capture's two visits to the pool's
+// storage (the flush and the snapshot; then the clone and the promote),
+// and captureCleanupTimeout the rollback of one that failed. The two
+// visits are budgeted apart: see Capture.
 const (
-	captureTimeout        = 2 * time.Minute
+	defaultCaptureTimeout = 2 * time.Minute
 	captureCleanupTimeout = 30 * time.Second
 )
 
@@ -236,16 +243,41 @@ const (
 // before the snapshot is taken and returns the function that undoes it;
 // the run is only held still for the snapshot itself.
 //
+// The pool's lock is held for the storage and for nothing else. The
+// quiesce runs before it is taken, and what it returns after the
+// snapshot, with the lock let go in between. Either can be long: a stop
+// that also saves the VM's memory has the hypervisor write all of guest
+// RAM while the VM is paused, and what undoes that is the image's seal
+// and the VM's resume, which after a vm.snapshot that did not answer
+// waits for the snapshot still being written (up to snapshotTimeout).
+// Every other volume operation of the driver takes the same lock, so
+// held across either it would keep every other run's create, resume and
+// destroy waiting.
+//
+// What the lock protects stays under it: every change to the clone
+// topology, which is the flush and the snapshot on the run's volume,
+// then the clone and the promote of the holder, and every rollback. In
+// the gap the run's volume holds a snapshot that is nobody's reference.
+// Two operations could meet it there. A second capture of the same run
+// cannot come: the caller admits one capture of a run at a time, so
+// nothing else touches this volume meanwhile. A removal of the volume
+// is never asked for while the manager holds the run for a capture, and
+// were it, the capture would fail at its clone and roll back, which is
+// what a removal during a capture should mean. Everything else works on
+// other volumes, or reaches this one as the clone of a dead snapshot
+// (collect), which it is as much before a capture as in the middle of
+// one.
+//
 // Once the run has been quiesced the capture no longer follows the
-// caller's context: it is a handful of short commands, and a caller that
-// leaves between two of them would otherwise strand a snapshot on the
-// run's volume, or a holder that was cloned and never promoted.
+// caller's context: it is a handful of short commands under a budget of
+// their own, and a caller that leaves between two of them would otherwise
+// strand a snapshot on the run's volume, or a holder that was cloned and
+// never promoted. The storage before the VM's resume and the storage
+// after it are budgeted apart: the resume is not on their clock.
 func (v *Volumes) Capture(ctx context.Context, name, ref string, quiesce func() (resume func() error, err error)) (result error) {
 	if !v.OwnsRef(ref) {
 		return fmt.Errorf("refusing to capture into %q: not a reference minted by this driver", ref)
 	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
 	volume := v.runVolume(name)
 	holder := datasetOf(ref)
 	// The snapshot is taken on the run's volume under the name it will
@@ -256,33 +288,55 @@ func (v *Volumes) Capture(ctx context.Context, name, ref string, quiesce func() 
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), captureTimeout)
-	defer cancel()
+	v.mu.Lock()
+	snapshotCtx, cancelSnapshot := v.budget(ctx)
+	defer cancelSnapshot()
 	// The device flush is what makes "the bytes at this instant" true: the
 	// hypervisor writes through the host's page cache, and a snapshot only
 	// holds what has reached the volume.
 	err = v.flushDevice(v.DevicePath(name))
 	if err == nil {
-		err = v.zfs.Snapshot(ctx, temporary)
+		err = v.zfs.Snapshot(snapshotCtx, temporary)
 	}
+	v.mu.Unlock()
+
+	// The VM's own again, and whatever the quiesce had besides: with no
+	// lock held, for as long as it takes.
 	if resumeErr := resume(); resumeErr != nil {
 		// A run that cannot be woken is the worse failure; report both.
 		err = errors.Join(err, resumeErr)
 	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	if err != nil {
-		return errors.Join(fmt.Errorf("snapshot %s: %w", volume, err), v.abandonCapture(ctx, volume, ref))
+		return errors.Join(fmt.Errorf("snapshot %s: %w", volume, err), v.abandonCapture(snapshotCtx, volume, ref))
 	}
-	if err := v.zfs.Clone(ctx, temporary, holder, v.props(kindSnapshot)); err != nil {
-		return errors.Join(fmt.Errorf("snapshot holder %s: %w", holder, err), v.abandonCapture(ctx, volume, ref))
+	// A budget of its own: the resume above is not on the storage's clock,
+	// and can outlast a whole one.
+	holderCtx, cancelHolder := v.budget(ctx)
+	defer cancelHolder()
+	if err := v.zfs.Clone(holderCtx, temporary, holder, v.props(kindSnapshot)); err != nil {
+		return errors.Join(fmt.Errorf("snapshot holder %s: %w", holder, err), v.abandonCapture(holderCtx, volume, ref))
 	}
-	if err := v.zfs.Promote(ctx, holder); err != nil {
-		return errors.Join(fmt.Errorf("promote %s: %w", holder, err), v.abandonCapture(ctx, volume, ref))
+	if err := v.zfs.Promote(holderCtx, holder); err != nil {
+		return errors.Join(fmt.Errorf("promote %s: %w", holder, err), v.abandonCapture(holderCtx, volume, ref))
 	}
 	// The promote also moved whatever dead snapshots the run's volume was
 	// still holding (pinned by a clone, or left by an interrupted capture);
 	// let them go if nothing needs them.
-	v.collectLogged(ctx, holder)
+	v.collectLogged(holderCtx, holder)
 	return nil
+}
+
+// budget is a deadline of captureTimeout for one visit to the pool's
+// storage, detached from the request that asked for the capture.
+func (v *Volumes) budget(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := v.captureTimeout
+	if timeout <= 0 {
+		timeout = defaultCaptureTimeout
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
 // abandonCapture undoes a capture that failed at any step. It goes by

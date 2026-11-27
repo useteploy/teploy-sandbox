@@ -167,11 +167,17 @@ func TestConnectNeedsVersion2AndOldOpsKeepVersion1(t *testing.T) {
 	if got := ask(Request{V: 2, Op: OpPing}); got.Code != "" {
 		t.Fatalf("a version 2 ping is refused: %+v", got)
 	}
+	if got := ask(Request{V: ProtocolVersion, Op: OpPing}); got.Code != "" {
+		t.Fatalf("a ping at the newest version is refused: %+v", got)
+	}
 	if got := ask(Request{V: 1, Op: OpConnect, Port: 1}); got.Code != CodeUnsupportedVersion {
 		t.Fatalf("a version 1 connect is not refused: %+v", got)
 	}
-	if got := ask(Request{V: 3, Op: OpPing}); got.Code != CodeUnsupportedVersion || got.V != 2 {
-		t.Fatalf("version 3 not refused with the agent's version: %+v", got)
+	if got := ask(Request{V: 2, Op: OpRestored, NowNs: 1, Entropy: make([]byte, RestoredEntropyBytes)}); got.Code != CodeUnsupportedVersion {
+		t.Fatalf("a version 2 restored is not refused: %+v", got)
+	}
+	if got := ask(Request{V: ProtocolVersion + 1, Op: OpPing}); got.Code != CodeUnsupportedVersion || got.V != ProtocolVersion {
+		t.Fatalf("a version beyond the agent's not refused with the agent's version: %+v", got)
 	}
 	if got := ask(Request{V: 2, Op: OpConnect, Port: 70000}); got.Code != CodeBadRequest {
 		t.Fatalf("port 70000 accepted: %+v", got)

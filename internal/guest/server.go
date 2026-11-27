@@ -56,6 +56,20 @@ type Server struct {
 	// ConnectResultTimeout bound. Tests substitute it.
 	DialTCP func(address string) (net.Conn, error)
 
+	// SetClock sets the guest's wall clock (nanoseconds since the epoch);
+	// nil means the platform's clock_settime.
+	SetClock func(nowNs int64) error
+	// AddEntropy mixes bytes into the kernel's random pool, crediting
+	// them as entropy, and asks for a reseed; it reports whether the
+	// reseed request was honoured. Nil means the platform's.
+	AddEntropy func(entropy []byte) (reseeded bool, err error)
+	// VMGenIDSeen reports whether the kernel has the VM Generation ID
+	// device, whose driver reseeds the random pool on every restore. Nil
+	// means the platform's.
+	VMGenIDSeen func() bool
+	// ClockNs reads the guest's wall clock; nil means time.Now.
+	ClockNs func() int64
+
 	// killAfter and maxFile override the TERM-to-KILL grace and the file
 	// size limit in tests.
 	killAfter time.Duration
@@ -203,9 +217,49 @@ func (s *Server) handle(conn io.Reader, out *frameWriter) (Result, net.Conn) {
 		return s.read(out, req), nil
 	case OpConnect:
 		return s.connect(req)
+	case OpRestored:
+		return s.restored(req), nil
 	default:
 		return failure(CodeBadRequest, "unknown op %q", req.Op), nil
 	}
+}
+
+// restored is the handshake of a restored VM: the clock is stepped to the
+// time the daemon sent, the entropy is added and the generator reseeded,
+// and the answer says what became of it. A clock that cannot be set is a
+// failure: a guest left with the clock of its saved memory would verify
+// no certificate.
+func (s *Server) restored(req Request) Result {
+	if req.NowNs <= 0 {
+		return failure(CodeBadRequest, "restored needs the host's time (nowNs), in nanoseconds since the epoch")
+	}
+	if len(req.Entropy) != RestoredEntropyBytes {
+		return failure(CodeBadRequest, "restored needs %d bytes of entropy, got %d", RestoredEntropyBytes, len(req.Entropy))
+	}
+	setClock := s.SetClock
+	if setClock == nil {
+		setClock = platformSetClock
+	}
+	if err := setClock(req.NowNs); err != nil {
+		return failure(CodeInternal, "set the clock: %v", err)
+	}
+	addEntropy := s.AddEntropy
+	if addEntropy == nil {
+		addEntropy = platformAddEntropy
+	}
+	reseeded, err := addEntropy(req.Entropy)
+	if err != nil {
+		return failure(CodeInternal, "add entropy: %v", err)
+	}
+	seen := s.VMGenIDSeen
+	if seen == nil {
+		seen = platformVMGenIDSeen
+	}
+	clock := s.ClockNs
+	if clock == nil {
+		clock = func() int64 { return time.Now().UnixNano() }
+	}
+	return Result{Restored: &RestoredResult{VMGenIDSeen: seen(), Reseeded: reseeded, ClockNs: clock()}}
 }
 
 // connect dials the guest port: 127.0.0.1 first (where dev servers bind),

@@ -1522,6 +1522,18 @@ func hostAddresses() (map[string][]netip.Prefix, error) {
 // that configures itself differently is held to the same rules.
 func guestNetScript(n *GuestNetwork) string {
 	var b strings.Builder
+	fmt.Fprintf(&b, "%s", guestNetPrelude(n))
+	fmt.Fprintf(&b, "%s", guestNetFunctions(n))
+	fmt.Fprintf(&b, "%s", guestNetWait())
+	fmt.Fprintf(&b, "%s", guestNetRoutes(n))
+	return b.String()
+}
+
+// guestNetPrelude sets the shell's rules and names the device's
+// addresses, then has the guest look for the device the daemon
+// hot-plugged.
+func guestNetPrelude(n *GuestNetwork) string {
+	var b strings.Builder
 	line := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
 	line("set -eu")
 	line("mac=%s addr=%s gw=%s gwmac=%s", n.MAC, n.Address, n.Gateway, n.HostMAC)
@@ -1529,6 +1541,14 @@ func guestNetScript(n *GuestNetwork) string {
 	// device tree (arm64) is not told of that, so it looks; one that is
 	// told (ACPI) finds nothing new.
 	line(`echo 1 > /sys/bus/pci/rescan 2>/dev/null || true`)
+	return b.String()
+}
+
+// guestNetFunctions finds the device by its address (its name is the
+// guest's choice) and configures it; both set the shell's dev.
+func guestNetFunctions(n *GuestNetwork) string {
+	var b strings.Builder
+	line := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
 	// The device is found by its address: its name is the guest's choice,
 	// and the guest's device manager may still be renaming it (an
 	// interface that is up can no longer be renamed, so it is waited
@@ -1540,6 +1560,13 @@ func guestNetScript(n *GuestNetwork) string {
 	line(`  echo 1 > "/proc/sys/net/ipv6/conf/$dev/disable_ipv6" 2>/dev/null || true`)
 	line(`  ip link set dev "$dev" up && ip addr replace "$addr/32" dev "$dev" && ip route replace "$gw/32" dev "$dev" && ip neigh replace "$gw" lladdr "$gwmac" dev "$dev" nud permanent`)
 	line(`}`)
+	return b.String()
+}
+
+// guestNetWait waits for the device to appear and be configurable.
+func guestNetWait() string {
+	var b strings.Builder
+	line := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
 	line(`dev="" err="" tries=0`)
 	line(`while :; do`)
 	line(`  if command -v udevadm >/dev/null 2>&1; then udevadm settle -t 5 >/dev/null 2>&1 || true; fi`)
@@ -1551,23 +1578,65 @@ func guestNetScript(n *GuestNetwork) string {
 	line(`  fi`)
 	line(`  sleep 0.1`)
 	line(`done`)
-	if n.Tier == run.NetworkOpen {
-		dns := make([]string, len(n.DNS))
-		for i, addr := range n.DNS {
-			dns[i] = addr.String()
-		}
-		servers := strings.Join(dns, " ")
-		line(`ip route replace default via "$gw" dev "$dev"`)
-		// Through the guest's resolver service where it has one, so that
-		// its /etc/resolv.conf stays what the image made it.
-		line(`if command -v resolvectl >/dev/null 2>&1 && resolvectl dns "$dev" %s 2>/dev/null; then`, servers)
-		line(`  resolvectl domain "$dev" '~.' || true`)
-		line(`  resolvectl default-route "$dev" yes 2>/dev/null || true`)
-		line(`else`)
-		line(`  rm -f /etc/resolv.conf`)
-		line(`  printf 'nameserver %%s\n' %s > /etc/resolv.conf`, servers)
-		line(`fi`)
+	return b.String()
+}
+
+// guestNetRoutes gives a device of the open tier its way out.
+func guestNetRoutes(n *GuestNetwork) string {
+	if n.Tier != run.NetworkOpen {
+		return ""
 	}
+	dns := make([]string, len(n.DNS))
+	for i, addr := range n.DNS {
+		dns[i] = addr.String()
+	}
+	servers := strings.Join(dns, " ")
+	var b strings.Builder
+	line := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
+	line(`ip route replace default via "$gw" dev "$dev"`)
+	// Through the guest's resolver service where it has one, so that
+	// its /etc/resolv.conf stays what the image made it.
+	line(`if command -v resolvectl >/dev/null 2>&1 && resolvectl dns "$dev" %s 2>/dev/null; then`, servers)
+	line(`  resolvectl domain "$dev" '~.' || true`)
+	line(`  resolvectl default-route "$dev" yes 2>/dev/null || true`)
+	line(`else`)
+	line(`  rm -f /etc/resolv.conf`)
+	line(`  printf 'nameserver %%s\n' %s > /etc/resolv.conf`, servers)
+	line(`fi`)
+	return b.String()
+}
+
+// restoreNetMark is the first line of the script a restored guest runs
+// to use its network device on the run's new address.
+const restoreNetMark = "# teploy-sandbox restore network"
+
+// restoreNetScript is what a guest restored from a memory image runs
+// for its network device. The device came back with the VM, under the
+// address it had when the VM was saved (oldMAC), so there is nothing to
+// rescan for: the device is found by that address, its addresses and
+// neighbours are flushed, it is given the run's new address, and today's
+// configuration is applied to it.
+func restoreNetScript(n *GuestNetwork, oldMAC string) string {
+	var b strings.Builder
+	line := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
+	line("%s", restoreNetMark)
+	line("set -eu")
+	line("mac=%s addr=%s gw=%s gwmac=%s", n.MAC, n.Address, n.Gateway, n.HostMAC)
+	line(`odev=""`)
+	line(`for d in /sys/class/net/*; do if [ "$(cat "$d/address" 2>/dev/null)" = "%s" ]; then odev="${d##*/}"; fi; done`, oldMAC)
+	line(`[ -n "$odev" ] || { echo "no network device with the address %s" >&2; exit 3; }`, oldMAC)
+	line(`ip addr flush dev "$odev"`)
+	line(`ip neigh flush dev "$odev" 2>/dev/null || true`)
+	// virtio-net takes a new address while it is up; a device that
+	// does not is brought down for the change and up again by configure.
+	line(`if ! ip link set dev "$odev" address "$mac" 2>/dev/null; then`)
+	line(`  ip link set dev "$odev" down`)
+	line(`  ip link set dev "$odev" address "$mac"`)
+	line(`fi`)
+	fmt.Fprintf(&b, "%s", guestNetFunctions(n))
+	line(`dev="$odev"`)
+	line(`configure`)
+	fmt.Fprintf(&b, "%s", guestNetRoutes(n))
 	return b.String()
 }
 

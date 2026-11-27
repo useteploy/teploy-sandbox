@@ -330,6 +330,110 @@ device and its name, the `ip` commands); the host's part (namespace,
 tap, rules, routes, the hand-over) is tens of milliseconds. AUDIT_OPEN.md
 has the figures.
 
+### Memory stop and resume (experimental, off by default)
+
+`--vm-memory-snapshots` (`SBX_VM_MEMORY_SNAPSHOTS`; default off, and only
+with `--driver vm`) has a stop save each VM's memory as well as its disk.
+While the VM is paused for the disk snapshot, the hypervisor writes its
+memory into an image of its own on the pool, and a resume on the same
+host brings the VM back from that image instead of booting it. What ran
+in the guest keeps running: processes, open files, listening servers.
+
+The disk stays the durable truth; the memory image is a cache. Whenever
+the image cannot be used, the resume boots the disk snapshot exactly as
+it did before, and says so: the run's `resumedFrom` is `disk` rather than
+`memory`, and the daemon's log says why. An image is not used when it is
+missing or damaged, was saved on another kind of host (CPU, host kernel,
+hypervisor or guest kernel) or beside another disk snapshot, has another
+size than the run, when the hypervisor cannot restore it or silently
+copies the memory instead of mapping it, when the guest's clock could
+not be stepped, or when the guest's kernel has no driver bound to the
+VM Generation ID device (below). A stop never fails
+because of memory: when no image could be saved the stop is the stop it
+always was, and the stopped run's `memory` says why
+(`docs/wire-contract.md`).
+
+Each image is a ZFS filesystem of its own under `--vm-image-dataset`
+(default `<pool>/teploy-img`), its own encryption root with a random
+32-byte key. The key reaches `zfs` on standard input and is written
+nowhere; the registry keeps it wrapped under this host's secret
+(`--remote-host-secret-file`: 32 random bytes, made 0600 the first time
+it is needed, and refused inside `--state-dir`, so a copied state
+directory opens none of its images). Deleting an image deletes its key,
+and the daemon zeroes the raw key wherever it held one. The memory is
+per run and never shared: an image restores one VM, once.
+
+A stopped run's image is closed: from the moment the stop hands it to
+the run's record it is unmounted and its key is unloaded, and a resume
+opens it again (it stays open while the VM restored from it lives,
+which reads its memory through the mount). So a stopped run's memory is
+not to be read off the pool without both the registry and the host's
+secret. And since an image is an encrypted dataset, the pool is backed
+up raw: `zfs send -R` refuses a tree with one in it unless `-w`, its key
+loaded or not, and a plain send of an image alone needs its key loaded,
+which a stopped run's never is (measured on ZFS 2.3.9).
+
+The hypervisor that writes an image is treated as taken over, as every
+hypervisor is. The image is sealed before the VM runs again (taken out
+of the VM's reach, made root's and read-only), and anything but the three
+plain files of a snapshot refuses it. The configuration the restoring
+hypervisor is given is the daemon's own: the saved one is read under a
+strict schema, every value must be one this daemon configures, and
+whatever is not refuses the image. The restoring hypervisor is confined
+like a booting one, and the daemon checks that the memory really was
+mapped copy-on-write.
+
+A restored guest comes back with the random state it was saved with,
+which is in the image on disk. What makes it new is the guest's kernel:
+before the VM is let run again, the hypervisor changes its VM
+Generation ID and notifies the guest's device, and the kernel's driver
+for it reseeds the generator as soon as the guest runs. The daemon
+requires that driver to be bound, on both of its handshake paths, and
+refuses the image without it. The guest's agent adds entropy of the
+host's and asks for a reseed of its own on top; that is no evidence by
+itself, since it comes only once the guest has been running again for
+as long as its first answer took (seconds), and is logged, not relied
+on.
+
+What it costs, and what it does not do:
+
+- The VM is paused while its memory is written: all of guest RAM, so it
+  grows with the guest. Measured on the test host (eMMC): a stop with a
+  512 MiB image took 3 to 10 s.
+- The first contact with a restored guest pays its page faults, read
+  from the image. On the test host that was 3 to 5 s, where the restore
+  itself is about 0.15 s; on faster storage it should be smaller (not
+  measured). Resume to first exec, medians of five, 512 MiB: 3.2 s from
+  memory against 4.7 s from the disk. AUDIT_OPEN.md has the figures; the
+  design's targets were set for a bigger host and are not met here.
+- An image takes the pool's space until the run resumes or is destroyed.
+  No image is saved into a pool below its reserve
+  (`--remote-pool-reserve`), and one below its reserve loses images, the
+  oldest stop first, before anything else of the runs'. A stop makes
+  room for its own image the same way, the oldest first, but only while
+  dropping images can make the room: a pool that is short for other
+  reasons keeps them, and the stop goes on without an image.
+- Same host only. A run stopped on another host, or on this host before
+  the CPU, kernel, hypervisor or guest kernel changed, resumes from its
+  disk.
+- Turning the flag off again leaves what it made: the records stop
+  naming images as their runs resume, are stopped again or are
+  destroyed, but nothing removes the images from the pool until a daemon
+  with the flag on starts once more (its start destroys every image no
+  stopped run names).
+- Not on arm64, as the command line stands: it has no `acpi=on`, so an
+  arm64 guest has no VM Generation ID device and no driver to reseed on,
+  and every resume there boots from the disk (a stop still saves an
+  image). None of this was run live on arm64.
+- While a stop writes the image, the VM's memory limit covers it: raised
+  by the image's size (the guest's memory plus 64 MiB) for the length
+  of the stop, and put back after. The image goes through the page
+  cache of the VM's own memory group, and a guest with most of its
+  memory in use otherwise has its hypervisor killed by that limit in
+  the middle of the snapshot (seen live). What the room holds is page
+  cache, which the host can reclaim.
+- Fork is not memory fork: a forked run boots its disk, as before.
+
 ### Host sizing
 
 Three limits on the host are shared by every VM and are the operator's
@@ -465,7 +569,9 @@ The layers are independent; each is checked by the live suite.
   what listens there before it sends anything.
 - **Its own cgroup**, entered at the moment the process is created:
   `memory.max` is the guest's size plus 64 MiB plus 8 MiB per GiB of
-  guest (`memory.swap.max` 0), `pids.max` is 128 plus 4 per vCPU,
+  guest (`memory.swap.max` 0; and, for as long as a stop writes the
+  VM's memory image, another image's size on top, see "Memory stop and
+  resume"), `pids.max` is 128 plus 4 per vCPU,
   `cpu.max` is the VM's vCPUs, and `io.max` on the VM's volume is
   `--vm-disk-mbps` (default 256 MiB/s) and `--vm-disk-iops` (default
   16000), each for reads and for writes separately; 0 turns one off.

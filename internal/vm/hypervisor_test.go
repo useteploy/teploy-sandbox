@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -34,7 +35,7 @@ func shortDir(t *testing.T) string {
 
 func TestMachineArgsAreTheProvenCommandLine(t *testing.T) {
 	h := &CloudHypervisor{Bin: "/opt/ch", Kernel: "/var/lib/teploy-sandbox/vm/Image", Cmdline: "root=/dev/vda1 rw console=ttyAMA0 quiet", RunDir: "/run/sbx/abc"}
-	got := h.machineArgs(MachineConfig{Name: "teploy-sbx-x", Disk: "/dev/zvol/tank/teploy-sbx-x", CPUs: 2, MemoryMB: 2048}, "/run/sbx/abc/teploy-sbx-x", 7)
+	got := h.machineArgs(MachineConfig{Name: "teploy-sbx-x", Disk: "/dev/zvol/tank/teploy-sbx-x", CPUs: 2, MemoryMB: 2048}, "/run/sbx/abc/teploy-sbx-x", 7, "")
 	want := []string{
 		// The kernel where the jail holds it: the host's path is not
 		// named to the hypervisor, and does not exist in its jail.
@@ -73,6 +74,16 @@ func TestSweepOnlyKillsVMsOfThisDaemonIdentity(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// A restore's inbox, beside a VM's runtime dir (confine.go,
+	// setInbox): root's, with the daemon's rewritten configuration. A
+	// daemon that died around a restore leaves it, and it is nobody's.
+	inbox := filepath.Join(mine, "teploy-sbx-1"+inboxSuffix)
+	if err := os.MkdirAll(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inbox, imageConfigFile), []byte("{}"), 0o444); err != nil {
+		t.Fatal(err)
 	}
 	alive := map[int][]string{
 		10: {"cloud-hypervisor", "--kernel", "k", "--api-socket", filepath.Join(mine, "teploy-sbx-1", "api.sock")},
@@ -121,6 +132,9 @@ func TestSweepOnlyKillsVMsOfThisDaemonIdentity(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(mine); len(entries) != 0 {
 		t.Fatalf("stale runtime dirs left: %v", entries)
+	}
+	if _, err := os.Lstat(inbox); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a stale restore inbox survived the sweep: %v", err)
 	}
 	// The leftover VM's cgroup went with it, killed rather than trusted
 	// to be empty.
@@ -365,7 +379,7 @@ func TestStartAndKillManageTheProcessAndItsRuntimeDir(t *testing.T) {
 // daemon keeps a fixed amount of it.
 func TestAGuestsConsoleOutputIsBoundedOnTheHost(t *testing.T) {
 	h := &CloudHypervisor{Bin: "/opt/ch", Kernel: "/k", Cmdline: "c", RunDir: "/run/sbx/abc"}
-	for _, arg := range h.machineArgs(MachineConfig{Name: "teploy-sbx-x", Disk: "/dev/zvol/tank/teploy-sbx-x", CPUs: 1, MemoryMB: 64}, "/run/sbx/abc/teploy-sbx-x", 3) {
+	for _, arg := range h.machineArgs(MachineConfig{Name: "teploy-sbx-x", Disk: "/dev/zvol/tank/teploy-sbx-x", CPUs: 1, MemoryMB: 64}, "/run/sbx/abc/teploy-sbx-x", 3, "") {
 		if strings.HasPrefix(arg, "file=") || strings.Contains(arg, ",file=") {
 			t.Fatalf("the hypervisor is told to write a file a guest can grow: %q", arg)
 		}

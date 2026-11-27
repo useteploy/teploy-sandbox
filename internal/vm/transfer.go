@@ -414,8 +414,11 @@ func (v *Volumes) collectBase(ctx context.Context, volume string) error {
 // still marked as a restore belong to one a previous daemon life did not
 // finish. A restore's volumes are clones of one another, so they go in
 // as many passes as it takes. A filesystem carrying this daemon's mark
-// is nothing the driver makes — it came out of a stream — and goes the
-// same way, whatever it is marked as.
+// is, as far as transfers go, nothing the driver makes from a stream (it
+// came out of one), and goes the same way, whatever it is marked as.
+// Memory images (kind image) are the one filesystem the driver does
+// make: they are the memory images' own to keep or to drop, and are left
+// alone here whether or not this daemon keeps memory images now.
 func (v *Volumes) sweepTransfers(ctx context.Context) error {
 	for {
 		volumes, err := v.zfs.Volumes(ctx, v.root)
@@ -429,7 +432,7 @@ func (v *Volumes) sweepTransfers(ctx context.Context) error {
 		left, removed := 0, 0
 		var last error
 		for index, dataset := range append(filesystems, volumes...) {
-			if !v.mine(dataset) || (index >= len(filesystems) && dataset.Kind != kindRestore) {
+			if !v.mine(dataset) || dataset.Kind == kindImage || (index >= len(filesystems) && dataset.Kind != kindRestore) {
 				continue
 			}
 			if err := v.destroyWhole(ctx, dataset.Name); err != nil {

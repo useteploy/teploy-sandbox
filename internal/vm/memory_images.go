@@ -265,8 +265,10 @@ type memoryImages struct {
 	// mu guards the maps and, through them, every image's fields. It is
 	// held for bookkeeping only, never across a host's command: every
 	// VM's end comes through here (vmGone), and a destroy that waits on
-	// a busy dataset can wait for seconds (see settle). A VM's own end
-	// waits for its images; no other path waits for them.
+	// a busy dataset can wait for seconds (see settle). Whoever comes
+	// here waits for the host's commands on the images the call is for
+	// — a VM's end for its own images, a release for the one it lets
+	// go — and never on the lock behind another's.
 	mu sync.Mutex
 	// known are the images on this host that something may still want.
 	known map[string]*image
@@ -282,7 +284,8 @@ type memoryImages struct {
 	unclosed []*image
 	// retryAfter is how long an image that is owed (a destroy, a close)
 	// waits between the sweep's attempts. Its own VM's end does not wait
-	// for that. now is the clock that paces them.
+	// for that: it tries at once, and the VM's removal waits for the try
+	// (vmGone). now is the clock that paces them.
 	retryAfter time.Duration
 	now        func() time.Time
 }
@@ -745,12 +748,15 @@ func (s *memoryImages) drop(ctx context.Context, img *image) {
 // close of a sealed image it wrote that was refused while it lived —
 // whatever the VM kept open in either is closed now.
 //
-// All of it is this VM's own images, and they are tried at once: a
-// VM's end waits for its own images' destroys and closes, for as long
-// as those take (a destroy that finds a dataset busy can wait for
-// seconds). Nothing of another VM's is tried here: an image another VM
-// wrote, mapped or holds waits for the sweep, and no VM's end waits
-// behind a destroy or a close that is not its own.
+// All of it is this VM's own images, and they are tried here, before
+// this returns: the driver's kill calls it synchronously, so a VM's
+// removal waits for its own images' destroys and closes — a destroy
+// that finds a dataset busy is retried for as long as the pool is given
+// to let go (zfsCLI), a close for its budget (closeBudget) — and what
+// still would not go or close is owed, to the sweep. Nothing of another
+// VM's is tried here: an image another VM wrote, mapped or holds waits
+// for the sweep, and no VM's end waits behind a destroy or a close that
+// is not its own.
 func (s *memoryImages) vmGone(ctx context.Context, vm string) {
 	s.mu.Lock()
 	var gone []*image

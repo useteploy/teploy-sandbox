@@ -68,6 +68,71 @@ func TestRecheckABusyCloseIsRetriedWhenTheWriterIsGone(t *testing.T) {
 	}
 }
 
+// A VM's end waits for its own images, and for nothing of another VM's.
+// kill calls vmGone synchronously, and what it returns from is done: the
+// image a VM was restored from is gone, and the close its writer owed is
+// tried — while an image another VM owes is left to the sweep. (The
+// comment there once said that no VM's end waits behind a destroy. None
+// does behind another's; every one does behind its own.)
+func TestAVMsEndWaitsForItsOwnImagesAndForNoOthers(t *testing.T) {
+	busy, s, img, _ := owedStore(t)
+	// The pool lets the next close go, so that the first image is the
+	// only one owed. Another image, which a VM is restored from and its
+	// record has let go: its destroy, at that VM's end, is made to take
+	// as long as the test likes.
+	busy.held = false
+	other, otherRec := savedImage(t, s, "other", 256)
+	opened, err := s.open(bg, "other", &otherRec)
+	must(t, err)
+	s.mapping(opened, "teploy-sbx-vm")
+	must(t, s.release(bg, otherRec.ID))
+	point := newHoldPoint()
+	busy.fakeZFS.mu.Lock()
+	busy.hold["destroy "+other.dataset] = point
+	busy.fakeZFS.mu.Unlock()
+
+	// Another VM's end: neither image is its own, and it returns at
+	// once, the held destroy notwithstanding.
+	quick := make(chan struct{})
+	go func() {
+		s.vmGone(bg, "teploy-sbx-someother")
+		close(quick)
+	}()
+	select {
+	case <-quick:
+	case <-time.After(2 * time.Second):
+		close(point.release)
+		t.Fatal("a VM's end waited behind images that are not its own")
+	}
+
+	// The restored VM's end waits behind its own image's destroy, and
+	// returns only once it has gone through.
+	gone := make(chan struct{})
+	go func() {
+		s.vmGone(bg, "teploy-sbx-vm")
+		close(gone)
+	}()
+	<-point.reached
+	select {
+	case <-gone:
+		t.Fatal("a VM's end did not wait for its own image's destroy")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(point.release)
+	<-gone
+	if busy.has(t, other.dataset) {
+		t.Fatal("a VM's end returned before its image was destroyed")
+	}
+
+	// The writer's end tries the close it owes before it returns: one
+	// more try, and the image is closed.
+	before := busy.tried()
+	s.vmGone(bg, "teploy-sbx-writer")
+	if mounted, loaded := busy.openState(img.dataset); mounted || loaded || busy.tried() != before+1 || len(s.unclosed) != 0 {
+		t.Fatalf("after the writer's end: mounted %t, key loaded %t, %d tries (want %d), %d owed", mounted, loaded, busy.tried(), before+1, len(s.unclosed))
+	}
+}
+
 // unmountWhile refuses every unmount for as long as held says so, and
 // counts the tries: a descriptor still open in the dataset.
 type unmountWhile struct {

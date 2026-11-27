@@ -4,10 +4,12 @@ package vm
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -119,24 +121,66 @@ func (z *fakeZFS) has(t *testing.T, name string) bool {
 	return ok
 }
 
+// openState says whether the fake pool has the image dataset mounted and
+// its key loaded: what a sealed image is while something reads it, and
+// not while nothing does.
+func (z *fakeZFS) openState(dataset string) (mounted, loaded bool) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	return z.datasets[dataset].fsMounted, z.datasets[dataset].fsKeyLoaded
+}
+
+// fsCallsSoFar are the commands the fake pool ran for filesystems, in
+// order.
+func (z *fakeZFS) fsCallsSoFar() []string {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	return slices.Clone(z.fsCalls)
+}
+
+// unmountRefused is a pool that answers busy to every unmount of an
+// image dataset: a descriptor still open in it.
+type unmountRefused struct{ *fakeZFS }
+
+func (z *unmountRefused) Unmount(context.Context, string) error {
+	return zfsError("cannot unmount: dataset is busy")
+}
+
 func TestAMemoryImageIsAnEncryptedDatasetSealedReadOnlyAndNamedByTheRecord(t *testing.T) {
 	z := newFakeZFS()
 	s := newTestImages(t, z)
-	img, rec := savedImage(t, s, "01ARZ3NDEKTSV4RRFFQ69G5FAV", 512)
+	img, err := s.begin(bg, "teploy-sbx-writer", 512, testVMUID)
+	must(t, err)
+	// The slice the daemon holds the raw key in: what is left in it once
+	// the daemon drops the key is looked at below.
+	raw := img.key
+	if len(raw) != 32 || bytes.Equal(raw, make([]byte, 32)) {
+		t.Fatalf("the image's key is %x", raw)
+	}
+	target, err := s.bind(img, t.TempDir())
+	must(t, err)
+	writeSnapshot(t, img)
 	dataset := testPool + "/" + imageDatasetName + "/" + img.id
 	if !slices.Contains(z.calls, "createfs "+testPool+"/"+imageDatasetName) || !slices.Contains(z.calls, "createfs "+dataset) {
 		t.Fatalf("the image dataset and the image were not created: %v", z.calls)
-	}
-	if !slices.Contains(z.calls, "set readonly=on "+dataset) {
-		t.Fatalf("the image was not made read-only: %v", z.calls)
 	}
 	z.mu.Lock()
 	created := z.datasets[dataset]
 	owner, kind := created.props[propOwner], created.props[propKind]
 	mounted, loaded := created.fsMounted, created.fsKeyLoaded
 	z.mu.Unlock()
+	// While the VM writes it: mounted, with its key loaded.
 	if owner != testOwner || kind != kindImage || !mounted || !loaded {
 		t.Fatalf("the image dataset: owner %q kind %q mounted %t key loaded %t", owner, kind, mounted, loaded)
+	}
+	must(t, s.seal(bg, img))
+	if !slices.Contains(z.calls, "set readonly=on "+dataset) {
+		t.Fatalf("the image was not made read-only: %v", z.calls)
+	}
+	rec, err := s.handOver("01ARZ3NDEKTSV4RRFFQ69G5FAV", img, run.MemoryImage{Disk: "7001", MemoryMB: 512, CPUs: 1})
+	must(t, err)
+	if _, err := os.Lstat(target); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the image is still bound at %s once sealed (%v)", target, err)
 	}
 	want := map[string]string{
 		"mountpoint": img.dir, "compression": "lz4", "primarycache": "metadata", "quota": "576M",
@@ -192,6 +236,91 @@ func TestAMemoryImageIsAnEncryptedDatasetSealedReadOnlyAndNamedByTheRecord(t *te
 	}
 	if !img.sealed || img.key != nil || img.bound != "" {
 		t.Errorf("after the hand-over: sealed %t key %x bound %q", img.sealed, img.key, img.bound)
+	}
+	// The raw key is gone where it lay, not only unnamed.
+	if !slices.Equal(raw, make([]byte, 32)) {
+		t.Errorf("the image's raw key is still in the memory the daemon held it in: %x", raw)
+	}
+}
+
+// A sealed image is closed while nothing reads it. From the hand-over
+// that gives it to the run's record it is unmounted and its key is
+// unloaded, as a host's reboot leaves it: a guest's memory in clear is
+// not to be read off the mount, nor carried off by a plain zfs send. A
+// resume opens it again (its key loaded, then mounted) and it stays
+// open while the VM restored from it lives, since that VM reads its
+// memory through the mount. An image nothing restores is destroyed as
+// it lies. A close the pool refuses is said and costs nothing: the
+// image stays open, and is as usable so.
+func TestASealedImageIsClosedAtRestAndOpenedByAResume(t *testing.T) {
+	z := newFakeZFS()
+	s := newTestImages(t, z)
+	img, rec := savedImage(t, s, "run", 256)
+	if mounted, loaded := z.openState(img.dataset); mounted || loaded {
+		t.Fatalf("an image at rest is mounted %t, key loaded %t", mounted, loaded)
+	}
+	// The seal's last two commands on the pool: the dataset unmounted,
+	// and only then its key unloaded.
+	if calls := z.fsCallsSoFar(); !slices.Equal(calls[max(len(calls)-2, 0):], []string{"unmount " + img.dataset, "unload-key " + img.dataset}) {
+		t.Fatalf("the pool was last asked: %v", calls)
+	}
+	opened, err := s.open(bg, "run", &rec)
+	must(t, err)
+	if mounted, loaded := z.openState(img.dataset); !mounted || !loaded {
+		t.Fatalf("an image under a restore is mounted %t, key loaded %t", mounted, loaded)
+	}
+	s.mapping(opened, "teploy-sbx-vm")
+	must(t, s.release(bg, rec.ID))
+	if mounted, loaded := z.openState(img.dataset); !mounted || !loaded {
+		t.Fatalf("an image a VM is restored from is mounted %t, key loaded %t: the VM reads its memory through it", mounted, loaded)
+	}
+	s.vmGone(bg, "teploy-sbx-vm")
+	if z.has(t, img.dataset) {
+		t.Fatal("the image outlived the VM restored from it")
+	}
+
+	// Never restored: destroyed as it lies, closed.
+	other, otherRec := savedImage(t, s, "gone", 256)
+	if mounted, loaded := z.openState(other.dataset); mounted || loaded {
+		t.Fatalf("an image at rest is mounted %t, key loaded %t", mounted, loaded)
+	}
+	must(t, s.release(bg, otherRec.ID))
+	if z.has(t, other.dataset) {
+		t.Fatal("a released image is still on the pool")
+	}
+
+	// A close the pool refuses, as for a descriptor still open in the
+	// dataset: said, and the image is kept, and as usable as before.
+	refusing := &unmountRefused{newFakeZFS()}
+	stubborn := newTestImages(t, refusing.fakeZFS)
+	stubborn.zfs = refusing
+	var log bytes.Buffer
+	stubborn.log = slog.New(slog.NewTextHandler(&log, nil))
+	kept, err := stubborn.begin(bg, "teploy-sbx-writer", 256, testVMUID)
+	must(t, err)
+	_, err = stubborn.bind(kept, t.TempDir())
+	must(t, err)
+	writeSnapshot(t, kept)
+	must(t, stubborn.seal(bg, kept))
+	rec, err = stubborn.handOver("run", kept, run.MemoryImage{Disk: "7001", MemoryMB: 256, CPUs: 1})
+	if err != nil || rec.ID != kept.id {
+		t.Fatalf("a hand-over whose close the pool refused: %+v %v", rec, err)
+	}
+	if mounted, loaded := refusing.openState(kept.dataset); !mounted || !loaded {
+		t.Fatalf("a refused close changed the image: mounted %t, key loaded %t", mounted, loaded)
+	}
+	if calls := refusing.fsCallsSoFar(); slices.Contains(calls, "unload-key "+kept.dataset) {
+		t.Fatalf("the key was unloaded under a mounted dataset: %v", calls)
+	}
+	if said := log.String(); !strings.Contains(said, "stays open") || !strings.Contains(said, "dataset is busy") {
+		t.Fatalf("the daemon did not say what became of the image:\n%s", said)
+	}
+	opened, err = stubborn.open(bg, "run", &rec)
+	must(t, err)
+	stubborn.drop(bg, opened)
+	must(t, stubborn.release(bg, rec.ID))
+	if refusing.has(t, kept.dataset) {
+		t.Fatal("an image whose close was refused outlived its release")
 	}
 }
 
@@ -514,11 +643,13 @@ func TestOpeningRefusesAnImageThatIsNotASealedSnapshotOnThisHost(t *testing.T) {
 		t.Fatalf("an image of another class: %v", err)
 	}
 
-	// After a reboot the key is not loaded and nothing is mounted: the
-	// image is opened with its own key, then mounted, then checked.
-	must(t, z.Unmount(bg, dataset))
+	// As the hand-over leaves the image, which is as a reboot does: the
+	// key is not loaded and nothing is mounted. It is opened with its own
+	// key, then mounted, then checked.
+	if mounted, loaded := z.openState(dataset); mounted || loaded {
+		t.Fatalf("the image at rest is mounted %t, key loaded %t", mounted, loaded)
+	}
 	z.mu.Lock()
-	z.datasets[dataset].fsKeyLoaded = false
 	z.fsCalls = nil
 	z.mu.Unlock()
 	if _, err := s.open(bg, "run", &rec); err != nil {
@@ -859,9 +990,12 @@ func TestNoHostCommandRunsUnderTheImagesLock(t *testing.T) {
 		z := newFakeZFS()
 		s := newTestImages(t, z)
 		slow, slowRec := savedImage(t, s, "slow", 256)
-		must(t, z.Unmount(bg, slow.dataset))
+		// Closed, as every image the hand-over gave to a record is: the
+		// open loads its key first.
+		if mounted, loaded := z.openState(slow.dataset); mounted || loaded {
+			t.Fatalf("the image at rest is mounted %t, key loaded %t", mounted, loaded)
+		}
 		z.mu.Lock()
-		z.datasets[slow.dataset].fsKeyLoaded = false
 		z.hold["load-key "+slow.dataset] = newHoldPoint()
 		point := z.hold["load-key "+slow.dataset]
 		z.mu.Unlock()

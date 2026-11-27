@@ -338,8 +338,19 @@ Each image is a ZFS filesystem of its own under `--vm-image-dataset`
 nowhere; the registry keeps it wrapped under this host's secret
 (`--remote-host-secret-file`: 32 random bytes, made 0600 the first time
 it is needed, and refused inside `--state-dir`, so a copied state
-directory opens none of its images). Deleting an image deletes its key.
-The memory is per run and never shared: an image restores one VM, once.
+directory opens none of its images). Deleting an image deletes its key,
+and the daemon zeroes the raw key wherever it held one. The memory is
+per run and never shared: an image restores one VM, once.
+
+A stopped run's image is closed: from the moment the stop hands it to
+the run's record it is unmounted and its key is unloaded, and a resume
+opens it again (it stays open while the VM restored from it lives,
+which reads its memory through the mount). So a stopped run's memory is
+not to be read off the pool without both the registry and the host's
+secret. And since an image is an encrypted dataset, the pool is backed
+up raw: `zfs send -R` refuses a tree with one in it unless `-w`, its key
+loaded or not, and a plain send of an image alone needs its key loaded,
+which a stopped run's never is (measured on ZFS 2.3.9).
 
 The hypervisor that writes an image is treated as taken over, as every
 hypervisor is. The image is sealed before the VM runs again (taken out

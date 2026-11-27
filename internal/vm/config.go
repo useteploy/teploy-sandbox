@@ -296,6 +296,9 @@ func newMemoryImagesFor(ctx context.Context, config Config, hypervisorPath strin
 	if err != nil {
 		return nil, fmt.Errorf("the host's secret (--remote-host-secret-file): %w", err)
 	}
+	// The wrapping key is derived from it once; the secret itself is
+	// zeroed here, and stays where the daemon keeps it: in its file.
+	defer clear(secret)
 	// Everything an image depends on is measured once, here: a daemon
 	// that keeps images must know its own class before it saves one.
 	class, err := detectHostClass(ctx, config, hypervisorPath)

@@ -259,9 +259,11 @@ type imageFS interface {
 	Mount(ctx context.Context, name string) error
 	Unmount(ctx context.Context, name string) error
 	// LoadKey loads the raw key of a dataset's encryption root from
-	// standard input; CheckKey only verifies it, loaded or not.
+	// standard input; CheckKey only verifies it, loaded or not;
+	// UnloadKey forgets it again, of a dataset that is not mounted.
 	LoadKey(ctx context.Context, name string, key []byte) error
 	CheckKey(ctx context.Context, name string, key []byte) error
+	UnloadKey(ctx context.Context, name string) error
 }
 
 // zfsCLI is ZFS over the zfs(8) command.
@@ -455,6 +457,11 @@ func (z *zfsCLI) LoadKey(ctx context.Context, name string, key []byte) error {
 
 func (z *zfsCLI) CheckKey(ctx context.Context, name string, key []byte) error {
 	return z.stream(ctx, bytes.NewReader(key), nil, "load-key", "-n", name)
+}
+
+func (z *zfsCLI) UnloadKey(ctx context.Context, name string) error {
+	_, err := z.run(ctx, "unload-key", name)
+	return err
 }
 
 func (z *zfsCLI) Snapshot(ctx context.Context, name string) error {

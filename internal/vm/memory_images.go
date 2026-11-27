@@ -191,7 +191,9 @@ type image struct {
 	writer string
 	// key is the dataset's raw key, in memory only while the daemon may
 	// still need it: from begin until the record is written, and from
-	// open until the dataset is mounted.
+	// open until the dataset is mounted. Dropped, and zeroed where it
+	// lay, the moment it is not (forgetKey): at the hand-over, when a
+	// stop gives the image up, and once an open has the image mounted.
 	key          []byte
 	dataset, dir string
 	// bound is where the dataset is bound into a VM's outbox, while it is.
@@ -219,6 +221,14 @@ type image struct {
 // destroyed, whatever its record says. Under memoryImages.mu.
 func (img *image) wanted() bool {
 	return img.held || len(img.mappers) > 0 || img.opening > 0
+}
+
+// forgetKey drops the image's raw key: zeroed where it lay, and no
+// longer named. It is the holder's to call, at the moment the key has
+// done its work: the stop (begin until handOver or abandon), or open.
+func (img *image) forgetKey() {
+	clear(img.key)
+	img.key = nil
 }
 
 // memoryImages is the daemon's images on this host.
@@ -331,6 +341,7 @@ func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid u
 	img := &image{id: id, memoryMB: memoryMB, uid: uid, writer: vm, held: true}
 	img.key = make([]byte, 32)
 	if _, err := rand.Read(img.key); err != nil {
+		clear(img.key)
 		return nil, err
 	}
 	img.dataset, img.dir = s.root+"/"+img.id, filepath.Join(s.mountDir, img.id)
@@ -350,6 +361,7 @@ func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid u
 		propOwner: s.owner, propKind: kindImage,
 	}
 	if err := s.zfs.CreateFilesystem(ctx, img.dataset, props, img.key); err != nil {
+		img.forgetKey()
 		return nil, fmt.Errorf("create the image dataset: %w", err)
 	}
 	err := s.chown(img.dir, uid, uid)
@@ -358,6 +370,7 @@ func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid u
 	}
 	if err != nil {
 		img.held = false
+		img.forgetKey()
 		_ = s.settle(ctx, img)
 		return nil, fmt.Errorf("hand the image dataset to the VM: %w", err)
 	}
@@ -469,6 +482,7 @@ func (s *memoryImages) abandon(ctx context.Context, img *image) {
 	}
 	s.mu.Lock()
 	img.held = false
+	img.forgetKey()
 	s.mu.Unlock()
 	_ = s.settle(ctx, img)
 }
@@ -548,7 +562,8 @@ func (s *memoryImages) open(ctx context.Context, runID string, rec *run.MemoryIm
 		}
 		return nil, err
 	}
-	img.key, img.sealed = nil, true
+	img.forgetKey()
+	img.sealed = true
 	return img, nil
 }
 
@@ -575,6 +590,8 @@ func (s *memoryImages) ready(ctx context.Context, img *image, runID string, rec 
 	if err != nil {
 		return err
 	}
+	// The raw key is the daemon's no longer once the dataset is open.
+	defer clear(key)
 	if err := s.zfs.CheckKey(ctx, img.dataset, key); err != nil {
 		return fmt.Errorf("its key does not open the dataset (wrong key): %w", err)
 	}
@@ -660,22 +677,69 @@ func (s *memoryImages) vmGone(ctx context.Context, vm string) {
 
 // handOver passes a sealed image from the stop that made it to the
 // record of the run it belongs to: the record to keep, with the image's
-// key wrapped under the host's secret. what carries what the driver
-// knows of the VM (its disk, its network device, its size).
+// key wrapped under the host's secret, and the image closed (see close)
+// from then until a resume opens it. what carries what the driver knows
+// of the VM (its disk, its network device, its size). The raw key is
+// forgotten here: the wrapped one in the record is all there is.
 func (s *memoryImages) handOver(runID string, img *image, what run.MemoryImage) (run.MemoryImage, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !img.sealed {
+		s.mu.Unlock()
 		return run.MemoryImage{}, fmt.Errorf("the image %s is not sealed", img.id)
 	}
 	wrapped, err := s.keys.wrap(runID, img.id, img.key)
 	if err != nil {
+		s.mu.Unlock()
 		return run.MemoryImage{}, err
 	}
-	img.key = nil
+	img.forgetKey()
+	s.mu.Unlock()
 	what.ID, what.Key = img.id, wrapped
 	what.Class, what.Hypervisor, what.Kernel = s.class.id, s.class.hypervisor, s.class.kernel
+	// The stop's own request is over by now; the closing gets a budget
+	// of its own.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.close(ctx, img); err != nil {
+		s.logger().Warn("a sealed image stays open: its dataset could not be unmounted or its key unloaded; it is as usable so, and goes with its run", "image", img.id, "error", err)
+	}
 	return what, nil
+}
+
+// close shuts an image nothing is reading: its dataset unmounted and
+// its key unloaded, as a host's reboot leaves it, until a resume opens
+// it again (ready). A sealed image is a guest's memory in clear for
+// whoever can read its mount, and while its key is loaded a plain
+// `zfs send` of the image alone carries that clear text off into
+// whatever receives the stream (a raw send is encrypted either way). So
+// an image at rest is closed: by the hand-over after the stop that made
+// it; and a resume reopens it and leaves it open for as long as the VM
+// restored from it lives, since that VM reads its memory through the
+// mount. Closed, zfs refuses the plain send for want of the key. (A
+// recursive send of the pool refuses every encrypted dataset in it
+// unless raw, key loaded or not, so the pool is backed up raw either
+// way: measured on ZFS 2.3.9.)
+//
+// Best effort, and said when it fails: an image that cannot be closed
+// is as usable mounted as closed, and goes with its run like any other.
+// The caller holds no lock: these are the host's commands.
+func (s *memoryImages) close(ctx context.Context, img *image) error {
+	if mounted, err := s.zfs.Property(ctx, img.dataset, propMounted); err != nil {
+		return err
+	} else if mounted == "yes" {
+		if err := s.zfs.Unmount(ctx, img.dataset); err != nil {
+			return fmt.Errorf("unmount its dataset: %w", err)
+		}
+	}
+	if status, err := s.zfs.Property(ctx, img.dataset, propKeyStatus); err != nil {
+		return err
+	} else if status == "available" {
+		if err := s.zfs.UnloadKey(ctx, img.dataset); err != nil {
+			return fmt.Errorf("unload its key: %w", err)
+		}
+	}
+	s.logger().Info("memory image closed", "image", img.id)
+	return nil
 }
 
 // retain is RetainMemory, called once the registry is loaded, before

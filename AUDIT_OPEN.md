@@ -4484,7 +4484,27 @@ added here runs, and a VM's jail and command line are what they were.
   `exec=off,setuid=off,devices=off`. The registry keeps the key wrapped
   (AES-256-GCM under `HKDF(host secret, "teploy-sandbox/v2/local-image-wrap")`,
   AAD `…/v2/local-image/<tenant>/<run>/<image>`), so a registry copied to
-  another host opens none of its images. Per run, never shared.
+  another host opens none of its images. Per run, never shared. The raw
+  key is zeroed wherever the daemon held it (at the hand-over, when a
+  stop gives an image up, once an open has it mounted; the host's
+  secret once the wrapping key is derived).
+- **An image at rest is closed.** From the hand-over that gives it to
+  the run's record, a sealed image is unmounted and its key unloaded
+  (`memory_images.go`: `handOver` → `close`), as a host's reboot leaves
+  it; a resume opens it again (`ready`: key loaded, then mounted) and it
+  stays open while the VM restored from it lives, which reads its memory
+  through the mount. A sealed image is a guest's memory in clear for
+  whoever can read its mount, and with its key loaded a plain `zfs send`
+  of the image alone carries that clear text off. Closed, zfs refuses
+  that send for want of the key and a raw send (`-w`) goes encrypted:
+  measured on the real pool (`TestVMMemoryImagesOnARealPool`). So the
+  pool is backed up raw either way: a recursive `zfs send -R` of it
+  refuses any encrypted dataset in the tree unless `-w`, its key loaded
+  or not (measured by hand on the test host, ZFS 2.3.9). A close the
+  pool refuses (a descriptor still open in the dataset) is logged and
+  costs nothing: the image stays open and is as usable so. (A review's
+  nit: unload the key after the seal. Done after the seal rather than in
+  it, so the VM's pause is not lengthened by four `zfs` commands.)
 - **Sealing.** After `vm.snapshot` and before the VM runs again, the
   daemon takes the image out of the VM's outbox, makes its files root's
   and `0444` through descriptors that follow no link, sets `readonly=on`,

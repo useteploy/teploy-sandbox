@@ -12,6 +12,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hkdf"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -327,10 +332,105 @@ func guestCameBack(t *testing.T, r *memoryRig, id string, reseedsBefore int, res
 	}
 }
 
-// unseal opens a sealed image for a moment, as an administrator would to
-// repair it, and seals it again.
-func unseal(t *testing.T, dataset string, change func()) {
+// mountedAt is whether anything is mounted at path (as /proc/self/mountinfo
+// says of it).
+func mountedAt(t *testing.T, path string) bool {
 	t.Helper()
+	raw, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if fields := strings.Fields(line); len(fields) > 6 && fields[4] == path {
+			return true
+		}
+	}
+	return false
+}
+
+// registryImage is the stopped run's memory image as the daemon's
+// registry keeps it: the wrapped key included, which the API never
+// shows.
+func registryImage(t *testing.T, stateDir, id string) run.MemoryImage {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(stateDir, "runs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var registry struct {
+		Runs []struct {
+			ID     string          `json:"id"`
+			Memory json.RawMessage `json:"memory"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal(raw, &registry); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range registry.Runs {
+		if entry.ID == id {
+			var memory run.MemoryImage
+			if err := json.Unmarshal(entry.Memory, &memory); err != nil || memory.ID == "" {
+				t.Fatalf("run %s names no memory image in the registry (%v)", id, err)
+			}
+			return memory
+		}
+	}
+	t.Fatalf("run %s is not in the registry", id)
+	return run.MemoryImage{}
+}
+
+// imageKey unwraps a run's image key as the daemon does before a resume:
+// the registry's wrapped key under the host's secret, bound to the run
+// and the image together (internal/vm/memory_images.go). The daemon
+// closes an image when it hands it to a record, so whoever would look
+// inside one needs both.
+func imageKey(t *testing.T, config vm.Config, runID string, memory run.MemoryImage) []byte {
+	t.Helper()
+	secret, err := os.ReadFile(config.HostSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(secret)
+	wrapping, err := hkdf.Key(sha256.New, secret, nil, "teploy-sandbox/v2/local-image-wrap", 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := aes.NewCipher(wrapping)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := base64.RawStdEncoding.DecodeString(memory.Key)
+	if err != nil || len(blob) < aead.NonceSize() {
+		t.Fatalf("the registry's wrapped key of image %s: %v", memory.ID, err)
+	}
+	nonce, sealed := blob[:aead.NonceSize()], blob[aead.NonceSize():]
+	key, err := aead.Open(nil, nonce, sealed, []byte("teploy-sandbox/v2/local-image/default/"+runID+"/"+memory.ID))
+	if err != nil || len(key) != 32 {
+		t.Fatalf("the record's key does not open under the host's secret: %v", err)
+	}
+	return key
+}
+
+// unseal opens a sealed image for a moment, as an administrator would to
+// repair it (its key loaded, then mounted), and leaves it as the daemon
+// does: closed, and sealed.
+func unseal(t *testing.T, config vm.Config, runID string, memory run.MemoryImage, change func()) {
+	t.Helper()
+	dataset := config.ImageDataset + "/" + memory.ID
+	key := imageKey(t, config, runID, memory)
+	defer clear(key)
+	load := exec.Command("zfs", "load-key", dataset)
+	load.Stdin = bytes.NewReader(key)
+	if out, err := load.CombinedOutput(); err != nil {
+		t.Fatalf("zfs load-key %s: %v %s", dataset, err, out)
+	}
+	defer zfs(t, "unload-key", dataset)
+	zfs(t, "mount", dataset)
+	defer zfs(t, "unmount", dataset)
 	zfs(t, "set", "readonly=off", dataset)
 	defer zfs(t, "set", "readonly=on", dataset)
 	change()
@@ -455,10 +555,11 @@ func TestVMMemoryResume(t *testing.T) {
 	dataset := stop(id)
 	stopTook := time.Since(began)
 	image := imageDir(t, r, id)
-	// The image: an encrypted filesystem of its own, sealed, and mounted
-	// where only root can name it.
+	// The image: an encrypted filesystem of its own, sealed; and closed
+	// while the run is stopped, as nothing reads it: unmounted and its key
+	// unloaded, where only root can name it.
 	for name, want := range map[string]string{
-		"encryption": "aes-256-gcm", "keyformat": "raw", "keylocation": "prompt", "keystatus": "available", "mounted": "yes",
+		"encryption": "aes-256-gcm", "keyformat": "raw", "keylocation": "prompt", "keystatus": "unavailable", "mounted": "no",
 		"readonly": "on", "exec": "off", "setuid": "off", "devices": "off", "compression": "lz4", "primarycache": "metadata",
 		"quota": "576M",
 	} {
@@ -466,16 +567,11 @@ func TestVMMemoryResume(t *testing.T) {
 			t.Errorf("the image dataset's %s is %q, want %q", name, got, want)
 		}
 	}
-	var names []string
-	for _, entry := range mustReadDir(t, image) {
-		info, _ := entry.Info()
-		names = append(names, fmt.Sprintf("%s %04o", entry.Name(), info.Mode().Perm()))
+	if mountedAt(t, image) {
+		t.Errorf("the image of a stopped run is mounted at %s", image)
 	}
-	if got := strings.Join(names, ", "); got != "config.json 0444, memory-ranges 0444, state.json 0444" {
-		t.Errorf("the image holds %s", got)
-	}
-	if info, err := os.Stat(image); err != nil || info.Mode().Perm() != 0o755 {
-		t.Errorf("the image's directory: %v %v", info, err)
+	if entries, err := os.ReadDir(image); err != nil || len(entries) != 0 {
+		t.Errorf("where a closed image is mounted there is %v (%v), want the empty mount point", entries, err)
 	}
 	if info, err := os.Stat(config.ImageMountDir); err != nil || info.Mode().Perm() != 0o700 {
 		t.Errorf("the images' directory: %v %v", info, err)
@@ -486,11 +582,6 @@ func TestVMMemoryResume(t *testing.T) {
 	// Nothing of the image stays where the VM could reach it.
 	if out, _ := exec.Command("grep", "-rl", memoryImage(t, r, id).Image, config.RunDir).Output(); len(out) > 0 {
 		t.Errorf("a VM's runtime directory names the image: %s", out)
-	}
-	// What the hypervisor wrote, for the record: the unit tests mirror
-	// this file.
-	if raw, err := os.ReadFile(filepath.Join(image, "config.json")); err == nil {
-		t.Logf("the saved configuration of the VM:\n%s", raw)
 	}
 
 	began = time.Now()
@@ -504,6 +595,30 @@ func TestVMMemoryResume(t *testing.T) {
 	guestCameBack(t, r, id, reseedsBefore, true)
 	if lines := r.says("vm restored from its memory image"); len(lines) != 1 {
 		t.Errorf("the daemon did not say the VM was restored:\n%s", r.log.String())
+	}
+	// The resume opened the image, and it stays open while the VM
+	// restored from it lives, since the VM reads its memory through the
+	// mount: mounted, its key loaded, its files root's and read-only.
+	for name, want := range map[string]string{"keystatus": "available", "mounted": "yes"} {
+		if got := zfsProperty(t, dataset, name); got != want {
+			t.Errorf("the restored VM's image has %s %q, want %q", name, got, want)
+		}
+	}
+	var names []string
+	for _, entry := range mustReadDir(t, image) {
+		info, _ := entry.Info()
+		names = append(names, fmt.Sprintf("%s %04o", entry.Name(), info.Mode().Perm()))
+	}
+	if got := strings.Join(names, ", "); got != "config.json 0444, memory-ranges 0444, state.json 0444" {
+		t.Errorf("the image holds %s", got)
+	}
+	if info, err := os.Stat(image); err != nil || info.Mode().Perm() != 0o755 {
+		t.Errorf("the image's directory: %v %v", info, err)
+	}
+	// What the hypervisor wrote, for the record: the unit tests mirror
+	// this file.
+	if raw, err := os.ReadFile(filepath.Join(image, "config.json")); err == nil {
+		t.Logf("the saved configuration of the VM:\n%s", raw)
 	}
 	t.Logf("stop with memory %s; resume %s; first exec after %s", stopTook.Round(time.Millisecond), resumeTook.Round(time.Millisecond), firstExecTook.Round(time.Millisecond))
 	for _, line := range r.says("vm restore steps", "vm memory image saved") {
@@ -537,11 +652,12 @@ func TestVMMemoryResume(t *testing.T) {
 
 	// --- every image that cannot be used boots the disk: the same guest,
 	// from its disk snapshot.
-	for name, spoil := range map[string]func(t *testing.T, dataset, image string){
-		"corrupted": func(t *testing.T, dataset, image string) {
+	for name, spoil := range map[string]func(t *testing.T, config vm.Config, runID string, memory run.MemoryImage, dataset, image string){
+		"corrupted": func(t *testing.T, config vm.Config, runID string, memory run.MemoryImage, dataset, image string) {
 			// The devices' state, scrambled where it is sealed: the
-			// hypervisor can make no VM of it.
-			unseal(t, dataset, func() {
+			// hypervisor can make no VM of it. The image is closed at
+			// rest; whoever repairs one opens it as this does.
+			unseal(t, config, runID, memory, func() {
 				rewrite(t, filepath.Join(image, "state.json"), func(raw []byte) []byte {
 					for i := range min(len(raw), 4096) {
 						raw[i] = 0xff
@@ -550,13 +666,13 @@ func TestVMMemoryResume(t *testing.T) {
 				})
 			})
 		},
-		"truncated": func(t *testing.T, dataset, image string) {
+		"truncated": func(t *testing.T, config vm.Config, runID string, memory run.MemoryImage, dataset, image string) {
 			// Less memory than the guest has.
-			unseal(t, dataset, func() {
+			unseal(t, config, runID, memory, func() {
 				rewrite(t, filepath.Join(image, "memory-ranges"), func(raw []byte) []byte { return raw[:1<<20] })
 			})
 		},
-		"missing": func(t *testing.T, dataset, _ string) {
+		"missing": func(t *testing.T, _ vm.Config, _ string, _ run.MemoryImage, dataset, _ string) {
 			zfs(t, "destroy", dataset)
 		},
 	} {
@@ -564,8 +680,9 @@ func TestVMMemoryResume(t *testing.T) {
 		guestStarts(t, r, id)
 		reseedsBefore := forkReseeds(t, r, id)
 		dataset := stop(id)
-		image := imageDir(t, r, id)
-		spoil(t, dataset, image)
+		memory := registryImage(t, stateDir, id)
+		image := filepath.Join(r.config.ImageMountDir, memory.ID)
+		spoil(t, config, id, memory, dataset, image)
 		resume(id, run.ResumedFromDisk)
 		guestCameBack(t, r, id, reseedsBefore, false)
 		if lines := r.says("vm memory image not used; booting from the disk"); len(lines) == 0 {

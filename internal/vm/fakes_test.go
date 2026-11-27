@@ -1313,6 +1313,25 @@ func (z *fakeZFS) LoadKey(_ context.Context, name string, key []byte) error {
 	return nil
 }
 
+func (z *fakeZFS) UnloadKey(_ context.Context, name string) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.fsCalls = append(z.fsCalls, "unload-key "+name)
+	dataset, ok := z.datasets[name]
+	if !ok || dataset.fsKey == nil {
+		return fmt.Errorf("cannot unload key for '%s': not an encryption root", name)
+	}
+	// As zfs: a dataset with its key loaded has to be unmounted first.
+	if dataset.fsMounted {
+		return fmt.Errorf("cannot unload-key '%s': dataset is mounted", name)
+	}
+	if !dataset.fsKeyLoaded {
+		return fmt.Errorf("Key unload error: Key not loaded for '%s'", name)
+	}
+	dataset.fsKeyLoaded = false
+	return nil
+}
+
 func (z *fakeZFS) CheckKey(_ context.Context, name string, key []byte) error {
 	z.mu.Lock()
 	defer z.mu.Unlock()

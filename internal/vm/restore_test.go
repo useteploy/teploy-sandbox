@@ -200,6 +200,11 @@ func TestAStopSavesTheVMsMemoryAndAResumeRestoresTheVMFromIt(t *testing.T) {
 	if !rig.zfs.has(t, image.dataset) {
 		t.Fatal("the image is not on the pool")
 	}
+	// Closed while the run is stopped, since nothing reads it: unmounted,
+	// and its key unloaded. The resume opens it again.
+	if mounted, loaded := rig.zfs.openState(image.dataset); mounted || loaded {
+		t.Fatalf("the image of a stopped run is mounted %t, key loaded %t", mounted, loaded)
+	}
 	raw, err := os.ReadFile(filepath.Join(stateDir, "runs.json"))
 	if err != nil || !strings.Contains(string(raw), saved.Image) {
 		t.Fatalf("the registry does not name the image: %v %s", err, raw)
@@ -225,6 +230,11 @@ func TestAStopSavesTheVMsMemoryAndAResumeRestoresTheVMFromIt(t *testing.T) {
 	restored := rig.hypervisor.machine(containerName(created.ID))
 	if restored == nil || restored == machine {
 		t.Fatal("the run's VM is not the restored one")
+	}
+	// Open while the VM restored from it lives: the VM reads its memory
+	// through the mount.
+	if mounted, loaded := rig.zfs.openState(image.dataset); !mounted || !loaded {
+		t.Fatalf("the image a VM is restored from is mounted %t, key loaded %t", mounted, loaded)
 	}
 	request := restored.restoredRequests[0]
 	if len(restored.restoredRequests) != 1 || restored.Inbox() == "" || request.SourceURL != "file://"+restored.Inbox() || request.NetFD != nil {

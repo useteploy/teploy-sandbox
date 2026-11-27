@@ -5,8 +5,9 @@ package vm
 // The memory image store on a real pool, as root: the dataset an image is
 // made of (encrypted, its own encryption root, with the flags a jail's
 // slave bind keeps), the bind through which the hypervisor writes, the
-// sealing, the quota, and what is refused; then the same image opened by
-// the daemon's next life. It runs with the live suite:
+// sealing, the quota, and what is refused; an image closed at rest (and
+// what zfs then sends of it); then the same image opened by the daemon's
+// next life. It runs with the live suite:
 //
 //	CGO_ENABLED=0 go test -c -tags vmintegration -o vm-unit.test ./internal/vm/
 //	sudo ./vm-unit.test -test.run TestVMMemoryImagesOnARealPool -test.v
@@ -15,6 +16,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -169,16 +171,56 @@ func TestVMMemoryImagesOnARealPool(t *testing.T) {
 		t.Error("the sealed image can be written")
 	}
 	must(t, verifyImage(img.dir, 256, 0))
-	raw := bytes.Clone(img.key)
+	// The slice itself, and not a copy: what is left in it once the
+	// daemon drops the key is looked at below.
+	raw := img.key
 	rec, err := s.handOver("run", img, run.MemoryImage{Disk: "7001", MemoryMB: 256, CPUs: 1})
 	must(t, err)
 	// The record keeps the key wrapped: the raw key is in no file and in
-	// no record.
+	// no record, and is zeroed where the daemon held it.
 	if blob, _ := base64.RawStdEncoding.DecodeString(rec.Key); bytes.Contains(blob, raw) || img.key != nil {
 		t.Error("the record's key holds the raw key")
 	}
+	if !bytes.Equal(raw, make([]byte, len(raw))) {
+		t.Error("the raw key is still in the memory the daemon held it in")
+	}
 	if exists, _ := zfs.Exists(bg, img.dataset); !exists {
 		t.Fatal("the sealed image is not on the pool")
+	}
+	// Closed from the hand-over on, while nothing reads it: unmounted,
+	// its key unloaded. zfs then refuses a plain send of the image alone,
+	// for want of the key: nothing carries a guest's memory off in clear
+	// from it. Raw, it goes, encrypted. (A recursive send of the pool
+	// refuses an encrypted dataset unless raw whether its key is loaded
+	// or not: measured by hand on the test host, ZFS 2.3.9.)
+	for name, want := range map[string]string{propKeyStatus: "unavailable", propMounted: "no"} {
+		if got, _ := zfs.Property(bg, img.dataset, name); got != want {
+			t.Errorf("the image at rest has %s %q, want %q", name, got, want)
+		}
+	}
+	if line := mountInfo(t, img.dir); line != "" {
+		t.Errorf("the image at rest is mounted: %q", line)
+	}
+	if entries, err := os.ReadDir(img.dir); err != nil || len(entries) != 0 {
+		t.Errorf("where a closed image is mounted there is %v (%v)", entries, err)
+	}
+	// zfsDiscarding runs zfs with its output dropped (a stream is not
+	// read into memory) and answers with what it said on stderr.
+	zfsDiscarding := func(args ...string) (string, error) {
+		cmd := exec.Command("zfs", args...)
+		cmd.Stdout = io.Discard
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		return stderr.String(), err
+	}
+	if said, err := zfsDiscarding("send", img.dataset); err == nil {
+		t.Errorf("a closed image was sent plain: %s", said)
+	} else {
+		t.Logf("zfs send of a closed image: %v %s", err, said)
+	}
+	if said, err := zfsDiscarding("send", "-w", img.dataset); err != nil {
+		t.Errorf("a closed image was not sent raw: %v %s", err, said)
 	}
 
 	// --- what a hostile writer leaves is refused on a real dataset, and
@@ -253,7 +295,9 @@ func TestVMMemoryImagesOnARealPool(t *testing.T) {
 	}
 	img = first
 
-	// --- the daemon's next life: nothing is mounted and no key is loaded.
+	// --- the daemon's next life finds the images as the hand-over left
+	// them: nothing mounted and no key is loaded, which is also what a
+	// host's reboot leaves.
 	second, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
 	must(t, err)
 	_, err = s.bind(second, outbox)
@@ -266,12 +310,11 @@ func TestVMMemoryImagesOnARealPool(t *testing.T) {
 	orphan, err := s.begin(bg, "teploy-sbx-writer", 256, testVMUID)
 	must(t, err)
 	for _, image := range []*image{img, second} {
-		must(t, zfs.Unmount(bg, image.dataset))
-		if out, err := exec.Command("zfs", "unload-key", image.dataset).CombinedOutput(); err != nil {
-			t.Fatalf("zfs unload-key %s: %v %s", image.dataset, err, out)
-		}
 		if got, _ := zfs.Property(bg, image.dataset, propKeyStatus); got != "unavailable" {
-			t.Fatalf("the key of %s is still loaded: %q", image.id, got)
+			t.Errorf("the key of %s is still loaded: %q", image.id, got)
+		}
+		if line := mountInfo(t, image.dir); line != "" {
+			t.Errorf("%s is still mounted at the hand-over: %q", image.id, line)
 		}
 	}
 
@@ -288,7 +331,8 @@ func TestVMMemoryImagesOnARealPool(t *testing.T) {
 	if line := mountInfo(t, orphan.bound); line != "" {
 		t.Errorf("the orphan's bind outlived it: %q", line)
 	}
-	// Opened for a restore: its key loaded, its dataset mounted, checked.
+	// Opened for a restore from the state a reboot leaves: its key
+	// loaded, its dataset mounted, checked.
 	opened, err := restarted.open(bg, "run", &rec)
 	must(t, err)
 	if got, _ := zfs.Property(bg, opened.dataset, propKeyStatus); got != "available" {

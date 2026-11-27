@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -328,7 +330,7 @@ func TestARestoreUnderWayIsLeftAloneByTheRetryOfAClose(t *testing.T) {
 	}
 	// Its writer's end, after: nothing is owed, so nothing is tried.
 	s.vmGone(bg, "teploy-sbx-writer")
-	if busy.tried() != 1 || busy.has(t, img.dataset) == false {
+	if busy.tried() != 1 || !busy.has(t, img.dataset) {
 		t.Fatalf("after the writer's end: %d tries, on the pool %t", busy.tried(), busy.has(t, img.dataset))
 	}
 	must(t, s.release(bg, rec.ID))
@@ -432,6 +434,210 @@ func TestANewLifeClosesTheImagesTheRegistryNames(t *testing.T) {
 		must(t, restarted.sweep(bg))
 		if mounted, loaded := busy.openState(img.dataset); mounted || loaded || len(restarted.unclosed) != 0 {
 			t.Fatalf("after the sweep: mounted %t, key loaded %t, %d owed", mounted, loaded, len(restarted.unclosed))
+		}
+	})
+}
+
+// forgetPoolCalls drops what the pool was asked of filesystems so far,
+// so that a test can look at what comes next alone.
+func forgetPoolCalls(z *fakeZFS) {
+	z.mu.Lock()
+	z.fsCalls = nil
+	z.mu.Unlock()
+}
+
+type mountRefused struct{ *fakeZFS }
+
+func (z *mountRefused) Mount(context.Context, string) error {
+	return zfsError("cannot mount: mountpoint is busy")
+}
+
+// An open that loaded the key and then failed (mount, or the image's
+// check) leaves the key loaded: the image is no longer at rest closed,
+// and stays so if the release that follows cannot destroy it (owed).
+func TestRecheckAFailedOpenLeavesTheImageClosed(t *testing.T) {
+	z := newFakeZFS()
+	s := newTestImages(t, z)
+	img, rec := savedImage(t, s, "run", 256)
+	s.zfs = &mountRefused{z}
+	if _, err := s.open(bg, "run", &rec); err == nil {
+		t.Fatal("an open whose mount failed succeeded")
+	}
+	if mounted, loaded := z.openState(img.dataset); mounted || loaded {
+		t.Fatalf("a failed open left the image mounted %t, key loaded %t", mounted, loaded)
+	}
+	// And the release that follows, where the pool cannot destroy the
+	// image: owed, and closed while it waits.
+	z.fail["destroy "+img.dataset] = zfsError("cannot destroy 'x': system is busy")
+	if err := s.release(bg, rec.ID); err == nil || len(s.owed) != 1 {
+		t.Fatalf("the destroy was set up to fail: %v, %d owed", err, len(s.owed))
+	}
+	if mounted, loaded := z.openState(img.dataset); mounted || loaded {
+		t.Fatalf("an image owed its destroy is mounted %t, key loaded %t", mounted, loaded)
+	}
+}
+
+// strictPool is a pool that, as zfs, does nothing more for a request
+// that is over: its Mount ends the request and fails with its error.
+type strictPool struct {
+	*fakeZFS
+	cancel context.CancelFunc
+}
+
+func (z *strictPool) Mount(ctx context.Context, _ string) error {
+	z.cancel()
+	return ctx.Err()
+}
+
+func (z *strictPool) Unmount(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return z.fakeZFS.Unmount(ctx, name)
+}
+
+func (z *strictPool) UnloadKey(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return z.fakeZFS.UnloadKey(ctx, name)
+}
+
+// undoRefused is a pool that refuses an open's mount and, while held
+// says so, the undo's unloading of the key.
+type undoRefused struct {
+	*fakeZFS
+	held bool
+}
+
+func (z *undoRefused) Mount(context.Context, string) error {
+	return zfsError("cannot mount: mountpoint is busy")
+}
+
+func (z *undoRefused) UnloadKey(ctx context.Context, name string) error {
+	if z.held {
+		return zfsError("cannot unload-key for 'x': dataset is busy")
+	}
+	return z.fakeZFS.UnloadKey(ctx, name)
+}
+
+// What a failed open undoes: what it asked the pool for, and only that,
+// as the pool says now, under a budget of its own. Each case is a way an
+// open fails once it has asked for part of it.
+func TestAFailedOpenUndoesWhatItAskedOfThePool(t *testing.T) {
+	t.Run("the dataset would not mount", func(t *testing.T) {
+		z := newFakeZFS()
+		s := newTestImages(t, z)
+		img, rec := savedImage(t, s, "run", 256)
+		s.zfs = &mountRefused{z}
+		forgetPoolCalls(z)
+		if _, err := s.open(bg, "run", &rec); err == nil {
+			t.Fatal("an open whose mount failed succeeded")
+		}
+		// The key it asked loaded is unloaded; the dataset it asked
+		// mounted, and is not, is not asked to unmount.
+		want := []string{"check-key " + img.dataset, "load-key " + img.dataset, "unload-key " + img.dataset}
+		if calls := z.fsCallsSoFar(); strings.Join(calls, "; ") != strings.Join(want, "; ") {
+			t.Fatalf("the pool was asked:\n%s\nwant:\n%s", strings.Join(calls, "\n"), strings.Join(want, "\n"))
+		}
+		if len(s.unclosed) != 0 || len(s.known) != 1 {
+			t.Fatalf("a closed image is owed or unknown: %d owed, known %d", len(s.unclosed), len(s.known))
+		}
+	})
+
+	t.Run("the image is not what a sealed image must be", func(t *testing.T) {
+		z := newFakeZFS()
+		s := newTestImages(t, z)
+		img, rec := savedImage(t, s, "run", 256)
+		// A file a writer made writable again after the seal.
+		must(t, os.Chmod(filepath.Join(img.dir, imageStateFile), 0o644))
+		forgetPoolCalls(z)
+		if _, err := s.open(bg, "run", &rec); err == nil {
+			t.Fatal("an image with a writable file was opened")
+		}
+		if mounted, loaded := z.openState(img.dataset); mounted || loaded {
+			t.Fatalf("a failed open left the image mounted %t, key loaded %t", mounted, loaded)
+		}
+		// Opened as far as the check, then closed as a close does: the
+		// dataset unmounted, and only then its key unloaded.
+		want := []string{"check-key " + img.dataset, "load-key " + img.dataset, "mount " + img.dataset, "unmount " + img.dataset, "unload-key " + img.dataset}
+		if calls := z.fsCallsSoFar(); strings.Join(calls, "; ") != strings.Join(want, "; ") {
+			t.Fatalf("the pool was asked:\n%s\nwant:\n%s", strings.Join(calls, "\n"), strings.Join(want, "\n"))
+		}
+		// The image is its record's still, and opens once it is what
+		// it must be.
+		must(t, os.Chmod(filepath.Join(img.dir, imageStateFile), 0o444))
+		opened, err := s.open(bg, "run", &rec)
+		must(t, err)
+		s.drop(bg, opened)
+	})
+
+	t.Run("the request ended at the mount", func(t *testing.T) {
+		z := newFakeZFS()
+		s := newTestImages(t, z)
+		img, rec := savedImage(t, s, "run", 256)
+		ctx, cancel := context.WithCancel(bg)
+		defer cancel()
+		s.zfs = &strictPool{fakeZFS: z, cancel: cancel}
+		if _, err := s.open(ctx, "run", &rec); err == nil || !strings.Contains(err.Error(), "context canceled") {
+			t.Fatalf("an open whose request ended: %v", err)
+		}
+		// The undo is the daemon's, not the request's: its key is
+		// unloaded although nothing more is done for that request.
+		if mounted, loaded := z.openState(img.dataset); mounted || loaded {
+			t.Fatalf("an open whose request ended left the image mounted %t, key loaded %t", mounted, loaded)
+		}
+	})
+
+	t.Run("the pool refuses the undo too", func(t *testing.T) {
+		z := newFakeZFS()
+		s := newTestImages(t, z)
+		s.now = func() time.Time { return time.Unix(1700000000, 0) }
+		img, rec := savedImage(t, s, "run", 256)
+		stubborn := &undoRefused{fakeZFS: z, held: true}
+		s.zfs = stubborn
+		_, err := s.open(bg, "run", &rec)
+		if err == nil || !strings.Contains(err.Error(), "left open") {
+			t.Fatalf("an open whose undo the pool refused: %v", err)
+		}
+		if mounted, loaded := z.openState(img.dataset); mounted || !loaded || len(s.unclosed) != 1 || s.unclosed[0] != img {
+			t.Fatalf("a close the undo could not make is not owed: mounted %t, key loaded %t, %d owed", mounted, loaded, len(s.unclosed))
+		}
+		if _, known := s.known[img.id]; !known {
+			t.Fatal("an image whose close is owed is no longer known")
+		}
+		// Too soon for the sweep, and the image is its run's still.
+		if err := s.sweep(bg); err != nil || !z.has(t, img.dataset) {
+			t.Fatalf("too soon: %v", err)
+		}
+		stubborn.held = false
+		s.now = func() time.Time { return time.Unix(1700000000, 0).Add(s.retryAfter) }
+		must(t, s.sweep(bg))
+		if mounted, loaded := z.openState(img.dataset); mounted || loaded || len(s.unclosed) != 0 || !z.has(t, img.dataset) {
+			t.Fatalf("after the sweep: mounted %t, key loaded %t, %d owed, on the pool %t", mounted, loaded, len(s.unclosed), z.has(t, img.dataset))
+		}
+	})
+
+	t.Run("an image that lay open before lies open still", func(t *testing.T) {
+		busy, s, img, rec := owedStore(t)
+		// Not what a sealed image must be: the open fails at its
+		// check, having asked the pool for nothing.
+		must(t, os.Chmod(filepath.Join(img.dir, imageStateFile), 0o644))
+		if _, err := s.open(bg, "run", &rec); err == nil {
+			t.Fatal("an image with a writable file was opened")
+		}
+		if mounted, loaded := busy.openState(img.dataset); !mounted || !loaded {
+			t.Fatalf("a failed open changed an image that lay open: mounted %t, key loaded %t", mounted, loaded)
+		}
+		if busy.tried() != 1 || len(s.unclosed) != 1 {
+			t.Fatalf("the open touched an owing that is not its own: %d tries, %d owed", busy.tried(), len(s.unclosed))
+		}
+		// Still owed to the sweep: the pool lets the close go.
+		busy.held = false
+		s.now = func() time.Time { return time.Unix(1700000000, 0).Add(s.retryAfter) }
+		must(t, s.sweep(bg))
+		if mounted, loaded := busy.openState(img.dataset); mounted || loaded || len(s.unclosed) != 0 {
+			t.Fatalf("after the sweep: mounted %t, key loaded %t, %d owed", mounted, loaded, len(s.unclosed))
 		}
 	})
 }

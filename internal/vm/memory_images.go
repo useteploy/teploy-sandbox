@@ -617,7 +617,13 @@ func (s *memoryImages) open(ctx context.Context, runID string, rec *run.MemoryIm
 // ready is the host's half of opening: the dataset is there, this
 // daemon's and sealed; the record's key opens it; it is mounted; and it
 // is what a sealed image must be.
-func (s *memoryImages) ready(ctx context.Context, img *image, runID string, rec *run.MemoryImage) error {
+//
+// An open that fails once it has asked the pool for part of that undoes
+// what it asked (unopen), and leaves the image as it found it: a key
+// left loaded is a guest's memory in clear to a plain zfs send for as
+// long as the image stays, and the release that follows a failed
+// restore can be refused, which leaves it staying.
+func (s *memoryImages) ready(ctx context.Context, img *image, runID string, rec *run.MemoryImage) (err error) {
 	dataset, err := s.zfs.Dataset(ctx, img.dataset)
 	if errors.Is(err, ErrNoDataset) {
 		return fmt.Errorf("the image %s is not on this host", rec.ID)
@@ -628,9 +634,11 @@ func (s *memoryImages) ready(ctx context.Context, img *image, runID string, rec 
 	if dataset.Owner != s.owner || dataset.Kind != kindImage {
 		return fmt.Errorf("%s is not a memory image of this daemon", img.dataset)
 	}
-	if sealed, err := s.zfs.Property(ctx, img.dataset, propReadonly); err != nil {
+	sealed, err := s.zfs.Property(ctx, img.dataset, propReadonly)
+	if err != nil {
 		return err
-	} else if sealed != "on" {
+	}
+	if sealed != "on" {
 		return fmt.Errorf("the image %s is not sealed (its dataset is not read-only)", rec.ID)
 	}
 	key, err := s.keys.unwrap(runID, rec.ID, rec.Key)
@@ -642,21 +650,56 @@ func (s *memoryImages) ready(ctx context.Context, img *image, runID string, rec 
 	if err := s.zfs.CheckKey(ctx, img.dataset, key); err != nil {
 		return fmt.Errorf("its key does not open the dataset (wrong key): %w", err)
 	}
-	if status, err := s.zfs.Property(ctx, img.dataset, propKeyStatus); err != nil {
+	// What this call asks the pool for is noted before it is asked: a
+	// command that ends at a deadline can have taken effect. All of it
+	// is undone if the open fails from here.
+	var asked opened
+	defer func() {
+		if err != nil && asked != (opened{}) {
+			err = errors.Join(err, s.unopen(img, asked))
+		}
+	}()
+	status, err := s.zfs.Property(ctx, img.dataset, propKeyStatus)
+	if err != nil {
 		return err
-	} else if status == "unavailable" {
+	}
+	if status == "unavailable" {
+		asked.key = true
 		if err := s.zfs.LoadKey(ctx, img.dataset, key); err != nil {
 			return fmt.Errorf("load its key: %w", err)
 		}
 	}
-	if mounted, err := s.zfs.Property(ctx, img.dataset, propMounted); err != nil {
+	mounted, err := s.zfs.Property(ctx, img.dataset, propMounted)
+	if err != nil {
 		return err
-	} else if mounted != "yes" {
+	}
+	if mounted != "yes" {
+		asked.mount = true
 		if err := s.zfs.Mount(ctx, img.dataset); err != nil {
 			return fmt.Errorf("mount its dataset: %w", err)
 		}
 	}
 	return verifyImage(img.dir, rec.MemoryMB, s.sealedUID)
+}
+
+// unopen undoes what a failed open asked the pool for: the key it asked
+// loaded, the dataset it asked mounted, and nothing else. An image that
+// lay open before (a close it owes) lies open as it did, and is owed as
+// it was: nothing was asked of it. Under a budget of its own, since a
+// failed open is often a request that ended, and its commands would
+// fail for the same reason again. A close the pool refuses is owed here
+// as anywhere else (oweClose), and is said in the open's error.
+func (s *memoryImages) unopen(img *image, asked opened) error {
+	ctx, cancel := context.WithTimeout(context.Background(), closeBudget)
+	defer cancel()
+	err := s.closeOf(ctx, img, asked)
+	if err == nil {
+		return nil
+	}
+	s.mu.Lock()
+	s.oweClose(img, err)
+	s.mu.Unlock()
+	return fmt.Errorf("the image is left open after an open that failed: %w", err)
 }
 
 // changedSince says what differs between an image's host class and this
@@ -801,25 +844,45 @@ func (s *memoryImages) shut(ctx context.Context, img *image) {
 // nothing's work, and is not announced. The caller holds no lock: these
 // are the host's commands.
 func (s *memoryImages) close(ctx context.Context, img *image) error {
-	mounted, err := s.zfs.Property(ctx, img.dataset, propMounted)
-	if err != nil {
-		return err
-	}
-	if mounted == "yes" {
-		if err := s.zfs.Unmount(ctx, img.dataset); err != nil {
-			return fmt.Errorf("unmount its dataset: %w", err)
+	return s.closeOf(ctx, img, opened{key: true, mount: true})
+}
+
+// opened names what may be open of an image, and so what one closing
+// touches: its key loaded, its dataset mounted. A close names both; an
+// open that failed names what it asked the pool for, and no more.
+type opened struct{ key, mount bool }
+
+// closeOf is close, of what of names and nothing else: the dataset
+// unmounted where it is mounted, the key unloaded where it is loaded,
+// each as the pool says now rather than as any caller was told.
+func (s *memoryImages) closeOf(ctx context.Context, img *image, of opened) error {
+	mounted := false
+	if of.mount {
+		value, err := s.zfs.Property(ctx, img.dataset, propMounted)
+		if err != nil {
+			return err
+		}
+		mounted = value == "yes"
+		if mounted {
+			if err := s.zfs.Unmount(ctx, img.dataset); err != nil {
+				return fmt.Errorf("unmount its dataset: %w", err)
+			}
 		}
 	}
-	status, err := s.zfs.Property(ctx, img.dataset, propKeyStatus)
-	if err != nil {
-		return err
-	}
-	if status == "available" {
-		if err := s.zfs.UnloadKey(ctx, img.dataset); err != nil {
-			return fmt.Errorf("unload its key: %w", err)
+	loaded := false
+	if of.key {
+		value, err := s.zfs.Property(ctx, img.dataset, propKeyStatus)
+		if err != nil {
+			return err
+		}
+		loaded = value == "available"
+		if loaded {
+			if err := s.zfs.UnloadKey(ctx, img.dataset); err != nil {
+				return fmt.Errorf("unload its key: %w", err)
+			}
 		}
 	}
-	if mounted != "yes" && status != "available" {
+	if !mounted && !loaded {
 		return nil
 	}
 	s.logger().Info("memory image closed", "image", img.id)

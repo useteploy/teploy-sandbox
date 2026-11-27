@@ -4548,11 +4548,17 @@ added here runs, and a VM's jail and command line are what they were.
   `memory` on every stopped run, when the daemon keeps images.
 - **Lifetime.** An image is held by the run's record, by a restore under
   way, and by the VM restored from it; destroyed at zero and only then
-  (the reference count is the only guard, per M0). Eviction: no image
-  into a pool below `--remote-pool-reserve`; images leave such a pool
-  oldest-stop-first, before any local copy of a disk snapshot. At start
-  the registry names what is kept, the rest goes, and a run whose image
-  is not here stops claiming it.
+  (the reference count is the only guard, per M0). An image whose
+  unmount or destroy is refused is owed and never forgotten: it is
+  tried again when the VM that wrote or mapped it is gone (`vmGone`, at
+  the end of the stop that made it), and by the reaper, no sooner than a
+  minute after its last attempt (`SweepMemory`). Eviction: no image into
+  a pool below `--remote-pool-reserve`; images leave such a pool
+  oldest-stop-first, before any local copy of a disk snapshot, and a
+  stop makes room for its own image the same way only while dropping
+  images can cover the shortfall. At start the registry names what is
+  kept, the rest goes, and a run whose image is not here stops claiming
+  it.
 - **Invariants kept.** The jail (one more bind, the outbox, a slave of a
   shared mount; three read-only file binds for an inbox), the per-run
   UID, both seccomp filters (no new allowed syscall: the daemon's denylist
@@ -4786,8 +4792,29 @@ also ran as root there, as CI's root job runs it: 310 pass, none skipped.
   built from this release's `teploy-guestd` for the occasion. Rebuild
   the golden when this ships.
 - **`zfs destroy` of a dataset a jailed VM maps was not tried.** The
-  reference count is what keeps the daemon from asking; a destroy that
-  fails (busy) is owed and retried at the next start.
+  reference count is what keeps the daemon from asking, and it is all
+  that does: M0 (U9) measured that an unmount of an image two jailed VMs
+  had mapped succeeded. A destroy that fails (busy) is owed and never
+  forgotten: tried again when the VM that wrote or mapped the image is
+  gone, and by the reaper once a minute; at a start nothing is owed.
+- **Restored guests' background processes keep the proxy they were
+  started with.** On the allowlist tier a run's egress proxy is opened
+  anew at every resume, with a new port and a new credential
+  (`egress.Pool.OpenFor`: port 0, a random secret), and closed at the
+  stop. The daemon gives the new one to every exec of the run after the
+  resume (`createEnv`), but a process that was saved with the old
+  `HTTP_PROXY`/`HTTPS_PROXY` in its environment is brought back with
+  it: after a restore from memory its egress goes to the run's gateway
+  on a port nothing listens on, or with a credential the proxy no longer
+  knows, and is refused. Closed, not open: only the run's own guest can
+  reach its gateway, and the proxy answers nothing but its own
+  credential. It stays so until the process is started again from an
+  exec of the run; a guest booted from the disk has no such processes.
+  Not measured live (the live suite resumes no allowlist run from memory
+  with a background process of its own). Candidates, none tried: keep
+  the proxy's port and credential across a stop, so that a resume
+  reopens the same and the saved environment works again; a restored
+  guest cannot be made to re-read what its processes inherited.
 - **With the flag off, the images of a host that ran with it on stay on
   the pool.** A daemon started without `--vm-memory-snapshots` touches
   none of it: no code of the flag's runs. The registry stays sane, as

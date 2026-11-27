@@ -3,8 +3,10 @@
 // Live tests of memory stop and resume (--vm-memory-snapshots): a stop
 // saves the VM's memory beside its disk snapshot and a resume restores
 // the VM from it, under the daemon's whole confinement; every image that
-// cannot be used boots the disk; and what it costs is measured. They run
-// with the rest of the live suite (see vm_integration_test.go).
+// cannot be used boots the disk; the guest's random state is shown to be
+// new at a restore, two ways that can fail; and what it costs is
+// measured. They run with the rest of the live suite (see
+// vm_integration_test.go).
 package main
 
 import (
@@ -189,21 +191,44 @@ echo "server=[$out] python3=[$(command -v python3)] curl=[$(command -v curl)] ti
 	}
 }
 
-// guestSample is a reading of the guest's random stream, to compare with
-// the next one.
-func guestSample(t *testing.T, r *memoryRig, id string) string {
+// forkReseeds is how many times so far the guest's kernel has reseeded
+// its random generator because its VM was forked or restored. Its VM
+// Generation ID driver logs each one ("crng reseeded due to virtual
+// machine fork"), and nothing else does. The hypervisor changes the ID
+// and notifies the guest's device before a restored VM runs again, so
+// the driver reseeds at every restore.
+//
+// The count is compared across a restore, not merely found. Since Linux
+// 6.10 the driver logs nothing at boot and one line at every restore;
+// the driver before that logged one at boot and none at a restore, so
+// for it the count does not move, which is the finding.
+func forkReseeds(t *testing.T, r *memoryRig, id string) int {
 	t.Helper()
-	return vmRun(t, r.manager, id, `head -c 32 /dev/urandom | sha256sum | cut -c1-16`, "", nil, 30*time.Second).stdout
+	got := vmRun(t, r.manager, id, `dmesg | grep -c 'crng reseeded due to virtual machine fork'`, "", nil, 30*time.Second)
+	if got.stderr != "" {
+		t.Fatalf("the guest's kernel log could not be read: %q %q", got.stdout, got.stderr)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(got.stdout))
+	if err != nil {
+		t.Fatalf("the guest's count of reseeds reads %q: %v", got.stdout, err)
+	}
+	return n
 }
 
 // guestCameBack is what a resumed guest must still have. From its disk,
 // it is a fresh boot of the saved filesystem: the file is there, and
 // nothing that ran before is. From its memory, the file, the process
 // (the same one, still writing), the listening server, and the host's
-// clock are there too; its random state is its own, the kernel says it
-// reseeded, and its hypervisor maps the image as a copy-on-write
-// restore does.
-func guestCameBack(t *testing.T, r *memoryRig, id, randomBefore string, restored bool) {
+// clock are there too; its random state is its own (the kernel's count
+// of reseeds has grown across the restore: reseedsBefore is what it
+// read before the stop), and its hypervisor maps the image as a
+// copy-on-write restore does.
+//
+// Two readings of /dev/urandom, one before the stop and one after the
+// restore, are not compared: they differ whether or not anything
+// reseeded the generator, since the stream had moved on past the first
+// reading when the memory was saved (a review of the first cut).
+func guestCameBack(t *testing.T, r *memoryRig, id string, reseedsBefore int, restored bool) {
 	t.Helper()
 	if got := vmRun(t, r.manager, id, `cat /work/kept`, "", nil, 30*time.Second); got.stdout != "kept\n" {
 		t.Fatalf("the file: %+v", got)
@@ -231,14 +256,14 @@ func guestCameBack(t *testing.T, r *memoryRig, id, randomBefore string, restored
 	if drift := time.Since(time.Unix(0, int64(last*1e9))); drift < -time.Second || drift > 5*time.Second {
 		t.Fatalf("the guest's clock is %s from the host's", drift.Round(time.Millisecond))
 	}
-	if got := guestSample(t, r, id); got == randomBefore {
-		t.Fatal("the guest's random stream is where it was when it was saved")
-	}
-	// The kernel says so itself: the VM Generation ID driver reseeds the
-	// generator on every restore.
-	reseeds := vmRun(t, r.manager, id, `dmesg | grep -c 'crng reseeded due to virtual machine fork'`, "", nil, 30*time.Second)
-	if n, _ := strconv.Atoi(strings.TrimSpace(reseeds.stdout)); n < 1 {
-		t.Fatalf("the guest kernel did not reseed its generator: %q %q", reseeds.stdout, reseeds.stderr)
+	// The kernel says so itself, and the count is what shows it happened
+	// at this restore and not at some time before the stop: the VM
+	// Generation ID driver reseeds the generator on the hypervisor's
+	// notification, once per restore.
+	after := forkReseeds(t, r, id)
+	t.Logf("the guest kernel's reseeds: %d before the stop, %d after the restore", reseedsBefore, after)
+	if after <= reseedsBefore {
+		t.Fatalf("the guest kernel's count of reseeds is %d after the restore and was %d before the stop: nothing reseeded its random state at the restore", after, reseedsBefore)
 	}
 	// The hypervisor maps the memory file over its whole length,
 	// privately: nothing it writes reaches the image, and nothing of the
@@ -414,7 +439,7 @@ func TestVMMemoryResume(t *testing.T) {
 	// restores the VM from it.
 	id := create(run.NetworkNone)
 	guestStarts(t, r, id)
-	randomBefore := guestSample(t, r, id)
+	reseedsBefore := forkReseeds(t, r, id)
 	began := time.Now()
 	dataset := stop(id)
 	stopTook := time.Since(began)
@@ -465,7 +490,7 @@ func TestVMMemoryResume(t *testing.T) {
 	if first.code != 0 {
 		t.Fatalf("first exec: %+v", first)
 	}
-	guestCameBack(t, r, id, randomBefore, true)
+	guestCameBack(t, r, id, reseedsBefore, true)
 	if lines := r.says("vm restored from its memory image"); len(lines) != 1 {
 		t.Errorf("the daemon did not say the VM was restored:\n%s", r.log.String())
 	}
@@ -526,12 +551,12 @@ func TestVMMemoryResume(t *testing.T) {
 	} {
 		id := create(run.NetworkNone)
 		guestStarts(t, r, id)
-		randomBefore := guestSample(t, r, id)
+		reseedsBefore := forkReseeds(t, r, id)
 		dataset := stop(id)
 		image := imageDir(t, r, id)
 		spoil(t, dataset, image)
 		resume(id, run.ResumedFromDisk)
-		guestCameBack(t, r, id, randomBefore, false)
+		guestCameBack(t, r, id, reseedsBefore, false)
 		if lines := r.says("vm memory image not used; booting from the disk"); len(lines) == 0 {
 			t.Errorf("%s: the daemon did not say the image was not used:\n%s", name, r.log.String())
 		}
@@ -543,36 +568,36 @@ func TestVMMemoryResume(t *testing.T) {
 	// none of its images, and a restart on the same host opens them.
 	id = create(run.NetworkNone)
 	guestStarts(t, r, id)
-	randomBefore = guestSample(t, r, id)
+	reseedsBefore = forkReseeds(t, r, id)
 	stop(id)
 	other := config
 	other.HostSecret = config.HostSecret + ".other"
 	r = newMemoryDaemon(t, other, stateDir)
 	resume(id, run.ResumedFromDisk)
-	guestCameBack(t, r, id, randomBefore, false)
+	guestCameBack(t, r, id, reseedsBefore, false)
 	destroy(id)
 	ids = nil
 
 	// --- an image of another host class: the hypervisor was upgraded.
 	id = create(run.NetworkNone)
 	guestStarts(t, r, id)
-	randomBefore = guestSample(t, r, id)
+	reseedsBefore = forkReseeds(t, r, id)
 	dataset = stop(id)
 	registryChange(t, stateDir, id, func(memory map[string]any) { memory["class"] = "another class" })
 	r = newMemoryDaemon(t, config, stateDir)
 	resume(id, run.ResumedFromDisk)
-	guestCameBack(t, r, id, randomBefore, false)
+	guestCameBack(t, r, id, reseedsBefore, false)
 	destroy(id)
 	ids = nil
 
 	// --- a daemon restart on the same host: the image is still the run's.
 	id = create(run.NetworkNone)
 	guestStarts(t, r, id)
-	randomBefore = guestSample(t, r, id)
+	reseedsBefore = forkReseeds(t, r, id)
 	dataset = stop(id)
 	r = newMemoryDaemon(t, config, stateDir)
 	resume(id, run.ResumedFromMemory)
-	guestCameBack(t, r, id, randomBefore, true)
+	guestCameBack(t, r, id, reseedsBefore, true)
 	destroy(id)
 	ids = nil
 
@@ -704,4 +729,143 @@ func median(samples []time.Duration) string {
 		middle = (sorted[len(sorted)/2-1] + sorted[len(sorted)/2]) / 2
 	}
 	return fmt.Sprintf("%d (%d–%d)", ms(middle), ms(sorted[0]), ms(sorted[len(sorted)-1]))
+}
+
+// Two restores of one image do not read one random stream: the first
+// bytes each restored guest reads from its generator differ. Both start
+// from the state the image saved, so without a reseed at the restore
+// they would read the same stream, and whatever generated a key in the
+// memory of one could be replayed from the other. (A reading before the
+// stop compared with one after it shows nothing: the stream had moved on
+// past the first reading when the memory was saved. A review of the
+// first cut asked for a check that can fail.)
+//
+// This goes through the driver as a resume does, with the record holding
+// the image across both restores: the manager lets a record go of its
+// image at the first resume, so it could not restore one twice. One VM
+// runs at a time.
+func TestVMMemoryRestoresOfOneImageReadTwoRandomStreams(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Fatal("the vm suite needs root (zfs, /dev/kvm)")
+	}
+	config := memoryTestConfig(t)
+	baseline := poolListing(t, config.Pool)
+	if slices.Contains(baseline, config.ImageDataset) {
+		t.Fatalf("%s is in the pool before the test: a previous attempt left it", config.ImageDataset)
+	}
+	r := newMemoryDaemon(t, config, t.TempDir())
+	ctx := context.Background()
+	driver := r.driver
+	const memoryMB, cpus = 512, 1
+	// A reading in a VM the driver runs for the test alone: the first
+	// bytes of the random stream, or the kernel's count of reseeds.
+	in := func(id, what string) string {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		if code, timedOut, err := driver.Exec(ctx, id, what, "/", nil, 30*time.Second, &stdout, &stderr); err != nil || timedOut || code != 0 || stderr.Len() > 0 {
+			t.Fatalf("in the VM %s, %q: code %d, timed out %t, %v\nstdout: %s\nstderr: %s", id, what, code, timedOut, err, stdout.String(), stderr.String())
+		}
+		return strings.TrimSpace(stdout.String())
+	}
+	const sample = "head -c 32 /dev/urandom | sha256sum | cut -c1-16"
+	// grep -c answers 0 with the status of "no line": here that is a
+	// reading, not a failure. A kernel log that cannot be read is one.
+	const reseeds = "dmesg | grep -c 'crng reseeded due to virtual machine fork' || test $? = 1"
+	var record *run.MemoryImage
+	var ref string
+	var vms []string
+	t.Cleanup(func() {
+		// Whatever a failed attempt left, before the suite's dataset goes
+		// in memoryTestConfig's cleanup.
+		for _, id := range vms {
+			_ = driver.Remove(ctx, id)
+		}
+		if record != nil {
+			_ = driver.ReleaseMemory(ctx, record)
+		}
+		if ref != "" {
+			_ = driver.RemoveImage(ctx, ref)
+		}
+	})
+	name := func() string { return run.ContainerName(run.NewULID(time.Now())) }
+	spec := run.CreateSpec{Name: name(), Image: vm.GoldenImage, MemoryMB: memoryMB, CPUs: cpus}
+	saved, err := driver.Create(ctx, spec)
+	if err != nil || saved != spec.Name {
+		t.Fatalf("create: %q %v", saved, err)
+	}
+	vms = append(vms, saved)
+	// What the image will hold: the kernel log as it is before any
+	// restore (empty of reseeds, with a driver that logs one only at a
+	// restore).
+	count := in(saved, reseeds)
+	reseedsBefore, err := strconv.Atoi(count)
+	if err != nil {
+		t.Fatalf("the kernel's count of reseeds reads %q: %v", count, err)
+	}
+	// The run the image belongs to: its key is wrapped for that run and
+	// that image together, so every restore of it names the same run.
+	runID := "run-" + saved
+	ref = driver.NewSnapshotRef(time.Now())
+	record, note, err := driver.SaveMemory(ctx, runID, saved, ref)
+	if err != nil || record == nil || note != "" {
+		t.Fatalf("save: %+v %q %v\n%s", record, note, err, r.log.String())
+	}
+	// The VM that wrote it is gone; the record's is the image now, and it
+	// stays for the second restore.
+	if err := driver.Remove(ctx, saved); err != nil {
+		t.Fatal(err)
+	}
+	vms = nil
+	dataset := config.ImageDataset + "/" + record.ID
+	if !slices.Contains(poolListing(t, config.ImageDataset), dataset) {
+		t.Fatal("the image went with the VM that wrote it, while its record still names it")
+	}
+
+	restore := func(n int) string {
+		t.Helper()
+		spec := run.CreateSpec{Name: name(), Image: ref, MemoryMB: memoryMB, CPUs: cpus}
+		id, from, note, err := driver.ResumeMemory(ctx, runID, spec, record)
+		if err != nil || from != run.ResumedFromMemory || note != "" {
+			t.Fatalf("restore %d: id %q from %q note %q err %v\n%s", n, id, from, note, err, r.log.String())
+		}
+		vms = append(vms, id)
+		// The kernel reseeded at this restore, of this image: the count
+		// is one more than the image was saved with.
+		if after, err := strconv.Atoi(in(id, reseeds)); err != nil || after != reseedsBefore+1 {
+			t.Errorf("restore %d: the kernel's count of reseeds is %d (%v), want %d", n, after, err, reseedsBefore+1)
+		}
+		first := in(id, sample)
+		if err := driver.Remove(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+		vms = vms[:len(vms)-1]
+		return first
+	}
+	first, second := restore(1), restore(2)
+	t.Logf("the first 32 bytes of the restored guests' random streams: %s, %s", first, second)
+	if len(first) != 16 || len(second) != 16 {
+		t.Fatalf("the readings are %q and %q", first, second)
+	}
+	if first == second {
+		t.Fatalf("two restores of one image read the same random stream: %s", first)
+	}
+	// Nothing of the test is left: the image with its record's claim, the
+	// snapshot, the VMs; and the pool is as it was found.
+	if err := driver.ReleaseMemory(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	record = nil
+	if err := driver.RemoveImage(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	ref = ""
+	if left := hypervisorProcesses(t, config.RunDir); len(left) != 0 {
+		t.Errorf("hypervisor processes left: %v", left)
+	}
+	if got := poolListing(t, config.ImageDataset); !slices.Equal(got, []string{config.ImageDataset}) {
+		t.Errorf("images left on the pool: %v", got)
+	}
+	if got := poolListing(t, config.Pool); !slices.Equal(got, append(slices.Clone(baseline), config.ImageDataset)) {
+		t.Errorf("the pool after the test: %v, want the baseline and %s: %v", got, config.ImageDataset, baseline)
+	}
 }

@@ -4612,7 +4612,11 @@ Live (`TestVMMemoryResume`, on the laptop): a corrupted `state.json`, a
 truncated `memory-ranges`, a missing dataset, the key of another host (a
 daemon restart under another secret), and a registry that claims another
 host class: each resumes from the disk, with the file and without what
-ran before; and after a restart under the same secret, from memory.
+ran before; and after a restart under the same secret, from memory. The
+guest's kernel reseeds at each of those restores from memory (its
+message is counted across the restore). `TestVMMemoryRestoresOfOneImageReadTwoRandomStreams`
+restores one image twice through the driver and gets two different
+first readings of the guest's random stream.
 
 ### What was measured (x86-64 test laptop, not representative)
 
@@ -4697,7 +4701,14 @@ also ran as root there, as CI's root job runs it: 310 pass, none skipped.
   sleep events only): there the driver would be seen, and the reseed at a
   restore would be the agent's own, late. The guest kernel is the
   daemon's own (`SBX_VM_KERNEL`; 7.2.8 on the test host), and the live
-  suite checks that it reseeds at a restore (`TestVMMemoryResume`).
+  suite checks that it reseeds at a restore, two ways that can fail: the
+  kernel's reseed message is counted before the stop and after the
+  restore and must have grown (`TestVMMemoryResume`), and one image
+  restored twice must give two different first readings of the random
+  stream (`TestVMMemoryRestoresOfOneImageReadTwoRandomStreams`). The
+  earlier check compared one reading before the stop with one after it,
+  which differ whether or not anything reseeded (a review of the first
+  cut), and looked for the message without counting it.
 - **The golden image in use on the test host predates protocol v3**, so
   the product path (the `restored` op: `clock_settime` to the nanosecond,
   `RNDADDENTROPY`, `RNDRESEEDCRNG`) ran only against a second golden

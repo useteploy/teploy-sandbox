@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -761,6 +762,92 @@ func TestAnImageIsItsRunsWhileItIsStoppedAndNoLongerThanTheRun(t *testing.T) {
 	}
 	if _, err := m.Get(parent.ID); err == nil {
 		t.Fatal("the retired run is still there")
+	}
+}
+
+// The flag off, on a host that ran with it on: the registry may name
+// images and the pool may still hold them, and a daemon without a driver
+// that keeps images touches neither. What it does keep sane is the
+// registry, exactly as with the flag on: nothing claims an image once its
+// run has resumed, been stopped again or been destroyed; a stopped run
+// that still names one goes on naming it, for a later life with the flag
+// on; and that life finds only those, and has the driver destroy the
+// rest at its start (RetainMemory).
+func TestWithTheFlagOffARegistryThatNamesImagesStaysSane(t *testing.T) {
+	dir := t.TempDir()
+	m, _, _ := memoryManager(t, dir)
+	var ids []string
+	for range 3 {
+		created := mustCreate(t, m, CreateRequest{})
+		mustStop(t, m, created.ID)
+		ids = append(ids, created.ID)
+	}
+	resumed, destroyed, kept := ids[0], ids[1], ids[2]
+	naming := func() map[string]string {
+		named := map[string]string{}
+		for _, run := range readStateFile(t, dir).Runs {
+			if run.Memory != nil {
+				named[run.ID] = run.Memory.ID
+			}
+		}
+		return named
+	}
+	before := naming()
+	if len(before) != 3 {
+		t.Fatalf("with the flag on: %v", before)
+	}
+
+	// A life without the flag: nothing is said of images, and nothing is
+	// reconciled or swept.
+	off, rt, _ := newTestManager(t)
+	if _, err := off.LoadState(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	if view, err := off.Get(kept); err != nil || view.Memory != nil || view.ResumedFrom != "" {
+		t.Fatalf("with the flag off a run speaks of an image: %+v %v", view, err)
+	}
+	if n, err := off.ReconcileMemoryImages(context.Background()); err != nil || n != 0 {
+		t.Fatalf("without a driver that keeps images: reconciled %d, %v", n, err)
+	}
+	off.Reap(context.Background())
+	if len(naming()) != 3 {
+		t.Fatal("a life without the flag touched the registry's images")
+	}
+	// A resume boots the disk, as every resume did before images existed;
+	// a stop takes a disk snapshot alone; a destroy deletes the record.
+	// Each leaves the record claiming no image.
+	again, err := off.Resume(context.Background(), resumed, 0)
+	if err != nil || again.ResumedFrom != "" || again.Memory != nil {
+		t.Fatalf("with the flag off: resumed from %q, memory %+v, %v", again.ResumedFrom, again.Memory, err)
+	}
+	if stopped, err := off.Stop(context.Background(), resumed); err != nil || stopped.Memory != nil {
+		t.Fatalf("stopped with the flag off: %+v %v", stopped, err)
+	}
+	if err := off.Destroy(context.Background(), destroyed); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.live) != 0 {
+		t.Fatalf("containers left: %v", rt.live)
+	}
+	after := naming()
+	if want := map[string]string{kept: before[kept]}; !maps.Equal(after, want) {
+		t.Fatalf("after a life with the flag off the registry names %v, want only the run still stopped: %v", after, want)
+	}
+
+	// The next life has the flag on: the run still stopped resumes from
+	// its image; the one stopped with the flag off says it has none.
+	on, _, keeper := memoryManager(t, dir)
+	if n, err := on.ReconcileMemoryImages(context.Background()); err != nil || n != 1 {
+		t.Fatalf("reconcile: kept %d, err %v", n, err)
+	}
+	if len(keeper.retained) != 1 || len(keeper.retained[0]) != 1 || keeper.retained[0][0].ID != before[kept] {
+		t.Fatalf("the driver was asked to keep %+v, want only %s", keeper.retained, before[kept])
+	}
+	if view := memoryOf(t, on, resumed); view.State != MemoryNone || view.Image != "" {
+		t.Fatalf("a run stopped with the flag off: %+v", view)
+	}
+	if resumedKept, err := on.Resume(context.Background(), kept, 0); err != nil || resumedKept.ResumedFrom != ResumedFromMemory {
+		t.Fatalf("the run that kept its image: %q %v", resumedKept.ResumedFrom, err)
 	}
 }
 

@@ -4788,6 +4788,21 @@ also ran as root there, as CI's root job runs it: 310 pass, none skipped.
 - **`zfs destroy` of a dataset a jailed VM maps was not tried.** The
   reference count is what keeps the daemon from asking; a destroy that
   fails (busy) is owed and retried at the next start.
+- **With the flag off, the images of a host that ran with it on stay on
+  the pool.** A daemon started without `--vm-memory-snapshots` touches
+  none of it: no code of the flag's runs. The registry stays sane, as
+  with the flag on: nothing claims an image once its run has resumed,
+  been stopped again or been destroyed, and a stopped run that still
+  names one goes on naming it, for a later life with the flag on
+  (`TestWithTheFlagOffARegistryThatNamesImagesStaysSane`). But the
+  datasets of the runs that moved on are nobody's until a daemon with
+  the flag on next starts, whose start destroys every image no stopped
+  run names. So turning the flag off never loses an image a stopped run
+  can still use, and costs pool space (what the orphaned images hold)
+  until the flag is on again for one start. **Open:** reclaiming them
+  from a life with the flag off would mean code of the flag running with
+  it off (the driver knowing the image dataset without keeping images);
+  documented in the README instead.
 - **In-flight execs do not survive a stop.** A stop needs an idle run, as
   before; after a restore the hypervisor resets the guest's vsock
   connections, and guestd ends the processes of a connection that is gone

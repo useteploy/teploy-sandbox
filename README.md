@@ -395,6 +395,11 @@ What it costs, and what it does not do:
 - Same host only. A run stopped on another host, or on this host before
   the CPU, kernel, hypervisor or guest kernel changed, resumes from its
   disk.
+- Turning the flag off again leaves what it made: the records stop
+  naming images as their runs resume, are stopped again or are
+  destroyed, but nothing removes the images from the pool until a daemon
+  with the flag on starts once more (its start destroys every image no
+  stopped run names).
 - Not on arm64, as the command line stands: it has no `acpi=on`, so an
   arm64 guest has no VM Generation ID device and no driver to reseed on,
   and every resume there boots from the disk (a stop still saves an

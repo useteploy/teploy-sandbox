@@ -243,21 +243,37 @@ const (
 // before the snapshot is taken and returns the function that undoes it;
 // the run is only held still for the snapshot itself.
 //
-// quiesce runs before the pool's lock is taken, and what it returns
-// after the snapshot is taken with it held: a quiesce can be long (a
-// stop that also saves the VM's memory has the hypervisor write all of
-// guest RAM while the VM is paused), and every other volume operation
-// of the driver takes that lock. The caller admits one capture of a run
-// at a time, so nothing else touches this volume meanwhile.
+// The pool's lock is held for the storage and for nothing else. The
+// quiesce runs before it is taken, and what it returns after the
+// snapshot, with the lock let go in between. Either can be long: a stop
+// that also saves the VM's memory has the hypervisor write all of guest
+// RAM while the VM is paused, and what undoes that is the image's seal
+// and the VM's resume, which after a vm.snapshot that did not answer
+// waits for the snapshot still being written (up to snapshotTimeout).
+// Every other volume operation of the driver takes the same lock, so
+// held across either it would keep every other run's create, resume and
+// destroy waiting.
+//
+// What the lock protects stays under it: every change to the clone
+// topology, which is the flush and the snapshot on the run's volume,
+// then the clone and the promote of the holder, and every rollback. In
+// the gap the run's volume holds a snapshot that is nobody's reference.
+// Two operations could meet it there. A second capture of the same run
+// cannot come: the caller admits one capture of a run at a time, so
+// nothing else touches this volume meanwhile. A removal of the volume
+// is never asked for while the manager holds the run for a capture, and
+// were it, the capture would fail at its clone and roll back, which is
+// what a removal during a capture should mean. Everything else works on
+// other volumes, or reaches this one as the clone of a dead snapshot
+// (collect), which it is as much before a capture as in the middle of
+// one.
 //
 // Once the run has been quiesced the capture no longer follows the
 // caller's context: it is a handful of short commands under a budget of
 // their own, and a caller that leaves between two of them would otherwise
 // strand a snapshot on the run's volume, or a holder that was cloned and
 // never promoted. The storage before the VM's resume and the storage
-// after it are budgeted apart: the resume is not on their clock (a
-// stop's seals a memory image, and waits for a hypervisor that is still
-// writing one).
+// after it are budgeted apart: the resume is not on their clock.
 func (v *Volumes) Capture(ctx context.Context, name, ref string, quiesce func() (resume func() error, err error)) (result error) {
 	if !v.OwnsRef(ref) {
 		return fmt.Errorf("refusing to capture into %q: not a reference minted by this driver", ref)
@@ -273,7 +289,6 @@ func (v *Volumes) Capture(ctx context.Context, name, ref string, quiesce func() 
 		return err
 	}
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	snapshotCtx, cancelSnapshot := v.budget(ctx)
 	defer cancelSnapshot()
 	// The device flush is what makes "the bytes at this instant" true: the
@@ -283,16 +298,22 @@ func (v *Volumes) Capture(ctx context.Context, name, ref string, quiesce func() 
 	if err == nil {
 		err = v.zfs.Snapshot(snapshotCtx, temporary)
 	}
+	v.mu.Unlock()
+
+	// The VM's own again, and whatever the quiesce had besides: with no
+	// lock held, for as long as it takes.
 	if resumeErr := resume(); resumeErr != nil {
 		// A run that cannot be woken is the worse failure; report both.
 		err = errors.Join(err, resumeErr)
 	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	if err != nil {
 		return errors.Join(fmt.Errorf("snapshot %s: %w", volume, err), v.abandonCapture(snapshotCtx, volume, ref))
 	}
 	// A budget of its own: the resume above is not on the storage's clock,
-	// and can outlast a whole one (a stop that also saves the VM's memory
-	// waits there for a hypervisor snapshot that did not answer).
+	// and can outlast a whole one.
 	holderCtx, cancelHolder := v.budget(ctx)
 	defer cancelHolder()
 	if err := v.zfs.Clone(holderCtx, temporary, holder, v.props(kindSnapshot)); err != nil {

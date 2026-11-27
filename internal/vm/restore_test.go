@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -384,6 +385,81 @@ func (n *fakeNetwork) guest(name string) *GuestNetwork {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.attached[name]
+}
+
+// A stop holds the pool's lock for its storage and for nothing else
+// (Volumes.Capture): the seal of its image, and the VM's resume after
+// it, run with the lock let go. Meanwhile another run is resumed from
+// its image, a third is created and both are destroyed, through the
+// driver as the manager uses it. (The seal was the second half of a
+// finding two reviews made of the first cut; the quiesce was the first.)
+func TestAStopsSealAndResumeDoNotHoldThePoolForOtherRuns(t *testing.T) {
+	rig := newMemoryRig(t, nil)
+	speaksV3(rig)
+	spec, record := savedForResume(t, rig, 2)
+	stopping, err := rig.driver.Create(bg, run.CreateSpec{Name: runName(1), Image: GoldenImage, MemoryMB: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The seal of the stopping run's image: held there, on the way out of
+	// the VM's outbox.
+	inner := rig.driver.images.mounts.unbind
+	inSeal, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	rig.driver.images.mounts.unbind = func(target string) error {
+		if strings.Contains(target, stopping+string(filepath.Separator)) {
+			once.Do(func() { close(inSeal); <-release })
+		}
+		return inner(target)
+	}
+	var saved *run.MemoryImage
+	var ref string
+	stopped := make(chan error, 1)
+	go func() {
+		ref = rig.driver.NewSnapshotRef(time.Now())
+		image, _, err := rig.driver.SaveMemory(bg, "run-"+stopping, stopping, ref)
+		saved = image
+		stopped <- err
+	}()
+	<-inSeal
+	done := make(chan error, 1)
+	go func() {
+		id, from, _, err := rig.driver.ResumeMemory(bg, "run-"+spec.Name, spec, &record)
+		if err == nil && from != run.ResumedFromMemory {
+			err = fmt.Errorf("the second run resumed from %q", from)
+		}
+		if err == nil {
+			err = rig.driver.Remove(bg, id)
+		}
+		var third string
+		if err == nil {
+			third, err = rig.driver.Create(bg, run.CreateSpec{Name: runName(3), Image: GoldenImage, MemoryMB: 256})
+		}
+		if err == nil {
+			err = rig.driver.Remove(bg, third)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		must(t, err)
+	case <-time.After(5 * time.Second):
+		close(release)
+		<-stopped
+		t.Fatal("another run's resume, create and destroy waited for a stop's seal: the pool's lock is held across it")
+	}
+	close(release)
+	must(t, <-stopped)
+	if saved == nil {
+		t.Fatal("the stopping run saved no image")
+	}
+	must(t, rig.driver.ReleaseMemory(bg, &record))
+	must(t, rig.driver.ReleaseMemory(bg, saved))
+	must(t, rig.driver.Remove(bg, stopping))
+	if len(rig.driver.images.known) != 0 || len(rig.driver.images.dead) != 0 {
+		t.Fatalf("images still known: %v", rig.imageIDs())
+	}
+	assertPool(t, rig.zfs, append([]string{datasetOf(spec.Image), spec.Image, datasetOf(ref), ref}, memoryPristine...)...)
 }
 
 // A pool that cannot say how much is free.

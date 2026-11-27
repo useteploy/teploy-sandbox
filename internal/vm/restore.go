@@ -240,16 +240,21 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 		if err != nil {
 			note = "the hypervisor's snapshot: " + err.Error()
 			giveBack()
-			if !errors.Is(err, context.DeadlineExceeded) {
-				// The hypervisor answered, and with its answer its
-				// writing ended: nothing writes the image now, and the
-				// room is the VM's own again before the VM runs.
+			var refused *hypervisorRefusal
+			if errors.As(err, &refused) {
+				// The hypervisor answered (a refusal is an HTTP answer),
+				// and with its answer its writing ended: nothing writes
+				// the image now, and the room is the VM's own again
+				// before the VM runs. Anything else is not an answer: a
+				// socket deadline (os.ErrDeadlineExceeded, not a
+				// context's), a dropped connection, a context that ran
+				// out. The hypervisor may still be writing then.
 				return func() error {
 					putBack()
 					return resume()
 				}, nil
 			}
-			// It did not answer in time. It goes on writing until it is
+			// It did not answer. It may go on writing until it is
 			// done, and the resume queued behind it must outwait it; the
 			// room stays until the VM has resumed (resume gives it back),
 			// since that writing must stay covered.

@@ -533,6 +533,8 @@ func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
 		"the image does not reach the VM's jail":                          {unraised, []int64{0}},
 		"the hypervisor refuses the snapshot":                             {refused, []int64{0}},
 		"the hypervisor's snapshot does not answer in time":               {unanswered, []int64{imageNeedsBytes(256)}},
+		"the hypervisor's socket times out under the snapshot":            {unanswered, []int64{imageNeedsBytes(256)}},
+		"the hypervisor's socket drops under the snapshot":                {unanswered, []int64{imageNeedsBytes(256)}},
 		"a hypervisor taken over leaves an extra file":                    {snapshotted, []int64{0}},
 		"a hypervisor taken over leaves a link to a host file":            {snapshotted, []int64{0}},
 		"a hypervisor taken over keeps the image busy until it is killed": {snapshotted, []int64{0}},
@@ -563,6 +565,16 @@ func TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk(t *testing.T) {
 		},
 		"the hypervisor's snapshot does not answer in time": func(t *testing.T, rig *testRig, machine *fakeMachine) {
 			machine.snapshotErr = context.DeadlineExceeded
+		},
+		// What the real request returns when its socket deadline passes:
+		// a net timeout, not a context's. The hypervisor may still be
+		// writing, so the room stays until the VM has resumed.
+		"the hypervisor's socket times out under the snapshot": func(t *testing.T, rig *testRig, machine *fakeMachine) {
+			machine.snapshotErr = fmt.Errorf("hypervisor vm.snapshot: %w", os.ErrDeadlineExceeded)
+		},
+		// No answer at all is not an answer either.
+		"the hypervisor's socket drops under the snapshot": func(t *testing.T, rig *testRig, machine *fakeMachine) {
+			machine.snapshotErr = fmt.Errorf("hypervisor vm.snapshot: %w", io.ErrUnexpectedEOF)
 		},
 		"a hypervisor taken over leaves an extra file": func(t *testing.T, rig *testRig, machine *fakeMachine) {
 			machine.snapshotHook = func(dir string) { _ = os.WriteFile(filepath.Join(dir, "notes"), nil, 0o600) }

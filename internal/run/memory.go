@@ -419,6 +419,13 @@ func (m *Manager) hasMemoryImages() bool {
 // far as deadline allows, for the reading to show it. It answers with
 // the last reading, and with whether the pool has shown any of what
 // went: a reading below the one before.
+//
+// Once the reading has moved, it is still not taken at its word until it
+// holds still: ZFS frees a big dataset over several transaction groups
+// (the pool's `freeing`), so the first reading to move may show only
+// part of what went, and taking the rest as still missing would evict
+// another image for room already on its way. A reading is settled when
+// the next one, a poll later, is no lower, or when the deadline comes.
 func (m *Manager) memoryRoomShown(ctx context.Context, need, before int64, deadline time.Time) (short int64, moved bool, err error) {
 	for {
 		short, err = m.MemoryImages.MemoryShortBy(ctx, need)
@@ -426,15 +433,26 @@ func (m *Manager) memoryRoomShown(ctx context.Context, need, before int64, deadl
 			return short, short < before, err
 		}
 		if short < before {
-			return short, true, nil
+			moved = true
 		}
 		if !time.Now().Before(deadline) {
-			return short, false, nil
+			return short, moved, nil
 		}
 		select {
 		case <-ctx.Done():
-			return short, false, ctx.Err()
+			return short, moved, ctx.Err()
 		case <-time.After(memorySettleEvery):
+		}
+		if moved {
+			next, err := m.MemoryImages.MemoryShortBy(ctx, need)
+			if err != nil || next <= 0 || next >= short {
+				if err == nil && next < short {
+					short = next
+				}
+				return short, true, err
+			}
+			// Still going down: the pool is still freeing. Ask again.
+			before = next
 		}
 	}
 }

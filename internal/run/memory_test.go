@@ -652,6 +652,118 @@ func TestAStopEvictsJustEnoughImagesToMakeRoomForItsOwn(t *testing.T) {
 	}
 }
 
+// The pool may not show what a destroyed image gave back at once: ZFS
+// frees in its own time. A stop that made room by one image does not
+// evict another on a reading that is still the one from before the
+// destroy: it waits, for a bound, for the pool to show what went. Where
+// the pool does not within the bound, another goes only for what the
+// ones that went cannot cover even at the most, and no further; the
+// driver asks the pool itself before it saves, so there the stop has no
+// image, but it loses no image beyond the two that covered the room.
+// And what an image may hold is no account while the reading moves: an
+// image is compressed, and the pool's own word is what evicts no more
+// and no fewer.
+func TestAStopEvictsNoExtraImageWhileThePoolHasNotShownTheRoom(t *testing.T) {
+	const miB = 1 << 20
+	all, half := func(bytes int64) int64 { return bytes }, func(bytes int64) int64 { return bytes / 2 }
+	for name, c := range map[string]struct {
+		lag    time.Duration     // how long after an image went the pool shows its room
+		of     func(int64) int64 // how much of what an image may hold the pool shows
+		settle time.Duration     // how long a stop waits for that
+		saved  bool              // whether the driver's own reading lets the stop save
+		want   []string          // which of the three images went
+	}{
+		"the pool shows it a moment after the destroy": {300 * time.Millisecond, all, 2 * time.Second, true, []string{"small", "middle"}},
+		"the pool does not show it within the wait":    {time.Hour, all, 300 * time.Millisecond, false, []string{"small", "middle"}},
+		"the images took less than they may hold":      {0, half, 2 * time.Second, true, []string{"small", "middle", "large"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, _, keeper := memoryManager(t, t.TempDir())
+			clock := newTestClock(m)
+			m.MemorySettle = c.settle
+			keeper.holds = func(memoryMB int) int64 { return int64(memoryMB+64) * miB }
+			// The pool shows what was free to begin with and what the
+			// images that went gave back, as much of it as it shows,
+			// lag after they went.
+			var mu sync.Mutex
+			var free int64 = 1 << 40
+			var went []struct {
+				at    time.Time
+				bytes int64
+			}
+			keeper.onRelease = func(image *MemoryImage) {
+				mu.Lock()
+				defer mu.Unlock()
+				went = append(went, struct {
+					at    time.Time
+					bytes int64
+				}{time.Now(), c.of(keeper.holds(image.MemoryMB))})
+			}
+			keeper.shortBy = func(need int64) (int64, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				shown := free
+				for _, gone := range went {
+					if time.Since(gone.at) >= c.lag {
+						shown += gone.bytes
+					}
+				}
+				return max(need-shown, 0), nil
+			}
+			stopOfSize := func(memoryMB int) (id, image string) {
+				t.Helper()
+				keeper.memoryMB = memoryMB
+				created := mustCreate(t, m, CreateRequest{Limits: &Limits{MemoryMB: memoryMB}})
+				mustStop(t, m, created.ID)
+				clock.advance(time.Minute)
+				return created.ID, memoryOf(t, m, created.ID).Image
+			}
+			small, smallImage := stopOfSize(256)   // may hold 320 MiB
+			middle, middleImage := stopOfSize(512) // may hold 576 MiB
+			large, largeImage := stopOfSize(1024)  // may hold 1088 MiB
+
+			// Short by 700 MiB for a new image.
+			mu.Lock()
+			free = keeper.holds(1024) - 700*miB
+			mu.Unlock()
+			keeper.memoryMB = 1024
+			if !c.saved {
+				// What the driver itself reads before it saves.
+				keeper.saveNote = "the pool is below its reserve"
+			}
+			newest := mustCreate(t, m, CreateRequest{Limits: &Limits{MemoryMB: 1024}})
+			mustStop(t, m, newest.ID)
+
+			var want []string
+			for _, name := range c.want {
+				image := map[string]string{"small": smallImage, "middle": middleImage, "large": largeImage}[name]
+				want = append(want, image)
+				id := map[string]string{"small": small, "middle": middle, "large": large}[name]
+				if got := memoryOf(t, m, id); got.State != MemoryEvicted || got.Error != evictedForRoom {
+					t.Errorf("%s: %+v", name, got)
+				}
+			}
+			if !slices.Equal(keeper.released, want) {
+				t.Fatalf("released %v, want %v and no more", keeper.released, want)
+			}
+			for name, id := range map[string]string{"small": small, "middle": middle, "large": large} {
+				if !slices.Contains(c.want, name) {
+					if got := memoryOf(t, m, id); got.State != MemorySaved || got.Image == "" {
+						t.Errorf("%s lost its image, which covered nothing: %+v", name, got)
+					}
+				}
+			}
+			if c.saved {
+				if got := memoryOf(t, m, newest.ID); got.State != MemorySaved || got.Image == "" {
+					t.Fatalf("the stop saved no image although the pool showed the room: %+v", got)
+				}
+			} else if got := memoryOf(t, m, newest.ID); got.State != MemoryFailed || got.Error != "the pool is below its reserve" {
+				t.Fatalf("the stop %+v, want no image and why", got)
+			}
+		})
+	}
+}
+
 // The reaper's pass also has the driver retry the images that would not
 // go (MemoryKeeper.SweepMemory), so that one nothing wants does not
 // stay on the pool until the daemon restarts. A pass that still cannot

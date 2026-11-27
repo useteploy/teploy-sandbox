@@ -4464,6 +4464,23 @@ covered only through `SyncRemote`.
   requirements or a fence (for example, a destroyed record written at
   the next generation whenever a first write's outcome is unknown).
 
+### Open edge cases from the PR #14 review (2026-11-25)
+
+- **A record write that timed out must not land later.** If one lands
+  after a later lookup answered NotFound, an unconfirmed copy is deleted
+  locally while the late record stays for another daemon to adopt. (Also
+  noted under the PR #13 follow-ups.)
+- **An unreadable newest record blocks deleting an unconfirmed copy.**
+  `destroyStopped` now reads the record's content (`Latest`) for an
+  unconfirmed run; a corrupt record, or one in a newer format, fails
+  every retry. The old path only used `Advance`. Possible hardening:
+  when the newest record is this daemon's own, delete locally if it says
+  destroyed, and write the destroyed record at +1 if it is this daemon's
+  running record or another snapshot, instead of failing.
+- **A rolled-back registry or bucket** can make the same delete fail for
+  good (this daemon's own record, not a stopped one of the same
+  snapshot). The no-rollback rule excludes it.
+
 ## 2026-11-25 — release workflow (binaries and checksums)
 
 There were no release binaries: the only workflow was `ci.yml`, and

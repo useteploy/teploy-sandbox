@@ -152,10 +152,11 @@ type MemoryKeeper interface {
 	// it any more is tried again, so that it goes without a restart. It
 	// answers with what still could not go.
 	SweepMemory(ctx context.Context) error
-	// MemoryShortOf reports whether the pool has less than need bytes
-	// plus its reserve free. An image is not saved into a short pool,
-	// and images go from one, oldest stop first.
-	MemoryShortOf(ctx context.Context, need int64) (bool, error)
+	// MemoryShortBy reports how many bytes the pool is short of having
+	// need bytes plus its reserve free: 0 when it has room. An image is
+	// not saved into a short pool, and images go from one that is below
+	// its reserve, oldest stop first.
+	MemoryShortBy(ctx context.Context, need int64) (short int64, err error)
 	// MemoryNeedsBytes is the most an image of a guest of memoryMB may
 	// take on the pool.
 	MemoryNeedsBytes(memoryMB int) int64
@@ -172,6 +173,14 @@ var ErrMemoryNotTried = errors.New("the run's memory image was not tried")
 const (
 	memoryReleaseTimeout = 30 * time.Second
 	memorySweepTimeout   = 30 * time.Second
+)
+
+// Why a stopped run's memory image was dropped (MemoryEvicted), as the
+// run says: room was made for a newer run's image, or the pool was
+// below its reserve.
+const (
+	evictedForRoom     = "the pool had no room for a newer run's memory image above its reserve"
+	evictedForPressure = "the pool is below its reserve"
 )
 
 // memoryIDShape: an image's id is a lower-cased ULID.
@@ -283,13 +292,23 @@ func (m *Manager) memorySpent(id string, image *MemoryImage, note string) {
 // makeMemoryRoom drops memory images, the oldest stop first, until the
 // pool has need bytes plus its reserve free: an image is kept while the
 // pool has room, and never at the cost of a new one.
+//
+// Only while dropping them can make the room. The pool is asked how
+// much it is short by, and another image goes only while what the
+// images that could still go hold, at the most, covers it; then the
+// pool is asked again. A pool that is short for other reasons (run
+// volumes, snapshots) does not lose its images for a new one that
+// cannot be saved either way.
 func (m *Manager) makeMemoryRoom(ctx context.Context, need int64) error {
 	for {
-		short, err := m.MemoryImages.MemoryShortOf(ctx, need)
-		if err != nil || !short {
+		short, err := m.MemoryImages.MemoryShortBy(ctx, need)
+		if err != nil || short <= 0 {
 			return err
 		}
-		if !m.evictOldestMemory(ctx, MemoryEvicted, "the pool is below its reserve") {
+		if m.evictableMemoryBytes() < short {
+			return nil
+		}
+		if !m.evictOldestMemory(ctx, MemoryEvicted, evictedForRoom) {
 			return nil
 		}
 	}
@@ -306,11 +325,11 @@ func (m *Manager) evictMemoryUnderPressure(ctx context.Context) {
 		if !m.hasMemoryImages() {
 			return
 		}
-		short, err := m.MemoryImages.MemoryShortOf(ctx, 0)
-		if err != nil || !short {
+		short, err := m.MemoryImages.MemoryShortBy(ctx, 0)
+		if err != nil || short <= 0 {
 			return
 		}
-		if !m.evictOldestMemory(ctx, MemoryEvicted, "the pool is below its reserve") {
+		if !m.evictOldestMemory(ctx, MemoryEvicted, evictedForPressure) {
 			return
 		}
 	}
@@ -325,6 +344,34 @@ func (m *Manager) hasMemoryImages() bool {
 		}
 	}
 	return false
+}
+
+// memoryEvictable says whether the run's memory image can be dropped
+// for the pool's sake: a stopped run's, with nothing else under way on
+// the run. Caller holds Manager.mu.
+func (live *Run) memoryEvictable() bool {
+	return live.State == StateStopped && live.memory != nil && !live.exclusive && !live.removing
+}
+
+// evictableMemoryBytes is the most that dropping every image that could
+// go would give back: the sum, over the runs whose image can be evicted,
+// of what their images may hold. An upper bound: what an image takes on
+// the pool is its guest's memory at most, and the pool is asked again
+// after each that goes.
+func (m *Manager) evictableMemoryBytes() int64 {
+	m.mu.Lock()
+	var sizes []int
+	for _, live := range m.runs {
+		if live.memoryEvictable() {
+			sizes = append(sizes, live.memory.MemoryMB)
+		}
+	}
+	m.mu.Unlock()
+	var held int64
+	for _, memoryMB := range sizes {
+		held += m.MemoryImages.MemoryNeedsBytes(memoryMB)
+	}
+	return held
 }
 
 // sweepMemoryImages has the driver retry the images that could not be
@@ -350,7 +397,7 @@ func (m *Manager) evictOldestMemory(ctx context.Context, state, why string) bool
 	var oldestID string
 	var oldest *Run
 	for id, live := range m.runs {
-		if live.State != StateStopped || live.memory == nil || live.exclusive || live.removing {
+		if !live.memoryEvictable() {
 			continue
 		}
 		if oldest == nil || live.StoppedAt.Before(*oldest.StoppedAt) {

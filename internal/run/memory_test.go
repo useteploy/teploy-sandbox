@@ -40,16 +40,24 @@ type fakeMemory struct {
 	// one answers.
 	sweeps   int
 	sweepErr error
-	// short says whether the pool has less than need bytes plus its
-	// reserve free, or why it cannot say.
-	short func(need int64) (bool, error)
-	need  int64
+	// memoryMB is the size of the image the next save answers (0 is
+	// 512, as every image was before it could be told apart), and
+	// onRelease, when set, hears of each release.
+	memoryMB  int
+	onRelease func(image *MemoryImage)
+	// holds, when set, is what an image of a guest of memoryMB MiB takes
+	// on the pool (need for every image otherwise).
+	holds func(memoryMB int) int64
+	// shortBy says how many bytes the pool is short of need bytes plus
+	// its reserve, or why it cannot say.
+	shortBy func(need int64) (int64, error)
+	need    int64
 }
 
 var nextImage int
 
 func newFakeMemory() *fakeMemory {
-	return &fakeMemory{need: 64 << 20, short: func(int64) (bool, error) { return false, nil }}
+	return &fakeMemory{need: 64 << 20, shortBy: func(int64) (int64, error) { return 0, nil }}
 }
 
 func (f *fakeMemory) id() string {
@@ -69,7 +77,11 @@ func (f *fakeMemory) SaveMemory(_ context.Context, runID, containerID, snapshotR
 	if f.saveNote != "" {
 		return nil, f.saveNote, nil
 	}
-	return &MemoryImage{ID: f.id(), Key: "wrapped", Class: "class", Disk: "guid", MemoryMB: 512, CPUs: 1}, "", nil
+	memoryMB := f.memoryMB
+	if memoryMB == 0 {
+		memoryMB = 512
+	}
+	return &MemoryImage{ID: f.id(), Key: "wrapped", Class: "class", Disk: "guid", MemoryMB: memoryMB, CPUs: 1}, "", nil
 }
 
 // ResumeMemory is MemoryKeeper.ResumeMemory. The runtime's Create makes
@@ -93,6 +105,9 @@ func (f *fakeMemory) ReleaseMemory(_ context.Context, image *MemoryImage) error 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.released = append(f.released, image.ID)
+	if f.onRelease != nil {
+		f.onRelease(image)
+	}
 	return nil
 }
 
@@ -112,14 +127,21 @@ func (f *fakeMemory) SweepMemory(_ context.Context) error {
 	return f.sweepErr
 }
 
-func (f *fakeMemory) MemoryShortOf(_ context.Context, need int64) (bool, error) {
+func (f *fakeMemory) MemoryShortBy(_ context.Context, need int64) (int64, error) {
 	f.mu.Lock()
-	short := f.short
+	shortBy := f.shortBy
 	f.mu.Unlock()
-	return short(need)
+	return shortBy(need)
 }
 
-func (f *fakeMemory) MemoryNeedsBytes(int) int64 { return f.need }
+func (f *fakeMemory) MemoryNeedsBytes(memoryMB int) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.holds != nil {
+		return f.holds(memoryMB)
+	}
+	return f.need
+}
 
 // memoryManager is a manager on a driver that keeps memory images, with
 // its registry in dir.
@@ -440,9 +462,12 @@ func TestAPoolBelowItsReserveLosesMemoryImagesOldestFirst(t *testing.T) {
 	// A stop with no room for its image makes room first: the oldest
 	// image goes, and with room for one then, the stop saves its own.
 	asked := 0
-	keeper.short = func(need int64) (bool, error) {
+	keeper.shortBy = func(need int64) (int64, error) {
 		asked++
-		return need > 0 && asked == 1, nil
+		if need > 0 && asked == 1 {
+			return need, nil // short by exactly an image
+		}
+		return 0, nil
 	}
 	clock.advance(time.Minute)
 	third := mustCreate(t, m, CreateRequest{})
@@ -454,21 +479,26 @@ func TestAPoolBelowItsReserveLosesMemoryImagesOldestFirst(t *testing.T) {
 	if memoryOf(t, m, second.ID).Image != newest {
 		t.Fatal("the second image went too")
 	}
+	// Why it went is said: the stop needed the room, which is not the
+	// pool being below its reserve.
+	if image := memoryOf(t, m, first.ID); image.State != MemoryEvicted || image.Error != evictedForRoom {
+		t.Errorf("the first run: %+v", image)
+	}
 	// Below the reserve when the daemon reaps: the rest go, the oldest
-	// stop first.
-	keeper.short = func(int64) (bool, error) { return true, nil }
+	// stop first, and that is the reason they carry.
+	keeper.shortBy = func(int64) (int64, error) { return 1, nil }
 	m.Reap(context.Background())
 	if !slices.Equal(keeper.released, []string{oldest, newest, saved.Image}) {
 		t.Fatalf("released %v, want the oldest first: %s %s %s", keeper.released, oldest, newest, saved.Image)
 	}
-	for _, id := range []string{first.ID, second.ID, third.ID} {
-		if image := memoryOf(t, m, id); image.State != MemoryEvicted || !strings.Contains(image.Error, "reserve") {
+	for _, id := range []string{second.ID, third.ID} {
+		if image := memoryOf(t, m, id); image.State != MemoryEvicted || image.Error != "the pool is below its reserve" {
 			t.Errorf("run %s: %+v", id, image)
 		}
 	}
 	// The pool's space unreadable: a stop goes on and saves its image
 	// (the driver asks the pool itself), and the reaper claims nothing.
-	keeper.short = func(int64) (bool, error) { return false, errors.New("cannot get: pool is busy") }
+	keeper.shortBy = func(int64) (int64, error) { return 0, errors.New("cannot get: pool is busy") }
 	fourth := mustCreate(t, m, CreateRequest{})
 	mustStop(t, m, fourth.ID)
 	last := memoryOf(t, m, fourth.ID).Image
@@ -488,6 +518,132 @@ func TestAPoolBelowItsReserveLosesMemoryImagesOldestFirst(t *testing.T) {
 	}
 	if resumed, err := m.Resume(context.Background(), fourth.ID, 0); err != nil || resumed.ResumedFrom != ResumedFromDisk || len(keeper.resumes) != 0 {
 		t.Fatalf("resume: %q %v", resumed.ResumedFrom, err)
+	}
+}
+
+// A review's repro, kept. A stop dropped other runs' images, the oldest
+// first, for a new image the pool had no room for even once every one
+// of them was gone; and the stop then saved no image either. A pool
+// that is short by more than all images together lost every image for
+// nothing.
+func TestAStopDoesNotEvictImagesItCannotUse(t *testing.T) {
+	m, _, keeper := memoryManager(t, t.TempDir())
+	clock := newTestClock(m)
+	a := mustCreate(t, m, CreateRequest{Limits: &Limits{MemoryMB: 512}})
+	mustStop(t, m, a.ID)
+	kept := memoryOf(t, m, a.ID).Image
+	clock.advance(time.Minute)
+
+	// The pool now has room for no image at all, whatever is evicted:
+	// short of any new image (need > 0) by more than every image
+	// together, and not below its reserve as such.
+	keeper.shortBy = func(need int64) (int64, error) {
+		if need <= 0 {
+			return 0, nil
+		}
+		return 2*keeper.need + need, nil
+	}
+	keeper.saveNote = "the pool is below its reserve"
+	b := mustCreate(t, m, CreateRequest{Limits: &Limits{MemoryMB: 512}})
+	mustStop(t, m, b.ID)
+
+	if v := memoryOf(t, m, b.ID); v.State != MemoryFailed {
+		t.Fatalf("b: %+v", v)
+	}
+	if v := memoryOf(t, m, a.ID); v.State != MemorySaved || v.Image != kept {
+		t.Fatalf("a's image was evicted to make room for b's, and b got none anyway: a says %+v, released %v", v, keeper.released)
+	}
+	if slices.Contains(keeper.released, kept) {
+		t.Fatalf("released %v", keeper.released)
+	}
+}
+
+// The pool is asked how much it is short by, and another image goes only
+// while the images that could still go cover it, at the most: a stop
+// evicts just enough, the oldest first, and no more; a pool short for
+// other reasons by more than every image together loses none to a stop.
+// A pool below its reserve loses its images when the daemon reaps,
+// whatever made it short, and stops as soon as it is not.
+func TestAStopEvictsJustEnoughImagesToMakeRoomForItsOwn(t *testing.T) {
+	const miB = 1 << 20
+	m, _, keeper := memoryManager(t, t.TempDir())
+	clock := newTestClock(m)
+	// What an image takes on the pool: the guest's memory and 64 MiB.
+	keeper.holds = func(memoryMB int) int64 { return int64(memoryMB+64) * miB }
+	// The pool: how much is free, asked as the driver asks (need bytes
+	// plus a reserve) and told what each released image gave back.
+	const reserve = 3 << 30
+	var free int64 = reserve + 4<<30 // plenty, to begin with
+	keeper.shortBy = func(need int64) (int64, error) { return max(reserve+need-free, 0), nil }
+	keeper.onRelease = func(image *MemoryImage) { free += keeper.holds(image.MemoryMB) }
+	stopOfSize := func(memoryMB int) (id, image string) {
+		t.Helper()
+		keeper.memoryMB = memoryMB
+		created := mustCreate(t, m, CreateRequest{Limits: &Limits{MemoryMB: memoryMB}})
+		mustStop(t, m, created.ID)
+		clock.advance(time.Minute)
+		return created.ID, memoryOf(t, m, created.ID).Image
+	}
+	small, smallImage := stopOfSize(256)   // 320 MiB
+	middle, middleImage := stopOfSize(512) // 576 MiB
+	large, largeImage := stopOfSize(1024)  // 1088 MiB
+
+	// Room for a new image of 1088 MiB once the two oldest have gone:
+	// short by 700 MiB, which the smallest alone does not cover.
+	keeper.memoryMB = 1024
+	free = reserve + keeper.holds(1024) - 700*miB
+	newest := mustCreate(t, m, CreateRequest{Limits: &Limits{MemoryMB: 1024}})
+	mustStop(t, m, newest.ID)
+	newestImage := memoryOf(t, m, newest.ID).Image
+	if !slices.Equal(keeper.released, []string{smallImage, middleImage}) {
+		t.Fatalf("released %v, want the two oldest: %s %s", keeper.released, smallImage, middleImage)
+	}
+	for _, id := range []string{small, middle} {
+		if image := memoryOf(t, m, id); image.State != MemoryEvicted || image.Error != evictedForRoom {
+			t.Errorf("run %s: %+v", id, image)
+		}
+	}
+	for _, id := range []string{large, newest.ID} {
+		if image := memoryOf(t, m, id); image.State != MemorySaved || image.Error != "" {
+			t.Errorf("run %s: %+v", id, image)
+		}
+	}
+	// Short for other reasons by more than every image together: a stop
+	// evicts nothing, for all that the pool is below its reserve. Its
+	// own image could not be saved into such a pool either, so nothing
+	// would have been gained by dropping the others for it.
+	keeper.memoryMB = 1024
+	free = 0
+	doomed := mustCreate(t, m, CreateRequest{Limits: &Limits{MemoryMB: 1024}})
+	mustStop(t, m, doomed.ID)
+	doomedImage := memoryOf(t, m, doomed.ID).Image
+	if !slices.Equal(keeper.released, []string{smallImage, middleImage}) {
+		t.Fatalf("released %v: a stop evicted images for an image the pool had no room for whatever it dropped", keeper.released)
+	}
+	// Below its reserve when the daemon reaps: the rest go, the oldest
+	// first, until it is not.
+	m.Reap(context.Background())
+	if !slices.Equal(keeper.released, []string{smallImage, middleImage, largeImage, newestImage, doomedImage}) {
+		t.Fatalf("released %v", keeper.released)
+	}
+	for _, id := range []string{large, newest.ID, doomed.ID} {
+		if image := memoryOf(t, m, id); image.State != MemoryEvicted || image.Error != evictedForPressure {
+			t.Errorf("run %s: %+v", id, image)
+		}
+	}
+
+	// And no further than the reserve: a byte below it costs the oldest
+	// image alone.
+	free = reserve + 4<<30
+	_, olderImage := stopOfSize(256)
+	newer, newerImage := stopOfSize(256)
+	free = reserve - 1
+	m.Reap(context.Background())
+	if !slices.Equal(keeper.released, []string{smallImage, middleImage, largeImage, newestImage, doomedImage, olderImage}) {
+		t.Fatalf("released %v", keeper.released)
+	}
+	if image := memoryOf(t, m, newer); image.State != MemorySaved || image.Image != newerImage {
+		t.Fatalf("a pool a byte below its reserve lost a second image: %+v", image)
 	}
 }
 

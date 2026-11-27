@@ -365,7 +365,10 @@ What it costs, and what it does not do:
 - An image takes the pool's space until the run resumes or is destroyed.
   No image is saved into a pool below its reserve
   (`--remote-pool-reserve`), and one below its reserve loses images, the
-  oldest stop first, before anything else of the runs'.
+  oldest stop first, before anything else of the runs'. A stop makes
+  room for its own image the same way, the oldest first, but only while
+  dropping images can make the room: a pool that is short for other
+  reasons keeps them, and the stop goes on without an image.
 - Same host only. A run stopped on another host, or on this host before
   the CPU, kernel, hypervisor or guest kernel changed, resumes from its
   disk.

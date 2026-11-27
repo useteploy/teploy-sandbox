@@ -1309,3 +1309,65 @@ func TestAPoolBelowItsReserveLosesMemoryImagesOldestFirst(t *testing.T) {
 	}
 	assertPool(t, rig.zfs, memoryPristine...)
 }
+
+// A stop makes room for its image only while dropping images can make
+// it: a pool that is short by more than every image together keeps
+// them, for all that a new image cannot be saved into it either (a
+// review's repro, on the driver's own pool numbers). The reaper's pass
+// still drops them, since the pool is below its reserve, and says so.
+func TestAStopEvictsNoImageForANewOneThePoolHasNoRoomFor(t *testing.T) {
+	rig := newMemoryRig(t, nil)
+	speaksV3(rig)
+	var ids []string
+	for range 2 {
+		created, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Limits: &run.Limits{MemoryMB: 256}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rig.manager.Stop(bg, created.ID); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, created.ID)
+	}
+	// Eight of a hundred GiB free against a reserve of ten: 2 GiB below
+	// it, and so short of a third image (320 MiB at most) by more than
+	// the two that are there hold together.
+	rig.zfs.mu.Lock()
+	rig.zfs.available, rig.zfs.used = 8<<30, 92<<30
+	rig.zfs.mu.Unlock()
+	third, err := rig.manager.Create(bg, run.CreateRequest{Image: GoldenImage, Limits: &run.Limits{MemoryMB: 256}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rig.manager.Stop(bg, third.ID); err != nil {
+		t.Fatal(err)
+	}
+	if view := memoryView(t, rig.manager, third.ID); view.State != run.MemoryFailed || view.Error == "" {
+		t.Fatalf("the third stop: %+v", view)
+	}
+	for _, id := range ids {
+		if view := memoryView(t, rig.manager, id); view.State != run.MemorySaved || view.Error != "" {
+			t.Fatalf("an image was evicted for one the pool had no room for whatever it dropped: %+v", view)
+		}
+	}
+	if len(rig.driver.images.known) != 2 {
+		t.Fatalf("images: %v", rig.imageIDs())
+	}
+	// Below its reserve when the daemon reaps: both go, the oldest
+	// stop first, and that is the reason they carry.
+	rig.manager.Reap(bg)
+	for _, id := range ids {
+		if view := memoryView(t, rig.manager, id); view.State != run.MemoryEvicted || view.Error != "the pool is below its reserve" {
+			t.Fatalf("run %s: %+v", id, view)
+		}
+	}
+	for _, id := range ids {
+		resumed, err := rig.manager.Resume(bg, id, 0)
+		if err != nil || resumed.ResumedFrom != run.ResumedFromDisk {
+			t.Fatalf("resume: %+v %v", resumed.ResumedFrom, err)
+		}
+		must(t, rig.manager.Destroy(bg, id))
+	}
+	must(t, rig.manager.Destroy(bg, third.ID))
+	assertPool(t, rig.zfs, memoryPristine...)
+}

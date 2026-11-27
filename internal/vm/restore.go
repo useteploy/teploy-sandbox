@@ -102,11 +102,11 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 	case current.machine.Outbox() == "" || d.images == nil:
 		note = "this daemon keeps no memory images"
 	default:
-		short, err := d.MemoryShortOf(ctx, imageNeedsBytes(current.memoryMB))
+		short, err := d.MemoryShortBy(ctx, imageNeedsBytes(current.memoryMB))
 		switch {
 		case err != nil:
 			note = "the pool's space could not be read: " + err.Error()
-		case short:
+		case short > 0:
 			note = "the pool is below its reserve"
 		default:
 			// Detached: a dataset a cancelled request leaves behind is
@@ -234,14 +234,15 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 	return nil, "the image could not be recorded: " + err.Error(), nil
 }
 
-// MemoryShortOf is run.MemoryKeeper.MemoryShortOf.
-func (d *Driver) MemoryShortOf(ctx context.Context, need int64) (bool, error) {
+// MemoryShortBy is run.MemoryKeeper.MemoryShortBy: how many bytes the
+// pool is short of need bytes plus its reserve.
+func (d *Driver) MemoryShortBy(ctx context.Context, need int64) (int64, error) {
 	free, used, err := d.volumes.zfs.Space(ctx, d.poolName())
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	reserve := (free + used) * int64(max(d.reservePercent, 0)) / 100
-	return free-need < reserve, nil
+	return max(reserve-(free-need), 0), nil
 }
 
 // MemoryNeedsBytes is run.MemoryKeeper.MemoryNeedsBytes.

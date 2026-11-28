@@ -50,6 +50,15 @@ type Keyring struct {
 	// with: rotation's half-done state, and a daemon's read path during
 	// one. Wrapping always uses master.
 	previous map[string]cipher.AEAD
+
+	// masterRaw and previousRaw are the same keys as bytes, by the same
+	// IDs, for one thing the v1 AEADs above cannot do: the v2 public
+	// sections are derived from the master key itself (PublicAEAD), under
+	// their own label. Nothing v1 reads these: the v1 paths are as they
+	// were, byte for byte. A keyHolder, so that a keyring printed with
+	// any verb shows where the key is, never the key.
+	masterRaw   *keyHolder
+	previousRaw map[string]*keyHolder
 }
 
 // ParseMasterKey reads a master key: 32 random bytes, as 64 hex digits,
@@ -133,7 +142,7 @@ func NewKeyring(master []byte) (*Keyring, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Keyring{master: aead, id: id}, nil
+	return &Keyring{master: aead, id: id, masterRaw: rootRaw(master)}, nil
 }
 
 // AddPrevious lets the keyring open, never wrap with, another master:
@@ -151,9 +160,56 @@ func (k *Keyring) AddPrevious(master []byte) error {
 	}
 	if k.previous == nil {
 		k.previous = map[string]cipher.AEAD{}
+		k.previousRaw = map[string]*keyHolder{}
 	}
 	k.previous[id] = aead
+	k.previousRaw[id] = rootRaw(master)
 	return nil
+}
+
+// PublicAEAD is the AEAD of the fleet metadata key fmkID for the public
+// section of the object called name of its kind: what every host in the
+// fleet may read.
+//
+//	HKDF-SHA256(FMK, nil, "teploy-sandbox/v2/meta/<kind>/<name>", 32)
+//
+// The key is chosen by the ID the envelope names, the current master or
+// one of the previous ones, and never by trying the keys at hand:
+// ErrWrongKey when this daemon has it not.
+func (k *Keyring) PublicAEAD(fmkID, kind, name string) (cipher.AEAD, error) {
+	if err := checkKindName(kind, name); err != nil {
+		return nil, err
+	}
+	var master *keyHolder
+	if fmkID != "" && fmkID == k.id {
+		master = k.masterRaw
+	} else {
+		master = k.previousRaw[fmkID]
+	}
+	if master == nil || master.key.wiped {
+		return nil, fmt.Errorf("%w (fleet key %s, this daemon has %s)", ErrWrongKey, quoted(fmkID), quoted(k.id))
+	}
+	return deriveAEAD(master.key.bytes[:], labelV2+"meta/"+kind+"/"+name)
+}
+
+// Close wipes the raw master key material held for v2 public-section
+// derivation. Call on shutdown or when discarding a keyring.
+func (k *Keyring) Close() {
+	if k == nil {
+		return
+	}
+	if k.masterRaw != nil {
+		k.masterRaw.key.wiped = true
+		clear(k.masterRaw.key.bytes[:])
+		k.masterRaw = nil
+	}
+	for id, prev := range k.previousRaw {
+		if prev != nil {
+			prev.key.wiped = true
+			clear(prev.key.bytes[:])
+		}
+		delete(k.previousRaw, id)
+	}
 }
 
 // Key is one run's data key: every chunk, manifest and record of the run

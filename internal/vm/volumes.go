@@ -61,8 +61,12 @@ type Volumes struct {
 	captureTimeout time.Duration
 
 	// bases remembers, by guid, the base images found by walking a
-	// volume's origins (see Transfer.BaseOf): a golden image that is no
-	// longer the configured one still has runs descending from it.
+	// volume's origins (see Transfer.BaseOf), so that a base image
+	// received here is found again by its ID: only one positively marked
+	// is ever remembered — the configured golden image, or a base image
+	// received and committed here (kindBase). An older golden image is
+	// neither once it is no longer configured, and runs still descending
+	// from it are not uploaded until it is again.
 	basesMu sync.Mutex
 	bases   map[string]string
 

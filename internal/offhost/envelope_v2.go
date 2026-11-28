@@ -677,6 +677,37 @@ func SealV2(fmk *Keyring, kind, name string, publicBytes []byte, holdKey *HoldKe
 	return json.Marshal(envelope)
 }
 
+// resealPublic is a v2 envelope with its public section sealed again
+// under fmk's current key, and nothing else changed: the public bytes are
+// the ones that were opened, and the sealed section, its nonce and the
+// wrapped hold key are carried over exactly. So the sealed section still
+// opens: its AAD holds the SHA-256 of the public bytes, which did not
+// move. This is the fleet key's rotation of a v2 manifest — it needs the
+// fleet key alone, never the run's hold key.
+//
+// opened must have been opened as kind name, and must be under another
+// key than fmk's current one: a caller that reseals what is current gets
+// a new nonce for nothing.
+func resealPublic(fmk *Keyring, kind, name string, opened *OpenedPublicV2) ([]byte, error) {
+	if opened.kind != kind || opened.name != name {
+		return nil, fmt.Errorf("%w: the envelope was opened as %s %s, and is asked for as %s %s", ErrCorrupt, opened.kind, opened.name, kind, name)
+	}
+	public, err := fmk.PublicAEAD(fmk.id, kind, name)
+	if err != nil {
+		return nil, err
+	}
+	section, err := sealSection(public, opened.PublicBytes, publicAADV2(kind, name))
+	if err != nil {
+		return nil, err
+	}
+	envelope := EnvelopeV2{
+		Version: EnvelopeVersionV2, FMK: fmk.id,
+		PublicNonce: section[:public.NonceSize()], Public: section[public.NonceSize():],
+		Key: opened.WrappedKey, SealedNonce: opened.sealedNonce, Sealed: opened.sealedBytes,
+	}
+	return json.Marshal(envelope)
+}
+
 // OpenedPublicV2 is the public section of a v2 envelope, opened: all of
 // it that any host in the fleet may read. It needs no tenant key, and it
 // is what OpenSealedV2 is given with the run's hold key.

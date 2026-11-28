@@ -148,9 +148,30 @@ func (t *Transfer) Stat(ctx context.Context, id string) (string, bool, error) {
 // maxOriginWalk bounds the walk from a snapshot to its base image.
 const maxOriginWalk = 256
 
+// isBase says whether the origin snapshot, whose dataset is parent, is a
+// base image this daemon can vouch for, by a positive mark and nothing
+// else: the configured golden image, or a base image this daemon received
+// and committed (kindBase). Nothing derived from a tenant's disk is either.
+//
+// Key custody (D9): before, the first origin walking back that was not
+// this daemon's was taken for a base image and could be uploaded as one,
+// under a "base-" ID, for the whole fleet to boot from. A dataset that is
+// nobody's mark is not a base image.
+func (v *Volumes) isBase(origin string, parent Dataset) bool {
+	return origin == v.golden || (v.mine(parent) && parent.Kind == kindBase)
+}
+
 // BaseOf is the ID of the base image the snapshot's volume descends from:
-// the first origin, walking back, that is not a run volume or a snapshot
-// holder of this daemon. "" for a volume that is a clone of nothing.
+// walking back through this daemon's own run volumes and snapshot
+// holders, the first origin that is positively a base image — the
+// configured golden image, or one received from remote storage and
+// committed here. "" for a volume that is a clone of nothing.
+//
+// Any other origin is an error, not a base image: a dataset without this
+// daemon's mark (another daemon's, an operator's, a golden image that is
+// no longer the configured one) was never received and verified here, and
+// nothing derived from it is uploaded under a "base-" ID. A snapshot of
+// such a volume is not uploaded; it stays on this host.
 func (t *Transfer) BaseOf(ctx context.Context, id string) (string, error) {
 	v := t.volumes
 	v.mu.Lock()
@@ -179,6 +200,9 @@ func (t *Transfer) BaseOf(ctx context.Context, id string) (string, error) {
 			volume = parent.Name
 			continue
 		}
+		if !v.isBase(dataset.Origin, parent) {
+			return "", fmt.Errorf("snapshot %s descends from %s, which is not a base image of this daemon (neither the configured golden image nor one received and verified here); it is not uploaded as one", id, dataset.Origin)
+		}
 		guid, err := v.zfs.Property(ctx, dataset.Origin, "guid")
 		if err != nil {
 			return "", err
@@ -192,6 +216,69 @@ func (t *Transfer) BaseOf(ctx context.Context, id string) (string, error) {
 		return baseIDPrefix + guid, nil
 	}
 	return "", fmt.Errorf("volume %s has no end to its origins", datasetOf(name))
+}
+
+// StreamHash is the stream hash recorded on this host's live copy of id:
+// the hash of the stream it was sent with or received and checked with.
+// "" when none is: not recorded (a copy from before the property
+// existed, or another host's golden image, which is never marked), or
+// there is no live copy here.
+//
+// It is the only place an incremental upload takes its parent's hash
+// from, and what a restore holds a parent it already has to: a remote
+// manifest's parent hash is never read for either, and a GUID says which
+// snapshot a copy is, not that its bytes are the stream that was pinned.
+func (t *Transfer) StreamHash(ctx context.Context, id string) (string, error) {
+	v := t.volumes
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	name, ok, err := v.locate(ctx, id, false)
+	if err != nil || !ok {
+		return "", err
+	}
+	return v.zfs.LocalProperty(ctx, name, propStreamSHA256)
+}
+
+// validStreamHash is the shape of a recorded stream hash: 64 hex digits.
+func validStreamHash(hash string) bool {
+	return len(hash) == 64 && strings.Trim(hash, "0123456789abcdef") == ""
+}
+
+// SetStreamHash records on this host's copy of id that its stream hashes
+// to hash: after an upload of it from here, after a restore that checked
+// the stream it received. What a restore has received and not committed
+// counts as this host's copy, so a restore can record each stream before
+// it commits.
+//
+// Only this daemon's own datasets are marked: the configured golden image
+// and another daemon's volumes are never changed, here or anywhere.
+func (t *Transfer) SetStreamHash(ctx context.Context, id, hash string) error {
+	if !validStreamHash(hash) {
+		return fmt.Errorf("a stream hash is 64 hex digits, and %q is not", hash)
+	}
+	v := t.volumes
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	name, ok, err := v.locate(ctx, id, true)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrNoSnapshot, id)
+	}
+	dataset, err := v.zfs.Dataset(ctx, datasetOf(name))
+	if errors.Is(err, ErrNoDataset) {
+		return fmt.Errorf("%w: %s", ErrNoSnapshot, id)
+	}
+	if err != nil {
+		return err
+	}
+	if !v.mine(dataset) {
+		// The golden image when it is the base image asked about, or
+		// another daemon's: read and cloned, never changed.
+		return fmt.Errorf("%w: %s is not this daemon's to mark", ErrNoSnapshot, name)
+	}
+	return v.zfs.SetProperty(ctx, name, propStreamSHA256, hash)
 }
 
 // Send writes the stream of id to w, incremental against from when given.

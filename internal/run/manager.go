@@ -403,11 +403,16 @@ type Manager struct {
 	accessFloors map[string]int64
 	remoteSeen   map[string]uint64
 	orphans      []string
-	lastSync     time.Time
-	lastGC       time.Time
-	lastScrub    time.Time
-	maintaining  atomic.Bool
-	publishing   atomic.Bool
+	// remoteStopped are the runs remote storage has, stopped, that this
+	// daemon has no record of (key custody, pushed mode, where such a run
+	// is not adopted): counted in Capacity's StoppedRemote from their
+	// records' public sections. Guarded by mu; not persisted.
+	remoteStopped map[string]bool
+	lastSync      time.Time
+	lastGC        time.Time
+	lastScrub     time.Time
+	maintaining   atomic.Bool
+	publishing    atomic.Bool
 
 	// forking are the IDs of fork children whose record is in remote
 	// storage and whose VM is still booting: runs the registry does not

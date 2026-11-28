@@ -51,6 +51,12 @@ func newHostKeys(t *testing.T, bucket *offhosttest.Memory, name string, previous
 // separately from the bucket the test inspects: a wrapper that delays
 // one operation, to order a race by hand.
 func newHostObjs(t *testing.T, mem *offhosttest.Memory, objects offhost.Objects, name string, previous *remoteHost, keyring *offhost.Keyring, options ...hostOption) *remoteHost {
+	return newHostPrepared(t, mem, objects, name, previous, keyring, nil, options...)
+}
+
+// newHostPrepared is newHostObjs with prepare run on the store before it
+// is probed: a test puts it in key custody's mode here.
+func newHostPrepared(t *testing.T, mem *offhosttest.Memory, objects offhost.Objects, name string, previous *remoteHost, keyring *offhost.Keyring, prepare func(*offhost.Store), options ...hostOption) *remoteHost {
 	t.Helper()
 	h := &remoteHost{name: name, bucket: mem, stateDir: t.TempDir()}
 	var rig *testRig
@@ -76,6 +82,9 @@ func newHostObjs(t *testing.T, mem *offhosttest.Memory, objects offhost.Objects,
 	h.store = offhost.NewStore(objects, "fleet", keys, quietLog())
 	h.store.ChunkBytes = 96
 	h.store.Parallel = 3
+	if prepare != nil {
+		prepare(h.store)
+	}
 	if err := h.store.Probe(bg); err != nil {
 		t.Fatal(err)
 	}

@@ -961,7 +961,11 @@ type Capacity struct {
 	Stopped int
 	// StoppedRemote is how many of the stopped runs have no copy of
 	// their snapshot on this host: they cost it nothing, and a resume
-	// fetches the snapshot first.
+	// fetches the snapshot first. With key custody in pushed mode it
+	// also counts the stopped runs remote storage has that this daemon
+	// has no record of at all (it adopts none; SyncRemote reads their
+	// state from their records' public sections), which are not among
+	// Stopped.
 	StoppedRemote int
 	CPUs          float64
 	MemoryMB      int
@@ -997,6 +1001,11 @@ func (m *Manager) Capacity() Capacity {
 		c.Running++
 		c.CPUs += run.limits.CPUs
 		c.MemoryMB += run.limits.MemoryMB
+	}
+	for id := range m.remoteStopped {
+		if _, held := m.runs[id]; !held {
+			c.StoppedRemote++
+		}
 	}
 	return c
 }

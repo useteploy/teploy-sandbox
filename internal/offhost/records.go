@@ -54,6 +54,23 @@ type Record struct {
 	// conditional write whose answer was lost, it is how a daemon knows
 	// whether the generation that exists is its own.
 	Write string `json:"write"`
+
+	// Key custody (v2). None of it is on a v1 record's JSON, and a v1
+	// record has none of it set.
+	//
+	// Tenant and KID are the custody fields of the public section, and
+	// WrappedKey the hold key the sealed section is under, wrapped. A
+	// read of the public section alone (readRecordPublic) has them and
+	// no Payload: KID is worth trusting only when the envelope has a
+	// sealed section (opened.HasSealed), as a destroyed record's does not.
+	Tenant     string `json:"-"`
+	KID        string `json:"-"`
+	WrappedKey string `json:"-"`
+	// opened is the public section as it was opened, fmk the fleet key
+	// the envelope names, v2 that it is a v2 envelope.
+	opened *OpenedPublicV2
+	fmk    string
+	v2     bool
 }
 
 const recordVersion = 1
@@ -125,6 +142,11 @@ func (s *Store) newest(ctx context.Context, id string) (uint64, error) {
 }
 
 func (s *Store) readRecord(ctx context.Context, id string, generation uint64) (*Record, Key, error) {
+	if s.v2() {
+		opened, err := s.readRecordCustody(ctx, id, generation, true)
+		defer opened.hold.Zero()
+		return opened.record, opened.key, err
+	}
 	stored, err := s.objects.Get(ctx, s.recordKey(id, generation), maxSmallObject)
 	if err != nil {
 		return nil, Key{}, err
@@ -133,6 +155,121 @@ func (s *Store) readRecord(ctx context.Context, id string, generation uint64) (*
 	if err != nil {
 		return nil, Key{}, err
 	}
+	return recordOfDocument(id, generation, document, key)
+}
+
+// readRecordPublic reads one generation of a run's record as far as its
+// public section goes: who wrote it, when, its state, its generation, the
+// snapshot it names, and (key custody) its tenant and key ID. Nothing
+// here needs a tenant's key, so it is what every fleet-wide look at a
+// record uses: collection, the look before a collection deletes, the
+// fence's reads, rotation's counts, the sync. Without a key source a
+// record is whole under the fleet key, and this is readRecord.
+//
+// A v2 record's Payload is then nil (readRecord has it); a destroyed
+// record has none in any case.
+func (s *Store) readRecordPublic(ctx context.Context, id string, generation uint64) (*Record, Key, error) {
+	if !s.v2() {
+		return s.readRecord(ctx, id, generation)
+	}
+	opened, err := s.readRecordCustody(ctx, id, generation, false)
+	return opened.record, opened.key, err
+}
+
+// openedRecord is a generation of a record as read: the record, the data
+// key a v1 record is under, and the hold key a v2 one's sealed section
+// was opened with (none when it was not opened, or for a destroyed
+// record, which has no sealed section).
+type openedRecord struct {
+	record *Record
+	key    Key
+	hold   HoldKey
+}
+
+// readRecordCustody is readRecord in the custody mode, and
+// readRecordPublic with sealed false. The envelope's version is looked at
+// first and nothing is decrypted before it is known: a v2 envelope's
+// public section is opened under the fleet key alone; a v1 envelope only
+// as far as the key custody policy allows, and by the run it is the
+// record of.
+//
+// With sealed, a live v2 record's sealed section is opened too, under the
+// hold key its envelope names, as the key source unwraps it for this
+// tenant and run: ErrNeedKey when this host was not given it, ErrCorrupt
+// when the blob is not this run's or the section does not open. Then
+// nothing of the record is returned, and a caller that needs no payload
+// has no business asking.
+func (s *Store) readRecordCustody(ctx context.Context, id string, generation uint64, sealed bool) (openedRecord, error) {
+	stored, err := s.objects.Get(ctx, s.recordKey(id, generation), maxSmallObject)
+	if err != nil {
+		return openedRecord{}, err
+	}
+	record, key, err := s.openRecordAs(id, generation, stored)
+	if err != nil {
+		return openedRecord{}, err
+	}
+	if !sealed || !record.v2 || !record.opened.HasSealed {
+		return openedRecord{record: record, key: key}, nil
+	}
+	hold, err := s.source().Unwrap(record.Tenant, record.Run, record.WrappedKey)
+	if err != nil {
+		return openedRecord{}, err
+	}
+	plain, err := OpenSealedV2(kindRecord, recordName(id, generation), *record.opened, hold)
+	if err != nil {
+		return openedRecord{}, err
+	}
+	section, err := DecodeRecordSealedV2(plain)
+	if err != nil {
+		return openedRecord{}, err
+	}
+	record.Payload = section.Payload
+	return openedRecord{record: record, key: key, hold: hold}, nil
+}
+
+// openRecordAs is a fetched generation of a run's record, opened: by the
+// v1 reader without a key source; in the custody mode by its envelope's
+// version, as openManifestAs does for a manifest.
+func (s *Store) openRecordAs(id string, generation uint64, stored []byte) (*Record, Key, error) {
+	name := recordName(id, generation)
+	if !s.v2() {
+		document, key, err := s.keys.open("record", name, stored)
+		if err != nil {
+			return nil, Key{}, err
+		}
+		return recordOfDocument(id, generation, document, key)
+	}
+	version, err := InspectEnvelopeVersion(stored)
+	if err != nil {
+		return nil, Key{}, err
+	}
+	switch version {
+	case EnvelopeVersionV2:
+		opened, err := OpenPublicV2(s.keys, kindRecord, name, stored)
+		if err != nil {
+			return nil, Key{}, err
+		}
+		public := opened.Record()
+		return &Record{
+			Version: public.Version, Tenant: public.Tenant, Run: public.Run, KID: public.KID,
+			Generation: public.Generation, State: public.State, Owner: public.Owner, WrittenAt: public.WrittenAt,
+			Snapshot: public.Snapshot, Write: public.Write,
+			WrappedKey: opened.WrappedKey, opened: &opened, fmk: opened.FMKID, v2: true,
+		}, Key{}, nil
+	case envelopeVersion:
+		document, key, err := OpenV1IfAllowed(s.keys, kindRecord, name, stored, s.v1Policy(stored, ""))
+		if err != nil {
+			return nil, Key{}, err
+		}
+		return recordOfDocument(id, generation, document, key)
+	default:
+		return nil, Key{}, fmt.Errorf("record of %s has version %d, which this daemon does not read", id, version)
+	}
+}
+
+// recordOfDocument is a v1 record's document, held to what its name and
+// key say.
+func recordOfDocument(id string, generation uint64, document []byte, key Key) (*Record, Key, error) {
 	var record Record
 	if err := json.Unmarshal(document, &record); err != nil {
 		return nil, Key{}, fmt.Errorf("%w: record of %s: %v", ErrCorrupt, id, err)
@@ -152,8 +289,22 @@ func (s *Store) readRecord(ctx context.Context, id string, generation uint64) (*
 }
 
 // Latest reads a run's newest generation and the run's key. ErrNoRecord
-// when the run has none.
+// when the run has none. In the custody mode a v2 record's payload is
+// read too, under its hold key: ErrNeedKey (as the key source answers it)
+// when this host was not given it. A caller that needs only what the
+// record says, and not the run it carries, has LatestPublic.
 func (s *Store) Latest(ctx context.Context, id string) (*Record, Key, error) {
+	return s.latest(ctx, id, s.readRecord)
+}
+
+// LatestPublic is Latest of the public section alone (readRecordPublic):
+// never a hold key, so never ErrNeedKey. The state, generation, owner,
+// snapshot, tenant and key ID are all there; the payload is not.
+func (s *Store) LatestPublic(ctx context.Context, id string) (*Record, Key, error) {
+	return s.latest(ctx, id, s.readRecordPublic)
+}
+
+func (s *Store) latest(ctx context.Context, id string, read func(context.Context, string, uint64) (*Record, Key, error)) (*Record, Key, error) {
 	for range 3 {
 		generation, err := s.newest(ctx, id)
 		if err != nil {
@@ -162,7 +313,7 @@ func (s *Store) Latest(ctx context.Context, id string) (*Record, Key, error) {
 		if generation == 0 {
 			return nil, Key{}, fmt.Errorf("%w: %s", ErrNoRecord, id)
 		}
-		record, key, err := s.readRecord(ctx, id, generation)
+		record, key, err := read(ctx, id, generation)
 		if errors.Is(err, s3.ErrNotFound) {
 			// Collected between the listing and the read: look again.
 			continue
@@ -172,17 +323,11 @@ func (s *Store) Latest(ctx context.Context, id string) (*Record, Key, error) {
 	return nil, Key{}, fmt.Errorf("record of %s keeps changing", id)
 }
 
-// Advance creates the next generation of a run: record.Generation, which
-// must be one more than the newest there is (1 for a run with none).
-// daemon is the writer's identity, and becomes the record's owner.
-//
-// ErrConflict means the run moved on first: somebody else created that
-// generation, or a later one. Without conditional writes (Conditional is
-// false) the check is a read before the write and one after it, which is
-// not a lock; a run another daemon wrote last is then left alone
-// (ErrUnfenced) unless unfenced is set by an operator whose controller
-// already makes sure only one daemon acts on a run.
-func (s *Store) Advance(ctx context.Context, record Record, key Key, daemon string, unfenced bool) error {
+// checkAdvance is what must hold before a run's next generation is
+// written: the generation is one more than the newest there is, and,
+// where the service cannot decide a race, the record that stands is this
+// daemon's own (see Advance).
+func (s *Store) checkAdvance(ctx context.Context, record *Record, daemon string, unfenced bool) error {
 	if record.Generation == 0 {
 		return errors.New("offhost: generation 0 is not a generation")
 	}
@@ -194,7 +339,7 @@ func (s *Store) Advance(ctx context.Context, record Record, key Key, daemon stri
 		return fmt.Errorf("%w: run %s is at generation %d, not %d", ErrConflict, record.Run, newest, record.Generation-1)
 	}
 	if !s.conditional && !unfenced && newest > 0 {
-		previous, _, err := s.readRecord(ctx, record.Run, newest)
+		previous, _, err := s.readRecordPublic(ctx, record.Run, newest)
 		if err != nil {
 			return err
 		}
@@ -202,6 +347,11 @@ func (s *Store) Advance(ctx context.Context, record Record, key Key, daemon stri
 			return fmt.Errorf("%w (run %s)", ErrUnfenced, record.Run)
 		}
 	}
+	return nil
+}
+
+// stampRecord makes the record this daemon's write of its generation.
+func (s *Store) stampRecord(record *Record, daemon string) error {
 	token := make([]byte, 12)
 	if _, err := rand.Read(token); err != nil {
 		return err
@@ -210,24 +360,22 @@ func (s *Store) Advance(ctx context.Context, record Record, key Key, daemon stri
 	record.Owner = daemon
 	record.WrittenAt = s.now().UTC()
 	record.Write = hex.EncodeToString(token)
-	document, err := json.Marshal(record)
-	if err != nil {
-		return err
-	}
-	sealed, err := seal(key, "record", recordName(record.Run, record.Generation), document)
-	if err != nil {
-		return err
-	}
-	err = s.objects.Put(ctx, s.recordKey(record.Run, record.Generation), sealed, s3.PutOptions{IfAbsent: s.conditional, ContentType: "application/json"})
+	return nil
+}
+
+// settleRecord is what counts after a record's write, whatever the write
+// answered: the generation must be this write (a retried conditional
+// write is refused by its own first attempt), and it must be the newest
+// (the slot of an old generation is empty again once Collect has pruned
+// it, and a daemon acting on a stale view could create it). Both are read
+// from the public section: who wrote a generation and which write it was
+// are there for every host to see.
+func (s *Store) settleRecord(ctx context.Context, record *Record, sealed []byte) error {
+	err := s.objects.Put(ctx, s.recordKey(record.Run, record.Generation), sealed, s3.PutOptions{IfAbsent: s.conditional, ContentType: "application/json"})
 	if err != nil && !errors.Is(err, s3.ErrPreconditionFailed) {
 		return err
 	}
-	// Whatever the write answered, what counts is what is there now: the
-	// generation must be this write (a retried conditional write is
-	// refused by its own first attempt), and it must be the newest (the
-	// slot of an old generation is empty again once Collect has pruned
-	// it, and a daemon acting on a stale view could create it).
-	written, _, readErr := s.readRecord(ctx, record.Run, record.Generation)
+	written, _, readErr := s.readRecordPublic(ctx, record.Run, record.Generation)
 	if readErr != nil {
 		if err != nil {
 			return fmt.Errorf("%w: generation %d of %s exists", ErrConflict, record.Generation, record.Run)
@@ -248,4 +396,108 @@ func (s *Store) Advance(ctx context.Context, record Record, key Key, daemon stri
 		return fmt.Errorf("%w: run %s is already at generation %d", ErrConflict, record.Run, after)
 	}
 	return nil
+}
+
+// Advance creates the next generation of a run: record.Generation, which
+// must be one more than the newest there is (1 for a run with none).
+// daemon is the writer's identity, and becomes the record's owner.
+//
+// ErrConflict means the run moved on first: somebody else created that
+// generation, or a later one. Without conditional writes (Conditional is
+// false) the check is a read before the write and one after it, which is
+// not a lock; a run another daemon wrote last is then left alone
+// (ErrUnfenced) unless unfenced is set by an operator whose controller
+// already makes sure only one daemon acts on a run.
+//
+// It is the v1 write. In the custody mode a record is written with
+// AdvanceV2.
+func (s *Store) Advance(ctx context.Context, record Record, key Key, daemon string, unfenced bool) error {
+	if s.v2() {
+		return errV1Write
+	}
+	if err := s.checkAdvance(ctx, &record, daemon, unfenced); err != nil {
+		return err
+	}
+	if err := s.stampRecord(&record, daemon); err != nil {
+		return err
+	}
+	document, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	sealed, err := seal(key, "record", recordName(record.Run, record.Generation), document)
+	if err != nil {
+		return err
+	}
+	return s.settleRecord(ctx, &record, sealed)
+}
+
+// AdvanceV2 is Advance in the custody mode. A record is a v2 envelope:
+// its public section — tenant, run, generation, state, owner, the
+// snapshot, which write it is — under the fleet key, for every host; its
+// payload, the run with its env, under the run's hold key.
+//
+//   - A destroyed record has no sealed section and carries no payload or
+//     snapshot: it is written under the fleet key alone, with hold nil.
+//     Whoever destroys a run need not hold its key to say so, and a
+//     collector need not hold it to read it.
+//   - Any other state needs the run's hold key (hold), which must be the
+//     key of the record's tenant and run; its KID goes in the public
+//     section and its wrapped blob in the envelope.
+//
+// The fence is Advance's: the same conditional write, and the same reads
+// of the public section afterwards.
+func (s *Store) AdvanceV2(ctx context.Context, record Record, hold *HoldKey, daemon string, unfenced bool) error {
+	if !s.v2() {
+		return errors.New("offhost: AdvanceV2 is for a store with a key source; without one a record is written under its data key (Advance)")
+	}
+	if !ValidTenant(record.Tenant) {
+		return fmt.Errorf("%w: %s is not a tenant", ErrCorrupt, quoted(record.Tenant))
+	}
+	if !validAADSegment(record.Run) {
+		return invalidSegment("run ID", record.Run)
+	}
+	if record.Snapshot != "" && (!validID(record.Snapshot) || IsBaseID(record.Snapshot)) {
+		return fmt.Errorf("%w: a record names the snapshot it refers to by a snapshot ID, and %s is not one", ErrCorrupt, quoted(record.Snapshot))
+	}
+	if record.State == RecordDestroyed {
+		if hold != nil {
+			return errors.New("offhost: a destroyed record has no sealed section and is under no hold key: hold must be nil")
+		}
+	} else {
+		if hold == nil {
+			return errNoHoldKeyGiven
+		}
+		if hold.Tenant != record.Tenant || hold.Run != record.Run {
+			return fmt.Errorf("%w: the hold key is the key of run %s of tenant %s, and the record is of run %s of tenant %s",
+				ErrCorrupt, hold.Run, hold.Tenant, record.Run, record.Tenant)
+		}
+	}
+	if err := s.checkAdvance(ctx, &record, daemon, unfenced); err != nil {
+		return err
+	}
+	if err := s.stampRecord(&record, daemon); err != nil {
+		return err
+	}
+	public := RecordPublicV2{
+		Version: EnvelopeVersionV2, Tenant: record.Tenant, Run: record.Run, Generation: record.Generation,
+		State: record.State, Owner: record.Owner, WrittenAt: record.WrittenAt, Write: record.Write,
+	}
+	var sealedBytes []byte
+	if hold != nil {
+		public.KID, public.Snapshot = hold.KID, record.Snapshot
+		var err error
+		if sealedBytes, err = json.Marshal(RecordSealedV2{Payload: record.Payload}); err != nil {
+			return err
+		}
+	}
+	publicBytes, err := json.Marshal(public)
+	if err != nil {
+		return err
+	}
+	sealed, err := SealV2(s.keys, kindRecord, recordName(record.Run, record.Generation), publicBytes, hold, sealedBytes)
+	if err != nil {
+		return err
+	}
+	return s.settleRecord(ctx, &record, sealed)
 }

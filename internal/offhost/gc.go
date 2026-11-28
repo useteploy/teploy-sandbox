@@ -115,9 +115,26 @@ func markChains(needed map[string]bool, manifests map[string]*summary) error {
 	return nil
 }
 
-// envelopeMaster is the id of the master key a stored document's data
-// key is wrapped by, "" when the document is not an envelope.
+// envelopeMaster is the id of the key a stored document's inside is
+// sealed by, "" when the document is not an envelope: the master key a
+// v1 envelope's data key is wrapped by, or (key custody) the fleet
+// metadata key a v2 envelope names in its "fmk" field, read exactly so.
+// Rotation moves a record to the next generation under the new key, and
+// collection compares this of the generation before the newest with the
+// newest's to find the one the old key still protects.
 func envelopeMaster(stored []byte) string {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(stored, &fields) != nil {
+		return ""
+	}
+	var version int
+	if raw, ok := fields["v"]; ok && json.Unmarshal(raw, &version) == nil && version == EnvelopeVersionV2 {
+		var fmk string
+		if json.Unmarshal(fields["fmk"], &fmk) != nil {
+			return ""
+		}
+		return fmk
+	}
 	var sealed struct {
 		Key string `json:"key"`
 	}
@@ -128,6 +145,17 @@ func envelopeMaster(stored []byte) string {
 	if !ok {
 		return ""
 	}
+	return id
+}
+
+// recordMaster is the key a record as read is under by the id
+// envelopeMaster gives: the master of a v1 record's data key, or the
+// fleet key a v2 record's envelope names.
+func recordMaster(record *Record, key Key) string {
+	if record.v2 {
+		return record.fmk
+	}
+	id, _, _ := strings.Cut(key.Wrapped, ".")
 	return id
 }
 
@@ -206,7 +234,10 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	var doomedRecords []s3.Object
 	for id, entry := range runs {
 		seenRuns[id] = entry.newest
-		record, key, err := s.readRecord(ctx, id, entry.newest)
+		// The public section is all a collection reads: a record's state
+		// and the snapshot it names are there for every host, and no
+		// tenant's key is wanted to decide what nothing refers to.
+		record, key, err := s.readRecordPublic(ctx, id, entry.newest)
 		if err != nil {
 			return stats, fmt.Errorf("collect: record of %s: %w", id, err)
 		}
@@ -214,6 +245,7 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 		if !destroyed && record.Snapshot != "" {
 			needed[record.Snapshot] = true
 		}
+		newestMaster := recordMaster(record, key)
 		var generations []uint64
 		for generation := range entry.objects {
 			generations = append(generations, generation)
@@ -239,7 +271,6 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 				if err != nil {
 					return stats, fmt.Errorf("collect: record of %s: %w", id, err)
 				}
-				newestMaster, _, _ := strings.Cut(key.Wrapped, ".")
 				if before := envelopeMaster(stored); before != "" && before != newestMaster {
 					doomedRecords = append(doomedRecords, entry.objects[generation])
 				}
@@ -771,12 +802,63 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	return stats, nil
 }
 
+// errCondemnSurpassed: the manifest a collection copied was written again
+// or removed before the collection's delete reached the bucket, which the
+// delete's own condition (If-Match) said.
+var errCondemnSurpassed = errors.New("the manifest was replaced or removed since the collection copied it")
+
+// readManifestWith is a manifest's bytes with the ETag the service gives
+// them, where the store has `If-Match` on a delete: the ETag is what
+// makes the next delete of it conditional. Without that condition, the
+// plain read.
+func (s *Store) readManifestWith(ctx context.Context, id string) ([]byte, string, error) {
+	if !s.conditionalDeleteMatch {
+		raw, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject)
+		return raw, "", err
+	}
+	return s.objects.GetWithETag(ctx, s.manifestKey(id), maxSmallObject)
+}
+
+// deleteCondemned removes the manifest of a snapshot this collection
+// copied. Where the service has `If-Match` on a delete, it goes only while
+// it is still the very bytes that were copied (etag, of the read that gave
+// them): one written again in between — a re-upload, a repair's
+// replacement, a re-key's swap — is errCondemnSurpassed, and is left whole.
+// A 404 is treated as deleted (not surpassed): a retried conditional delete
+// whose first attempt already landed returns 404, so step 2's pin check
+// must still decide whether to put the manifest back. Without the
+// condition, the delete is unconditional, as it always was.
+func (s *Store) deleteCondemned(ctx context.Context, id, etag string) error {
+	if !s.conditionalDeleteMatch || etag == "" {
+		return s.objects.Delete(ctx, s.manifestKey(id))
+	}
+	err := s.objects.DeleteIfMatch(ctx, s.manifestKey(id), etag)
+	if errors.Is(err, s3.ErrPreconditionFailed) {
+		return errCondemnSurpassed
+	}
+	if errors.Is(err, s3.ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
 // condemn deletes the snapshots that are due by the two-phase delete:
 //
 //  1. Each due snapshot's manifest is copied to "condemned" (a write that
 //     only one collection can make, on a service with conditional
 //     writes), read again to be sure it is still the one decided on, and
 //     deleted. From here on every Verify of the snapshot fails.
+//
+//     The copy is written BEFORE the manifest is read again, and the
+//     order is pinned by a test: a re-key's swap (design, section 5) looks
+//     for the copy when it finds the manifest gone. And the delete is
+//     `If-Match` on the ETag of the bytes copied, where the service has
+//     it: a manifest written again in between — an upload sent the
+//     snapshot again, a repair replaced it — stays whole, and the copy of
+//     what no longer stands is removed. Without the condition the fresh
+//     manifest was deleted and the old one put back on the upload's pin
+//     (AUDIT_OPEN.md, rows 12b, 13 and 13b).
+//
 //  2. The prefix of each is listed. The listing must show this
 //     collection's own two writes (the copy there, the manifest gone);
 //     one that does not is behind, and nothing is concluded from it. Any
@@ -784,6 +866,7 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 //     have checked the snapshot and be building on it: the manifest is
 //     put back, and the manifest of everything the snapshot builds on
 //     that this round condemned too.
+//
 //  3. If more than half the grace has passed since the round's last look
 //     at the bucket (looked), every condemned manifest is put back: a pin
 //     is only certain to stand for the grace after it was written, and a
@@ -793,6 +876,7 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 //     clock or by the wall clock, whichever says more (a suspended
 //     machine's monotonic clock stands still), and a wall clock that went
 //     backwards counts as passed.
+//
 //  4. Of the rest, the chunks the manifest named are deleted, and then
 //     the condemned copy: a collection that dies in between leaves a copy
 //     whose chunks are in pieces, which a later round finishes.
@@ -850,7 +934,7 @@ func (s *Store) condemn(ctx context.Context, due map[string]bool, manifests, cha
 		}
 	}()
 	for _, id := range ids {
-		raw, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject)
+		raw, etag, err := s.readManifestWith(ctx, id)
 		if errors.Is(err, s3.ErrNotFound) {
 			continue
 		}
@@ -860,6 +944,7 @@ func (s *Store) condemn(ctx context.Context, due map[string]bool, manifests, cha
 		if manifest, err := s.parseManifest(id, raw); err != nil || manifest.Attempt != manifests[id].attempt {
 			continue // not the manifest this round decided on
 		}
+		// The copy first, of exactly the bytes read...
 		err = s.objects.Put(ctx, s.condemnedKey(id), raw, s3.PutOptions{IfAbsent: s.conditional, ContentType: "application/json"})
 		if errors.Is(err, s3.ErrPreconditionFailed) {
 			// Another collection condemned it first, or one left its
@@ -879,7 +964,9 @@ func (s *Store) condemn(ctx context.Context, due map[string]bool, manifests, cha
 		if err != nil {
 			return err
 		}
-		written[id] = mine
+		// ...and only now is the manifest read again. This order is
+		// load-bearing (see step 1): a copy already stands when the
+		// second read sees the manifest changed or gone.
 		again, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject)
 		if err != nil || !bytes.Equal(again, raw) {
 			// Written again since it was read: not what was decided on.
@@ -889,8 +976,19 @@ func (s *Store) condemn(ctx context.Context, due map[string]bool, manifests, cha
 			_ = s.objects.Delete(ctx, s.condemnedKey(id))
 			continue
 		}
+		written[id] = mine
 		condemned[id] = raw
-		if err := s.objects.Delete(ctx, s.manifestKey(id)); err != nil {
+		if err := s.deleteCondemned(ctx, id, etag); err != nil {
+			if errors.Is(err, errCondemnSurpassed) {
+				// Replaced between the second read and the delete (412):
+				// what stands is not this round's decision, and the copy
+				// of what no longer stands goes. Nothing of the snapshot
+				// is this round's to delete.
+				delete(condemned, id)
+				delete(written, id)
+				_ = s.objects.Delete(ctx, s.condemnedKey(id))
+				continue
+			}
 			return err
 		}
 	}
@@ -1091,7 +1189,7 @@ func (s *Store) spare(ctx context.Context, runs map[string]uint64, manifests map
 		if seen, known := runs[id]; known && seen == generation {
 			continue
 		}
-		record, _, err := s.readRecord(ctx, id, generation)
+		record, _, err := s.readRecordPublic(ctx, id, generation)
 		if errors.Is(err, s3.ErrNotFound) {
 			return 0, false, nil
 		}

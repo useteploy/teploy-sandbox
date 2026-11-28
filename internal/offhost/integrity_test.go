@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 	"strings"
@@ -30,12 +31,17 @@ type pool struct {
 	data  map[string][]byte
 	base  map[string]string
 	sends []string
+	// hashes is the stream hash recorded on a copy (key custody: what
+	// Snapshots.StreamHash answers), by snapshot.
+	hashes map[string]string
 	// sendErr fails a send against a parent: a parent the driver cannot
 	// send against after all.
 	sendErr error
 }
 
-func newPool() *pool { return &pool{data: map[string][]byte{}, base: map[string]string{}} }
+func newPool() *pool {
+	return &pool{data: map[string][]byte{}, base: map[string]string{}, hashes: map[string]string{}}
+}
 
 func (p *pool) ID(ref string) (string, bool) { return strings.CutPrefix(ref, "snap:") }
 func (p *pool) Ref(id string) string         { return "snap:" + id }
@@ -83,11 +89,31 @@ func (p *pool) Discard(_ context.Context, staged []string) error {
 	defer p.mu.Unlock()
 	for _, id := range staged {
 		delete(p.data, id)
+		delete(p.hashes, id)
 	}
 	return nil
 }
 func (p *pool) Space(context.Context) (int64, int64, error) { return 1 << 40, 1 << 40, nil }
 func (p *pool) Reclaim(context.Context) error               { return nil }
+
+// StreamHash is the hash recorded on this host's copy of id, "" when it
+// has the copy and none is recorded or has no copy at all.
+func (p *pool) StreamHash(_ context.Context, id string) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.hashes[id], nil
+}
+
+// SetStreamHash records the stream hash on this host's copy of id.
+func (p *pool) SetStreamHash(_ context.Context, id, hash string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.data[id]; !ok {
+		return fmt.Errorf("no such snapshot: %s", id)
+	}
+	p.hashes[id] = hash
+	return nil
+}
 
 func (p *pool) sent() []string {
 	p.mu.Lock()

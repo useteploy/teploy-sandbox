@@ -120,6 +120,14 @@ func (s *Store) readChunk(ctx context.Context, manifest *Manifest, index int) ([
 // *Incomplete whose Content is set, and is remembered (markBad); a
 // missing one with an *Incomplete; ErrNoSnapshot when there is no
 // manifest; any other error means it could not be asked.
+//
+// A chunk that is missing or is not the one uploaded may be one of an
+// upload attempt that was replaced while the manifest read still named it
+// (a re-key's swap, whose old chunks go a few requests later): before
+// that is a verdict, the manifest is read again, and when it names
+// another attempt the check starts over from that one's first chunk. A
+// chunk the superseded attempt was found lacking is then not this
+// manifest's, and is not remembered as damaged.
 func (s *Store) CheckContent(ctx context.Context, id string, from int, budget int64, expect string) (next int, attempt string, read int64, done bool, err error) {
 	manifest, _, err := s.Manifest(ctx, id)
 	if err != nil {
@@ -128,27 +136,44 @@ func (s *Store) CheckContent(ctx context.Context, id string, from int, budget in
 	if from < 0 || from > len(manifest.Chunks) || manifest.Attempt != expect {
 		from = 0
 	}
-	for index := from; index < len(manifest.Chunks); index++ {
-		if ctx.Err() != nil {
-			return index, manifest.Attempt, read, false, ctx.Err()
-		}
-		if read > 0 && read+manifest.Chunks[index].Size > budget {
-			return index, manifest.Attempt, read, false, nil
-		}
-		if _, err := s.readChunk(ctx, manifest, index); err != nil {
-			read += manifest.Chunks[index].Size
-			if errors.Is(err, ErrCorrupt) {
-				bad, damaged := s.badOf(manifest)
-				if damaged {
-					return index, manifest.Attempt, read, false, &Incomplete{Snapshot: id, Broken: id, Attempt: manifest.Attempt, Content: true, Chunk: bad.index,
-						Detail: fmt.Sprintf("chunk %d was read and is not the chunk that was uploaded (%s)", bad.index, bad.how)}
-				}
-				return index, manifest.Attempt, read, false, &Incomplete{Snapshot: id, Broken: id, Attempt: manifest.Attempt,
-					Detail: fmt.Sprintf("chunk %d is missing", index)}
+	for swaps := 0; ; {
+		restart := false
+		for index := from; index < len(manifest.Chunks); index++ {
+			if ctx.Err() != nil {
+				return index, manifest.Attempt, read, false, ctx.Err()
 			}
-			return index, manifest.Attempt, read, false, err
+			if read > 0 && read+manifest.Chunks[index].Size > budget {
+				return index, manifest.Attempt, read, false, nil
+			}
+			if _, err := s.readChunk(ctx, manifest, index); err != nil {
+				read += manifest.Chunks[index].Size
+				if errors.Is(err, ErrCorrupt) {
+					if swaps < incompleteRereads {
+						if latest, _, readErr := s.Manifest(ctx, id); readErr == nil && latest.Attempt != manifest.Attempt {
+							// Another attempt stands: what was read of
+							// the old one is not this manifest's, and a
+							// chunk a read found damaged there is not
+							// its damage.
+							s.badOf(latest)
+							manifest, from, swaps, restart = latest, 0, swaps+1, true
+							break
+						}
+					}
+					bad, damaged := s.badOf(manifest)
+					if damaged {
+						return index, manifest.Attempt, read, false, &Incomplete{Snapshot: id, Broken: id, Attempt: manifest.Attempt, Content: true, Chunk: bad.index,
+							Detail: fmt.Sprintf("chunk %d was read and is not the chunk that was uploaded (%s)", bad.index, bad.how)}
+					}
+					return index, manifest.Attempt, read, false, &Incomplete{Snapshot: id, Broken: id, Attempt: manifest.Attempt,
+						Detail: fmt.Sprintf("chunk %d is missing", index)}
+				}
+				return index, manifest.Attempt, read, false, err
+			}
+			read += manifest.Chunks[index].Size
 		}
-		read += manifest.Chunks[index].Size
+		if !restart {
+			break
+		}
 	}
 	return len(manifest.Chunks), manifest.Attempt, read, true, nil
 }

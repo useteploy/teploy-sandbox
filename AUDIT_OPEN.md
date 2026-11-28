@@ -4,6 +4,21 @@ Unresolved findings for this repository from the ChatGPT-led audit series (2026-
 
 Open source implementations: 0. One deliberate legacy SSE compatibility residual requires upstream consumer opt-in; deployment acceptance gates are listed below.
 
+## 2026-11-27 BusyBox exec timeout (fixed)
+
+Found by a real `teploy sandbox` run on a fresh Ubuntu 24.04 server with
+v0.1.0: every exec on alpine:3.20 failed with `timeout: unrecognized option:
+kill-after=5s`. The CLI always sets a timeout, so on Alpine (the image every
+doc uses) no command could run. The 2026-10-07 note above "fixed" this by
+moving the lifecycle fixture to a coreutils image; the product was never
+changed. The wrapper now uses `timeout -k 5 N` (common to BusyBox and
+coreutils) and maps BusyBox's deadline exit (143, its watcher TERMs the
+command itself) to 124 once the deadline has passed, so `timedOut` is right
+on both. Verified live via `docker exec` on alpine:3.20, busybox:1.36 and
+ubuntu:24.04: own exit 7 passes through, deadline 124, TERM-ignoring command
+137. `TestExecTimeoutScriptWorksWithBusyBoxAndCoreutils` runs the script
+against stand-ins for both tools and fails on the old wrapper.
+
 ## useteploy__teploy-sandbox-05 - P2 - Compatibility residual
 
 **Make SSE output encoding safe for carriage returns and split UTF-8**

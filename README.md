@@ -1943,7 +1943,9 @@ clients requiring safe carriage-return/binary delivery should set the exec
 body's `outputEncoding` to `"base64"` for byte-exact output, including carriage
 returns and binary bytes. Each stdout/stderr event then carries a base64
 string; `exit` retains its JSON schema. Consumers must explicitly request and
-decode this mode. Images used for timed execs must provide coreutils timeout.
+decode this mode. Images used for timed execs must provide a `timeout` tool:
+coreutils' or BusyBox's (Alpine and busybox images have it). An image with
+neither refuses a timed exec with exit 127 rather than run it unbounded.
 
 Before deployment, run `go build ./...`, `go vet ./...`, `go test ./...`,
 `go test -race ./...`, and `CGO_ENABLED=0 go test -tags integration ./...`.

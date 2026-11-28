@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -452,11 +453,22 @@ func (d *DockerRuntime) waitRunning(ctx context.Context, containerID string) err
 
 // execTimeoutScript bounds ONE exec from inside the container: `timeout`
 // watches the command's own tree and never signals anything outside it —
-// least of all the container's init. `$0` carries the duration, `$@` the
-// command, so nothing is re-quoted. Images without coreutils `timeout` FAIL
-// CLOSED: a requested deadline is a promise, so the exec refuses to run
-// unbounded rather than silently dropping it.
-const execTimeoutScript = `if command -v timeout >/dev/null 2>&1; then exec timeout --kill-after=5s "$0" "$@"; else echo "sandbox: image has no timeout tool; refusing an unbounded exec (install coreutils)" >&2; exit 127; fi`
+// least of all the container's init. `$0` carries the duration in whole
+// seconds, `$@` the command, so nothing is re-quoted. Images without a
+// `timeout` FAIL CLOSED: a requested deadline is a promise, so the exec
+// refuses to run unbounded rather than silently dropping it.
+//
+// It must work with BusyBox's `timeout` (Alpine, busybox images) as well as
+// coreutils'. Only the short `-k N` and a bare number of seconds are common
+// to both: BusyBox refuses `--kill-after=5s`, which failed every timed exec
+// on Alpine. They also report a kill at the deadline differently: coreutils
+// exits 124, while BusyBox's watcher TERMs the command itself, so the exit
+// is 143. The shell stays the parent (no `exec`) to see that, and a 143 at
+// or after the deadline is reported as 124. A 143 before the deadline is
+// the command's own and passes through. KILL after the grace is 137 in both.
+const execTimeoutScript = `command -v timeout >/dev/null 2>&1 || { echo "sandbox: image has no timeout tool; refusing an unbounded exec (install coreutils or busybox)" >&2; exit 127; }; ` +
+	`started=$(date +%s); timeout -k 5 "$0" "$@"; rc=$?; ` +
+	`if [ "$rc" -eq 143 ] && [ $(( $(date +%s) - started )) -ge "$0" ]; then rc=124; fi; exit "$rc"`
 
 // How long the docker CLI outlives the in-container timeout before the
 // daemon gives up on the exec. The tree is already dead by then (TERM at
@@ -482,7 +494,7 @@ func (d *DockerRuntime) execArgs(containerID, dir, cmd string, timeout time.Dura
 	if secs < 1 {
 		secs = 1
 	}
-	return append(args, "sh", "-c", execTimeoutScript, fmt.Sprintf("%ds", secs), "sh", "-c", cmd)
+	return append(args, "sh", "-c", execTimeoutScript, strconv.Itoa(secs), "sh", "-c", cmd)
 }
 
 // execEnvFile renders an exec's env in the docker env-file format, one

@@ -51,11 +51,11 @@ func TestCreateArgsHardening(t *testing.T) {
 func TestExecArgsScopedTimeout(t *testing.T) {
 	args := (&DockerRuntime{}).execArgs("cid", "/work", "pnpm test", 120*time.Second)
 	joined := strings.Join(args, "\x00")
-	if !strings.Contains(joined, "exec timeout --kill-after=5s") {
+	if !strings.Contains(joined, "timeout -k 5 \"$0\" \"$@\"") {
 		t.Errorf("in-container timeout wrapper missing: %q", args)
 	}
 	// $0 carries the duration; $@ the command — nothing re-quoted.
-	if !strings.Contains(joined, "\x00120s\x00") || !strings.Contains(joined, "\x00pnpm test") {
+	if !strings.Contains(joined, "\x00120\x00") || !strings.Contains(joined, "\x00pnpm test") {
 		t.Errorf("duration or command not carried by argv: %q", args)
 	}
 	if strings.Contains(joined, "kill -9 -1") {

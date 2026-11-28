@@ -20,7 +20,7 @@ import (
 
 const (
 	// killAfter is how long a timed-out command gets between TERM and KILL,
-	// the same five seconds the Docker driver's `timeout --kill-after` gives.
+	// the same five seconds the Docker driver's `timeout -k 5` gives.
 	killAfter = 5 * time.Second
 	// pipeGrace is how long a finished command's output pipes may stay open
 	// (a background child inherited them) before the exec answers anyway.

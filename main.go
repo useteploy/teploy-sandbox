@@ -58,7 +58,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, strings.ReplaceAll(`teploy-sandbox — isolated ephemeral execution for agent runs
 
 Usage:
-  teploy-sandbox serve [--addr 127.0.0.1:7439] [--token-file /deployments/sandbox/token]
+  teploy-sandbox serve [--addr 127.0.0.1:7439] [--overlay-cidr CIDR,...] [--tls-cert FILE --tls-key FILE] [--token-file /deployments/sandbox/token]
                        [--egress-allow host,.suffix,host:port] [--egress-proxy-port 7443]
                        [--cache-root /var/lib/teploy-sandbox/cache] [--cache-max-gb 20]
                        [--state-dir /var/lib/teploy-sandbox/state] [--stopped-retention 336h]
@@ -72,6 +72,7 @@ Usage:
                        [--vm-max-runs 0] [--vm-warm 2x2048=3,...] [--vm-warm-boots 2] [--vm-warm-headroom-mb 1024]
                        [--vm-memory-snapshots [--vm-image-dataset POOL/teploy-img] [--remote-host-secret-file PATH]]
                        [--remote-endpoint https://s3.example.com --remote-bucket NAME --remote-key-file PATH
+                        [--remote-kms local|pushed] [--remote-legacy-read]
                         [--remote-prefix P] [--remote-region us-east-1] [--remote-path-style]
                         [--remote-access-key ID] [--remote-secret-key-file PATH]
                         [--remote-previous-key-file PATH,...] [--remote-insecure-http]
@@ -90,6 +91,9 @@ Usage:
 func serve(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := flags.String("addr", "127.0.0.1:7439", "listen address (never bind publicly)")
+	overlayCIDR := flags.String("overlay-cidr", envOr("SBX_OVERLAY_CIDR", ""), "comma-separated CIDR prefixes of an encrypted overlay network permitted to carry pushed hold keys without TLS (e.g. 100.64.0.0/10)")
+	tlsCert := flags.String("tls-cert", envOr("SBX_TLS_CERT", ""), "optional server TLS certificate (PEM) for the control API")
+	tlsKey := flags.String("tls-key", envOr("SBX_TLS_KEY", ""), "optional server TLS private key (PEM) for the control API")
 	tokenFile := flags.String("token-file", "/deployments/sandbox/token", "bearer token path (minted 0600 if absent)")
 	reapInterval := flags.Duration("reap-interval", 30*time.Second, "TTL reaper tick interval")
 	egressAllow := flags.String("egress-allow", os.Getenv("SBX_EGRESS_ALLOW"),
@@ -184,6 +188,13 @@ func serve(args []string) error {
 	if *vmUIDBase > 1<<31 {
 		return fmt.Errorf("vm-uid-base: %d is not a usable UID", *vmUIDBase)
 	}
+	if (*tlsCert == "") != (*tlsKey == "") {
+		return errors.New("tls-cert and tls-key must both be set or both omitted")
+	}
+	overlayPrefixes, err := server.ParseOverlayCIDRs(*overlayCIDR)
+	if err != nil {
+		return err
+	}
 	if *vmMemorySnapshots {
 		if *driverName != driverVM {
 			return errors.New("vm-memory-snapshots: memory images are the vm driver's (--driver vm)")
@@ -192,6 +203,14 @@ func serve(args []string) error {
 		// with it.
 		if err := hostsecret.Outside(*hostSecretFile, *stateDir); err != nil {
 			return fmt.Errorf("remote-host-secret-file: %w", err)
+		}
+	}
+	if *remote.kms == "pushed" {
+		if err := hostsecret.Outside(*hostSecretFile, *stateDir); err != nil {
+			return fmt.Errorf("remote-host-secret-file: %w", err)
+		}
+		if err := server.SafeForPushedKeys(*addr, *tlsCert != "", overlayPrefixes...); err != nil {
+			return fmt.Errorf("addr: %w", err)
 		}
 	}
 	if *driverName == driverVM && *cacheRoot != "" {
@@ -475,10 +494,11 @@ func serve(args []string) error {
 	if pool != nil {
 		manager.Egress = pool
 	}
-	offHost, err := remote.open(context.Background(), snapshots, *stateDir, retention, log)
+	offHost, closeRemote, err := remote.openWithHostSecret(context.Background(), snapshots, *stateDir, *hostSecretFile, retention, log)
 	if err != nil {
 		return err
 	}
+	defer closeRemote()
 	if offHost != nil {
 		manager.OffHost = offHost
 		manager.LocalCache = *remote.local
@@ -513,6 +533,7 @@ func serve(args []string) error {
 		if err != nil {
 			return fmt.Errorf("load run registry: %w", err)
 		}
+		manager.ReconcileHoldKeys()
 		log.Info("durable run registry enabled", "dir", *stateDir, "stopped", stopped, "retention", retention.String())
 		if offHost != nil {
 			// Before serving: the runs other daemons stopped, and the
@@ -558,7 +579,10 @@ func serve(args []string) error {
 		// Not in this slice under either driver: a container gets no
 		// /dev/kvm, and nested virtualization in a run's VM is neither
 		// configured nor verified yet.
-		NestedVirt: false,
+		NestedVirt:   false,
+		ListenAddr:   *addr,
+		TLS:          *tlsCert != "",
+		OverlayCIDRs: overlayPrefixes,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -573,7 +597,7 @@ func serve(args []string) error {
 			<-accessDone
 		}()
 	}
-	return server.Serve(ctx, *addr, srv, *reapInterval)
+	return server.ServeTLS(ctx, *addr, *tlsCert, *tlsKey, srv, *reapInterval)
 }
 
 // parseRetention reads --stopped-retention / SBX_STOPPED_RETENTION: a

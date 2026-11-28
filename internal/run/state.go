@@ -42,6 +42,9 @@ type stateFile struct {
 	// Tombstones are runs destroyed here whose remote record does not
 	// say so yet, with the generation that will (see remote.go).
 	Tombstones map[string]uint64 `json:"tombstones,omitempty"`
+	// TombstoneTenants carries the tenant of each pending tombstone in
+	// key custody mode (additive; omitted when custody is off).
+	TombstoneTenants map[string]string `json:"tombstoneTenants,omitempty"`
 	// SnapshotNotes are caller snapshots whose upload to remote storage
 	// is owed (waiting), in flight (uploading) or whose delete is owed
 	// (deleting). Additive: a daemon that does not know the field
@@ -92,6 +95,15 @@ type stateRun struct {
 	RemoteGen  uint64       `json:"remoteGen,omitempty"`
 	RemoteHeld bool         `json:"remoteHeld,omitempty"`
 	RemoteKey  string       `json:"remoteKey,omitempty"`
+	// Key custody metadata (additive; omitted when --remote-kms is unset).
+	// Raw key bytes are NEVER persisted in runs.json.
+	Tenant           string            `json:"tenant,omitempty"`
+	RemoteKID        string            `json:"remoteKid,omitempty"`
+	RemoteLegacy     bool              `json:"remoteLegacy,omitempty"`
+	RemoteWasDurable bool              `json:"remoteWasDurable,omitempty"`
+	RemotePinKID     string            `json:"remotePinKid,omitempty"`
+	RemotePinSHA256  string            `json:"remotePinSha256,omitempty"`
+	RemoteBases      map[string]string `json:"remoteBases,omitempty"`
 	// The run's access state (access.go). Additive, and absent unless
 	// access is on: the epoch and ports travel in the remote record too;
 	// AccessMoved never does.
@@ -169,13 +181,19 @@ func (m *Manager) LoadState(ctx context.Context, dir string) (int, error) {
 		m.tombstones[id] = generation
 	}
 	if len(data) > 0 {
-		var floors struct {
-			AccessFloors map[string]int64 `json:"accessFloors"`
+		var extras struct {
+			AccessFloors     map[string]int64  `json:"accessFloors"`
+			TombstoneTenants map[string]string `json:"tombstoneTenants"`
 		}
-		if json.Unmarshal(data, &floors) == nil {
-			for id, epoch := range floors.AccessFloors {
+		if json.Unmarshal(data, &extras) == nil {
+			for id, epoch := range extras.AccessFloors {
 				if validULID(id) && epoch > 0 && epoch <= accessgrant.MaxEpoch {
 					m.accessFloors[id] = epoch
+				}
+			}
+			for id, tenant := range extras.TombstoneTenants {
+				if validULID(id) && ValidTenant(tenant) {
+					m.tombstoneTenants[id] = tenant
 				}
 			}
 		}
@@ -347,39 +365,52 @@ func (rec stateRun) stoppedRun(owns func(ref string) bool) (*Run, error) {
 	if memory != nil && !validMemoryImage(*memory) {
 		memory = nil
 	}
+	if rec.Tenant != "" && !ValidTenant(rec.Tenant) {
+		return nil, fmt.Errorf("invalid tenant %q", rec.Tenant)
+	}
+	if err := validateBases(rec.RemoteBases); err != nil {
+		return nil, fmt.Errorf("remoteBases: %w", err)
+	}
 	return &Run{
-		ID:          rec.ID,
-		Image:       rec.Image,
-		Network:     rec.Network,
-		User:        rec.User,
-		Warm:        rec.WarmState,
-		CreatedAt:   rec.CreatedAt,
-		ExpiresAt:   rec.ExpiresAt,
-		State:       StateStopped,
-		Labels:      rec.Labels,
-		OnExpire:    rec.OnExpire,
-		StoppedAt:   rec.StoppedAt,
-		RetainUntil: rec.RetainUntil,
-		ForkedFrom:  rec.ForkedFrom,
-		leaseGen:    rec.LeaseGen,
-		env:         rec.Env,
-		egressAllow: rec.EgressAllow,
-		limits:      *rec.Limits,
-		warmReq:     rec.Warm,
-		snapshot:    rec.Snapshot,
-		runningFor:  time.Duration(rec.RunningMs) * time.Millisecond,
-		usageCarry:  usageOf(rec.Usage),
-		Remote:      rec.Remote,
-		base:        rec.Base,
-		remoteGen:   rec.RemoteGen,
-		remoteHeld:  rec.RemoteHeld,
-		remoteKey:   rec.RemoteKey,
-		accessEpoch: rec.AccessEpoch,
-		accessPorts: rec.AccessPorts,
-		accessMoved: rec.AccessMoved,
-		accessDirty: rec.AccessDirty,
-		accessBytes: bytesMoved,
-		memory:      memory,
+		ID:               rec.ID,
+		Image:            rec.Image,
+		Network:          rec.Network,
+		User:             rec.User,
+		Warm:             rec.WarmState,
+		CreatedAt:        rec.CreatedAt,
+		ExpiresAt:        rec.ExpiresAt,
+		State:            StateStopped,
+		Labels:           rec.Labels,
+		OnExpire:         rec.OnExpire,
+		StoppedAt:        rec.StoppedAt,
+		RetainUntil:      rec.RetainUntil,
+		ForkedFrom:       rec.ForkedFrom,
+		leaseGen:         rec.LeaseGen,
+		env:              rec.Env,
+		egressAllow:      rec.EgressAllow,
+		limits:           *rec.Limits,
+		warmReq:          rec.Warm,
+		snapshot:         rec.Snapshot,
+		runningFor:       time.Duration(rec.RunningMs) * time.Millisecond,
+		usageCarry:       usageOf(rec.Usage),
+		Remote:           rec.Remote,
+		base:             rec.Base,
+		remoteGen:        rec.RemoteGen,
+		remoteHeld:       rec.RemoteHeld,
+		remoteKey:        rec.RemoteKey,
+		tenant:           rec.Tenant,
+		remoteKID:        rec.RemoteKID,
+		remoteLegacy:     rec.RemoteLegacy,
+		remoteWasDurable: rec.RemoteWasDurable,
+		remotePinKID:     rec.RemotePinKID,
+		remotePinSHA256:  rec.RemotePinSHA256,
+		remoteBases:      cloneBases(rec.RemoteBases),
+		accessEpoch:      rec.AccessEpoch,
+		accessPorts:      rec.AccessPorts,
+		accessMoved:      rec.AccessMoved,
+		accessDirty:      rec.AccessDirty,
+		accessBytes:      bytesMoved,
+		memory:           memory,
 
 		firstRecordTried: rec.FirstRecordTried,
 	}, nil
@@ -399,38 +430,45 @@ func stoppedStateRun(run *Run) stateRun {
 		usage = &carry
 	}
 	return stateRun{
-		ID:          run.ID,
-		State:       StateStopped,
-		Image:       run.Image,
-		Network:     run.Network,
-		User:        run.User,
-		Labels:      run.Labels,
-		OnExpire:    run.OnExpire,
-		ForkedFrom:  run.ForkedFrom,
-		CreatedAt:   run.CreatedAt,
-		ExpiresAt:   run.ExpiresAt,
-		StoppedAt:   run.StoppedAt,
-		RetainUntil: run.RetainUntil,
-		Env:         run.env,
-		EgressAllow: run.egressAllow,
-		Limits:      &limits,
-		Warm:        run.warmReq,
-		WarmState:   run.Warm,
-		Snapshot:    run.snapshot,
-		RunningMs:   int64(run.runningFor / time.Millisecond),
-		Usage:       usage,
-		LeaseGen:    run.leaseGen,
-		Remote:      run.Remote,
-		Base:        run.base,
-		RemoteGen:   run.remoteGen,
-		RemoteHeld:  run.remoteHeld,
-		RemoteKey:   run.remoteKey,
-		AccessEpoch: run.accessEpoch,
-		AccessPorts: run.accessPorts,
-		AccessMoved: run.accessMoved,
-		AccessDirty: run.accessDirty,
-		AccessBytes: moved,
-		Memory:      run.memory,
+		ID:               run.ID,
+		State:            StateStopped,
+		Image:            run.Image,
+		Network:          run.Network,
+		User:             run.User,
+		Labels:           run.Labels,
+		OnExpire:         run.OnExpire,
+		ForkedFrom:       run.ForkedFrom,
+		CreatedAt:        run.CreatedAt,
+		ExpiresAt:        run.ExpiresAt,
+		StoppedAt:        run.StoppedAt,
+		RetainUntil:      run.RetainUntil,
+		Env:              run.env,
+		EgressAllow:      run.egressAllow,
+		Limits:           &limits,
+		Warm:             run.warmReq,
+		WarmState:        run.Warm,
+		Snapshot:         run.snapshot,
+		RunningMs:        int64(run.runningFor / time.Millisecond),
+		Usage:            usage,
+		LeaseGen:         run.leaseGen,
+		Remote:           run.Remote,
+		Base:             run.base,
+		RemoteGen:        run.remoteGen,
+		RemoteHeld:       run.remoteHeld,
+		RemoteKey:        run.remoteKey,
+		Tenant:           run.tenant,
+		RemoteKID:        run.remoteKID,
+		RemoteLegacy:     run.remoteLegacy,
+		RemoteWasDurable: run.remoteWasDurable,
+		RemotePinKID:     run.remotePinKID,
+		RemotePinSHA256:  run.remotePinSHA256,
+		RemoteBases:      cloneBases(run.remoteBases),
+		AccessEpoch:      run.accessEpoch,
+		AccessPorts:      run.accessPorts,
+		AccessMoved:      run.accessMoved,
+		AccessDirty:      run.accessDirty,
+		AccessBytes:      moved,
+		Memory:           run.memory,
 
 		FirstRecordTried: run.firstRecordTried,
 	}
@@ -476,6 +514,9 @@ func (m *Manager) writeState() error {
 	}
 	if len(m.tombstones) > 0 {
 		file.Tombstones = maps.Clone(m.tombstones)
+	}
+	if len(m.tombstoneTenants) > 0 {
+		file.TombstoneTenants = maps.Clone(m.tombstoneTenants)
 	}
 	if len(m.accessFloors) > 0 {
 		file.AccessFloors = maps.Clone(m.accessFloors)

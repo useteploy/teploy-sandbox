@@ -278,14 +278,24 @@ func (l *LocalKeySource) Rewrap(tenant, run, wrapped string) (string, error) {
 // another run or another tenant never gets this host's key (ErrCorrupt).
 // A re-wrapped blob of the same kid, tenant, and run still opens using
 // the held key, because the key's bytes did not change.
+//
+// Keys supplied with Supply are held persistently until Forget; keys
+// supplied with SupplyEphemeral are reference-counted and wiped+dropped
+// as soon as their release closure runs (unless also held).
 type PushedKeySource struct {
-	mu   sync.Mutex
-	keys map[string]HoldKey // by kid
+	mu        sync.Mutex
+	keys      map[string]HoldKey // by kid
+	held      map[string]bool    // kids supplied persistently via Supply
+	ephemeral map[string]int     // active SupplyEphemeral refcounts by kid
 }
 
 // NewPushedKeySource makes an empty source: Cloud fills it.
 func NewPushedKeySource() *PushedKeySource {
-	return &PushedKeySource{keys: map[string]HoldKey{}}
+	return &PushedKeySource{
+		keys:      map[string]HoldKey{},
+		held:      map[string]bool{},
+		ephemeral: map[string]int{},
+	}
 }
 
 // String names the source without showing a key (see LocalKeySource).
@@ -325,8 +335,44 @@ func (p *PushedKeySource) Rewrap(tenant, run, wrapped string) (string, error) {
 // differ, as it does once Cloud has re-wrapped it, and the new blob is
 // what is held from then on.
 func (p *PushedKeySource) Supply(keys ...HoldKey) error {
+	_, err := p.supply(true, keys...)
+	return err
+}
+
+// SupplyEphemeral temporarily supplies open keys for the duration of a
+// restore. Calling the returned release function decrements their
+// reference counts and wipes+drops any key that is not persistently held
+// once no caller still borrows it. Safe to call release multiple times.
+func (p *PushedKeySource) SupplyEphemeral(keys ...HoldKey) (func(), error) {
+	kids, err := p.supply(false, keys...)
+	if err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			for _, kid := range kids {
+				if p.ephemeral[kid] > 1 {
+					p.ephemeral[kid]--
+					continue
+				}
+				delete(p.ephemeral, kid)
+				if !p.held[kid] {
+					if key, ok := p.keys[kid]; ok {
+						key.Zero()
+						delete(p.keys, kid)
+					}
+				}
+			}
+		})
+	}, nil
+}
+
+func (p *PushedKeySource) supply(held bool, keys ...HoldKey) ([]string, error) {
 	if len(keys) == 0 {
-		return nil
+		return nil, nil
 	}
 	// Copies, one per kid in the batch.
 	var stored []HoldKey
@@ -342,12 +388,12 @@ func (p *PushedKeySource) Supply(keys ...HoldKey) error {
 	for _, key := range keys {
 		copy, err := key.clone()
 		if err != nil {
-			return fmt.Errorf("hold key %s: %w", quoted(key.KID), err)
+			return nil, fmt.Errorf("hold key %s: %w", quoted(key.KID), err)
 		}
 		if first, ok := byKID[copy.KID]; ok {
 			if err := sameKey(stored[first], copy); err != nil {
 				copy.Zero()
-				return fmt.Errorf("hold key %s is pushed twice in one batch: %w", quoted(copy.KID), err)
+				return nil, fmt.Errorf("hold key %s is pushed twice in one batch: %w", quoted(copy.KID), err)
 			}
 			copy.Zero() // one copy of one key is enough
 			continue
@@ -358,26 +404,44 @@ func (p *PushedKeySource) Supply(keys ...HoldKey) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, key := range stored {
-		if held, ok := p.keys[key.KID]; ok {
-			if err := sameKey(held, key); err != nil {
-				return fmt.Errorf("hold key %s is pushed again: %w", quoted(key.KID), err)
+		if existing, ok := p.keys[key.KID]; ok {
+			if err := sameKey(existing, key); err != nil {
+				return nil, fmt.Errorf("hold key %s is pushed again: %w", quoted(key.KID), err)
 			}
 		}
 	}
 	if p.keys == nil {
 		p.keys = make(map[string]HoldKey)
 	}
-	committed = true
-	for _, key := range stored {
-		if held, ok := p.keys[key.KID]; ok {
-			// The key this replaces is wiped where it lies. A
-			// copy of it handed out before is another's, and
-			// stays whole.
-			held.Zero()
-		}
-		p.keys[key.KID] = key
+	if p.held == nil {
+		p.held = make(map[string]bool)
 	}
-	return nil
+	if p.ephemeral == nil {
+		p.ephemeral = make(map[string]int)
+	}
+	committed = true
+	kids := make([]string, 0, len(stored))
+	for _, key := range stored {
+		kids = append(kids, key.KID)
+		if existing, ok := p.keys[key.KID]; ok {
+			if held {
+				existing.Zero()
+				p.keys[key.KID] = key
+				p.held[key.KID] = true
+			} else {
+				key.Zero()
+				p.ephemeral[key.KID]++
+			}
+		} else {
+			p.keys[key.KID] = key
+			if held {
+				p.held[key.KID] = true
+			} else {
+				p.ephemeral[key.KID] = 1
+			}
+		}
+	}
+	return kids, nil
 }
 
 // sameKey is whether two hold keys of one kid are the one key: the same
@@ -396,13 +460,17 @@ func sameKey(a, b HoldKey) error {
 
 // Forget wipes a pushed key's bytes and drops it: Cloud's own delete of
 // the run on this host, or local retention running out. A kid this
-// source does not hold is nothing.
+// source does not hold is nothing. If an ephemeral restore is still
+// borrowing the same kid, it is wiped when that restore finishes.
 func (p *PushedKeySource) Forget(kid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if key, ok := p.keys[kid]; ok {
-		key.Zero()
-		delete(p.keys, kid)
+	delete(p.held, kid)
+	if p.ephemeral[kid] == 0 {
+		if key, ok := p.keys[kid]; ok {
+			key.Zero()
+			delete(p.keys, kid)
+		}
 	}
 }
 

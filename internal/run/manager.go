@@ -190,6 +190,15 @@ type Run struct {
 	remoteGen  uint64
 	remoteHeld bool
 	remoteKey  string
+	// Key custody metadata (empty/false/nil when --remote-kms is unset).
+	// Raw key bytes are NEVER stored on Run or in runs.json.
+	tenant           string
+	remoteKID        string
+	remoteLegacy     bool
+	remoteWasDurable bool
+	remotePinKID     string
+	remotePinSHA256  string
+	remoteBases      map[string]string
 	// leftover is a container a failed resume could not remove. It still
 	// holds the run's container name, so it must go before the next try.
 	leftover string
@@ -300,6 +309,27 @@ type CreateRequest struct {
 	// OnExpire is "destroy" (or absent) to remove the run at its deadline,
 	// "stop" to stop it there instead (see Manager.Stop).
 	OnExpire string `json:"onExpire,omitempty"`
+	// ID optionally supplies the run's ULID (required in pushed key-custody
+	// mode so Cloud's wrapped hold key binds to the run ID).
+	ID string `json:"id,omitempty"`
+	// Key custody fields (additive; refused when --remote-kms is unset).
+	Tenant string            `json:"tenant,omitempty"`
+	Keys   *KeyBundle        `json:"keys,omitempty"`
+	Bases  map[string]string `json:"bases,omitempty"`
+	Expect *RemoteExpect     `json:"expect,omitempty"`
+}
+
+func (r CreateRequest) String() string {
+	return fmt.Sprintf("CreateRequest{id:%q image:%q tenant:%q keys:%v}", r.ID, r.Image, r.Tenant, r.Keys)
+}
+func (r CreateRequest) GoString() string { return r.String() }
+func (r CreateRequest) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", r.ID),
+		slog.String("image", r.Image),
+		slog.String("tenant", r.Tenant),
+		slog.Any("keys", r.Keys),
+	)
 }
 
 type Limits struct {
@@ -396,7 +426,8 @@ type Manager struct {
 	// was last looked at. orphans are the snapshots held by runs the
 	// previous daemon life lost, kept until the first sync has decided
 	// which of those runs come back. All guarded by mu.
-	tombstones map[string]uint64
+	tombstones       map[string]uint64
+	tombstoneTenants map[string]string
 	// accessFloors are epochs of runs this daemon let go of while its
 	// epoch was ahead of the run's record (a revoke here whose write
 	// failed): adopting the run again never goes below them. Persisted.
@@ -424,6 +455,7 @@ type Manager struct {
 	// releaseOwed those of them whose last holder let go meanwhile. All
 	// guarded by mu.
 	forking     map[string]struct{}
+	reserving   map[string]struct{}
 	fetching    map[string]int
 	pins        map[string]int
 	releaseOwed map[string]bool
@@ -457,14 +489,16 @@ func NewManager(runtime Runtime, log *slog.Logger) *Manager {
 		now:     time.Now,
 		runs:    make(map[string]*Run),
 
-		tombstones:    make(map[string]uint64),
-		accessFloors:  make(map[string]int64),
-		snapshotNotes: make(map[string]*snapshotNote),
-		remoteSeen:    make(map[string]uint64),
-		forking:       make(map[string]struct{}),
-		fetching:      make(map[string]int),
-		pins:          make(map[string]int),
-		releaseOwed:   make(map[string]bool),
+		tombstones:       make(map[string]uint64),
+		tombstoneTenants: make(map[string]string),
+		accessFloors:     make(map[string]int64),
+		snapshotNotes:    make(map[string]*snapshotNote),
+		remoteSeen:       make(map[string]uint64),
+		forking:          make(map[string]struct{}),
+		reserving:        make(map[string]struct{}),
+		fetching:         make(map[string]int),
+		pins:             make(map[string]int),
+		releaseOwed:      make(map[string]bool),
 
 		SandboxUser:      DefaultSandboxUser,
 		StoppedRetention: DefaultStoppedRetention,
@@ -480,8 +514,21 @@ func NewManager(runtime Runtime, log *slog.Logger) *Manager {
 func (m *Manager) SetClock(now func() time.Time) { m.now = now }
 
 func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
+	defer req.Keys.Wipe()
 	if strings.TrimSpace(req.Image) == "" {
 		return nil, fmt.Errorf("%w: image is required", ErrBadRequest)
+	}
+	custody := m.custody()
+	if custody == nil {
+		if req.ID != "" || req.Tenant != "" || req.Keys != nil || req.Bases != nil || req.Expect != nil {
+			return nil, fmt.Errorf("%w: key custody is not enabled on this daemon (--remote-kms)", ErrBadRequest)
+		}
+	}
+	if err := validateBases(req.Bases); err != nil {
+		return nil, err
+	}
+	if err := validateExpect(req.Expect, false, false); err != nil {
+		return nil, err
 	}
 	// "snapshot:<id>" names a snapshot in remote storage by the name it
 	// has on every host; from here on it is this host's reference. Only
@@ -535,8 +582,47 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	}
 
 	now := m.now()
+	runID := NewULID(now)
+	releaseID := func() {}
+	if req.ID != "" {
+		releaseID, err = m.reserveIDs(req.ID)
+		if err != nil {
+			return nil, err
+		}
+		defer releaseID()
+		runID = req.ID
+	}
+	tenant := ""
+	var holdKey PushedKey
+	hasHoldKey := false
+	if custody != nil {
+		tenant = req.Tenant
+		if tenant == "" {
+			tenant = DefaultTenant
+		}
+		if !ValidTenant(tenant) {
+			return nil, fmt.Errorf("%w: tenant %q must match [a-z0-9-]{1,64}", ErrBadRequest, tenant)
+		}
+		if m.OffHost.Pushed() {
+			if req.ID == "" {
+				return nil, fmt.Errorf("%w: id is required in pushed key-custody mode", ErrBadRequest)
+			}
+			if req.Keys == nil || req.Keys.Hold == nil {
+				return nil, fmt.Errorf("%w: keys.hold is required in pushed key-custody mode", ErrBadRequest)
+			}
+			holdKey = *req.Keys.Hold
+			defer func() { holdKey.Raw = "" }()
+			hasHoldKey = true
+			if _, _, err := validatePushedKeyShape(holdKey, tenant, runID); err != nil {
+				return nil, err
+			}
+		} else if req.Keys != nil && req.Keys.HasRaw() {
+			return nil, fmt.Errorf("%w: pushed keys are only accepted in pushed mode (--remote-kms pushed)", ErrBadRequest)
+		}
+	}
+
 	boot := bootRequest{
-		id:      NewULID(now),
+		id:      runID,
 		image:   req.Image,
 		env:     maps.Clone(req.Env),
 		network: network,
@@ -563,26 +649,86 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	}
 
 	run := &Run{
-		Image:     req.Image,
-		CreatedAt: now,
-		ExpiresAt: now.Add(ttl),
-		Labels:    maps.Clone(req.Labels),
-		OnExpire:  onExpire,
+		Image:       req.Image,
+		CreatedAt:   now,
+		ExpiresAt:   now.Add(ttl),
+		Labels:      maps.Clone(req.Labels),
+		OnExpire:    onExpire,
+		tenant:      tenant,
+		remoteBases: cloneBases(req.Bases),
+	}
+	// Supply ephemeral open keys (if any) for snapshot:<id> restore, dropped
+	// before Create returns.
+	if custody != nil && m.OffHost.Pushed() && req.Keys != nil && len(req.Keys.Open) > 0 {
+		releaseOpen, err := custody.SupplyOpenKeys(tenant, runID, req.Keys.Open)
+		if err != nil {
+			return nil, err
+		}
+		defer releaseOpen()
 	}
 	// absent: a snapshot reference of this daemon's for a snapshot this
 	// host does not have. That is a snapshot named by its ID as much as
 	// "snapshot:<id>" is — a reference is the ID between a fixed prefix
 	// and suffix — and it is about to be fetched from remote storage.
+	isSnapshot := portable || (m.OffHost != nil && m.ownsSnapshotRef(req.Image))
 	absent := false
 	if m.OffHost != nil && m.ownsSnapshotRef(req.Image) {
 		if has, err := m.OffHost.HasLocal(ctx, req.Image); err == nil && !has {
 			absent = true
 		}
 	}
+	ensureOpts := EnsureOptions{Tenant: tenant, Bases: req.Bases}
+	if req.Expect != nil {
+		ensureOpts.ExpectKID = req.Expect.KID
+	}
 	if portable || absent {
 		// Named by its ID: a caller's snapshot, never a run's stop.
+		if custody != nil && m.OffHost.Pushed() && req.Expect == nil {
+			return nil, fmt.Errorf("%w: expect is required when creating from a snapshot in pushed mode", ErrBadRequest)
+		}
 		if err := m.admitPortable(ctx, req.Image); err != nil {
 			return nil, err
+		}
+	}
+	if custody != nil && isSnapshot {
+		if m.OffHost.Pushed() && req.Expect == nil {
+			return nil, fmt.Errorf("%w: expect is required when creating from a snapshot in pushed mode", ErrBadRequest)
+		}
+		if snapID, ok := m.OffHost.RemoteID(req.Image); ok && req.Expect != nil && req.Expect.Snapshot != "" && req.Expect.Snapshot != snapID {
+			return nil, fmt.Errorf("%w: expect.snapshot %q does not match requested snapshot %q", ErrRemoteConflict, req.Expect.Snapshot, snapID)
+		}
+		meta, found, metaErr := custody.SnapshotMeta(ctx, req.Image, "")
+		if metaErr != nil && req.Expect != nil && req.Expect.KID == LegacyKID {
+			// For a legacy v1 snapshot, retry with the snapshot's owner run if known.
+			if _, owner, ok, pErr := m.OffHost.SnapshotPurpose(ctx, req.Image); pErr == nil && ok && owner != "" {
+				ensureOpts.LegacyRun = owner
+				meta, found, metaErr = custody.SnapshotMeta(ctx, req.Image, owner)
+			}
+		}
+		if metaErr != nil {
+			// Fail closed on remote metadata errors; never skip tenant/expect checks.
+			return nil, metaErr
+		}
+		if found {
+			if meta.V2 && meta.Tenant != "" && meta.Tenant != tenant {
+				return nil, fmt.Errorf("%w: snapshot belongs to tenant %s, not %s", ErrBadRequest, meta.Tenant, tenant)
+			}
+			if req.Expect != nil && req.Expect.KID == LegacyKID && meta.Run != "" {
+				ensureOpts.LegacyRun = meta.Run
+			}
+		} else {
+			// Local-only snapshot (not yet in remote storage): enforce tenant and
+			// key checks from this daemon's snapshot notes or owning run.
+			localTenant, localKID := m.localSnapshotCustody(req.Image)
+			if localTenant == "" && m.OffHost.Pushed() {
+				return nil, fmt.Errorf("%w: snapshot %q is not in remote storage and has no known local tenant owner", ErrBadRequest, req.Image)
+			}
+			if localTenant != "" && localTenant != tenant {
+				return nil, fmt.Errorf("%w: snapshot belongs to tenant %s, not %s", ErrBadRequest, localTenant, tenant)
+			}
+			if req.Expect != nil && localKID != "" && req.Expect.KID != localKID {
+				return nil, fmt.Errorf("%w: local snapshot is under key %s, expected %s", ErrRemoteConflict, localKID, req.Expect.KID)
+			}
 		}
 	}
 	// A snapshot that is in remote storage and not on this host is
@@ -612,7 +758,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 		m.mu.Unlock()
 		m.persist()
 	}
-	fetched, err := m.ensureLocal(ctx, req.Image)
+	fetched, _, err := m.ensureLocalFor(ctx, req.Image, ensureOpts)
 	if err != nil {
 		settle()
 		return nil, err
@@ -620,11 +766,32 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Run, error) {
 	if fetched {
 		run.images = []string{req.Image}
 	}
+	if hasHoldKey {
+		kid, wrapped, err := custody.PutHoldKey(tenant, runID, holdKey)
+		if err != nil {
+			settle()
+			if fetched {
+				m.releaseImages(run.images)
+			}
+			return nil, err
+		}
+		run.remoteKey = wrapped
+		run.remoteKID = kid
+	}
 	created, err := m.launch(ctx, boot, run)
 	// Registered with the image it holds, or the image released: either
 	// way it is no longer only a fetch.
 	settle()
 	if err != nil {
+		if hasHoldKey {
+			// If launch left no tracked rollback run behind, erase the cached key.
+			m.mu.Lock()
+			_, tracked := m.runs[runID]
+			m.mu.Unlock()
+			if !tracked {
+				m.eraseHoldKey(runID, run.remoteKID)
+			}
+		}
 		return nil, err
 	}
 	m.log.Info("run created", "id", created.ID, "image", req.Image, "network", network, "user", created.User, "egressAllow", len(extra), "expiresAt", created.ExpiresAt)
@@ -939,6 +1106,7 @@ func (m *Manager) viewLocked(run *Run) *Run {
 	}
 	m.accessViewLocked(run, &view)
 	m.memoryViewLocked(run, &view)
+	m.custodyViewLocked(run, &view)
 	return &view
 }
 
@@ -1064,6 +1232,7 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 	// asks the manager about runs, so the two locks are never nested.
 	m.execLog.dropRun(id)
 	m.releaseWarm(current)
+	m.eraseHoldKey(id, current.remoteKID)
 	if len(current.images) > 0 || current.base != "" {
 		// The container is gone, so the snapshots it was created from can
 		// go too; the registry stops listing them as owned.
@@ -1197,7 +1366,7 @@ func (m *Manager) SnapshotRemote(ctx context.Context, id string) (string, *Snaps
 		// confirmed: a snapshot taken on a note that never landed would
 		// be retried by nothing.
 		m.mu.Lock()
-		m.snapshotNotes[ref] = &snapshotNote{Ref: ref, Run: id, Key: current.remoteKey, Base: current.base, AddedAt: m.now(), State: noteUploading}
+		m.snapshotNotes[ref] = &snapshotNote{Ref: ref, Run: id, Tenant: current.tenant, Key: current.remoteKey, Base: current.base, Bases: cloneBases(current.remoteBases), AddedAt: m.now(), State: noteUploading}
 		m.mu.Unlock()
 		if err := m.persistNow(); err != nil {
 			m.mu.Lock()

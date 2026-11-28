@@ -6,13 +6,16 @@ package server
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"runtime"
 	"strconv"
@@ -28,10 +31,11 @@ import (
 // Problem is the RFC 7807 error body (the Neutron contract's shape,
 // adopted across the stack).
 type Problem struct {
-	Type   string `json:"type"`
-	Title  string `json:"title"`
-	Status int    `json:"status"`
-	Detail string `json:"detail"`
+	Type     string        `json:"type"`
+	Title    string        `json:"title"`
+	Status   int           `json:"status"`
+	Detail   string        `json:"detail"`
+	NeedKeys []run.KeyNeed `json:"needKeys,omitempty"`
 }
 
 func problem(status int, detail string) Problem {
@@ -45,10 +49,72 @@ func problem(status int, detail string) Problem {
 		suffix, title = "not-found", "Not Found"
 	case http.StatusConflict:
 		suffix, title = "conflict", "Conflict"
+	case http.StatusPreconditionRequired:
+		suffix, title = "need-keys", "Precondition Required"
 	case http.StatusServiceUnavailable:
 		suffix, title = "at-capacity", "Service Unavailable"
 	}
 	return Problem{Type: "https://neutron.dev/errors/" + suffix, Title: title, Status: status, Detail: detail}
+}
+
+// ParseOverlayCIDRs parses a comma-separated list of CIDR prefixes (e.g.
+// "100.64.0.0/10,fd7a:115c:a1e0::/48") trusted as an encrypted overlay network
+// for receiving raw pushed hold keys without TLS on the control listener.
+func ParseOverlayCIDRs(raw string) ([]netip.Prefix, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out []netip.Prefix
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(part)
+		if err != nil {
+			return nil, fmt.Errorf("overlay-cidr %q: %w", part, err)
+		}
+		if prefix.Addr().Is4In6() {
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		out = append(out, prefix.Masked())
+	}
+	return out, nil
+}
+
+// SafeForPushedKeys reports whether a control API listener at addr (with or
+// without TLS) is allowed to receive raw hold keys in pushed mode (§7): TLS
+// on, loopback (127.0.0.0/8, ::1, localhost), or an address within an
+// operator-configured --overlay-cidr prefix. Unspecified, LAN, CGNAT/ULA
+// without --overlay-cidr, and public listeners without TLS are refused.
+func SafeForPushedKeys(addr string, tlsOn bool, overlayCIDRs ...netip.Prefix) error {
+	if tlsOn {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("listen address %q is not host:port: %w", addr, err)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return fmt.Errorf("pushed key custody refuses raw keys on %q without TLS: bind loopback, configure --overlay-cidr, or enable --tls-cert/--tls-key", addr)
+	}
+	ip = ip.Unmap()
+	if ip.IsUnspecified() {
+		return fmt.Errorf("pushed key custody refuses raw keys on unspecified address %q without TLS: bind loopback, configure --overlay-cidr, or enable --tls-cert/--tls-key", addr)
+	}
+	if ip.IsLoopback() {
+		return nil
+	}
+	for _, prefix := range overlayCIDRs {
+		if prefix.Contains(ip) {
+			return nil
+		}
+	}
+	return fmt.Errorf("pushed key custody refuses raw keys on %q without TLS: bind loopback, configure --overlay-cidr, or enable --tls-cert/--tls-key", addr)
 }
 
 type Server struct {
@@ -72,6 +138,12 @@ type Server struct {
 	// Access is the access listener's control side; nil (access off)
 	// leaves the API exactly as it was: no access routes, no access field.
 	Access *access.Control
+	// ListenAddr, TLS, and OverlayCIDRs record how this control server is bound
+	// so raw pushed keys are refused on non-loopback, non-overlay listeners
+	// without TLS (key custody §7).
+	ListenAddr   string
+	TLS          bool
+	OverlayCIDRs []netip.Prefix
 }
 
 func (s *Server) Handler() http.Handler {
@@ -89,6 +161,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/runs/{id}/stop", s.auth(s.handleStop))
 	mux.Handle("POST /v1/runs/{id}/resume", s.auth(s.handleResume))
 	mux.Handle("POST /v1/runs/{id}/fork", s.auth(s.handleFork))
+	mux.Handle("POST /v1/runs/{id}/keys", s.auth(s.handlePushKeys))
 	mux.Handle("GET /v1/capacity", s.auth(s.handleCapacity))
 	mux.Handle("POST /v1/runs/{id}/lease", s.auth(s.handleLeaseAcquire))
 	mux.Handle("POST /v1/runs/{id}/lease/renew", s.auth(s.handleLeaseRenew))
@@ -134,7 +207,14 @@ func (s *Server) writeProblem(w http.ResponseWriter, p Problem) {
 }
 
 func (s *Server) writeError(w http.ResponseWriter, err error) {
+	var needKey *run.NeedKeyError
 	switch {
+	case errors.As(err, &needKey):
+		p := problem(http.StatusPreconditionRequired, err.Error())
+		p.NeedKeys = needKey.Missing
+		s.writeProblem(w, p)
+	case errors.Is(err, run.ErrRemoteNeedKey):
+		s.writeProblem(w, problem(http.StatusPreconditionRequired, err.Error()))
 	case errors.Is(err, run.ErrNotFound), errors.Is(err, run.ErrExecNotFound):
 		s.writeProblem(w, problem(http.StatusNotFound, err.Error()))
 	case errors.Is(err, run.ErrBadRequest):
@@ -154,6 +234,13 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	}
 }
 
+func (s *Server) checkKeyListener(r *http.Request) error {
+	if r.TLS != nil || s.TLS || s.ListenAddr == "" {
+		return nil
+	}
+	return SafeForPushedKeys(s.ListenAddr, false, s.OverlayCIDRs...)
+}
+
 func (s *Server) writeJSON(w http.ResponseWriter, status int, body map[string]any) {
 	body["server"] = s.ServerName
 	w.Header().Set("Content-Type", "application/json")
@@ -171,6 +258,13 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
 		return
+	}
+	defer req.Keys.Wipe()
+	if req.Keys.HasRaw() {
+		if err := s.checkKeyListener(r); err != nil {
+			s.writeProblem(w, problem(http.StatusBadRequest, err.Error()))
+			return
+		}
 	}
 	created, err := s.Manager.Create(r.Context(), req)
 	if err != nil {
@@ -213,6 +307,13 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
 		return
 	}
+	defer req.Keys.Wipe()
+	if req.Keys.HasRaw() {
+		if err := s.checkKeyListener(r); err != nil {
+			s.writeProblem(w, problem(http.StatusBadRequest, err.Error()))
+			return
+		}
+	}
 	resumed, err := s.Manager.ResumeWith(r.Context(), r.PathValue("id"), req)
 	if err != nil {
 		s.writeError(w, err)
@@ -221,11 +322,37 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 	s.writeRun(w, http.StatusOK, resumed)
 }
 
+func (s *Server) handlePushKeys(w http.ResponseWriter, r *http.Request) {
+	var req run.PushKeysRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
+		return
+	}
+	defer req.Wipe()
+	if err := s.checkKeyListener(r); err != nil {
+		s.writeProblem(w, problem(http.StatusBadRequest, err.Error()))
+		return
+	}
+	updated, err := s.Manager.PushRunKeys(r.Context(), r.PathValue("id"), req)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeRun(w, http.StatusOK, updated)
+}
+
 func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 	var req run.ForkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
 		return
+	}
+	defer req.Keys.Wipe()
+	if req.Keys.HasRaw() {
+		if err := s.checkKeyListener(r); err != nil {
+			s.writeProblem(w, problem(http.StatusBadRequest, err.Error()))
+			return
+		}
 	}
 	if req.Count <= 1 {
 		forked, err := s.Manager.Fork(r.Context(), r.PathValue("id"), req)
@@ -948,13 +1075,28 @@ var (
 // Serve runs the daemon with graceful shutdown: stop accepting, let
 // in-flight execs finish, then reap every run.
 func Serve(ctx context.Context, addr string, s *Server, reapInterval time.Duration) error {
+	return ServeTLS(ctx, addr, "", "", s, reapInterval)
+}
+
+// ServeTLS runs the daemon over HTTPS when tlsCert and tlsKey are set, or
+// plain HTTP when both are empty.
+func ServeTLS(ctx context.Context, addr, tlsCert, tlsKey string, s *Server, reapInterval time.Duration) error {
 	s.Manager.StartReaper(ctx, reapInterval)
 	s.Manager.StartUsageSampler(ctx)
 	httpServer := &http.Server{Addr: addr, Handler: s.Handler()}
+	if tlsCert != "" || tlsKey != "" {
+		httpServer.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- httpServer.ListenAndServe() }()
-	s.Log.Info("sandbox daemon listening", "addr", addr, "server", s.ServerName, "version", s.Version)
+	go func() {
+		if tlsCert != "" || tlsKey != "" {
+			errCh <- httpServer.ListenAndServeTLS(tlsCert, tlsKey)
+			return
+		}
+		errCh <- httpServer.ListenAndServe()
+	}()
+	s.Log.Info("sandbox daemon listening", "addr", addr, "tls", tlsCert != "", "server", s.ServerName, "version", s.Version)
 
 	select {
 	case err := <-errCh:

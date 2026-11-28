@@ -261,9 +261,9 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 				doomedRecords = append(doomedRecords, entry.objects[generation])
 			case !destroyed && generation+1 == entry.newest:
 				// The generation before the newest stays, except when the
-				// newest replaced it under another master key: it is then
-				// the last object the old master protects, and what a
-				// rotation is waiting on.
+				// newest replaced it under another master key or hold key
+				// (or moved from v1 to v2): it is then the last object the
+				// old key protects, and what a rotation or re-key is waiting on.
 				stored, err := s.objects.Get(ctx, entry.objects[generation].Key, maxSmallObject)
 				if errors.Is(err, s3.ErrNotFound) {
 					continue
@@ -272,6 +272,10 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 					return stats, fmt.Errorf("collect: record of %s: %w", id, err)
 				}
 				if before := envelopeMaster(stored); before != "" && before != newestMaster {
+					doomedRecords = append(doomedRecords, entry.objects[generation])
+					continue
+				}
+				if s.v2() && s.recordSupersededByKey(id, generation, stored, record) {
 					doomedRecords = append(doomedRecords, entry.objects[generation])
 				}
 			}
@@ -734,30 +738,15 @@ func (s *Store) Collect(ctx context.Context, grace time.Duration) (CollectStats,
 	}
 
 	for _, doomed := range doomedAttempts {
-		// Once more, now: a manifest written since this round listed may
-		// name exactly these chunks, and so may a copy a collection that
-		// began since has condemned.
-		current, _, err := s.Manifest(ctx, doomed.id)
-		if err != nil && !errors.Is(err, ErrNoSnapshot) {
-			return stats, fmt.Errorf("collect: %w", err)
-		}
-		if err == nil && current.Attempt == doomed.attempt {
-			continue
-		}
-		if raw, err := s.objects.Get(ctx, s.condemnedKey(doomed.id), maxSmallObject); err == nil {
-			if condemned, err := s.parseManifest(doomed.id, raw); err != nil || condemned.Attempt == doomed.attempt {
-				continue
-			}
-		} else if !errors.Is(err, s3.ErrNotFound) {
-			return stats, fmt.Errorf("collect: %w", err)
-		}
-		count, size, err := s.deleteUnder(ctx, s.attemptPrefix(doomed.id, doomed.attempt))
+		deleted, count, size, err := s.deleteUnnamedAttempt(ctx, doomed.id, doomed.attempt)
 		stats.Objects += count
 		stats.Bytes += size
 		if err != nil {
-			return stats, err
+			return stats, fmt.Errorf("collect: %w", err)
 		}
-		delete(s.garbage, doomed.id+"/"+doomed.attempt)
+		if deleted {
+			delete(s.garbage, doomed.id+"/"+doomed.attempt)
+		}
 	}
 	// Condemned copies beside a manifest, and pins, once watched for the
 	// grace. Each pin by the name that was watched: a pin is never
@@ -1247,4 +1236,104 @@ func (s *Store) spare(ctx context.Context, runs map[string]uint64, manifests map
 		}
 	}
 	return spared, true, nil
+}
+
+// deleteUnnamedAttempt deletes the chunks of one upload attempt ONLY after
+// re-reading both the snapshot's manifest and any condemned copy and proving
+// neither names attempt. Shared by Collect and re-key step 6 (design §5).
+func (s *Store) deleteUnnamedAttempt(ctx context.Context, id, attempt string) (deleted bool, count int, bytes int64, err error) {
+	current, _, err := s.Manifest(ctx, id)
+	if err != nil && !errors.Is(err, ErrNoSnapshot) {
+		return false, 0, 0, err
+	}
+	if err == nil && current.Attempt == attempt {
+		return false, 0, 0, nil
+	}
+	if raw, err := s.objects.Get(ctx, s.condemnedKey(id), maxSmallObject); err == nil {
+		if condemned, err := s.parseManifest(id, raw); err != nil || condemned.Attempt == attempt {
+			return false, 0, 0, nil
+		}
+	} else if !errors.Is(err, s3.ErrNotFound) {
+		return false, 0, 0, err
+	}
+	count, bytes, err = s.deleteUnder(ctx, s.attemptPrefix(id, attempt))
+	if err != nil {
+		return false, count, bytes, err
+	}
+	return true, count, bytes, nil
+}
+
+// recordSupersededByKey reports whether stored (generation newest-1 of a run)
+// is protected by a different hold key or envelope version than newest: when
+// true, Collect deletes newest-1 rather than keeping it so a re-key or
+// running-run key rotation leaves nothing in the bucket under the old key.
+func (s *Store) recordSupersededByKey(id string, generation uint64, stored []byte, newest *Record) bool {
+	version, err := InspectEnvelopeVersion(stored)
+	if err != nil {
+		return false
+	}
+	if version == envelopeVersion {
+		// Previous generation was v1 while newest is v2: collect it.
+		return newest.v2
+	}
+	if version != EnvelopeVersionV2 || !newest.v2 {
+		// Never treat a v2 -> v1 downgrade as superseded.
+		return false
+	}
+	opened, err := OpenPublicV2(s.keys, kindRecord, recordName(id, generation), stored)
+	if err != nil || !opened.HasSealed || opened.Record() == nil {
+		return false
+	}
+	prevKID := opened.Record().KID
+	if newest.KID != "" && prevKID != newest.KID {
+		return true
+	}
+	// Also collect when TKVersion changed (rewrap pass retired an old TK version).
+	if opened.WrappedKey != "" && newest.WrappedKey != "" {
+		prevParsed, err1 := ParseWrappedHoldKey(opened.WrappedKey)
+		newestParsed, err2 := ParseWrappedHoldKey(newest.WrappedKey)
+		if err1 == nil && err2 == nil && prevParsed.TKVersion != newestParsed.TKVersion {
+			return true
+		}
+	}
+	return false
+}
+
+// DeleteOlderRecords deletes every generation < keepGen of runID after
+// confirming keepGen still stands as the newest generation (oldest first).
+// Used by re-key step 7 and running-run key push so earlier generations sealed
+// under the old hold key are promptly removed from the bucket.
+func (s *Store) DeleteOlderRecords(ctx context.Context, runID string, keepGen uint64) error {
+	if keepGen <= 1 {
+		return nil
+	}
+	prefix := s.prefix + "run/" + runID + "/"
+	var older []uint64
+	var newest uint64
+	err := s.objects.Walk(ctx, prefix, func(object s3.Object) error {
+		id, gen, ok := s.parseRecordKey(object.Key)
+		if !ok || id != runID {
+			return nil
+		}
+		if gen > newest {
+			newest = gen
+		}
+		if gen < keepGen {
+			older = append(older, gen)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if newest < keepGen {
+		return fmt.Errorf("%w: run %s newest generation is %d, expected at least %d", ErrConflict, runID, newest, keepGen)
+	}
+	sort.Slice(older, func(i, j int) bool { return older[i] < older[j] })
+	for _, gen := range older {
+		if err := s.objects.Delete(ctx, s.recordKey(runID, gen)); err != nil && !errors.Is(err, s3.ErrNotFound) {
+			return err
+		}
+	}
+	return nil
 }

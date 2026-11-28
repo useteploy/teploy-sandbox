@@ -385,6 +385,16 @@ func (h HoldKey) clone() (HoldKey, error) {
 		raw: holdRaw(key.bytes[:], h.Tenant, h.Run, h.KID, h.Wrapped)}, nil
 }
 
+// withWrapped returns an independent copy of the hold key carrying a re-wrapped
+// blob spelling (same tenant, run, kid, and raw key bytes).
+func (h HoldKey) withWrapped(newWrapped string) (HoldKey, error) {
+	key, err := h.key()
+	if err != nil {
+		return HoldKey{}, err
+	}
+	return NewHoldKey(h.Tenant, h.Run, h.KID, newWrapped, key.bytes[:])
+}
+
 // Zero wipes the key's bytes where they lie, for every copy of the
 // value.
 func (h *HoldKey) Zero() {

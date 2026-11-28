@@ -345,6 +345,12 @@ func (f *remoteFlags) openWithHostSecret(ctx context.Context, snapshots offhost.
 	// Master keys this daemon still opens but no longer wraps with: the
 	// state while a rotation runs. Given as files, comma-separated,
 	// because a key on a command line is a key in a process listing.
+	var prevMasters [][]byte
+	defer func() {
+		for _, pm := range prevMasters {
+			clear(pm)
+		}
+	}()
 	for _, path := range strings.Split(*f.previousKeys, ",") {
 		if path = strings.TrimSpace(path); path == "" {
 			continue
@@ -361,11 +367,12 @@ func (f *remoteFlags) openWithHostSecret(ctx context.Context, snapshots offhost.
 			return nil, noop, fmt.Errorf("remote-previous-key-file %s: %w", path, err)
 		}
 		err = keys.AddPrevious(prevMaster)
-		clear(prevMaster)
 		if err != nil {
+			clear(prevMaster)
 			keys.Close()
 			return nil, noop, fmt.Errorf("remote-previous-key-file %s: %w", path, err)
 		}
+		prevMasters = append(prevMasters, prevMaster)
 	}
 	token, err := secretFrom("", "SBX_REMOTE_SESSION_TOKEN", "AWS_SESSION_TOKEN")
 	if err != nil {
@@ -404,10 +411,16 @@ func (f *remoteFlags) openWithHostSecret(ctx context.Context, snapshots offhost.
 	var pushedSource *offhost.PushedKeySource
 	switch *f.kms {
 	case "local":
-		localSource, err := offhost.NewLocalKeySource(master)
+		localSource, err := offhost.NewLocalKeySourceFromKey(master)
 		if err != nil {
 			keys.Close()
 			return nil, noop, fmt.Errorf("remote-kms local: %w", err)
+		}
+		for _, prevMaster := range prevMasters {
+			if err := localSource.AddPreviousKey(prevMaster); err != nil {
+				keys.Close()
+				return nil, noop, fmt.Errorf("remote-kms local previous key: %w", err)
+			}
 		}
 		store.SetKeySource(localSource)
 		store.SetLegacyRead(*f.legacyRead)

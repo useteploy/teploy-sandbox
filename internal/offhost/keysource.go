@@ -2,7 +2,10 @@ package offhost
 
 import (
 	"bytes"
+	"crypto/hkdf"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -98,6 +101,11 @@ type LocalKeySource struct {
 	current int
 	// roots are the root keys by version, as many as are still to open.
 	roots map[int]*keyHolder
+	// v1Fallback lists candidate root keys (current first, then each previous
+	// key in configured order) for opening pre-K4 local-mode blobs written at
+	// TK version 1 when version 1 is not explicitly bound in roots. Never used
+	// for TKVersion >= 2, which always selects strictly by version.
+	v1Fallback []*keyHolder
 }
 
 // NewLocalKeySource makes a source on root key root, version 1.
@@ -123,6 +131,94 @@ func (l *LocalKeySource) Version() int {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.current
+}
+
+// LocalKeyVersion derives a deterministic tenant key version in [2, 2^30+1]
+// from a 32-byte local root key so every host configured with the same
+// --remote-key-file (and --remote-previous-key-file) agrees on versions across
+// rotations without shared state or extra flags. Version 1 is reserved for
+// pre-K4 NewLocalKeySource blobs.
+//
+// Note: the derived version acts as a public 30-bit fingerprint of the local
+// root key in wrapped blobs (needed to select the root key without trial
+// decryption).
+func LocalKeyVersion(root []byte) (int, error) {
+	if len(root) != KeySize {
+		return 0, fmt.Errorf("a root key is %d bytes, got %d", KeySize, len(root))
+	}
+	derived, err := hkdf.Key(sha256.New, root, nil, labelV2+"local-key-version", 4)
+	if err != nil {
+		return 0, err
+	}
+	defer clear(derived)
+	// Positive 30-bit integer in [2, 2^30+1]: reserves version 1 for pre-K4
+	// local-mode blobs while fitting every platform's int and maxTKVersionLen.
+	v := 2 + int(binary.BigEndian.Uint32(derived)&0x3fffffff)
+	return v, nil
+}
+
+// NewLocalKeySourceFromKey creates a LocalKeySource whose current version is
+// LocalKeyVersion(root). Also registers root as a fallback candidate for
+// legacy TK version 1 blobs (pre-K4 NewLocalKeySource) so existing local-mode
+// objects keep opening on upgrade without re-wrapping. Previous key files are
+// added with AddPreviousKey.
+func NewLocalKeySourceFromKey(root []byte) (*LocalKeySource, error) {
+	v, err := LocalKeyVersion(root)
+	if err != nil {
+		return nil, err
+	}
+	src, err := NewLocalKeySourceWithVersion(v, root)
+	if err != nil {
+		return nil, err
+	}
+	src.v1Fallback = []*keyHolder{src.roots[v]}
+	return src, nil
+}
+
+// AddPreviousKey adds an earlier root key file to a LocalKeySource using its
+// deterministic LocalKeyVersion(root), for --remote-previous-key-file in local
+// mode. Refuses duplicate keys or version collisions. Also appends this key to
+// the legacy version-1 fallback list so pre-K4 blobs written under either the
+// current or any previous root open and re-wrap cleanly during Rotate/Rewrap.
+func (l *LocalKeySource) AddPreviousKey(root []byte) error {
+	v, err := LocalKeyVersion(root)
+	if err != nil {
+		return err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if v == l.current {
+		return fmt.Errorf("previous root key has the same version (%d) as the current root key", v)
+	}
+	if _, known := l.roots[v]; known {
+		return fmt.Errorf("previous root key version %d is already known", v)
+	}
+	for other, key := range l.roots {
+		if bytes.Equal(key.key.bytes[:], root) {
+			return fmt.Errorf("the previous root key is identical to the root key of version %d", other)
+		}
+	}
+	holder := rootRaw(root)
+	l.roots[v] = holder
+	l.v1Fallback = append(l.v1Fallback, holder)
+	return nil
+}
+
+// Current reports whether wrapped is already wrapped under this source's
+// current tenant key version.
+func (l *LocalKeySource) Current(wrapped string) bool {
+	parsed, err := ParseWrappedHoldKey(wrapped)
+	if err != nil {
+		return false
+	}
+	return parsed.TKVersion == l.Version()
+}
+
+// HasPrevious reports whether this source holds any previous root keys.
+func (l *LocalKeySource) HasPrevious() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return len(l.roots) > 1
 }
 
 // AddPrevious lets the source open, never wrap with, the root key of an
@@ -171,6 +267,19 @@ func (l *LocalKeySource) root(version int) (*keyHolder, error) {
 		return nil, fmt.Errorf("%w (tenant key version %d, this source is at %d)", ErrWrongKey, version, l.current)
 	}
 	return root, nil
+}
+
+// legacyV1Candidates returns a snapshot of the legacy TKVersion==1 fallback
+// root keys when version 1 is not explicitly bound in roots.
+func (l *LocalKeySource) legacyV1Candidates() []*keyHolder {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if _, explicit := l.roots[1]; explicit || len(l.v1Fallback) == 0 {
+		return nil
+	}
+	out := make([]*keyHolder, len(l.v1Fallback))
+	copy(out, l.v1Fallback)
+	return out
 }
 
 // tenantKey derives the tenant key of tenant from the root key of one
@@ -235,6 +344,24 @@ func (l *LocalKeySource) Unwrap(tenant, run, wrapped string) (HoldKey, error) {
 	if parsed.Tenant != tenant {
 		return HoldKey{}, fmt.Errorf("%w: the wrapped hold key %s is for tenant %s, not %s",
 			ErrCorrupt, parsed.KID, parsed.Tenant, tenant)
+	}
+	if parsed.TKVersion == 1 {
+		if candidates := l.legacyV1Candidates(); len(candidates) > 0 {
+			var lastErr error
+			for _, cand := range candidates {
+				tk, err := TenantKey(cand.key.bytes[:], parsed.Tenant)
+				if err != nil {
+					return HoldKey{}, err
+				}
+				hk, err := UnwrapHoldKey(tk, run, wrapped)
+				clear(tk)
+				if err == nil {
+					return hk, nil
+				}
+				lastErr = err
+			}
+			return HoldKey{}, lastErr
+		}
 	}
 	tk, err := l.tenantKey(parsed.TKVersion, parsed.Tenant)
 	if err != nil {

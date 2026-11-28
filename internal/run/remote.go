@@ -233,6 +233,9 @@ type RotateStats struct {
 	// LocalKeysFailed how many could not be.
 	LocalKeys       int `json:"localKeysRewrapped"`
 	LocalKeysFailed int `json:"localKeysFailed"`
+	// OldKeysRemaining is key custody's: objects still wrapping a hold key
+	// under a previous tenant key version (local key-file rotation).
+	OldKeysRemaining int `json:"oldKeysRemaining,omitempty"`
 	// PreviousKeyNeeded: the previous master key must stay configured.
 	PreviousKeyNeeded    bool     `json:"previousKeyNeeded"`
 	PreviousKeyNeededFor []string `json:"previousKeyNeededFor"`

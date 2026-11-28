@@ -108,7 +108,11 @@ func (m *Manager) retrySnapshotNotes(ctx context.Context) {
 	for _, note := range due {
 		m.mu.Lock()
 		current, ok := m.snapshotNotes[note.Ref]
-		claimed := ok && current.State == noteWaiting
+		live := m.runs[note.Run]
+		// Do not start a snapshot upload while its run holds exclusivity (e.g.,
+		// running-run key rotation is advancing the record and re-pointing waiting
+		// snapshot notes to the new key; must-fix #2 / S8).
+		claimed := ok && current.State == noteWaiting && (live == nil || !live.exclusive)
 		if claimed {
 			current.State = noteUploading
 			note = *current

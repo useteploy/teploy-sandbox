@@ -161,6 +161,27 @@ func TestRemoteKMSFlagsValidationAndOpen(t *testing.T) {
 	if _, _, err := flags2.openWithHostSecret(context.Background(), noSnapshots{}, stateDir, secretBPath, time.Hour, quietLogger()); !strings.Contains(err.Error(), "cloned") {
 		t.Fatalf("cloned hold cache: got %v, want cloned cache refusal", err)
 	}
+
+	// --remote-kms local with --remote-previous-key-file opens cleanly (K4).
+	raw2 := make([]byte, offhost.KeySize)
+	_, _ = rand.Read(raw2)
+	keyFile2 := filepath.Join(t.TempDir(), "remote2.key")
+	if err := os.WriteFile(keyFile2, []byte(hex.EncodeToString(raw2)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SBX_REMOTE_SECRET_KEY", "secret")
+	localFlags := parseRemoteFlags(t, "--remote-endpoint", s3srv.URL, "--remote-bucket", "b", "--remote-path-style",
+		"--remote-access-key", "a", "--remote-key-file", keyFile2, "--remote-previous-key-file", keyFile, "--remote-kms", "local")
+	svc, closeFn, err := localFlags.openWithHostSecret(context.Background(), noSnapshots{}, t.TempDir(), filepath.Join(t.TempDir(), "hs2"), time.Hour, quietLogger())
+	if err != nil {
+		t.Fatalf("--remote-kms local with --remote-previous-key-file failed: %v", err)
+	}
+	if closeFn != nil {
+		closeFn()
+	}
+	if svc == nil || svc.Pushed() || !svc.Custody() {
+		t.Fatalf("unexpected service flags for local custody: svc=%v pushed=%v custody=%v", svc != nil, svc != nil && svc.Pushed(), svc != nil && svc.Custody())
+	}
 }
 
 // Review A10: a key file others can read is refused, and a secret taken

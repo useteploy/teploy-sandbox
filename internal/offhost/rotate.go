@@ -45,6 +45,11 @@ type RotateStats struct {
 	// (A v2 destroyed record under a previous fleet key needs no key to
 	// move, and is moved: it counts under Records.)
 	RecordsNeedKey int
+	// OldKeysRemaining is how many objects (manifests, condemned copies, or
+	// records) still wrap a hold key under a previous tenant key version
+	// (local key-file rotation or rewrap mode). Zero is required before
+	// retiring a previous root key file or TK version.
+	OldKeysRemaining int
 	// PreviousKeyNeeded: something this pass saw is still under a
 	// previous master, or was until this pass and its old generation has
 	// not been collected yet. False is necessary for retiring a previous
@@ -99,9 +104,15 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 	defer s.collectMu.Unlock()
 	defer func() {
 		stats.PreviousKeyNeeded = err != nil || stats.Records > 0 || stats.RecordsRunningPrevious > 0 || stats.RecordsDestroyedPrevious > 0 ||
-			stats.RecordsConflicted > 0 || stats.RecordsUnfenced > 0 || stats.RecordsNeedKey > 0 || stats.ManifestsSkipped > 0
+			stats.RecordsConflicted > 0 || stats.RecordsUnfenced > 0 || stats.RecordsNeedKey > 0 || stats.ManifestsSkipped > 0 ||
+			stats.OldKeysRemaining > 0
 	}()
 
+	localSrc, isLocal := s.source().(*LocalKeySource)
+	localRewrap := isLocal && localSrc.HasPrevious()
+	if localRewrap && (!s.conditional || !s.conditionalPutMatch) {
+		return stats, ErrConditionalRequired
+	}
 	newest, err := s.Runs(ctx)
 	if err != nil {
 		return stats, err
@@ -117,6 +128,9 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 		current := s.keys.Current(key)
 		if record.v2 {
 			current = record.fmk == s.keys.id
+			if current && localRewrap && record.State != RecordDestroyed && record.WrappedKey != "" && !localSrc.Current(record.WrappedKey) {
+				current = false
+			}
 		}
 		switch record.State {
 		case RecordDestroyed:
@@ -149,10 +163,19 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 			stats.RecordsRunning++
 			if !current {
 				stats.RecordsRunningPrevious++
+				if localRewrap && record.v2 && record.WrappedKey != "" && !localSrc.Current(record.WrappedKey) {
+					stats.OldKeysRemaining++
+				}
 			}
 			continue
 		}
 		if current {
+			if localRewrap && record.v2 && generation > 1 {
+				// Ensure no older record generations remain under the old root key (S14).
+				if dErr := s.DeleteOlderRecords(ctx, id, generation); dErr != nil {
+					stats.OldKeysRemaining++
+				}
+			}
 			stats.RecordsCurrent++
 			continue
 		}
@@ -166,6 +189,9 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 				// Left under the previous fleet key, where a host that
 				// holds the run's key finds it on its own pass.
 				stats.RecordsNeedKey++
+				if localRewrap && record.WrappedKey != "" && !localSrc.Current(record.WrappedKey) {
+					stats.OldKeysRemaining++
+				}
 				continue
 			}
 		} else {
@@ -174,9 +200,17 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 		if err != nil {
 			if errors.Is(err, ErrConflict) {
 				stats.RecordsConflicted++
+				if localRewrap && record.v2 && record.WrappedKey != "" && !localSrc.Current(record.WrappedKey) {
+					stats.OldKeysRemaining++
+				}
 				continue
 			}
 			return stats, fmt.Errorf("rotate: record of %s: %w", id, err)
+		}
+		if localRewrap && record.v2 {
+			if dErr := s.DeleteOlderRecords(ctx, id, generation+1); dErr != nil {
+				stats.OldKeysRemaining++
+			}
 		}
 		stats.Records++
 	}
@@ -221,6 +255,9 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 			if !current {
 				s.log.Warn("a condemned snapshot's copy is under a previous key; run the rotation again once its collection has decided", "snapshot", id)
 				stats.ManifestsSkipped++
+				if localRewrap {
+					stats.OldKeysRemaining++
+				}
 				continue
 			}
 		} else if !errors.Is(err, s3.ErrNotFound) {
@@ -255,6 +292,9 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 			if errors.Is(err, ErrIncomplete) {
 				s.log.Error("a manifest names chunks that are not there; it is not rewritten", "snapshot", id, "detail", err.Error())
 				stats.ManifestsSkipped++
+				if localRewrap {
+					stats.OldKeysRemaining++
+				}
 				continue
 			}
 			return stats, fmt.Errorf("rotate: manifest of %s: %w", id, err)
@@ -266,10 +306,17 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 		if !ours {
 			s.log.Warn("a manifest was written again between this pass's read and its write; run the rotation again", "snapshot", id)
 			stats.ManifestsSkipped++
+			if localRewrap {
+				stats.OldKeysRemaining++
+			}
 			continue
 		}
+		beforeSkipped := stats.ManifestsSkipped
 		if err := s.afterManifestWrite(ctx, id, whole, fresh, &stats); err != nil {
 			return stats, err
+		}
+		if localRewrap && stats.ManifestsSkipped > beforeSkipped {
+			stats.OldKeysRemaining++
 		}
 	}
 	return stats, nil
@@ -378,7 +425,13 @@ func (s *Store) copyCurrent(id string, copied []byte) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		return opened.FMKID == s.keys.id, nil
+		if opened.FMKID != s.keys.id {
+			return false, nil
+		}
+		if ls, ok := s.source().(*LocalKeySource); ok && ls.HasPrevious() && opened.WrappedKey != "" && !ls.Current(opened.WrappedKey) {
+			return false, nil
+		}
+		return true, nil
 	case envelopeVersion:
 		_, key, err := OpenV1IfAllowed(s.keys, kindManifest, id, copied, s.manifestPolicy(id, copied, ""))
 		if err != nil {
@@ -416,8 +469,26 @@ func (s *Store) manifestToCurrent(id string, stored []byte) (whole *Manifest, fr
 			if err != nil {
 				return nil, nil, false, err
 			}
-			if opened.FMKID == s.keys.id {
+			needFMK := opened.FMKID != s.keys.id
+			needHoldRewrap := false
+			var rewrappedBlob string
+			if ls, ok := s.source().(*LocalKeySource); ok && ls.HasPrevious() && opened.WrappedKey != "" && !ls.Current(opened.WrappedKey) {
+				mp := opened.Manifest()
+				rewrappedBlob, err = ls.Rewrap(mp.Tenant, mp.Run, opened.WrappedKey)
+				if err != nil {
+					return nil, nil, false, err
+				}
+				needHoldRewrap = rewrappedBlob != opened.WrappedKey
+			}
+			if !needFMK && !needHoldRewrap {
 				return nil, nil, true, nil
+			}
+			if needHoldRewrap {
+				fresh, err := rewriteEnvelopeKey(s.keys, kindManifest, id, stored, &opened, rewrappedBlob)
+				if err != nil {
+					return nil, nil, false, err
+				}
+				return manifestOfPublic(&opened), fresh, false, nil
 			}
 			fresh, err := resealPublic(s.keys, kindManifest, id, &opened)
 			if err != nil {
@@ -527,6 +598,18 @@ func (s *Store) rotateRecordV2(ctx context.Context, record *Record) error {
 	)
 	if !destroyed {
 		hold = &opened.hold
+		if ls, ok := s.source().(*LocalKeySource); ok && ls.HasPrevious() && !ls.Current(hold.Wrapped) {
+			rewrapped, rErr := ls.Rewrap(hold.Tenant, hold.Run, hold.Wrapped)
+			if rErr != nil {
+				return rErr
+			}
+			updated, wErr := hold.withWrapped(rewrapped)
+			if wErr != nil {
+				return wErr
+			}
+			defer updated.Zero()
+			hold = &updated
+		}
 		public.KID = hold.KID
 		if sealedBytes, err = json.Marshal(RecordSealedV2{Payload: next.Payload}); err != nil {
 			return err

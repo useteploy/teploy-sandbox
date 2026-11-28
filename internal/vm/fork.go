@@ -64,10 +64,17 @@ type forkSource struct {
 // again, so its hypervisor has no path to it; what it may still hold is
 // a descriptor it opened itself, which an honest hypervisor closed
 // before vm.snapshot answered and a hypervisor taken over could have
-// used to write anything it liked before then too. The seal makes the
-// dataset read-only before it looks, so nothing written through such a
-// descriptor afterwards is believed: the image must be exactly the
-// three plain, single-link, root-owned files, or no child is given it.
+// used to write anything it liked before then too. And it cannot keep
+// one past the seal: zfs refuses to make a dataset read-only while
+// anything holds it open for writing, a descriptor or a writable
+// mapping, shared or private (measured on ZFS 2.3.9: the remount fails
+// and zfs exits 255, even with the descriptor closed behind the
+// mapping), and the seal takes that refusal for a refused image. A
+// shared mapping kept through the change would otherwise go on writing
+// into the file the children map (measured too). Once the dataset is
+// read-only nothing can change it, and only then does the seal look: the
+// image must be exactly the three plain, single-link, root-owned files,
+// or no child is given it.
 // And what is in the files is the parent tenant's own memory, mapped
 // only by that run's forks.
 func (d *Driver) SaveForkMemory(ctx context.Context, parentID, containerID, snapshotRef string) (*run.ForkImage, run.ForkSaved, error) {

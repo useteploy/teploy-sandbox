@@ -93,6 +93,7 @@ Returned by create, stop, resume and fork, and in `GET /v1/runs`.
 | `access` | object | Only when the daemon has access on (`--access-addr`): `{epoch, ports: [{port, visibility, protocol}], streams}`. See [Access](#access) |
 | `memory` | object | Only when the daemon keeps memory images (`--vm-memory-snapshots`, vm driver), on a stopped run: `{state, image?, error?}`. `state` is `saved` (there is an image, and `image` names it), `failed` (the stop saved none; `error` says why), `evicted` (there was one and it was dropped, or a resume did not use it; `error` says why) or `none` (there is none and this daemon did not record why). An image is a cache: a resume that cannot use it boots the disk, as without one |
 | `resumedFrom` | string | Only when the daemon keeps memory images, on a run that daemon resumed: `memory` (the VM was restored from its image) or `disk` (it was booted from its disk snapshot). Absent on a run that was never resumed |
+| `fork` | object | Only when the daemon keeps memory images, on a fork's child that daemon made: `{from, parentPauseMs?, error?}`. `from` is `memory` (restored from its running parent's memory) or `disk` (booted from the fork's disk snapshot; `error` says why not from memory). `parentPauseMs` is how long the parent's VM was paused for the fork (absent for a stopped parent). Not kept across a daemon restart |
 
 ### `usage`
 
@@ -150,7 +151,16 @@ resumed on another daemon from remote storage starts at zero there, as
 | `DELETE /v1/runs/{id}` | | 204 | 404, 409 |
 | `POST /v1/runs/{id}/stop` | | 200, the run (`state: "stopped"`) | 404, 409 |
 | `POST /v1/runs/{id}/resume` | `{ttlSec?, takeover?}` | 200, the run | 400, 404, 409, 503 |
-| `POST /v1/runs/{id}/fork` | `{ttlSec?, labels?, onExpire?}` | 201, the new run | 400, 404, 409, 503 |
+| `POST /v1/runs/{id}/fork` | `{ttlSec?, labels?, onExpire?, count?, force?}` | 201, the new run; with `count` > 1, `{runs: [run, ...]}` | 400, 404, 409, 500, 503 |
+
+Fork's `count` (1 to 16, default 1) and `force` need a daemon that keeps
+memory images (`--vm-memory-snapshots`); any other answers 400 to them.
+`count` children come from one capture and it is all or nothing: if one
+cannot be made, those made before it are destroyed and the fork fails.
+`force: true` lets a fork of a running run go on while recoverable execs
+are in flight in it (otherwise 409); the children end the sessions they
+inherit. A fork whose running parent could not be resumed after the
+fork's pause answers 500 and makes nothing.
 
 `ttlSec` defaults to 1800 and is at most 86400. `network` defaults to
 `none`. Limits default to 1 CPU, 1024 MiB and 256 pids.

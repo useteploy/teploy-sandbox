@@ -5,6 +5,7 @@ package vm
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -255,6 +256,14 @@ func TestAForkWhoseMemoryCannotBeUsedForksFromTheDisk(t *testing.T) {
 				_ = os.Remove(filepath.Join(dir, imageStateFile))
 				_ = os.Symlink("/etc/hostname", filepath.Join(dir, imageStateFile))
 			}
+		}, why: "not sealed"},
+		{name: "a hypervisor that kept its image open for writing", rig: func(r *testRig) {
+			// What zfs answers when a descriptor or a writable mapping is
+			// open on the dataset (measured: the remount to read-only
+			// fails, and zfs exits 255).
+			r.zfs.mu.Lock()
+			r.zfs.fail["set readonly=on "+imageDataset(fmt.Sprintf("%026d", 1))] = zfsError("cannot set mount attributes: mount failed; property may be set but unable to remount filesystem")
+			r.zfs.mu.Unlock()
 		}, why: "not sealed"},
 		{name: "a child whose hypervisor refuses the restore", rig: func(r *testRig) {
 			onRestored(r, func(m *fakeMachine) { m.forkOp = forkHandshakeOK; m.restoreErr = errors.New("refused") })

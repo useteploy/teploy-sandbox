@@ -2,6 +2,7 @@ package offhost
 
 import (
 	"context"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -103,6 +104,41 @@ type Manifest struct {
 	// stored.
 	replaces string
 	previous []byte
+
+	// Key custody (v2). None of what follows is on a v1 manifest's JSON,
+	// and a v1 manifest has none of it set.
+	//
+	// Tenant, KID and WrappedKey are the custody fields of a v2
+	// manifest's public section: the tenant and run the snapshot belongs
+	// to, and the hold key its sealed section is under, wrapped.
+	Tenant string `json:"-"`
+	KID    string `json:"-"`
+	// WrappedKey is "" for a v1 manifest, and for a read of the public
+	// section alone it is still the key the sealed section names.
+	WrappedKey string `json:"-"`
+	// ParentStreamSHA256 is what a v2 manifest's sealed section says of
+	// the snapshot its stream builds on. A v1 manifest has no such pin.
+	// Like StreamSHA256, it is known only once the sealed section was
+	// opened (openSealed): a read of the public section alone leaves both
+	// "".
+	ParentStreamSHA256 string `json:"-"`
+
+	// blessed, set by the caller of Upload for a base image, is the stream
+	// hash Cloud blessed it with. The upload is refused, and its chunks
+	// cleaned up, when the stream this host sends does not hash to it.
+	blessed string
+
+	// opened is the v2 envelope's public section as it was opened: what
+	// OpenSealedV2 is given with the run's hold key. v2 says the manifest
+	// is a v2 envelope's. fmk is the fleet metadata key that envelope
+	// names, unsealed that StreamSHA256 and ParentStreamSHA256 were read
+	// from the sealed section, and fromOther that writeManifest found
+	// another upload's manifest standing instead of writing this one.
+	opened    *OpenedPublicV2
+	fmk       string
+	v2        bool
+	unsealed  bool
+	fromOther bool
 }
 
 // Chunk is one stored object of a stream.
@@ -201,6 +237,26 @@ type Store struct {
 	// attempt (a repair) or the daemon restarts.
 	badMu sync.Mutex
 	bad   map[string]badChunk
+
+	// Key custody. With a key source the store is in the custody mode
+	// (v2, v2()): and none of the four is ever consulted without one:
+	// every path is then as it was.
+	//
+	// custodyMu guards the four: they are set as the daemon starts and by
+	// what Cloud tells it since, and read on every path.
+	custodyMu sync.RWMutex
+	// keySource is where hold keys come from. nil: v1.
+	keySource KeySource
+	// legacyRead is --remote-legacy-read (local mode, while a fleet
+	// migrates): any v1 envelope is read as one.
+	legacyRead bool
+	// pushed is --remote-kms pushed: this host holds only the keys Cloud
+	// pushed to it, and mints none.
+	pushed bool
+	// legacyRuns are the runs Cloud marked legacy (their kid is "v1"):
+	// the only runs whose v1 envelopes are read in the custody mode
+	// without legacyRead.
+	legacyRuns map[string]bool
 }
 
 // NewStore keeps everything under prefix ("" or "some/path") in objects.
@@ -214,6 +270,94 @@ func NewStore(objects Objects, prefix string, keys *Keyring, log *slog.Logger) *
 	return &Store{objects: objects, prefix: prefix + "v1/", keys: keys, log: log, now: time.Now,
 		ChunkBytes: DefaultChunkBytes, Parallel: DefaultParallel, unreferenced: map[string]time.Time{}, garbage: map[string]observation{},
 		bad: map[string]badChunk{}}
+}
+
+// The custody mode. Set before the store is used; nothing of it is on a
+// path while no key source is set.
+
+// SetKeySource puts the store in the custody mode: it writes v2, and
+// reads v1 only as far as the key custody policy allows (OpenV1IfAllowed).
+// With none it writes and reads v1 as it always did.
+func (s *Store) SetKeySource(source KeySource) {
+	s.custodyMu.Lock()
+	defer s.custodyMu.Unlock()
+	s.keySource = source
+}
+
+// SetLegacyRead allows every v1 envelope to be read in the custody mode:
+// local mode (--remote-legacy-read), which an operator takes off again
+// once the fleet is migrated.
+func (s *Store) SetLegacyRead(allow bool) {
+	s.custodyMu.Lock()
+	defer s.custodyMu.Unlock()
+	s.legacyRead = allow
+}
+
+// SetPushed says this host's key source serves only what Cloud pushed
+// (pushed mode): the store holds nothing it was not given, and nothing is
+// minted here.
+func (s *Store) SetPushed(pushed bool) {
+	s.custodyMu.Lock()
+	defer s.custodyMu.Unlock()
+	s.pushed = pushed
+}
+
+// SetLegacyRuns names the runs Cloud marked legacy — their objects are
+// still under v1 envelopes, and only theirs are read as v1 in the custody
+// mode (beside base images, which stay v1 for good). It replaces what was
+// marked before.
+func (s *Store) SetLegacyRuns(runs map[string]bool) {
+	marked := make(map[string]bool, len(runs))
+	for run, legacy := range runs {
+		if legacy && validAADSegment(run) {
+			marked[run] = true
+		}
+	}
+	s.custodyMu.Lock()
+	defer s.custodyMu.Unlock()
+	s.legacyRuns = marked
+}
+
+// v2 says whether the store is in the custody mode.
+func (s *Store) v2() bool {
+	s.custodyMu.RLock()
+	defer s.custodyMu.RUnlock()
+	return s.keySource != nil
+}
+
+// Pushed reports whether the store's key source serves only what Cloud
+// pushed to this host: nothing is minted here, and what was not pushed is
+// asked of Cloud (ErrNeedKey), never worked around.
+func (s *Store) Pushed() bool {
+	s.custodyMu.RLock()
+	defer s.custodyMu.RUnlock()
+	return s.pushed
+}
+
+// source is the store's key source; it is there whenever v2() is.
+func (s *Store) source() KeySource {
+	s.custodyMu.RLock()
+	defer s.custodyMu.RUnlock()
+	return s.keySource
+}
+
+// v1Policy says how far a v1 envelope may be read in the custody mode:
+// the store's own allowances (legacy read; the runs marked legacy, by the
+// envelope's owner, since the object is what decides), and the one run
+// the caller says is legacy for what it is reading (legacyRun), which is
+// held to the object. A base image's manifest is not decided here: what
+// it is opens it (see OpenV1IfAllowed).
+func (s *Store) v1Policy(stored []byte, legacyRun string) V1ReadPolicy {
+	s.custodyMu.RLock()
+	policy := V1ReadPolicy{LegacyRun: legacyRun, AllowLegacyRead: s.legacyRead}
+	legacyRuns := s.legacyRuns
+	s.custodyMu.RUnlock()
+	if policy.LegacyRun == "" && len(legacyRuns) > 0 {
+		if owner, err := envelopeOwnerOf(stored); err == nil && legacyRuns[owner] {
+			policy.LegacyRun = owner
+		}
+	}
+	return policy
 }
 
 func (s *Store) snapshotPrefix(id string) string { return s.prefix + "snap/" + id + "/" }
@@ -563,7 +707,22 @@ func (s *Store) CreateIdentity(ctx context.Context) (string, error) {
 
 // Manifest reads the manifest of a snapshot and the key it is under.
 // ErrNoSnapshot when there is none.
+//
+// In the custody mode what comes back is the public section: all that any
+// host in the fleet may read, and all that collection, verification, the
+// scrub, pins and the listing need — none of it wants a tenant's key.
+// StreamSHA256 and ParentStreamSHA256 are then "" until openSealed opens
+// the sealed section under the run's hold key, and Key is zero: the key a
+// v2 manifest is under is the one its WrappedKey names.
 func (s *Store) Manifest(ctx context.Context, id string) (*Manifest, Key, error) {
+	return s.ManifestAs(ctx, id, "")
+}
+
+// ManifestAs is Manifest for a caller that knows which run is legacy for
+// what it reads (a restore told so: EnsureOptions.LegacyRun). A v1
+// envelope is then read only as that run's, whatever the store marks. It
+// changes nothing else.
+func (s *Store) ManifestAs(ctx context.Context, id, legacyRun string) (*Manifest, Key, error) {
 	stored, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject)
 	if errors.Is(err, s3.ErrNotFound) {
 		return nil, Key{}, fmt.Errorf("%w: %s", ErrNoSnapshot, id)
@@ -571,21 +730,75 @@ func (s *Store) Manifest(ctx context.Context, id string) (*Manifest, Key, error)
 	if err != nil {
 		return nil, Key{}, err
 	}
-	return s.openManifest(id, stored)
+	return s.openManifestAs(id, stored, legacyRun)
 }
 
 // parseManifest opens a stored manifest of id: the manifest object, or
 // a condemned copy of it, which is the same bytes.
 func (s *Store) parseManifest(id string, stored []byte) (*Manifest, error) {
-	manifest, _, err := s.openManifest(id, stored)
+	manifest, _, err := s.openManifestAs(id, stored, "")
 	return manifest, err
 }
 
 func (s *Store) openManifest(id string, stored []byte) (*Manifest, Key, error) {
-	document, key, err := s.keys.open("manifest", id, stored)
+	return s.openManifestAs(id, stored, "")
+}
+
+// openManifestAs opens a stored manifest of id. Without a key source it
+// is the v1 reader, as it always was. With one the envelope's version is
+// read first, and nothing is decrypted before it is known:
+//
+//   - a v2 envelope's public section is opened under the fleet metadata
+//     key alone (OpenPublicV2); no tenant's key is needed or wanted;
+//   - a v1 envelope only as far as the key custody policy allows
+//     (OpenV1IfAllowed): a base image's, under its own ID; anything else
+//     as a legacy run's.
+//
+// There is no bare v1 read in the custody mode, here or anywhere.
+func (s *Store) openManifestAs(id string, stored []byte, legacyRun string) (*Manifest, Key, error) {
+	if !s.v2() {
+		document, key, err := s.keys.open("manifest", id, stored)
+		if err != nil {
+			return nil, Key{}, err
+		}
+		return manifestOfDocument(id, document, key)
+	}
+	version, err := InspectEnvelopeVersion(stored)
 	if err != nil {
 		return nil, Key{}, err
 	}
+	switch version {
+	case EnvelopeVersionV2:
+		opened, err := OpenPublicV2(s.keys, kindManifest, id, stored)
+		if err != nil {
+			return nil, Key{}, err
+		}
+		return manifestOfPublic(&opened), Key{}, nil
+	case envelopeVersion:
+		document, key, err := OpenV1IfAllowed(s.keys, kindManifest, id, stored, s.manifestPolicy(id, stored, legacyRun))
+		if err != nil {
+			return nil, Key{}, err
+		}
+		return manifestOfDocument(id, document, key)
+	default:
+		return nil, Key{}, fmt.Errorf("manifest of %s has version %d, which this daemon does not read", id, version)
+	}
+}
+
+// manifestPolicy is the v1 policy for a stored manifest of id in the
+// custody mode: a base image's is read as one, by what it is, whatever
+// the store marks and the caller says; any other's by the store's and the
+// caller's allowances (v1Policy).
+func (s *Store) manifestPolicy(id string, stored []byte, legacyRun string) V1ReadPolicy {
+	if IsBaseID(id) {
+		return V1ReadPolicy{IsBase: true, BaseID: id}
+	}
+	return s.v1Policy(stored, legacyRun)
+}
+
+// manifestOfDocument is a v1 manifest's document, held to what its name
+// and key say.
+func manifestOfDocument(id string, document []byte, key Key) (*Manifest, Key, error) {
 	var manifest Manifest
 	if err := json.Unmarshal(document, &manifest); err != nil {
 		return nil, Key{}, fmt.Errorf("%w: manifest of %s: %v", ErrCorrupt, id, err)
@@ -608,6 +821,58 @@ func (s *Store) openManifest(id string, stored []byte) (*Manifest, Key, error) {
 		return nil, Key{}, fmt.Errorf("%w: manifest of %s is under the key of %s, not of %s", ErrCorrupt, id, key.Owner, owner)
 	}
 	return &manifest, key, nil
+}
+
+// manifestOfPublic is a v2 manifest as a read of its public section
+// alone gives it: everything the graph says, and neither stream hash.
+// The shape checks of a v1 manifest (the attempt, the chunks, the chunk
+// size) are made where the public section is decoded (DecodeManifestPublicV2).
+func manifestOfPublic(opened *OpenedPublicV2) *Manifest {
+	public := opened.Manifest()
+	return &Manifest{
+		Version: public.Version, ID: public.ID, Purpose: public.Purpose, Run: public.Run, CreatedAt: public.CreatedAt,
+		Parent: public.Parent, GUID: public.GUID, ParentGUID: public.ParentGUID, Depth: public.Depth,
+		Attempt: public.Attempt, ChunkBytes: public.ChunkBytes, Chunks: public.Chunks,
+		StreamBytes: public.StreamBytes, StoredBytes: public.StoredBytes,
+		Tenant: public.Tenant, KID: public.KID, WrappedKey: opened.WrappedKey,
+		opened: opened, fmk: opened.FMKID, v2: true,
+	}
+}
+
+// publicOf is a v2 manifest's public section, as it is stored.
+func publicOf(manifest *Manifest) ManifestPublicV2 {
+	return ManifestPublicV2{
+		Version: EnvelopeVersionV2, ID: manifest.ID, Purpose: manifest.Purpose, Tenant: manifest.Tenant, Run: manifest.Run,
+		KID: manifest.KID, CreatedAt: manifest.CreatedAt,
+		Parent: manifest.Parent, GUID: manifest.GUID, ParentGUID: manifest.ParentGUID, Depth: manifest.Depth,
+		Attempt: manifest.Attempt, ChunkBytes: manifest.ChunkBytes, Chunks: manifest.Chunks,
+		StreamBytes: manifest.StreamBytes, StoredBytes: manifest.StoredBytes,
+	}
+}
+
+// openSealed opens the sealed section of a v2 manifest under holdKey and
+// fills in what it says: the stream's hash and its parent's pin. holdKey
+// must be the key the envelope names, and the public bytes the ones the
+// section was sealed over (OpenSealedV2), so this is also what
+// authenticates a manifest a restore or an upload is about to trust.
+//
+// A manifest read from the public section alone has neither hash: no
+// caller takes "" there for one, and DownloadV2 opens the section itself
+// when it has not been opened.
+func (m *Manifest) openSealed(holdKey HoldKey) error {
+	if !m.v2 || m.opened == nil {
+		return errors.New("offhost: not a v2 manifest read from storage")
+	}
+	plain, err := OpenSealedV2(kindManifest, m.ID, *m.opened, holdKey)
+	if err != nil {
+		return err
+	}
+	sealed, err := DecodeManifestSealedV2(plain)
+	if err != nil {
+		return err
+	}
+	m.StreamSHA256, m.ParentStreamSHA256, m.unsealed = sealed.StreamSHA256, sealed.ParentStreamSHA256, true
+	return nil
 }
 
 // checkChunks compares a manifest with what is stored: every chunk it
@@ -678,6 +943,15 @@ func (s *Store) checkChunks(ctx context.Context, manifest *Manifest) error {
 // A snapshot a read found damaged (bit rot, see CheckContent and
 // Download) is not whole either, though every chunk is there with its
 // size: the *Incomplete then says Content.
+//
+// An upload attempt can now vanish while its manifest was valid a moment
+// ago: a re-key swaps the manifest for one naming a new attempt in one
+// conditional write and deletes the old attempt's chunks a few requests
+// later. So a snapshot found missing chunks is looked at once more before
+// that is answered: when the manifest names another attempt now, the new
+// one is what is checked — and the manifest returned is that one — and
+// only when the same attempt still stands (or the manifest cannot be read
+// again) is the snapshot not whole.
 func (s *Store) Verify(ctx context.Context, id string) (*Manifest, Key, error) {
 	var first *Manifest
 	var firstKey Key
@@ -696,12 +970,27 @@ func (s *Store) Verify(ctx context.Context, id string) (*Manifest, Key, error) {
 		if err != nil {
 			return nil, Key{}, err
 		}
-		if err := s.checkChunks(ctx, manifest); err != nil {
-			var incomplete *Incomplete
-			if errors.As(err, &incomplete) {
-				incomplete.Snapshot = id
+		for look := 0; ; look++ {
+			err := s.checkChunks(ctx, manifest)
+			if err == nil {
+				break
 			}
-			return nil, Key{}, err
+			var incomplete *Incomplete
+			if !errors.As(err, &incomplete) || look == incompleteRereads {
+				if incomplete != nil {
+					incomplete.Snapshot = id
+				}
+				return nil, Key{}, err
+			}
+			latest, latestKey, readErr := s.Manifest(ctx, current)
+			if readErr != nil || latest.Attempt == manifest.Attempt {
+				incomplete.Snapshot = id
+				return nil, Key{}, err
+			}
+			// Another upload's manifest stands, and it is whole or
+			// not on its own chunks: a verdict about it is a verdict.
+			s.badOf(latest) // a damaged chunk of the attempt that no longer stands is not this manifest's
+			manifest, key = latest, latestKey
 		}
 		if bad, ok := s.badOf(manifest); ok {
 			return nil, Key{}, &Incomplete{Snapshot: id, Broken: manifest.ID, Attempt: manifest.Attempt, Content: true, Chunk: bad.index,
@@ -720,11 +1009,19 @@ func (s *Store) Verify(ctx context.Context, id string) (*Manifest, Key, error) {
 	}
 }
 
+// incompleteRereads is how often a check that found chunks missing looks
+// at the manifest again before it answers: the attempt may have been
+// swapped under it (a re-key), and each look is one small read.
+const incompleteRereads = 2
+
 // retract deletes the manifest of id if it still names attempt: the
 // manifest of an upload that turned out not to be whole, or one found
 // naming chunks that are gone. A manifest another upload has written
 // since is left alone. The chunks are not touched.
 func (s *Store) retract(ctx context.Context, id, attempt string) error {
+	if s.conditionalDeleteMatch {
+		return s.retractIfMatch(ctx, id, attempt)
+	}
 	manifest, _, err := s.Manifest(ctx, id)
 	if errors.Is(err, ErrNoSnapshot) {
 		return nil
@@ -738,6 +1035,45 @@ func (s *Store) retract(ctx context.Context, id, attempt string) error {
 	return s.objects.Delete(ctx, s.manifestKey(id))
 }
 
+// retractIfMatch is retract where the service has `If-Match` on a delete:
+// the manifest is read with the ETag of its bytes, and deleted only while
+// it is still that very object. One written again since — another
+// upload's, a re-key's swap — or gone is left alone: 412 and 404 are no
+// ops where an unconditional delete would have removed what replaced it.
+// A read that answers no ETag has nothing to make a condition of, and is
+// retract's other self.
+func (s *Store) retractIfMatch(ctx context.Context, id, attempt string) error {
+	raw, etag, err := s.objects.GetWithETag(ctx, s.manifestKey(id), maxSmallObject)
+	if errors.Is(err, s3.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if etag == "" {
+		manifest, err := s.parseManifest(id, raw)
+		if err != nil {
+			return err
+		}
+		if manifest.Attempt != attempt {
+			return nil
+		}
+		return s.objects.Delete(ctx, s.manifestKey(id))
+	}
+	manifest, err := s.parseManifest(id, raw)
+	if err != nil {
+		return err
+	}
+	if manifest.Attempt != attempt {
+		return nil
+	}
+	err = s.objects.DeleteIfMatch(ctx, s.manifestKey(id), etag)
+	if errors.Is(err, s3.ErrPreconditionFailed) || errors.Is(err, s3.ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
 // takeBack undoes an upload's manifest that turned out not whole: the
 // manifest it replaced is put back if it replaced one, else it is
 // retracted. Either way only while what stands is still this upload's.
@@ -745,17 +1081,29 @@ func (s *Store) takeBack(ctx context.Context, manifest *Manifest) error {
 	if manifest.previous == nil {
 		return s.retract(ctx, manifest.ID, manifest.Attempt)
 	}
-	current, _, err := s.Manifest(ctx, manifest.ID)
-	if errors.Is(err, ErrNoSnapshot) {
+	raw, etag, err := s.readForRotation(ctx, manifest.ID)
+	if errors.Is(err, s3.ErrNotFound) {
 		return s.objects.Put(ctx, s.manifestKey(manifest.ID), manifest.previous, s3.PutOptions{IfAbsent: s.conditional, ContentType: "application/json"})
 	}
+	if err != nil {
+		return err
+	}
+	current, err := s.parseManifest(manifest.ID, raw)
 	if err != nil {
 		return err
 	}
 	if current.Attempt != manifest.Attempt {
 		return nil
 	}
-	return s.objects.Put(ctx, s.manifestKey(manifest.ID), manifest.previous, s3.PutOptions{ContentType: "application/json"})
+	opts := s3.PutOptions{ContentType: "application/json"}
+	if s.conditionalPutMatch && etag != "" {
+		opts.IfMatch = etag
+	}
+	err = s.objects.Put(ctx, s.manifestKey(manifest.ID), manifest.previous, opts)
+	if errors.Is(err, s3.ErrPreconditionFailed) {
+		return nil
+	}
+	return err
 }
 
 // HasSnapshot reports whether a complete snapshot of that ID is stored.
@@ -772,9 +1120,93 @@ type uploadedChunk struct {
 	chunk Chunk
 }
 
+// streamKeys is how one snapshot's chunks and manifest are sealed: under
+// a run's data key (v1), or under its hold key (key custody, v2). Which,
+// is the store's mode and the caller's business; what an upload and a
+// download do with it is the same either way.
+type streamKeys interface {
+	// chunk is the AEAD every chunk of the snapshot snap is under.
+	chunk(snap string) (cipher.AEAD, error)
+	// aad is what the chunk index of the upload attempt of snap is bound to.
+	aad(snap, attempt string, index int) ([]byte, error)
+	// seal is the manifest as stored.
+	seal(manifest *Manifest) ([]byte, error)
+}
+
+// dataKey is a run's data key (v1).
+type dataKey struct{ key Key }
+
+func (d dataKey) chunk(snap string) (cipher.AEAD, error) { return d.key.derive("chunk", snap) }
+
+func (d dataKey) aad(snap, attempt string, index int) ([]byte, error) {
+	return chunkAAD(snap, attempt, index), nil
+}
+
+func (d dataKey) seal(manifest *Manifest) ([]byte, error) {
+	document, err := json.Marshal(manifest)
+	if err != nil {
+		return nil, err
+	}
+	return seal(d.key, "manifest", manifest.ID, document)
+}
+
+// holdKey is a run's hold key (v2): the chunks under one key derived from
+// it, the manifest's public section under the fleet key and its sealed
+// section (the stream hashes) under another, the second bound to the
+// bytes of the first.
+type holdKey struct {
+	store *Store
+	key   *HoldKey
+}
+
+func (h holdKey) chunk(snap string) (cipher.AEAD, error) { return h.key.ChunkAEAD(snap) }
+
+func (h holdKey) aad(snap, attempt string, index int) ([]byte, error) {
+	return h.key.ChunkAAD(snap, attempt, index)
+}
+
+func (h holdKey) seal(manifest *Manifest) ([]byte, error) {
+	public, err := json.Marshal(publicOf(manifest))
+	if err != nil {
+		return nil, err
+	}
+	sealed, err := json.Marshal(ManifestSealedV2{StreamSHA256: manifest.StreamSHA256, ParentStreamSHA256: manifest.ParentStreamSHA256})
+	if err != nil {
+		return nil, err
+	}
+	return SealV2(h.store.keys, kindManifest, manifest.ID, public, h.key, sealed)
+}
+
+// errNoHoldKeyGiven: an upload or a live record of a tenant run without the
+// run's hold key.
+var errNoHoldKeyGiven = errors.New("offhost: a tenant run's snapshot or record is sealed under the run's hold key, and none was given")
+
+// errV1Write: a v1 write asked of a store in the custody mode.
+var errV1Write = errors.New("offhost: this daemon keeps key custody (v2): a run's snapshot is uploaded under its hold key (UploadV2) and its record written with AdvanceV2; only base images are written under the fleet key")
+
+// isBaseUpload says what an upload is a base image's: it says so, and it
+// is stored under a base image's ID. ok is false when it is half of one,
+// which is refused in the custody mode (a base image is never anything
+// but whole: "base-<guid>", purpose base, under the fleet key).
+func isBaseUpload(manifest *Manifest) (is, ok bool) {
+	switch {
+	case manifest.Purpose == PurposeBase && IsBaseID(manifest.ID):
+		return true, true
+	case manifest.Purpose == PurposeBase:
+		return true, false
+	case IsBaseID(manifest.ID):
+		return true, false
+	}
+	return false, true
+}
+
 // Upload stores stream as the snapshot manifest describes (ID, Purpose,
 // Run, Parent, GUIDs and Depth are the caller's; the rest is filled in
 // here) under key, and returns the manifest as written.
+//
+// It is the v1 upload. In the custody mode it is for base images only,
+// which stay under the fleet key in v1 envelopes for good; a run's
+// snapshot is uploaded with UploadV2, under its hold key.
 //
 // The stream is never held whole: it is read a chunk at a time, each
 // chunk encrypted in place and written as its own object, a few at once.
@@ -790,10 +1222,81 @@ type uploadedChunk struct {
 // a wrong idea of the time, or of what is garbage, may have taken chunks
 // while the rest were still going up.
 func (s *Store) Upload(ctx context.Context, manifest Manifest, key Key, stream io.Reader) (result *Manifest, err error) {
+	if s.v2() {
+		base, whole := isBaseUpload(&manifest)
+		if !base {
+			return nil, errV1Write
+		}
+		if !whole {
+			return nil, fmt.Errorf("%w: a base image is purpose %s under a base image's ID, and this is purpose %s under %q", ErrCorrupt, PurposeBase, manifest.Purpose, manifest.ID)
+		}
+	}
+	return s.upload(ctx, manifest, dataKey{key}, stream)
+}
+
+// UploadV2 stores stream in the custody mode and returns the manifest as
+// written, with its sealed section's hashes in place (StreamSHA256,
+// ParentStreamSHA256): an upload knows the stream it sent.
+//
+// A base image (purpose base, a base image's ID; hold nil) is stored as
+// it is in every mode: in a v1 envelope under the fleet key, readable by
+// every host. When manifest.blessed is set (by the service, from what
+// Cloud blessed the image with), the stream this host sends must hash to
+// it: the manifest is then not written, the chunks are cleaned up, and
+// the answer is ErrCorrupt. A host whose copy sends another stream than
+// the blessed one never puts that stream in the bucket.
+//
+// Anything else is a run's snapshot: it needs the run's hold key (hold),
+// which must be the key of the tenant and the run the manifest names. Its
+// chunks are under a key derived from the hold key, each bound to its
+// tenant, snapshot, attempt and place in the stream; its manifest is a v2
+// envelope, the graph public under the fleet key and the stream hashes
+// sealed under the hold key over the public bytes. A hold key that is
+// another run's or another tenant's is refused (SealV2 holds the key to
+// the public section), so nothing is stored that OpenPublicV2 refuses.
+func (s *Store) UploadV2(ctx context.Context, manifest Manifest, hold *HoldKey, stream io.Reader) (result *Manifest, err error) {
+	if !s.v2() {
+		return nil, errors.New("offhost: UploadV2 is for a store with a key source; without one a snapshot is uploaded under its data key (Upload)")
+	}
+	if base, whole := isBaseUpload(&manifest); base {
+		if !whole {
+			return nil, fmt.Errorf("%w: a base image is purpose %s under a base image's ID, and this is purpose %s under %q", ErrCorrupt, PurposeBase, manifest.Purpose, manifest.ID)
+		}
+		if hold != nil {
+			return nil, errors.New("offhost: a base image is under the fleet key, never a hold key: hold must be nil")
+		}
+		key, err := s.keys.NewKey(manifest.ID)
+		if err != nil {
+			return nil, err
+		}
+		manifest.Run = ""
+		return s.upload(ctx, manifest, dataKey{key}, stream)
+	}
+	if hold == nil {
+		return nil, errNoHoldKeyGiven
+	}
+	switch manifest.Purpose {
+	case PurposeStop, PurposeSnapshot:
+	default:
+		return nil, fmt.Errorf("%w: the snapshot of a tenant run has purpose %s or %s, and this is %q", ErrCorrupt, PurposeStop, PurposeSnapshot, manifest.Purpose)
+	}
+	if hold.Tenant != manifest.Tenant || hold.Run != manifest.Run {
+		return nil, fmt.Errorf("%w: the hold key is the key of run %s of tenant %s, and the manifest is of run %s of tenant %s",
+			ErrCorrupt, hold.Run, hold.Tenant, manifest.Run, manifest.Tenant)
+	}
+	if manifest.Parent != "" && !validSHA256(manifest.ParentStreamSHA256) {
+		return nil, fmt.Errorf("%w: snapshot %s builds on %s and carries no valid parent stream hash", ErrCorrupt, manifest.ID, manifest.Parent)
+	}
+	manifest.KID, manifest.WrappedKey, manifest.v2 = hold.KID, hold.Wrapped, true
+	return s.upload(ctx, manifest, holdKey{s, hold}, stream)
+}
+
+// upload is Upload and UploadV2: one stream, cut and sealed with keys.
+func (s *Store) upload(ctx context.Context, manifest Manifest, keys streamKeys, stream io.Reader) (result *Manifest, err error) {
 	if manifest.Depth < 0 || manifest.Depth > MaxChainLimit {
 		return nil, fmt.Errorf("snapshot %s would be %d streams from its base image; the most any daemon restores through is %d", manifest.ID, manifest.Depth, MaxChainLimit)
 	}
-	aead, err := key.derive("chunk", manifest.ID)
+	aead, err := keys.chunk(manifest.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -852,6 +1355,12 @@ func (s *Store) Upload(ctx context.Context, manifest Manifest, key Key, stream i
 		go func() {
 			defer workers.Done()
 			for current := range jobs {
+				aad, err := keys.aad(manifest.ID, manifest.Attempt, current.index)
+				if err != nil {
+					fail(err)
+					buffers.Put(current.buffer) //nolint:staticcheck // a slice of fixed size
+					continue
+				}
 				nonce := current.buffer[:nonceSize]
 				if _, err := rand.Read(nonce); err != nil {
 					fail(err)
@@ -860,10 +1369,10 @@ func (s *Store) Upload(ctx context.Context, manifest Manifest, key Key, stream i
 				// Encrypted where it lies: the stream bytes sit behind
 				// the space the nonce takes.
 				plain := current.buffer[nonceSize : nonceSize+current.filled]
-				sealed := aead.Seal(plain[:0], nonce, plain, chunkAAD(manifest.ID, manifest.Attempt, current.index))
+				sealed := aead.Seal(plain[:0], nonce, plain, aad)
 				object := current.buffer[:nonceSize+len(sealed)]
 				digest := sha256.Sum256(object)
-				err := s.objects.Put(ctx, s.chunkKey(manifest.ID, manifest.Attempt, current.index), object, s3.PutOptions{ContentType: "application/octet-stream"})
+				err = s.objects.Put(ctx, s.chunkKey(manifest.ID, manifest.Attempt, current.index), object, s3.PutOptions{ContentType: "application/octet-stream"})
 				if err != nil {
 					fail(fmt.Errorf("upload chunk %d of %s: %w", current.index, manifest.ID, err))
 				} else {
@@ -928,13 +1437,24 @@ func (s *Store) Upload(ctx context.Context, manifest Manifest, key Key, stream i
 	}
 	manifest.StreamBytes = streamBytes
 	manifest.StreamSHA256 = hex.EncodeToString(streamHash.Sum(nil))
-	document, err := json.Marshal(manifest)
+	if manifest.blessed != "" && manifest.blessed != manifest.StreamSHA256 {
+		// Before the manifest, and with the chunks still nobody's: the
+		// deferred cleanup takes them. A base image this host cannot send
+		// as it was blessed is not put where a blessed one is looked for.
+		return nil, fmt.Errorf("%w: base image %s was blessed with a stream of another hash, and this host's copy does not send that stream; nothing is stored", ErrCorrupt, manifest.ID)
+	}
+	sealed, err := keys.seal(&manifest)
 	if err != nil {
 		return nil, err
 	}
-	sealed, err := seal(key, "manifest", manifest.ID, document)
-	if err != nil {
-		return nil, err
+	if manifest.v2 {
+		// What a read of the manifest will hold, so that the caller has
+		// the envelope it just wrote as if it had read it.
+		opened, err := OpenPublicV2(s.keys, kindManifest, manifest.ID, sealed)
+		if err != nil {
+			return nil, err
+		}
+		manifest.Version, manifest.opened, manifest.fmk, manifest.unsealed = EnvelopeVersionV2, &opened, opened.FMKID, true
 	}
 	written, err := s.writeManifest(ctx, parent, &manifest, sealed, &named, &discard)
 	if err != nil {
@@ -942,6 +1462,7 @@ func (s *Store) Upload(ctx context.Context, manifest Manifest, key Key, stream i
 	}
 	if written != &manifest {
 		// Another upload's manifest stands, and was found whole.
+		written.fromOther = true
 		return written, nil
 	}
 	if err := s.checkChunks(ctx, &manifest); err != nil {
@@ -966,19 +1487,25 @@ func (s *Store) Upload(ctx context.Context, manifest Manifest, key Key, stream i
 func (s *Store) writeManifest(ctx, parent context.Context, manifest *Manifest, sealed []byte, named, discard *bool) (*Manifest, error) {
 	if manifest.replaces != "" {
 		// Replace the manifest that stands, if it is still the one to
-		// be replaced, in one unconditional write; keep what it was.
-		previous, err := s.objects.Get(ctx, s.manifestKey(manifest.ID), maxSmallObject)
+		// be replaced, conditional on the ETag read where the service has
+		// If-Match on PUT so a concurrent re-key swap is never clobbered.
+		previous, etag, err := s.readForRotation(ctx, manifest.ID)
 		if err != nil && !errors.Is(err, s3.ErrNotFound) {
 			return nil, fmt.Errorf("read the manifest of %s before replacing it: %w", manifest.ID, err)
 		}
 		if err == nil {
 			if standing, parseErr := s.parseManifest(manifest.ID, previous); parseErr == nil && standing.Attempt == manifest.replaces {
 				*named = true
-				if err := s.objects.Put(ctx, s.manifestKey(manifest.ID), sealed, s3.PutOptions{ContentType: "application/json"}); err != nil {
-					return nil, fmt.Errorf("replace the manifest of %s: %w", manifest.ID, err)
+				ours, putErr := s.putManifest(ctx, manifest.ID, sealed, etag)
+				if putErr != nil {
+					return nil, fmt.Errorf("replace the manifest of %s: %w", manifest.ID, putErr)
 				}
-				manifest.previous = previous
-				return manifest, nil
+				if ours {
+					manifest.previous = previous
+					return manifest, nil
+				}
+				// 412: something else replaced the manifest first; fall
+				// through to inspect what stands now.
 			}
 		}
 		// Gone or changed since: written like any other upload's.
@@ -1003,11 +1530,15 @@ func (s *Store) writeManifest(ctx, parent context.Context, manifest *Manifest, s
 		}
 		// Someone uploaded this snapshot first (two daemons with the same
 		// base image), or this very write landed and its answer was lost.
-		existing, _, readErr := s.Manifest(ctx, manifest.ID)
-		if errors.Is(readErr, ErrNoSnapshot) && try == 0 {
+		previous, etag, rawErr := s.readForRotation(ctx, manifest.ID)
+		if errors.Is(rawErr, s3.ErrNotFound) && try == 0 {
 			// Refused by a manifest that is gone again: write once more.
 			continue
 		}
+		if rawErr != nil {
+			return nil, fmt.Errorf("manifest of %s exists and cannot be read: %w", manifest.ID, rawErr)
+		}
+		existing, _, readErr := s.openManifestAs(manifest.ID, previous, "")
 		if readErr != nil {
 			return nil, fmt.Errorf("manifest of %s exists and cannot be read: %w", manifest.ID, readErr)
 		}
@@ -1017,16 +1548,18 @@ func (s *Store) writeManifest(ctx, parent context.Context, manifest *Manifest, s
 		if _, damaged := s.badOf(existing); damaged {
 			// The manifest that stands names a chunk a read found
 			// damaged. This upload is whole: it replaces that manifest
-			// in one write, so the snapshot never stops existing on the
-			// way (a read can be wrong, and the old chunks stay until a
-			// collection ages them). What it replaces is kept, to be put
-			// back if this one turns out not whole (takeBack).
-			previous, err := s.objects.Get(ctx, s.manifestKey(manifest.ID), maxSmallObject)
-			if err != nil {
-				return nil, fmt.Errorf("read the manifest of %s before replacing it: %w", manifest.ID, err)
+			// conditional on its ETag (where supported) so a concurrent
+			// re-key swap is never overwritten. What it replaces is kept,
+			// to be put back if this one turns out not whole (takeBack).
+			ours, putErr := s.putManifest(ctx, manifest.ID, sealed, etag)
+			if putErr != nil {
+				return nil, fmt.Errorf("replace the manifest of %s, which names a damaged chunk: %w", manifest.ID, putErr)
 			}
-			if err := s.objects.Put(ctx, s.manifestKey(manifest.ID), sealed, s3.PutOptions{ContentType: "application/json"}); err != nil {
-				return nil, fmt.Errorf("replace the manifest of %s, which names a damaged chunk: %w", manifest.ID, err)
+			if !ours {
+				if try == 0 {
+					continue
+				}
+				return nil, fmt.Errorf("replace the manifest of %s, which names a damaged chunk: another write replaced it first", manifest.ID)
 			}
 			manifest.previous = previous
 			s.log.Warn("a snapshot with a damaged chunk was uploaded again from this host's copy", "snapshot", manifest.ID, "replaced", existing.Attempt)
@@ -1058,13 +1591,53 @@ func (s *Store) writeManifest(ctx, parent context.Context, manifest *Manifest, s
 // chunk that is missing, altered, cut short or swapped for another ends
 // the download with an error, and w has then received a prefix of the
 // stream and nothing else.
+//
+// It is the v1 download. A v2 manifest is downloaded with DownloadV2.
 func (s *Store) Download(ctx context.Context, manifest *Manifest, key Key, w io.Writer) error {
-	aead, err := key.derive("chunk", manifest.ID)
+	if manifest.v2 {
+		return errors.New("offhost: a v2 manifest is downloaded under the run's hold key (DownloadV2)")
+	}
+	return s.download(ctx, manifest, dataKey{key}, w)
+}
+
+// DownloadV2 is Download for a v2 manifest read from storage, under the
+// run's hold key. The key is held to the envelope first (openSealed: the
+// key the envelope names, the key of the tenant and run the public
+// section says, and the public bytes the sealed section was sealed over),
+// so the stream hashes the download verifies by are the authenticated
+// ones — never a public section's word, which anyone with the fleet key
+// could write.
+func (s *Store) DownloadV2(ctx context.Context, manifest *Manifest, hold HoldKey, w io.Writer) error {
+	if !manifest.v2 || manifest.opened == nil {
+		return errors.New("offhost: DownloadV2 is for a v2 manifest read from storage; a v1 one is downloaded under its data key (Download)")
+	}
+	if err := manifest.openSealed(hold); err != nil {
+		return err
+	}
+	return s.download(ctx, manifest, holdKey{s, &hold}, w)
+}
+
+// download is Download and DownloadV2.
+//
+// It returns only once every chunk fetch it started is finished, the
+// failed ones included: a caller that gives up on a download wipes the
+// run's hold key when it returns (a restore discards what it received, an
+// upload lets its key go), and a fetch still opening with that key would
+// race the wipe.
+func (s *Store) download(ctx context.Context, manifest *Manifest, keys streamKeys, w io.Writer) error {
+	aead, err := keys.chunk(manifest.ID)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// fetching is closed once every fetcher there was has finished. The
+	// context is cancelled first, so that a fetcher blocked on storage
+	// ends.
+	fetching := make(chan struct{})
+	defer func() {
+		cancel()
+		<-fetching
+	}()
 
 	type fetched struct {
 		done chan struct{}
@@ -1080,16 +1653,25 @@ func (s *Store) Download(ctx context.Context, manifest *Manifest, key Key, w io.
 		if err != nil {
 			return nil, err
 		}
-		plain, err := aead.Open(object[nonceSize:nonceSize], object[:nonceSize], object[nonceSize:], chunkAAD(manifest.ID, manifest.Attempt, index))
+		aad, err := keys.aad(manifest.ID, manifest.Attempt, index)
+		if err != nil {
+			return nil, err
+		}
+		plain, err := aead.Open(object[nonceSize:nonceSize], object[:nonceSize], object[nonceSize:], aad)
 		if err != nil {
 			return nil, fmt.Errorf("%w: chunk %d of %s does not decrypt", ErrCorrupt, index, manifest.ID)
 		}
 		return plain, nil
 	}
 
-	// Chunks are fetched a few ahead and handed on strictly in order.
+	// Chunks are fetched a few ahead and handed on strictly in order. The
+	// feeder owns the fetchers it starts: it ends the window, then waits
+	// for them (Add and Wait in one goroutine), then says it is done.
 	window := make(chan *fetched, max(s.Parallel, 1))
 	go func() {
+		defer close(fetching)
+		var fetchers sync.WaitGroup
+		defer fetchers.Wait()
 		defer close(window)
 		for index := range manifest.Chunks {
 			slot := &fetched{done: make(chan struct{})}
@@ -1098,7 +1680,9 @@ func (s *Store) Download(ctx context.Context, manifest *Manifest, key Key, w io.
 			case <-ctx.Done():
 				return
 			}
+			fetchers.Add(1)
 			go func() {
+				defer fetchers.Done()
 				slot.data, slot.err = fetch(index)
 				close(slot.done)
 			}()
@@ -1259,7 +1843,7 @@ func (s *Store) ListSnapshots(ctx context.Context) ([]run.RemoteSnapshot, error)
 		if manifest.Purpose != PurposeSnapshot {
 			continue
 		}
-		out = append(out, run.RemoteSnapshot{ID: id, Run: manifest.Run, CreatedAt: manifest.CreatedAt, StoredBytes: manifest.StoredBytes})
+		out = append(out, run.RemoteSnapshot{ID: id, Run: manifest.Run, CreatedAt: manifest.CreatedAt, StoredBytes: manifest.StoredBytes, Tenant: manifest.Tenant})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil

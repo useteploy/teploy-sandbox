@@ -5311,3 +5311,103 @@ goes through M1's strict reading and rewrite unchanged.
   settings (as M1's restored processes do).
 - The parent's pause grows with guest RAM; a dirty-tracking pre-copy or
   sparse snapshot upstream (M0 B7) is what would shorten it.
+
+## 2026-11-28 — key custody K2: the store and the service on public sections
+
+Off by default. With no key source (`--remote-kms` unset) every v1
+envelope and format is byte-identical; the safety improvements in
+"What holds in both modes" below apply in both modes.
+
+### What holds in both modes
+
+- **The collector's delete is conditional.** `condemn` reads the manifest
+  with its ETag, writes the `condemned` copy, reads the manifest again
+  (that order is pinned: `TestCondemnWritesTheCopyBeforeItReadsTheManifestAgain`),
+  and deletes with `If-Match` on the ETag of the bytes it copied, where
+  the service has it (`ConditionalDeleteMatch`). A manifest written again
+  in the gap (412) is left: the copy is removed and the snapshot is not
+  this round's (`TestCondemnLeavesAManifestWrittenAgainInItsGap`). A 404
+  from a retried conditional delete whose first attempt landed still goes
+  through step 2's pin check so a lost delete answer never drops a pinned
+  snapshot (`TestK2ReviewCondemnLostDeleteAnswerLosesAPinnedSnapshot`).
+- **A rotation's and upload replacement's in-place writes are conditional**
+  on the ETag of the bytes read, where the service has `If-Match` on a
+  write: a 412 is read back (a write of the caller's own that landed,
+  answer lost), and otherwise counts as skipped/retried rather than
+  clobbering a concurrent write
+  (`TestARotationWritesAManifestOnlyWhileItIsTheBytesItRead`). The
+  read-back checks after the write are kept, and take-back deletes use
+  `If-Match` where supported.
+- **A retraction is conditional** the same way (`retract`): a manifest
+  written again since it was read is left
+  (`TestRetractLeavesAManifestWrittenAgainSinceItWasRead`).
+- **"Not whole" looks once more.** `Verify`, `CheckContent`, a restore and
+  `Service.upload` read the manifest again when chunks are missing, and
+  go by the attempt that stands: an upload attempt can now be replaced
+  while the manifest that named it was valid (a re-key's swap), and
+  nothing is retracted on a verdict about an attempt that no longer stands
+  (`TestVerifyChecksTheAttemptThatStands`,
+  `TestCheckContentStartsOverOnTheAttemptThatStands`,
+  `TestARestoreStartsOverWhenAnAttemptIsSwappedUnderIt`,
+  `TestAnUploadStartsOverWhenTheManifestIsSwappedUnderItsCheck`).
+- **Positive base check (`vm.Transfer.BaseOf`).** Only the configured
+  golden snapshot or a received `kindBase` dataset owned by this daemon
+  is ever uploaded under a `base-` ID; an unmarked or foreign origin is
+  refused with an error rather than published as a fleet-readable base.
+
+### The two-phase table: rows this closes, where the service has `If-Match` on a delete
+
+| # | Before | Now |
+|---|---|---|
+| 12b | A rotation's rewrite in C's gap between its re-read and its delete: C deleted the rewrite and put the old bytes back | C's delete is refused (412; the manifest is another object now): C removes its copy and leaves the rewrite standing |
+| 13 | A re-upload entirely in C's gap: C deleted the fresh manifest and put back the old one on the upload's pin | C's delete is refused (412): the fresh manifest stays whole, the copy goes, nothing of the snapshot is deleted |
+| 13b | A repair's replace-in-one-write in C's gap: the same | The same |
+
+`TestR7bRotationInTheCondemnGap` now ends with the rewrite standing and
+no condemned copy.
+
+### Key custody (a key source is set)
+
+- Fleet work — collection, `Verify`, the scrub, the listing, the fence's
+  reads, the fleet key's rotation of manifests — reads public sections
+  under the fleet key alone, and runs on a host holding no tenant key
+  (`TestCustodyFleetWorkNeedsNoTenantKey`, `TestCustodyCollect`,
+  `TestCustodyRotationOfTheFleetKey`, `TestCustodyTwoPhase…`).
+- **What collection does with an FMK-forged graph (threat-model note).**
+  Because collection reads public sections under `FMK` alone (D2), an
+  attacker with bucket write access and `FMK` can forge a `destroyed`
+  record or rewrite a public `parent` pointer; after the GC grace,
+  `Collect` will condemn and delete the unreferenced snapshots. Bucket
+  deletion and withholding are explicitly out of scope for encryption —
+  provider object versioning or object lock is the only defense against
+  deletion. A restore never trusts a forged public section because the
+  sealed section's AAD covers the exact public bytes.
+- A restore refuses a chain of two tenants, a base image that is not the
+  blessed stream (by the blessing or by the pin alone), a base swapped in
+  during an uploader's own write (`TestK2ReviewABaseSwappedDuringTheUploadersOwnWriteIsNotBlessed`),
+  a parent whose recorded stream is not the pinned one — a local parent
+  with the right GUID and another hash, or none recorded, included — and
+  a public section written again under the fleet key.
+- A v1-only daemon stops collecting on the first v2 object and deletes
+  nothing (`TestAV1OnlyStoreStopsCollectingOnV2ObjectsAndDeletesNothing`).
+
+### Not done, and open
+
+- Rows 12b, 13 and 13b stay as they were on a service without `If-Match`
+  on DELETE. The portable follow-up stands: `Verify` GETs the condemned
+  key after reading a manifest and treats a copy as "being condemned, not
+  whole".
+- `--remote-local drop` stays refused: none of this ran against a real
+  service.
+- Key custody's daemon API (tenant, pushed keys, blessed bases, `428`,
+  `expect`, `needs-key`, pushed-mode erase rules so a public-only
+  `destroyed`/held-elsewhere record fences without erasing local copies
+  or cached keys), re-key, and legacy migration are not built yet (K3/K4).
+  In pushed mode the manager cannot resume yet: a restore there needs the
+  table of blessed base images, which nothing gives the manager
+  (`EnsureFor` takes it as `EnsureOptions.Bases`; wiring it through the
+  daemon API is K3).
+- A local copy from before the stream-hash property existed has none
+  recorded: it is never built on (uploads from it go against the base
+  image, restores onto it are refused) until it is uploaded or restored
+  again.

@@ -424,6 +424,21 @@ func (z *fakeZFS) SetProperty(_ context.Context, name, key, value string) error 
 	return fmt.Errorf("cannot open '%s': dataset does not exist", name)
 }
 
+// LocalProperty is the fake's own value on name, and never one inherited:
+// not a snapshot's from its dataset, not a dataset's from the pool. As
+// zfs, a name that is nothing is an error.
+func (z *fakeZFS) LocalProperty(_ context.Context, name, key string) (string, error) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	if snapshot, ok := z.snapshots[name]; ok {
+		return snapshot.props[key], nil
+	}
+	if dataset, ok := z.datasets[name]; ok {
+		return dataset.props[key], nil
+	}
+	return "", fmt.Errorf("cannot open '%s': dataset does not exist", name)
+}
+
 // fakeStream is what the fake pool sends: the snapshot's identity, the
 // identity of what it is incremental against, and its files. A real
 // stream carries only the difference; the rules around it are the same.

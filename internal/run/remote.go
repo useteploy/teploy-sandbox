@@ -126,6 +126,12 @@ var (
 	// service whose listings are behind its writes, which every upload
 	// will meet again.
 	ErrRemoteListing = errors.New("remote storage's listing does not show what was written")
+	// ErrRemoteNeedKey: key custody, pushed mode. A run's record is under
+	// a hold key this host was not given, so its payload cannot be read
+	// here. Not storage failing, and not a verdict on the run: the record
+	// is there and its public section says what it says (LatestPublic);
+	// only what needs the payload waits for Cloud to push the key.
+	ErrRemoteNeedKey = errors.New("the key this record is under was not pushed to this host")
 )
 
 // RemoteRecord is one generation of a run's remote record.
@@ -145,6 +151,12 @@ type RemoteRecord struct {
 	// Key is the run's wrapped data key ("" to have one minted).
 	Key       string
 	WrittenAt time.Time
+	// Tenant and KID are key custody's: the tenant the record's run
+	// belongs to, and the hold key its sealed section is under. Both are
+	// public (in the record's public section, under the fleet key), and
+	// both are "" on a v1 record. Key is then the hold key, wrapped.
+	Tenant string
+	KID    string
 }
 
 // UploadRequest asks for a snapshot to be made durable.
@@ -157,6 +169,17 @@ type UploadRequest struct {
 	// Key is the run's wrapped data key, "" for a run without one yet.
 	Key     string
 	Purpose string
+	// Tenant is key custody's: the tenant the run belongs to. "" is the
+	// default tenant. Ignored without a key source.
+	Tenant string
+	// Bases are the stream hashes of the base images the run may descend
+	// from, by base image ID: what Cloud blessed. When not nil, a base
+	// image that is not among them is refused, and one that is must hash
+	// to its blessed stream, in the bucket and on this host; a stream
+	// sent against it is pinned to the blessed hash. In pushed mode this
+	// is always required (nil is read as none blessed). Ignored without
+	// a key source.
+	Bases map[string]string
 }
 
 // UploadResult describes an upload.
@@ -195,6 +218,12 @@ type RotateStats struct {
 	// running and destroyed records a previous master still wraps.
 	RecordsRunningPrevious   int `json:"recordsRunningPrevious"`
 	RecordsDestroyedPrevious int `json:"recordsDestroyedPrevious"`
+	// RecordsNeedKey is key custody's: stopped runs' records under a
+	// previous fleet key whose hold key this host was not given, so that
+	// their next generation could not be written. Left as they are, and
+	// counted under previousKeyNeeded: a host that holds those keys runs
+	// the pass again.
+	RecordsNeedKey int `json:"recordsNeedKey,omitempty"`
 	// LocalKeys is how many data keys in this daemon's own registry
 	// (running runs, snapshot uploads owed) were re-wrapped by the pass;
 	// LocalKeysFailed how many could not be.
@@ -219,6 +248,18 @@ type OffHost interface {
 	Advance(ctx context.Context, record RemoteRecord) (key string, err error)
 	// Latest is a run's newest generation; ErrNotFound for none.
 	Latest(ctx context.Context, run string) (RemoteRecord, error)
+	// LatestPublic is Latest of a record's public section alone: state,
+	// generation, owner, snapshot, tenant and key ID, which are under
+	// the fleet key, and no payload. With key custody it is what the
+	// sync counts and fences by, since it never needs a hold key this
+	// host may lack (where Latest answers ErrRemoteNeedKey). Without key
+	// custody it is Latest.
+	LatestPublic(ctx context.Context, run string) (RemoteRecord, error)
+	// Pushed reports key custody's pushed mode: this host holds only the
+	// hold keys Cloud pushed to it. It adopts no run it does not know —
+	// it could not open the record's payload, and a run arrives when
+	// Cloud resumes it here.
+	Pushed() bool
 	// Runs is every run with a record, and its newest generation.
 	Runs(ctx context.Context) (map[string]uint64, error)
 	// Ensure makes sure this host has the snapshot, restoring it from
@@ -305,4 +346,7 @@ type RemoteSnapshot struct {
 	CreatedAt time.Time `json:"createdAt"`
 	// StoredBytes is what the snapshot occupies in the bucket.
 	StoredBytes int64 `json:"storedBytes"`
+	// Tenant is the tenant of the run the snapshot was taken of (key
+	// custody); absent on a snapshot uploaded without it.
+	Tenant string `json:"tenant,omitempty"`
 }

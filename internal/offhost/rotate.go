@@ -3,8 +3,6 @@ package offhost
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +36,15 @@ type RotateStats struct {
 	// of RecordsRunning and RecordsDestroyed that a previous master
 	// still wraps.
 	RecordsRunningPrevious, RecordsDestroyedPrevious int
+	// RecordsNeedKey is key custody's: stopped runs' records under a
+	// previous fleet key whose hold key this host was not given (pushed
+	// mode). Their next generation seals the payload again under that
+	// key, so they are left as they are, and the previous fleet key is
+	// still needed until a host that holds it runs the pass.
+	//
+	// (A v2 destroyed record under a previous fleet key needs no key to
+	// move, and is moved: it counts under Records.)
+	RecordsNeedKey int
 	// PreviousKeyNeeded: something this pass saw is still under a
 	// previous master, or was until this pass and its old generation has
 	// not been collected yet. False is necessary for retiring a previous
@@ -68,18 +75,31 @@ type RotateStats struct {
 // change them at all (this daemon wrote the record last, and unfenced
 // is not set); every other one waits for its own next write.
 //
-// A manifest is overwritten in place. That write cannot be made
-// conditional on what was read, so it is checked afterwards: a snapshot
+// A manifest is overwritten in place. Where the service has `If-Match`
+// on a write (ConditionalPutMatch), the write is conditional on the
+// ETag of the bytes the pass read: a manifest written again since —
+// a re-key's swap, an upload's replacement — is not clobbered, and
+// counts as skipped ("run again"). Where it has not, the write is
+// unconditional and is checked afterwards, as it always was: a snapshot
 // deleted between the read and the write would otherwise exist again
 // with no chunks, and its manifest is taken back. And it is pinned
 // before it is read, like any snapshot an upload checks: a collection
 // cannot condemn it under the pass without seeing that.
+//
+// Key custody (v2 envelopes): a manifest's public section is sealed
+// again under the current fleet key and nothing else changes (see
+// manifestToCurrent), so the fleet key's rotation moves no tenant's data
+// and needs no tenant's key. A live v2 record's next generation has other
+// public bytes (its generation, its time, its write), so its payload is
+// sealed again under the run's hold key: a record this host has no key
+// for is left, and counted (RecordsNeedKey). A destroyed v2 record has
+// no payload, and is moved with the fleet key alone (rotateRecordV2).
 func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats RotateStats, err error) {
 	s.collectMu.Lock()
 	defer s.collectMu.Unlock()
 	defer func() {
 		stats.PreviousKeyNeeded = err != nil || stats.Records > 0 || stats.RecordsRunningPrevious > 0 || stats.RecordsDestroyedPrevious > 0 ||
-			stats.RecordsConflicted > 0 || stats.RecordsUnfenced > 0 || stats.ManifestsSkipped > 0
+			stats.RecordsConflicted > 0 || stats.RecordsUnfenced > 0 || stats.RecordsNeedKey > 0 || stats.ManifestsSkipped > 0
 	}()
 
 	newest, err := s.Runs(ctx)
@@ -87,17 +107,43 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 		return stats, err
 	}
 	for id, generation := range newest {
-		record, key, err := s.readRecord(ctx, id, generation)
+		// What the pass decides by is public: the state, the owner, and
+		// (in the custody mode) the fleet key the record is under. No
+		// payload is read before a record is found to need rewriting.
+		record, key, err := s.readRecordPublic(ctx, id, generation)
 		if err != nil {
 			return stats, fmt.Errorf("rotate: record of %s: %w", id, err)
 		}
 		current := s.keys.Current(key)
+		if record.v2 {
+			current = record.fmk == s.keys.id
+		}
 		switch record.State {
 		case RecordDestroyed:
 			stats.RecordsDestroyed++
-			if !current {
-				stats.RecordsDestroyedPrevious++
+			if current {
+				continue
 			}
+			if !record.v2 {
+				stats.RecordsDestroyedPrevious++
+				continue
+			}
+			// A v2 destroyed record has no sealed section: its next
+			// generation is the public section sealed again under the
+			// current fleet key, and no hold key is needed for it. So
+			// the pass moves it now, with nothing but the fleet key, and
+			// a daemon given only the new fleet key can read it (and
+			// collect the run) at once — where a v1 one waits for a
+			// collection by a daemon that still has the previous master.
+			err = s.rotateRecordV2(ctx, record)
+			if err != nil {
+				if errors.Is(err, ErrConflict) {
+					stats.RecordsConflicted++
+					continue
+				}
+				return stats, fmt.Errorf("rotate: record of %s: %w", id, err)
+			}
+			stats.Records++
 			continue
 		case RecordRunning, RecordForked:
 			stats.RecordsRunning++
@@ -114,7 +160,18 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 			stats.RecordsUnfenced++
 			continue
 		}
-		if err := s.rotateRecord(ctx, record, key); err != nil {
+		if record.v2 {
+			err = s.rotateRecordV2(ctx, record)
+			if errors.Is(err, ErrNeedKey) {
+				// Left under the previous fleet key, where a host that
+				// holds the run's key finds it on its own pass.
+				stats.RecordsNeedKey++
+				continue
+			}
+		} else {
+			err = s.rotateRecord(ctx, record, key)
+		}
+		if err != nil {
 			if errors.Is(err, ErrConflict) {
 				stats.RecordsConflicted++
 				continue
@@ -154,28 +211,28 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 		if err := s.Pin(ctx, id); err != nil {
 			return stats, fmt.Errorf("rotate: pin %s: %w", id, err)
 		}
-		// A condemned copy under a previous master: skipped, so that the
-		// pass says the previous master is still needed and to run again.
+		// A condemned copy under a previous key: skipped, so that the
+		// pass says the previous key is still needed and to run again.
 		if copied, err := s.objects.Get(ctx, s.condemnedKey(id), maxSmallObject); err == nil {
-			_, key, err := s.keys.open("manifest", id, copied)
+			current, err := s.copyCurrent(id, copied)
 			if err != nil {
 				return stats, fmt.Errorf("rotate: condemned copy of %s: %w", id, err)
 			}
-			if !s.keys.Current(key) {
-				s.log.Warn("a condemned snapshot's copy is under a previous master; run the rotation again once its collection has decided", "snapshot", id)
+			if !current {
+				s.log.Warn("a condemned snapshot's copy is under a previous key; run the rotation again once its collection has decided", "snapshot", id)
 				stats.ManifestsSkipped++
 				continue
 			}
 		} else if !errors.Is(err, s3.ErrNotFound) {
 			return stats, fmt.Errorf("rotate: condemned copy of %s: %w", id, err)
 		}
-		stored, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject)
+		stored, etag, err := s.readForRotation(ctx, id)
 		if errors.Is(err, s3.ErrNotFound) {
 			// Deleted, or condemned, since the listing. A condemned
 			// manifest may come back as it was: skipped, which keeps the
 			// previous master needed until a pass sees it settled.
 			if copied, err := s.objects.Get(ctx, s.condemnedKey(id), maxSmallObject); err == nil {
-				if _, key, err := s.keys.open("manifest", id, copied); err == nil && s.keys.Current(key) {
+				if current, err := s.copyCurrent(id, copied); err == nil && current {
 					continue
 				}
 			}
@@ -185,20 +242,16 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 		if err != nil {
 			return stats, fmt.Errorf("rotate: manifest of %s: %w", id, err)
 		}
-		document, key, err := s.keys.open("manifest", id, stored)
+		whole, fresh, current, err := s.manifestToCurrent(id, stored)
 		if err != nil {
 			return stats, fmt.Errorf("rotate: manifest of %s: %w", id, err)
 		}
-		if s.keys.Current(key) {
+		if current {
 			stats.ManifestsCurrent++
 			continue
 		}
-		var manifest Manifest
-		if err := json.Unmarshal(document, &manifest); err != nil || manifest.ID != id || !validAttempt(manifest.Attempt) {
-			return stats, fmt.Errorf("rotate: %w: manifest of %s", ErrCorrupt, id)
-		}
 		// Only a snapshot that is there is rewritten.
-		if err := s.checkChunks(ctx, &manifest); err != nil {
+		if err := s.checkChunks(ctx, whole); err != nil {
 			if errors.Is(err, ErrIncomplete) {
 				s.log.Error("a manifest names chunks that are not there; it is not rewritten", "snapshot", id, "detail", err.Error())
 				stats.ManifestsSkipped++
@@ -206,59 +259,207 @@ func (s *Store) Rotate(ctx context.Context, daemon string, unfenced bool) (stats
 			}
 			return stats, fmt.Errorf("rotate: manifest of %s: %w", id, err)
 		}
-		fresh, err := s.keys.Rewrap(key)
+		ours, err := s.putManifest(ctx, id, fresh, etag)
 		if err != nil {
 			return stats, fmt.Errorf("rotate: manifest of %s: %w", id, err)
 		}
-		sealed, err := seal(fresh, "manifest", id, document)
-		if err != nil {
-			return stats, fmt.Errorf("rotate: manifest of %s: %w", id, err)
-		}
-		if err := s.objects.Put(ctx, s.manifestKey(id), sealed, s3.PutOptions{ContentType: "application/json"}); err != nil {
-			return stats, fmt.Errorf("rotate: manifest of %s: %w", id, err)
-		}
-		// The snapshot may have been deleted between the read and the
-		// write (another daemon's collection, a caller's delete): what
-		// was just written would then be a manifest of nothing.
-		if err := s.checkChunks(ctx, &manifest); err != nil {
-			if !errors.Is(err, ErrIncomplete) {
-				return stats, fmt.Errorf("rotate: manifest of %s: %w", id, err)
-			}
-			now, getErr := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject)
-			if getErr == nil && bytes.Equal(now, sealed) {
-				if err := s.objects.Delete(ctx, s.manifestKey(id)); err != nil {
-					return stats, fmt.Errorf("rotate: snapshot %s was deleted while its manifest was being rewritten, and the manifest could not be taken back: %w", id, err)
-				}
-			} else if getErr != nil && !errors.Is(getErr, s3.ErrNotFound) {
-				return stats, fmt.Errorf("rotate: manifest of %s: %w", id, getErr)
-			}
-			s.log.Warn("a snapshot was deleted while its manifest was being rewritten; the manifest was taken back", "snapshot", id)
-			continue
-		}
-		// And is what stands what was written? A collection that put a
-		// condemned copy back after this write stands with the old
-		// wrapping.
-		if now, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject); err != nil || !bytes.Equal(now, sealed) {
-			if err != nil && !errors.Is(err, s3.ErrNotFound) {
-				return stats, fmt.Errorf("rotate: manifest of %s: %w", id, err)
-			}
-			s.log.Warn("a manifest was replaced or removed right after this pass rewrote it; run the rotation again", "snapshot", id)
+		if !ours {
+			s.log.Warn("a manifest was written again between this pass's read and its write; run the rotation again", "snapshot", id)
 			stats.ManifestsSkipped++
 			continue
 		}
-		// And no collection condemned it meanwhile: one that read the
-		// manifest before this write keeps those bytes to put back, and
-		// its copy is the only trace of it.
-		if _, err := s.objects.Get(ctx, s.condemnedKey(id), maxSmallObject); err == nil {
-			s.log.Warn("a manifest this pass rewrote is being condemned; run the rotation again", "snapshot", id)
-			stats.ManifestsSkipped++
-			continue
-		} else if !errors.Is(err, s3.ErrNotFound) {
-			return stats, fmt.Errorf("rotate: condemned copy of %s: %w", id, err)
+		if err := s.afterManifestWrite(ctx, id, whole, fresh, &stats); err != nil {
+			return stats, err
 		}
-		stats.Manifests++
 	}
 	return stats, nil
+}
+
+// readForRotation is a manifest's bytes for a pass that may write them in
+// place: with the ETag the service gives them where it has `If-Match` on
+// a write (the condition of that write), and the plain read where not.
+func (s *Store) readForRotation(ctx context.Context, id string) ([]byte, string, error) {
+	if !s.conditionalPutMatch {
+		stored, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject)
+		return stored, "", err
+	}
+	return s.objects.GetWithETag(ctx, s.manifestKey(id), maxSmallObject)
+}
+
+// putManifest is a rotation's in-place write of the manifest of id.
+// Where the service has `If-Match` on a write and the ETag of what was
+// read is known, the write lands only while those bytes still stand.
+//
+// ok is false when the service refused the condition and what stands is
+// not what was written: another write got there first, and this is not
+// the pass's manifest to count. A 412 is read back before it is believed
+// as that: a retried conditional write is refused by its own first
+// attempt, which landed.
+func (s *Store) putManifest(ctx context.Context, id string, sealed []byte, etag string) (ok bool, err error) {
+	options := s3.PutOptions{ContentType: "application/json"}
+	if s.conditionalPutMatch && etag != "" {
+		options.IfMatch = etag
+	}
+	err = s.objects.Put(ctx, s.manifestKey(id), sealed, options)
+	if errors.Is(err, s3.ErrPreconditionFailed) {
+		now, readErr := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject)
+		if readErr == nil && bytes.Equal(now, sealed) {
+			return true, nil
+		}
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// afterManifestWrite is what a pass looks at once its manifest write was
+// answered, whatever the answer was: the write cannot be made conditional
+// everywhere, and a collection acts on the same manifest.
+func (s *Store) afterManifestWrite(ctx context.Context, id string, whole *Manifest, sealed []byte, stats *RotateStats) error {
+	// The snapshot may have been deleted between the read and the
+	// write (another daemon's collection, a caller's delete): what was
+	// just written would then be a manifest of nothing.
+	if err := s.checkChunks(ctx, whole); err != nil {
+		if !errors.Is(err, ErrIncomplete) {
+			return fmt.Errorf("rotate: manifest of %s: %w", id, err)
+		}
+		now, etag, getErr := s.readManifestWith(ctx, id)
+		if getErr == nil && bytes.Equal(now, sealed) {
+			if err := s.deleteCondemned(ctx, id, etag); err != nil && !errors.Is(err, errCondemnSurpassed) {
+				return fmt.Errorf("rotate: snapshot %s was deleted while its manifest was being rewritten, and the manifest could not be taken back: %w", id, err)
+			}
+		} else if getErr != nil && !errors.Is(getErr, s3.ErrNotFound) {
+			return fmt.Errorf("rotate: manifest of %s: %w", id, getErr)
+		}
+		s.log.Warn("a snapshot was deleted while its manifest was being rewritten; the manifest was taken back", "snapshot", id)
+		return nil
+	}
+	// And is what stands what was written? A collection that put a
+	// condemned copy back after this write stands with the old wrapping.
+	if now, err := s.objects.Get(ctx, s.manifestKey(id), maxSmallObject); err != nil || !bytes.Equal(now, sealed) {
+		if err != nil && !errors.Is(err, s3.ErrNotFound) {
+			return fmt.Errorf("rotate: manifest of %s: %w", id, err)
+		}
+		s.log.Warn("a manifest was replaced or removed right after this pass rewrote it; run the rotation again", "snapshot", id)
+		stats.ManifestsSkipped++
+		return nil
+	}
+	// And no collection condemned it meanwhile: one that read the
+	// manifest before this write keeps those bytes to put back, and its
+	// copy is the only trace of it.
+	if _, err := s.objects.Get(ctx, s.condemnedKey(id), maxSmallObject); err == nil {
+		s.log.Warn("a manifest this pass rewrote is being condemned; run the rotation again", "snapshot", id)
+		stats.ManifestsSkipped++
+		return nil
+	} else if !errors.Is(err, s3.ErrNotFound) {
+		return fmt.Errorf("rotate: condemned copy of %s: %w", id, err)
+	}
+	stats.Manifests++
+	return nil
+}
+
+// copyCurrent says whether a condemned copy of the manifest of id is
+// under the keyring's current key. It is opened as a manifest is (by its
+// envelope's version in the custody mode: never a bare v1 read).
+func (s *Store) copyCurrent(id string, copied []byte) (bool, error) {
+	if !s.v2() {
+		_, key, err := s.keys.open("manifest", id, copied)
+		if err != nil {
+			return false, err
+		}
+		return s.keys.Current(key), nil
+	}
+	version, err := InspectEnvelopeVersion(copied)
+	if err != nil {
+		return false, err
+	}
+	switch version {
+	case EnvelopeVersionV2:
+		opened, err := OpenPublicV2(s.keys, kindManifest, id, copied)
+		if err != nil {
+			return false, err
+		}
+		return opened.FMKID == s.keys.id, nil
+	case envelopeVersion:
+		_, key, err := OpenV1IfAllowed(s.keys, kindManifest, id, copied, s.manifestPolicy(id, copied, ""))
+		if err != nil {
+			return false, err
+		}
+		return s.keys.Current(key), nil
+	}
+	return false, fmt.Errorf("manifest of %s has version %d, which this daemon does not read", id, version)
+}
+
+// manifestToCurrent is what a rotation pass holds of a stored manifest:
+// the manifest (to check that its chunks are there), whether it is under
+// the current key already, and, if it is under a previous one, the same
+// manifest sealed again under the current key.
+//
+//   - A v1 envelope — every manifest without a key source; a base
+//     image's or a legacy run's in the custody mode — has its data key
+//     wrapped again under the current master. The raw key does not
+//     change, so the chunks do not move and the document is sealed again
+//     as it was.
+//   - A v2 envelope has its public section sealed again under the current
+//     fleet key, and nothing else changes (resealPublic). The public
+//     bytes are kept, so the sealed section over them stays valid without
+//     the run's hold key: the fleet key's rotation of a v2 manifest needs
+//     no tenant's key, and a collection or a sync on a host given only
+//     the new fleet key reads it from then on.
+func (s *Store) manifestToCurrent(id string, stored []byte) (whole *Manifest, fresh []byte, current bool, err error) {
+	if s.v2() {
+		version, err := InspectEnvelopeVersion(stored)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if version == EnvelopeVersionV2 {
+			opened, err := OpenPublicV2(s.keys, kindManifest, id, stored)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			if opened.FMKID == s.keys.id {
+				return nil, nil, true, nil
+			}
+			fresh, err := resealPublic(s.keys, kindManifest, id, &opened)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			return manifestOfPublic(&opened), fresh, false, nil
+		}
+		if version != envelopeVersion {
+			return nil, nil, false, fmt.Errorf("manifest of %s has version %d, which this daemon does not read", id, version)
+		}
+		document, key, err := OpenV1IfAllowed(s.keys, kindManifest, id, stored, s.manifestPolicy(id, stored, ""))
+		if err != nil {
+			return nil, nil, false, err
+		}
+		return s.v1ManifestToCurrent(id, document, key)
+	}
+	document, key, err := s.keys.open("manifest", id, stored)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return s.v1ManifestToCurrent(id, document, key)
+}
+
+// v1ManifestToCurrent is manifestToCurrent of a v1 envelope that opened
+// to document under key.
+func (s *Store) v1ManifestToCurrent(id string, document []byte, key Key) (*Manifest, []byte, bool, error) {
+	if s.keys.Current(key) {
+		return nil, nil, true, nil
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(document, &manifest); err != nil || manifest.ID != id || !validAttempt(manifest.Attempt) {
+		return nil, nil, false, fmt.Errorf("%w: manifest of %s", ErrCorrupt, id)
+	}
+	fresh, err := s.keys.Rewrap(key)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	sealed, err := seal(fresh, "manifest", id, document)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return &manifest, sealed, false, nil
 }
 
 // rotateRecord writes the next generation of a run's record with the
@@ -272,13 +473,9 @@ func (s *Store) rotateRecord(ctx context.Context, record *Record, key Key) error
 	}
 	next := *record
 	next.Generation = record.Generation + 1
-	token := make([]byte, 12)
-	if _, err := rand.Read(token); err != nil {
+	if err := s.stampRecord(&next, record.Owner); err != nil {
 		return err
 	}
-	next.Version = recordVersion
-	next.WrittenAt = s.now().UTC()
-	next.Write = hex.EncodeToString(token)
 	document, err := json.Marshal(next)
 	if err != nil {
 		return err
@@ -287,10 +484,78 @@ func (s *Store) rotateRecord(ctx context.Context, record *Record, key Key) error
 	if err != nil {
 		return err
 	}
+	return s.settleRotated(ctx, &next, sealed)
+}
+
+// rotateRecordV2 writes the next generation of a v2 record that is not
+// running — stopped, or destroyed — with the state, the owner and the
+// hold key unchanged, its public section under the current fleet key.
+//
+// What this needs depends on the record, and the difference is the point
+// of the v2 format:
+//
+//   - A live record's sealed section has to be sealed again, under the
+//     run's hold key: its AAD holds the hash of the public bytes, and a
+//     next generation's public bytes are other ones (its generation, its
+//     time, its write). This is the one write of the fleet key's
+//     rotation that needs a tenant's key. ErrNeedKey is returned as the
+//     key source answers it (pushed mode, a key this host was not
+//     given): the record is left under the previous fleet key, and the
+//     pass counts it rather than failing.
+//   - A destroyed record has no sealed section and carries no payload:
+//     its next generation is written with the fleet key alone. Whoever
+//     holds the fleet key can say a run is gone, here as in AdvanceV2.
+func (s *Store) rotateRecordV2(ctx context.Context, record *Record) error {
+	destroyed := record.State == RecordDestroyed
+	opened, err := s.readRecordCustody(ctx, record.Run, record.Generation, !destroyed)
+	if err != nil {
+		return err
+	}
+	defer opened.hold.Zero()
+	next := *opened.record // the whole record, payload with it
+	next.Generation = record.Generation + 1
+	if err := s.stampRecord(&next, record.Owner); err != nil {
+		return err
+	}
+	public := RecordPublicV2{
+		Version: EnvelopeVersionV2, Tenant: next.Tenant, Run: next.Run, Generation: next.Generation,
+		State: next.State, Owner: next.Owner, WrittenAt: next.WrittenAt, Snapshot: next.Snapshot, Write: next.Write,
+	}
+	var (
+		hold        *HoldKey
+		sealedBytes []byte
+	)
+	if !destroyed {
+		hold = &opened.hold
+		public.KID = hold.KID
+		if sealedBytes, err = json.Marshal(RecordSealedV2{Payload: next.Payload}); err != nil {
+			return err
+		}
+	} else {
+		// A destroyed record names neither a snapshot nor a key.
+		public.Snapshot = ""
+	}
+	publicBytes, err := json.Marshal(public)
+	if err != nil {
+		return err
+	}
+	name := recordName(next.Run, next.Generation)
+	sealed, err := SealV2(s.keys, kindRecord, name, publicBytes, hold, sealedBytes)
+	if err != nil {
+		return err
+	}
+	return s.settleRotated(ctx, &next, sealed)
+}
+
+// settleRotated is what counts after a pass wrote a record's next
+// generation: it must be this pass's write, and still the newest (the run
+// may have moved on while the write was in the air). Both are read from
+// the public section.
+func (s *Store) settleRotated(ctx context.Context, next *Record, sealed []byte) error {
 	if err := s.objects.Put(ctx, s.recordKey(next.Run, next.Generation), sealed, s3.PutOptions{IfAbsent: s.conditional, ContentType: "application/json"}); err != nil && !errors.Is(err, s3.ErrPreconditionFailed) {
 		return err
 	}
-	written, _, err := s.readRecord(ctx, next.Run, next.Generation)
+	written, _, err := s.readRecordPublic(ctx, next.Run, next.Generation)
 	if err != nil || written.Write != next.Write {
 		return fmt.Errorf("%w: generation %d of %s is not this pass's", ErrConflict, next.Generation, next.Run)
 	}

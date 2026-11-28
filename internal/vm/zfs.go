@@ -156,6 +156,14 @@ const (
 	// propDead marks a snapshot that is no longer a usable reference and
 	// only exists until nothing is cloned from it.
 	propDead = "teploy:dead"
+	// propStreamSHA256 is the SHA-256 of the stream a local snapshot was
+	// sent with (this host's own upload) or received and checked with (a
+	// restore): what an incremental upload pins as its parent's hash, and
+	// what a restore holds a parent it already has to. It is set on the
+	// snapshot itself and read only where it is that snapshot's own
+	// (LocalProperty): a snapshot inherits its dataset's user properties,
+	// and one snapshot's stream hash is never another's.
+	propStreamSHA256 = "teploy:stream-sha256"
 
 	kindRun      = "run"
 	kindSnapshot = "snapshot"
@@ -229,6 +237,13 @@ type ZFS interface {
 	// Property is the effective value of a property on a dataset, whether
 	// set there or inherited.
 	Property(ctx context.Context, name, key string) (string, error)
+	// LocalProperty is the value of a user property set on the dataset or
+	// snapshot name itself, "" when it is not (it is inherited from a
+	// parent, the default, or not set at all). ZFS lets a snapshot
+	// inherit its dataset's user properties, which is right for the
+	// driver's marks and wrong for a per-snapshot fact: this answers only
+	// what is the named object's own.
+	LocalProperty(ctx context.Context, name, key string) (string, error)
 	// Send writes the stream of a snapshot to w: all of it, or with from
 	// (a snapshot it descends from) only what changed since.
 	Send(ctx context.Context, snapshot, from string, w io.Writer) error
@@ -545,6 +560,28 @@ func (z *zfsCLI) Property(ctx context.Context, name, key string) (string, error)
 func (z *zfsCLI) SetProperty(ctx context.Context, name, key, value string) error {
 	_, err := z.run(ctx, "set", key+"="+value, name)
 	return err
+}
+
+// LocalProperty is the value of key where it is set on name itself. `zfs
+// get` answers the value with its source: "local" for one set there,
+// "inherited from <dataset>" for one a snapshot has from its dataset,
+// "-" for none, "default" for a native property's. Only the first is
+// name's own; every other source answers "", so a parent's value is never
+// taken for its snapshot's.
+func (z *zfsCLI) LocalProperty(ctx context.Context, name, key string) (string, error) {
+	out, err := z.run(ctx, "get", "-H", "-p", "-o", "value,source", key, name)
+	if err != nil {
+		return "", err
+	}
+	line := strings.TrimSpace(string(out))
+	cols := strings.Split(line, "\t")
+	if len(cols) != 2 {
+		return "", fmt.Errorf("zfs get %s %s: unexpected output %q", key, name, line)
+	}
+	if cols[1] != "local" {
+		return "", nil
+	}
+	return field(cols[0]), nil
 }
 
 func (z *zfsCLI) stream(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error {

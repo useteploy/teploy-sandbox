@@ -313,7 +313,7 @@ Limits and lifetime (constants, not configurable in this release):
 |---|---|---|---|
 | `POST /v1/runs/{id}/snapshot` | | 201 `{image, remote?: {state, id?, storedBytes?, incremental?, error?}}` | 404, 409 |
 | `DELETE /v1/snapshots?image=<ref>` | | 204 | 400 (not a snapshot ref), 409 (an image a run holds), 503 |
-| `GET /v1/remote/snapshots` | | 200 `{snapshots: [{id, run?, createdAt, storedBytes}]}` | 400 without remote storage, 503 |
+| `GET /v1/remote/snapshots` | | 200 `{snapshots: [{id, run?, tenant?, createdAt, storedBytes}]}` (`tenant` only on a snapshot uploaded with key custody) | 400 without remote storage, 503 |
 
 ### Warm repo cache
 
@@ -330,7 +330,7 @@ Limits and lifetime (constants, not configurable in this release):
 |---|---|
 | `POST /v1/remote/sync` | 200 `{remote, changed}` |
 | `POST /v1/remote/collect` | 204 |
-| `POST /v1/remote/rotate` | 200 `{manifestsRewrapped, manifestsCurrent, manifestsSkipped, recordsRewrapped, recordsCurrent, recordsRunning, recordsConflicted, recordsUnfenced, recordsDestroyed, recordsRunningPrevious, recordsDestroyedPrevious, localKeysRewrapped, localKeysFailed, previousKeyNeeded, previousKeyNeededFor}` |
+| `POST /v1/remote/rotate` | 200 `{manifestsRewrapped, manifestsCurrent, manifestsSkipped, recordsRewrapped, recordsCurrent, recordsRunning, recordsConflicted, recordsUnfenced, recordsDestroyed, recordsRunningPrevious, recordsDestroyedPrevious, recordsNeedKey?, localKeysRewrapped, localKeysFailed, previousKeyNeeded, previousKeyNeededFor}` (`recordsNeedKey` only with key custody, when a record was left for a hold key this host was not given) |
 | `POST /v1/remote/scrub` | 200 `{checked, notWhole, unreachable, contentReadBytes, contentSnapshots, damaged, rechecked}` |
 
 ## Access

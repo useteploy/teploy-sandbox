@@ -239,6 +239,13 @@ func TestMapsFileSeesOnlyAWholeMappingOfTheMemoryFile(t *testing.T) {
 	if mapsFile([]byte(whole), "fd:01", "42", size+1) {
 		t.Error("a mapping shorter than the file was taken for the whole file")
 	}
+	// An empty file is mapped wholly by anything, a copy that maps
+	// nothing of it included: never taken for a copy-on-write restore.
+	for name, maps := range map[string]string{"nothing mapped": "", "anonymous memory": "7f0000000000-7f2000000000 rw-p 00000000 00:00 0 \n", "the file mapped": whole} {
+		if mapsFile([]byte(maps), "fd:01", "42", 0) {
+			t.Errorf("an empty file, %s: taken for a whole mapping", name)
+		}
+	}
 	if runtime.GOOS != "linux" {
 		// Elsewhere there is no /proc to read a process's mappings from.
 		return
@@ -256,6 +263,13 @@ func TestMapsFileSeesOnlyAWholeMappingOfTheMemoryFile(t *testing.T) {
 	machine := &chMachine{process: &os.Process{Pid: os.Getpid()}}
 	if machine.MapsFile(path) {
 		t.Fatal("a file nothing maps")
+	}
+	empty := filepath.Join(t.TempDir(), imageMemoryFile)
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if machine.MapsFile(empty) {
+		t.Fatal("an empty file nothing maps was taken for a whole mapping")
 	}
 	one, err := syscall.Mmap(int(file.Fd()), 0, 4096, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE)
 	if err != nil {

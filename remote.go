@@ -378,7 +378,8 @@ func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, sta
 		}
 	}
 	log.Info("remote storage enabled", "endpoint", *f.endpoint, "bucket", *f.bucket, "prefix", *f.prefix, "daemon", identity,
-		"conditionalWrites", store.Conditional(), "chunkMB", *f.chunkMB, "parallel", *f.parallel, "maxChain", *f.maxChain,
+		"conditionalWrites", store.Conditional(), "conditionalPutIfMatch", store.ConditionalPutMatch(), "conditionalDeleteIfMatch", store.ConditionalDeleteMatch(),
+		"chunkMB", *f.chunkMB, "parallel", *f.parallel, "maxChain", *f.maxChain,
 		"local", *f.local, "poolReservePercent", *f.reserve, "gcGrace", f.gcGrace.String())
 	return offhost.NewService(store, snapshots, offhost.Config{
 		Daemon:         identity,

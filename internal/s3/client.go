@@ -62,8 +62,9 @@ var (
 	ErrNotFound = errors.New("s3: not found")
 	// ErrNoBucket: the service says the bucket itself does not exist.
 	ErrNoBucket = errors.New("s3: no such bucket")
-	// ErrPreconditionFailed: a conditional write found the object already
-	// there.
+	// ErrPreconditionFailed: a conditional write or delete found the
+	// object in a state its condition does not allow: already there
+	// under `If-None-Match: *`, or not at the ETag `If-Match` named.
 	ErrPreconditionFailed = errors.New("s3: precondition failed")
 )
 
@@ -365,37 +366,71 @@ type PutOptions struct {
 	// Store.Conditional in internal/offhost for how that is found out.
 	// The header is signed, so nothing between the daemon and the
 	// service can remove the condition without breaking the request.
-	IfAbsent    bool
+	IfAbsent bool
+	// IfMatch makes the write conditional on the object having this
+	// ETag, as GetWithETag or Head answered it (`If-Match`): it succeeds
+	// only while that is still the object's ETag, and is
+	// ErrPreconditionFailed when another write has replaced it since.
+	// An object that is not there matches nothing: the service answers
+	// 404 or 412 (ErrNotFound or ErrPreconditionFailed) and nothing is
+	// written. IfMatch cannot be set together with IfAbsent: Put answers
+	// an error and sends nothing. Signed like IfAbsent; whether the
+	// service honours it is Store.ConditionalPutMatch.
+	IfMatch     string
 	ContentType string
 }
 
-func (o PutOptions) headers() map[string]string {
+// headers is what the options add to a request. The one combination
+// that has no meaning is refused here, before anything is sent.
+func (o PutOptions) headers() (map[string]string, error) {
+	if o.IfAbsent && o.IfMatch != "" {
+		return nil, errors.New("s3: a write cannot be conditional on the object being absent and on its ETag at once")
+	}
 	headers := map[string]string{}
 	if o.IfAbsent {
 		headers["If-None-Match"] = "*"
 	}
+	if o.IfMatch != "" {
+		headers["If-Match"] = o.IfMatch
+	}
 	if o.ContentType != "" {
 		headers["Content-Type"] = o.ContentType
 	}
-	return headers
+	return headers, nil
 }
 
 // Put writes an object in one request. A retried conditional write can
-// answer ErrPreconditionFailed for an object this very call created (the
-// first attempt reached the service and its answer was lost): a caller
-// for whom that matters reads the object back.
+// answer ErrPreconditionFailed for a write of its own (the first attempt
+// reached the service and its answer was lost): under IfAbsent it is the
+// object this call created, under IfMatch the object as this call left
+// it. A caller for whom that matters reads the object back.
 func (c *Client) Put(ctx context.Context, key string, body []byte, opts PutOptions) error {
-	_, err := c.do(ctx, request{method: http.MethodPut, key: key, body: body, headers: opts.headers()})
+	headers, err := opts.headers()
+	if err != nil {
+		return err
+	}
+	_, err = c.do(ctx, request{method: http.MethodPut, key: key, body: body, headers: headers})
 	return err
 }
 
 // Get reads an object of at most limit bytes into memory.
 func (c *Client) Get(ctx context.Context, key string, limit int64) ([]byte, error) {
+	body, _, err := c.GetWithETag(ctx, key, limit)
+	return body, err
+}
+
+// GetWithETag is Get and answers with the bytes the ETag the service
+// gives them, in the form If-Match takes. Both come from one response,
+// so they describe one version of the object: a Get and a Head beside it
+// can straddle a write, and the condition would then name an ETag of
+// bytes that were never read. The ETag is "" when the service answers
+// none; such a service has no writes or deletes conditional on one.
+func (c *Client) GetWithETag(ctx context.Context, key string, limit int64) ([]byte, string, error) {
 	resp, err := c.do(ctx, request{method: http.MethodGet, key: key, limit: limit})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return resp.body, nil
+	return resp.body, resp.headers.Get("ETag"), nil
 }
 
 // Object is one listed or inspected object.
@@ -424,6 +459,24 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
+	return err
+}
+
+// DeleteIfMatch removes an object only while its ETag is etag, as
+// GetWithETag or Head answered it (`If-Match`, signed). It answers
+// ErrPreconditionFailed when the object is not at that ETag, which is
+// not retried, and ErrNotFound when there is no such object: unlike
+// Delete, what is gone is reported. An empty etag is refused and nothing
+// is sent: it would delete unconditionally. A retried conditional delete
+// can answer ErrNotFound for an object this very call removed (its first
+// attempt reached the service and its answer was lost). Whether the
+// service honours the condition is Store.ConditionalDeleteMatch in
+// internal/offhost.
+func (c *Client) DeleteIfMatch(ctx context.Context, key, etag string) error {
+	if etag == "" {
+		return errors.New("s3: a delete conditional on an ETag needs the ETag")
+	}
+	_, err := c.do(ctx, request{method: http.MethodDelete, key: key, headers: map[string]string{"If-Match": etag}})
 	return err
 }
 

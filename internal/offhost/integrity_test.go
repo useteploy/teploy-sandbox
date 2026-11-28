@@ -807,6 +807,10 @@ func TestAProbeWhoseFirstWriteWasRetried(t *testing.T) {
 	if !bucket.used || !store.Conditional() {
 		t.Fatalf("the retry was exercised: %t; conditional writes found: %t", bucket.used, store.Conditional())
 	}
+	// Key custody K0: the `If-Match` findings survive the retried write.
+	if !store.ConditionalPutMatch() || !store.ConditionalDeleteMatch() {
+		t.Fatalf("after a retried first write: If-Match on a write %t, on a delete %t", store.ConditionalPutMatch(), store.ConditionalDeleteMatch())
+	}
 }
 
 // Review A10: a record is under its own run's key. A holder of the

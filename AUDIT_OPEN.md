@@ -5235,16 +5235,18 @@ Pentium N5000, eMMC, ZFS 2.3.9, CH v54.1, guest kernel 7.2.8, golden
 `sbx/golden-guestd-f1@v1` (this branch's agent, protocol 4). Parent and
 child 512 MiB, 1 vCPU, open tier; two VMs at most.
 
-- **Parent pause**: 6.19 s and 5.92 s (encrypted image, all of guest RAM
+- **Parent pause**: 6.19 s, 8.11 s (two runs of `TestVMMemoryFork`) and
+  5.92 s (the siblings test) (encrypted image, all of guest RAM
   written; M0 5.1 s median unencrypted). Seal after the resume: 87 and
   93 ms. The design's ≤150 ms/GiB budget is not met here (M0's B7).
-- **Fork answered** in 12.9 s (pause, seal, then the child's restore:
+- **Fork answered** in 12.9 s and 15.1 s (pause, seal, then the child's restore:
   hypervisor 61 ms, `vm.restore` 136 ms, `vm.resume` 2 ms, first agent
   answer 4.3 s — page faults from the encrypted image, as M1 found —
   clock 0.48 s, network 0.13 s).
 - **Memory** (smaps_rollup, after the child's first execs): parent Rss
   511 / Pss 508 / Private_Dirty 506 MiB; child Rss 167 / Pss 164 /
-  Private_Dirty 26 MiB. The parent is a booted VM (its RAM is
+  Private_Dirty 26 MiB (second run: 516/514/511 and 181/179/31). The
+  child's random stream was read 188 and 112 ms after the fork answered. The parent is a booted VM (its RAM is
   anonymous); the child maps the image and is charged for what it
   touched.
 - **Density for 4 and 16 children: not possible on the laptop** (two VMs
@@ -5253,6 +5255,14 @@ child 512 MiB, 1 vCPU, open tier; two VMs at most.
 - `primarycache=metadata` against `all` for fork images: **unmeasured
   for F1** (images are created with M1's `metadata`; M0's 725 vs 664 ms
   stands).
+
+Also run on the laptop with this branch: the vm driver's whole unit
+binary as root (CI's vm-root parity): 347 pass, none skipped or failed;
+`TestVMMemoryResume` with the f1 golden (regression: resume still uses
+the v3 op, which a v4 agent serves): pass, memory resume to first exec
+3.9 s median against 4.6 s from the disk. Logs: `~/teploy-validate/f1/`
+on the test host (`fork-1`, `fork-2`, `siblings-1`, `vmunit-1`,
+`resume-1`).
 
 ### Security invariants
 

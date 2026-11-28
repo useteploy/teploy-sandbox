@@ -348,42 +348,6 @@ func mountedAt(t *testing.T, path string) bool {
 	return false
 }
 
-// watchMemoryLimit reads a run's memory limit (its cgroup's memory.max)
-// as often as it can until it is told to stop, and then answers with the
-// widest value it read and the last one. A stop takes seconds, so a
-// limit raised for the length of it is seen.
-func watchMemoryLimit(t *testing.T, config vm.Config, id string) (stop func() (widest, last int64)) {
-	t.Helper()
-	path := filepath.Join(config.Cgroup, config.Owner[:16], run.ContainerName(id), "memory.max")
-	done, result := make(chan struct{}), make(chan [2]int64)
-	go func() {
-		var widest, last int64
-		for {
-			select {
-			case <-done:
-				result <- [2]int64{widest, last}
-				return
-			default:
-			}
-			if raw, err := os.ReadFile(path); err == nil {
-				if n, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64); err == nil {
-					last, widest = n, max(widest, n)
-				}
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-	}()
-	var once sync.Once
-	var read [2]int64
-	return func() (int64, int64) {
-		once.Do(func() {
-			close(done)
-			read = <-result
-		})
-		return read[0], read[1]
-	}
-}
-
 // registryImage is the stopped run's memory image as the daemon's
 // registry keeps it: the wrapped key included, which the API never
 // shows.
@@ -588,20 +552,20 @@ func TestVMMemoryResume(t *testing.T) {
 	guestStarts(t, r, id)
 	reseedsBefore := forkReseeds(t, r, id)
 	// While the image is written the VM's memory limit covers it: the
-	// image goes through the page cache of the VM's own memory group,
-	// which killed a hypervisor mid-snapshot once (465 MiB resident
-	// against the 584 MiB allowed, the new image's pages on top). The limit
-	// is watched while the stop runs, and is the VM's own again after.
-	watch := watchMemoryLimit(t, config, id)
+	// snapshot of a restored VM reads its last image's pages into the
+	// page cache of the VM's own memory group, which killed a hypervisor
+	// mid-snapshot once (465 MiB resident against the 584 MiB allowed).
+	// The limit is watched while the stop runs, and is the VM's own again
+	// after.
+	// The window is asserted, not only its widths: the guest never runs
+	// with the limit raised, and the limit is raised with the image in
+	// the jail's reach and put back once it is out of it (watchStop).
+	watch := watchStop(t, config, id)
 	began := time.Now()
 	dataset := stop(id)
 	stopTook := time.Since(began)
-	widest, last := watch()
 	wantLimit, wantWidest := int64(vm.MemoryLimitMB(512))<<20, int64(vm.MemoryLimitMB(512))<<20+r.driver.MemoryNeedsBytes(512)
-	t.Logf("memory.max of the run while it was stopped: widest %d, after %d (the VM's own %d)", widest, last, wantLimit)
-	if widest != wantWidest || last != wantLimit {
-		t.Errorf("the run's memory limit while its image was written: widest %d and after the stop %d, want %d and %d", widest, last, wantWidest, wantLimit)
-	}
+	watch.assertWindow(t, "the stop of a booted VM", wantLimit, wantWidest)
 	image := imageDir(t, r, id)
 	// The image: an encrypted filesystem of its own, sealed; and closed
 	// while the run is stopped, as nothing reads it: unmounted and its key
@@ -687,15 +651,13 @@ func TestVMMemoryResume(t *testing.T) {
 	// The same for a VM restored from an image, which is the one that
 	// was killed: its image's pages are its own memory, read through the
 	// mount, and the new image goes on top.
-	watch = watchMemoryLimit(t, config, id)
+	watch = watchStop(t, config, id)
 	if again := stop(id); again == dataset {
 		t.Fatal("the second stop saved the same image")
 	} else if image := memoryImage(t, r, id); image.State != run.MemorySaved {
 		t.Fatalf("a VM restored from its memory could not be saved again: %+v\n%s", image, r.log.String())
 	}
-	if widest, last = watch(); widest != wantWidest || last != wantLimit {
-		t.Errorf("a restored VM's memory limit while its image was written: widest %d and after the stop %d, want %d and %d", widest, last, wantWidest, wantLimit)
-	}
+	watch.assertWindow(t, "the stop of a restored VM", wantLimit, wantWidest)
 	if slices.Contains(poolListing(t, config.ImageDataset), dataset) {
 		t.Fatal("the first image outlived the VM restored from it, which is gone now")
 	}

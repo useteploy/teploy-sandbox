@@ -286,13 +286,17 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 // It is for the moment a stop writes the VM's memory image, and for that
 // moment only (SaveMemory): the stop asks for the room once the VM is
 // paused and its image is about to be written, and gives it back once
-// the image is sealed, before the VM resumes. The image goes through
-// the page cache, which is charged to the VM's own group, and dirty
-// pages there are not reclaimed without I/O: a guest with most of its
-// memory in use had its hypervisor killed by its own limit in the middle
-// of its snapshot (seen live, as a VM restored from an image was stopped
-// again: 465 MiB resident against the 584 MiB allowed, the new image's
-// pages on top). The guest's own memory is all that group ever needs to
+// the image is sealed, before the VM resumes. A VM restored from an
+// image maps that image privately, and its snapshot reads every page of
+// it: the pages it had not read yet come into the page cache, charged to
+// the VM's own group, on top of what the group held (measured: a 768 MiB
+// guest at its 840 MiB limit went to 1095 MiB in the window, anon 490,
+// file 600). A guest with most of its memory in use had its hypervisor
+// killed by its own limit in the middle of its snapshot that way (seen
+// live, as a VM restored from an image was stopped again: 465 MiB
+// resident against the 584 MiB allowed). The new image's writing adds
+// nothing to the group: it goes to ZFS's ARC, not the page cache (a
+// booted guest's stop measured no growth). The guest's own memory is all that group ever needs to
 // hold, the image included, so the raised limit covers an image of this
 // guest's size; and since the guest is paused for all of that moment, a
 // running guest never has the room — with one exception, written where
@@ -302,13 +306,14 @@ func (c *confinement) enter(ctx context.Context, config MachineConfig, dir strin
 // back before the VM resumes, as for a sealed image.
 //
 // Putting it back lowers memory.max below what the group holds, the
-// image's pages being still charged to it: the kernel reclaims them
-// before the write returns, and the pause lasts as long as their
-// write-back (cgroups.memoryLimit). That cannot come to an OOM kill of
+// previous image's pages being still charged to it: the kernel reclaims
+// them before the write returns, and the pause lasts as long as that
+// (cgroups.memoryLimit); they are clean, so it is quick (measured: 255
+// MiB in about 100 ms). That cannot come to an OOM kill of
 // an honest hypervisor: the VM has been paused since before the room was
 // asked for, so it holds no more than it held under its own limit, and
-// all the group holds beyond that is the image's page cache, which is
-// reclaimed. What a hypervisor taken over may have made of the room
+// all the group holds beyond that is the clean page cache of the image it
+// was restored from, which is reclaimed. What a hypervisor taken over may have made of the room
 // while its VM was paused is what the kill is for. The one way a stop
 // leaves its VM running on — the capture succeeded and the container
 // could not be removed after it — finds the limit the VM's own again
@@ -976,7 +981,10 @@ func (c *cgroups) path(name string) string { return filepath.Join(c.dir, name) }
 // cache, written back where it is dirty, and mapped pages unmapped — a
 // round for the whole shortfall for as long as each round frees
 // something; so the write can take as long as the reclaim's I/O. After
-// five rounds in a row that free nothing, it kills in the group (and the
+// sixteen rounds that free nothing (MAX_RECLAIM_RETRIES, counted over the
+// whole write, not reset by a round that frees something; an earlier
+// comment here said five in a row, the count of kernels before 5.9), it
+// kills in the group (and the
 // group is one to the OOM killer, memory.oom.group: the VM), and goes on
 // until the group fits or nothing is left to kill. What the group cannot
 // give up — its anonymous memory, with no swap to send it to — must fit

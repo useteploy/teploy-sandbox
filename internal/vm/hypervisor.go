@@ -692,7 +692,7 @@ func (m *chMachine) waitAPI(ctx context.Context) error {
 // memory read the file and maps nothing of it.
 func (m *chMachine) MapsFile(hostPath string) bool {
 	info, err := os.Stat(hostPath)
-	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+	if err != nil || !info.Mode().IsRegular() {
 		return false
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
@@ -715,8 +715,12 @@ func (m *chMachine) MapsFile(hostPath string) bool {
 // mapping the process can only read is not one: a restore that copied
 // the memory read the file and maps nothing it writes. A shared one is
 // not one either, and would be worse: what the VM wrote would reach
-// the image.
+// the image. Nor is anything a whole mapping of an empty file: every
+// reading covers zero bytes, and a copy, which maps nothing, would pass.
 func mapsFile(maps []byte, dev, ino string, size int64) bool {
+	if size <= 0 {
+		return false
+	}
 	var mapped int64
 	for line := range strings.SplitSeq(string(maps), "\n") {
 		fields := strings.Fields(line)

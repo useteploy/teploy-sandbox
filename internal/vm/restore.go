@@ -123,10 +123,11 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 	}
 
 	// For the moment the image is written the VM's memory limit covers
-	// it (cell.raiseMemoryLimit): the image goes through the page cache
-	// of the VM's own memory group, and a guest with most of its memory
-	// in use otherwise has its hypervisor killed by that limit midway
-	// through the snapshot. The guest's own memory is all that group
+	// it (cell.raiseMemoryLimit): the snapshot of a VM restored from an
+	// image reads in the pages of that image it had not read yet, into
+	// the page cache of the VM's own memory group, and a guest with most
+	// of its memory in use otherwise has its hypervisor killed by that
+	// limit midway through the snapshot. The guest's own memory is all that group
 	// ever needs to hold, the image included, so the raised limit covers
 	// an image of this guest's size.
 	//
@@ -276,14 +277,16 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 			// Sealed or given up, nothing writes the image now. The
 			// limit is the VM's own again before the VM runs: a running
 			// guest never has the room. The write lowers memory.max
-			// below what the group holds (the image's pages are still
+			// below what the group holds (the pages of the image it was
+			// restored from, read in by the snapshot, are still
 			// charged to it), so the kernel reclaims against the new
 			// limit before the write returns (cgroups.memoryLimit), and
 			// the pause lasts as long as that takes. It cannot come to
 			// an OOM kill of an honest hypervisor: the guest has been
 			// paused since before the room was asked for and holds what
 			// it held under its own limit, and all the group holds
-			// beyond that is the image's page cache, which is reclaimed.
+			// beyond that is the clean page cache of the image it was
+			// restored from, which is reclaimed.
 			// What a hypervisor taken over may have made of the room
 			// while its VM was paused is what the kill is for; its VM
 			// goes with the stop.

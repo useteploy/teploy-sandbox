@@ -1059,11 +1059,25 @@ func (s *memoryImages) sweep(ctx context.Context) error {
 // (unclosed). The image is left alone while something may be reading
 // it: a restore under way (whose open ends what is owed, since what it
 // opens is its VM's), a VM restored from it, or a destroy under way
-// (which ends it too). As in settle, the lock is taken for the
-// bookkeeping and left while the host's commands run, and only one
-// close of an image runs at a time; what the open does while one does
-// is written there. An image that is still not closed stays owed, its
-// next attempt paced from this one.
+// (which ends it too).
+//
+// The mapped case cannot arise today: the open that let a VM have the
+// image ended the owing (closeDone) before the VM was named a mapper,
+// nothing makes a mapped image owe a close again (a close is owed only
+// by a stop's hand-over, a start's retain and a failed open, none of
+// which reaches an image a VM maps), and a second open of a mapped image
+// is refused before it asks the pool for anything
+// (TestAResumeEndsWhatTheCloseOwed and
+// TestARestoreUnderWayIsLeftAloneByTheRetryOfAClose pin that order). The
+// check stays as the guard, not the proof: it is the reference count M0
+// made the only thing between a mapped image and its unmount, and a
+// later change that broke the order would otherwise unmount an image
+// under a running VM (TestTheRetryOfACloseLeavesAMappedImageAlone).
+//
+// As in settle, the lock is taken for the bookkeeping and left while the
+// host's commands run, and only one close of an image runs at a time;
+// what the open does while one does is written there. An image that is
+// still not closed stays owed, its next attempt paced from this one.
 func (s *memoryImages) closeOwed(ctx context.Context, img *image) error {
 	s.mu.Lock()
 	if !img.unclosed || img.opening > 0 || len(img.mappers) > 0 || img.settling || img.closing != nil {

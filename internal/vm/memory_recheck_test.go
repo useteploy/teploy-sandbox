@@ -706,3 +706,134 @@ func TestAFailedOpenUndoesWhatItAskedOfThePool(t *testing.T) {
 		}
 	})
 }
+
+// An image this daemon's life has not touched (no start's retain named
+// it, no stop made it, no resume opened it) is made known by its first
+// open. An open of it that fails having asked the pool for its key, and
+// whose undo the pool refuses, leaves the image open and owes its close
+// (unopen): it must stay known for as long as that is owed, so that the
+// sweep's retry, the next open and the release of its run all reach the
+// image that is owed, and none of them makes a second image of the same
+// name beside it. One whose undo went through is forgotten again, as an
+// open that never was.
+func TestAFailedOpenOfAnImageThisLifeNeverOpened(t *testing.T) {
+	// neverOpened is a saved image and a daemon's next life, which has
+	// not touched it: no retain, no open.
+	neverOpened := func(t *testing.T) (*fakeZFS, *memoryImages, run.MemoryImage) {
+		t.Helper()
+		z := newFakeZFS()
+		s := newTestImages(t, z)
+		_, rec := savedImage(t, s, "run", 256)
+		restarted := newTestImagesAt(t, z, s.mountDir)
+		restarted.now = func() time.Time { return time.Unix(1700000000, 0) }
+		if _, known := restarted.known[rec.ID]; known || len(restarted.unclosed) != 0 {
+			t.Fatal("the set-up: the next life knows the image already")
+		}
+		return z, restarted, rec
+	}
+	// failOpen opens with the mount refused and the undo's unloading of
+	// the key refused, and gives back the image the store owes.
+	failOpen := func(t *testing.T, z *fakeZFS, s *memoryImages, rec run.MemoryImage) (*undoRefused, *image) {
+		t.Helper()
+		stubborn := &undoRefused{fakeZFS: z, held: true}
+		s.zfs = stubborn
+		_, err := s.open(bg, "run", &rec)
+		if err == nil || !strings.Contains(err.Error(), "left open") {
+			t.Fatalf("an open whose undo the pool refused: %v", err)
+		}
+		dataset := s.root + "/" + rec.ID
+		if mounted, loaded := z.openState(dataset); mounted || !loaded {
+			t.Fatalf("the set-up: the failed open left the image mounted %t, key loaded %t", mounted, loaded)
+		}
+		owed, known := s.known[rec.ID]
+		if !known {
+			t.Fatal("an image whose close is owed is no longer known: the sweep, the next open and the release reach another image of its name")
+		}
+		if len(s.unclosed) != 1 || s.unclosed[0] != owed || !owed.unclosed || owed.wanted() {
+			t.Fatalf("the image's close is not owed as it should be: %d owed, the known image owed %t, wanted %t", len(s.unclosed), owed.unclosed, owed.wanted())
+		}
+		return stubborn, owed
+	}
+
+	t.Run("the undo refused, the sweep closes it", func(t *testing.T) {
+		z, s, rec := neverOpened(t)
+		stubborn, owed := failOpen(t, z, s, rec)
+		// A second open, the pool refusing still: it finds the image
+		// that is owed, and makes no second one of the name.
+		if _, err := s.open(bg, "run", &rec); err == nil {
+			t.Fatal("an open whose mount failed succeeded")
+		}
+		if again := s.known[rec.ID]; again != owed || len(s.unclosed) != 1 || s.unclosed[0] != owed {
+			t.Fatalf("the second open made another image of the name: %p, want %p (%d owed)", again, owed, len(s.unclosed))
+		}
+		stubborn.held = false
+		s.now = func() time.Time { return time.Unix(1700000000, 0).Add(s.retryAfter) }
+		must(t, s.sweep(bg))
+		if mounted, loaded := z.openState(owed.dataset); mounted || loaded || len(s.unclosed) != 0 || owed.unclosed || !z.has(t, owed.dataset) {
+			t.Fatalf("after the sweep: mounted %t, key loaded %t, %d owed, on the pool %t", mounted, loaded, len(s.unclosed), z.has(t, owed.dataset))
+		}
+		// Its run's still, and it opens.
+		s.zfs = z
+		opened, err := s.open(bg, "run", &rec)
+		must(t, err)
+		if opened != owed {
+			t.Fatalf("the open after the sweep opened %p, want %p", opened, owed)
+		}
+		s.drop(bg, opened)
+	})
+
+	t.Run("the undo refused, the run's release destroys it", func(t *testing.T) {
+		z, s, rec := neverOpened(t)
+		_, owed := failOpen(t, z, s, rec)
+		// The run resumed from its disk and let its image go: the image
+		// goes, and nothing of it is owed any more.
+		must(t, s.release(bg, rec.ID))
+		if z.has(t, owed.dataset) || len(s.known) != 0 || len(s.unclosed) != 0 || len(s.owed) != 0 {
+			t.Fatalf("after the release: on the pool %t, %d known, %d owed a close, %d owed a destroy", z.has(t, owed.dataset), len(s.known), len(s.unclosed), len(s.owed))
+		}
+		s.now = func() time.Time { return time.Unix(1700000000, 0).Add(s.retryAfter) }
+		if err := s.sweep(bg); err != nil {
+			t.Fatalf("the sweep after the release: %v", err)
+		}
+	})
+
+	t.Run("the undo done, it is forgotten", func(t *testing.T) {
+		z, s, rec := neverOpened(t)
+		s.zfs = &mountRefused{z}
+		if _, err := s.open(bg, "run", &rec); err == nil || strings.Contains(err.Error(), "left open") {
+			t.Fatalf("an open whose mount failed: %v", err)
+		}
+		if mounted, loaded := z.openState(s.root + "/" + rec.ID); mounted || loaded || len(s.known) != 0 || len(s.unclosed) != 0 {
+			t.Fatalf("after the failed open: mounted %t, key loaded %t, %d known, %d owed", mounted, loaded, len(s.known), len(s.unclosed))
+		}
+		s.zfs = z
+		opened, err := s.open(bg, "run", &rec)
+		must(t, err)
+		s.drop(bg, opened)
+	})
+}
+
+// The retry of an owed close never touches an image a VM maps. No path
+// reaches that state today (closeOwed's comment says why), so it is set
+// up by hand: this pins the reference count as the guard, so a change
+// that broke the order cannot unmount an image under a running VM.
+func TestTheRetryOfACloseLeavesAMappedImageAlone(t *testing.T) {
+	busy, s, img, _ := owedStore(t)
+	busy.held = false
+	s.now = func() time.Time { return time.Unix(1700000000, 0).Add(s.retryAfter) }
+	s.mu.Lock()
+	if img.mappers == nil {
+		img.mappers = map[string]bool{}
+	}
+	img.mappers["teploy-sbx-vm"] = true
+	s.mu.Unlock()
+	if err := s.closeOwed(bg, img); err != nil {
+		t.Fatal(err)
+	}
+	if busy.tried() != 1 {
+		t.Fatalf("the close of a mapped image was tried again: %d tries", busy.tried())
+	}
+	if mounted, loaded := busy.openState(img.dataset); !mounted || !loaded {
+		t.Fatalf("a mapped image was closed: mounted %t, key loaded %t", mounted, loaded)
+	}
+}

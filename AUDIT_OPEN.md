@@ -4698,7 +4698,7 @@ without it.
 | 7 | A stop whose VM was gone asked the VM for a sync, where the snapshot path asks nothing | A new unit test | `SaveMemory` captures a gone VM's disk as it is. The fake case "the VM's process is gone" |
 | 8 | The manager's half of "a resume refused before it reaches the image keeps the image" was missing (the driver marked it; the manager released anyway) | A new unit test in `internal/run`: the driver's own test could not see it, since releasing is the manager's to do | `ResumeWith` honours `ErrMemoryNotTried`. `TestAResumeRefusedBeforeTheImageIsReachedKeepsIt` |
 | 9 | `Volumes.Capture` held the driver's volume lock across the quiesce, which with an image is the whole memory write: one run's stop would have stalled every other run's create, resume and destroy | Reading the capture path | The quiesce runs before the lock. `TestACapturesQuiesceDoesNotHoldThePool` |
-| 10 | **A stop could have its hypervisor killed by the VM's own memory limit midway through the snapshot.** The image is written through the page cache, charged to the VM's group; its dirty pages are not reclaimed without I/O, so with a guest's resident memory near its limit there was no room for them | Live, once in six runs of the suite after the reviews' fixes: `Memory cgroup out of memory: Killed process (cloud-hypervisor)`, a VM restored from an image and stopped again, 476392 kB resident (465 MiB) against the 584 MiB allowed; the stop failed ("resume vm after snapshot: connection refused") and the run was left claiming to run | `SaveMemory` raises the VM's `memory.max` by an image's size for exactly the moment the image is written (`cell.raiseMemoryLimit`), and a running guest never has the room: the room is asked for once the VM is paused and its image is bound where the hypervisor writes, and given back once the image is sealed, or given up, **before the VM resumes**. (It was first raised before the guest's flush, with the VM running, and put back after the resume: a window of the whole stop, seconds, in which a running guest had an image's size more than its limit.) Best effort, and said when either fails. The guest's memory is all that group ever needs to hold, so the raised limit covers any image. **Putting the room back is the delicate half.** It lowers `memory.max` below what the group holds, the image's pages being still charged to it, and the kernel does not defer that to the group's next allocation (`memory_max_write`): the write does not return until the group fits, the kernel reclaiming against the new limit meanwhile — so the pause lasts as long as the image's dirty pages take to write back — and it kills in the group after five reclaim rounds in a row that free nothing. That is no OOM kill of an honest hypervisor: the VM has been paused since before the room was asked for, so it holds what it held under its own limit, and all the group holds beyond that is the image's page cache, which is reclaimed. It is the kill for a hypervisor taken over that made something of the room while its VM was paused, and its VM goes with the stop. The one way a stop leaves its VM running on (the capture succeeded, the container could not be removed after it) finds the limit the VM's own again already, put back while it was paused. Where the hypervisor answered its snapshot with a failure, the room is given back before the VM resumes, as for a sealed image; the one way out that keeps it until after the resume is a snapshot that did not answer in time, since the hypervisor may go on writing and the resume is what waits for that (there the image is nobody's and the VM goes with the stop). `TestAStopSavesTheVMsMemoryAndAResumeRestoresTheVMFromIt` (the order, through the driver: paused, raised, snapshot, put back, resumed), `TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk` (the order for every way a stop goes, and that the room is never asked of a running VM), `TestAStopCoversItsImageInTheVMsMemoryLimitAndNeverFailsForIt`; live: `TestVMMemoryResume` reads `memory.max` every 5 ms across a stop |
+| 10 | **A stop could have its hypervisor killed by the VM's own memory limit midway through the snapshot.** The image is written through the page cache, charged to the VM's group; its dirty pages are not reclaimed without I/O, so with a guest's resident memory near its limit there was no room for them (**corrected by measurement, 2026-11-27, "M1 leftovers" below:** what is charged is not the new image's writing — a booted guest's stop adds nothing to its group — but the pages of the *previous* image that the snapshot reads in from a restored VM's private mapping of it: clean file pages, up to the guest's size on top of what it held) | Live, once in six runs of the suite after the reviews' fixes: `Memory cgroup out of memory: Killed process (cloud-hypervisor)`, a VM restored from an image and stopped again, 476392 kB resident (465 MiB) against the 584 MiB allowed; the stop failed ("resume vm after snapshot: connection refused") and the run was left claiming to run | `SaveMemory` raises the VM's `memory.max` by an image's size for exactly the moment the image is written (`cell.raiseMemoryLimit`), and a running guest never has the room: the room is asked for once the VM is paused and its image is bound where the hypervisor writes, and given back once the image is sealed, or given up, **before the VM resumes**. (It was first raised before the guest's flush, with the VM running, and put back after the resume: a window of the whole stop, seconds, in which a running guest had an image's size more than its limit.) Best effort, and said when either fails. The guest's memory is all that group ever needs to hold, so the raised limit covers any image. **Putting the room back is the delicate half.** It lowers `memory.max` below what the group holds, the image's pages being still charged to it, and the kernel does not defer that to the group's next allocation (`memory_max_write`): the write does not return until the group fits, the kernel reclaiming against the new limit meanwhile — so the pause lasts as long as the image's dirty pages take to write back — and it kills in the group after sixteen reclaim rounds that free nothing (`MAX_RECLAIM_RETRIES`; first written here as five in a row, corrected in "M1 leftovers" below). That is no OOM kill of an honest hypervisor: the VM has been paused since before the room was asked for, so it holds what it held under its own limit, and all the group holds beyond that is the image's page cache, which is reclaimed. It is the kill for a hypervisor taken over that made something of the room while its VM was paused, and its VM goes with the stop. The one way a stop leaves its VM running on (the capture succeeded, the container could not be removed after it) finds the limit the VM's own again already, put back while it was paused. Where the hypervisor answered its snapshot with a failure, the room is given back before the VM resumes, as for a sealed image; the one way out that keeps it until after the resume is a snapshot that did not answer in time, since the hypervisor may go on writing and the resume is what waits for that (there the image is nobody's and the VM goes with the stop). `TestAStopSavesTheVMsMemoryAndAResumeRestoresTheVMFromIt` (the order, through the driver: paused, raised, snapshot, put back, resumed), `TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk` (the order for every way a stop goes, and that the room is never asked of a running VM), `TestAStopCoversItsImageInTheVMsMemoryLimitAndNeverFailsForIt`; live: `TestVMMemoryResume` reads `memory.max` every 5 ms across a stop |
 
 In every case the fallback did what it is for: the run came back from
 its disk, with the reason in its record and the daemon's log.
@@ -5011,7 +5011,7 @@ there, except where its row says it is a guard for the opposite.
 |---|---|---|
 | **A refused close was never retried** (should-fix, repro). `handOver` closes the sealed image it gives to a run's record, and on EBUSY — the writer's hypervisor still holding a descriptor — it only said so: the image stayed mounted with its key loaded for as long as the run was stopped, against "an image at rest is closed". | A refused close is owed (`memoryImages.unclosed`): tried again when the VM that wrote the image is gone (`vmGone`), and by the sweep a minute apart, until it closes. A resume that opens the image ends the owing, and so does a destroy; an open waits for a retry under way rather than read the mount as it goes, and a retry stands aside while a restore or a destroy holds the image. What is owed does not outlive a daemon: a start closes the images the registry names that lie open (a life that ended between a close it owed and the retry, or in the middle of a resume), reading which of them lie open in one `zfs get` (`imageFS.openStates`), so a closed image costs a start nothing. | The repro, kept: `TestRecheckABusyCloseIsRetriedWhenTheWriterIsGone` (on the merged tree: "the writer is gone and the stopped run's image is still mounted true, key loaded true"). What the owing is held to: `TestACloseThePoolRefusesIsOwedUntilTheSweepClosesIt`, `TestAResumeEndsWhatTheCloseOwed`, `TestADestroyedImageOwesNoClose`, `TestAnOpenWaitsForACloseUnderWayAndNothingElseDoes`, `TestARestoreUnderWayIsLeftAloneByTheRetryOfAClose`; a start: `TestANewLifeClosesTheImagesTheRegistryNames`, `TestZFSCLIReadsHowEveryImageLiesOpenInOneCommand`. Live, on a real pool (`TestVMMemoryImagesOnARealPool`): a descriptor held open on a file of the image makes the hand-over's `zfs unmount` refuse, the writer's end is refused while the descriptor is held, and the sweep closes the image once it is gone. |
 | **A failed open left the key loaded** (should-fix, repro). `ready` loaded the key and then returned, on a mount that failed or on an image that is not what a sealed image must be, without unloading it; and if the release that followed could not destroy the image, the owed image kept its key loaded. | A failed open undoes what it asked the pool for, and only that (`unopen`): it reads the pool rather than trusting what the open was told, since a command that ended at a deadline can have taken effect; it runs under a budget of its own, since a failed open is often a request that ended; and a close the pool refuses is owed as any other is, and said in the open's error. An image that lay open before the open (a close it owes) is left as it was. | The repro, kept: `TestRecheckAFailedOpenLeavesTheImageClosed` (on the merged tree: "a failed open left the image mounted false, key loaded true"). The ways of it: `TestAFailedOpenUndoesWhatItAskedOfThePool` — a refused mount, the image's check, a request that ended at the mount, an undo the pool refuses too (owed, and closed by the sweep), and an image that lay open before (the guard for "only what it asked": it passes before and after). Live: `TestVMMemoryImagesOnARealPool`. |
-| **The `memory.max` raise's window was the whole stop** (should-fix; fault 10 above, first fixed in a9891df). The room was asked for before the guest's flush, with the VM running, and given back after the resume: for seconds a running guest had an image's size more than its limit. The comment on `cgroups.memoryLimit` said a lowered limit kills nothing and is charged against the group's next allocation. | The room is asked for once the VM is paused and its image is bound where the hypervisor writes, and given back once the image is sealed, or given up, before the VM resumes — the hypervisor's own failed snapshot included; the one way out that keeps it until after the resume is a snapshot that did not answer in time, since the hypervisor may go on writing and the resume waits for that. The comment is corrected from `memory_max_write` (read in 6.12, the test host's kernel, and the same in 7.4): the write does not return until the group fits, the kernel reclaiming meanwhile, and it kills in the group after five rounds in a row that free nothing — and why that is no OOM kill of a VM paused since before the room was asked for. The exact window is in fault 10. | The order, through the driver: `TestAStopSavesTheVMsMemoryAndAResumeRestoresTheVMFromIt` (`sync, pause, raise-limit, snapshot, restore-limit, resume, kill`; against the old ordering: `raise-limit` first and `restore-limit` after the resume); for every way a stop goes, and that the room is never asked of a running VM and never stands at a resume but after a snapshot that did not answer: `TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk`; `TestAStopCoversItsImageInTheVMsMemoryLimitAndNeverFailsForIt`. Live: `TestVMMemoryResume` reads `memory.max` every 5 ms across a stop. |
+| **The `memory.max` raise's window was the whole stop** (should-fix; fault 10 above, first fixed in a9891df). The room was asked for before the guest's flush, with the VM running, and given back after the resume: for seconds a running guest had an image's size more than its limit. The comment on `cgroups.memoryLimit` said a lowered limit kills nothing and is charged against the group's next allocation. | The room is asked for once the VM is paused and its image is bound where the hypervisor writes, and given back once the image is sealed, or given up, before the VM resumes — the hypervisor's own failed snapshot included; the one way out that keeps it until after the resume is a snapshot that did not answer in time, since the hypervisor may go on writing and the resume waits for that. The comment is corrected from `memory_max_write` (read in 6.12, the test host's kernel, and the same in 7.4): the write does not return until the group fits, the kernel reclaiming meanwhile, and it kills in the group after sixteen rounds that free nothing (first written as five in a row; corrected in "M1 leftovers" below) — and why that is no OOM kill of a VM paused since before the room was asked for. The exact window is in fault 10. | The order, through the driver: `TestAStopSavesTheVMsMemoryAndAResumeRestoresTheVMFromIt` (`sync, pause, raise-limit, snapshot, restore-limit, resume, kill`; against the old ordering: `raise-limit` first and `restore-limit` after the resume); for every way a stop goes, and that the room is never asked of a running VM and never stands at a resume but after a snapshot that did not answer: `TestAStopWhoseMemoryImageCannotBeSavedStillStopsFromTheDisk`; `TestAStopCoversItsImageInTheVMsMemoryLimitAndNeverFailsForIt`. Live: `TestVMMemoryResume` reads `memory.max` every 5 ms across a stop. |
 | **Nit: `makeMemoryRoom` could evict an extra image on a reading that had not moved.** It asked the pool again the moment after an image went; a destroy's freeing is the pool's to finish, and a reading from before it does shows the pool short by all it was. | A stop waits, for up to `MemorySettle`, for the reading to move, and takes it at its word then. Only a reading that has not moved by the end of the wait is set aside: another image goes then for what the ones that went cannot cover even at the most, and no further. What an image may hold is no account while the reading moves — an image is compressed and usually takes less — so the pool's own word still evicts exactly enough. The reaper's loop re-reads as before, on purpose: under pressure relief comes first, and its contract is to drop until the pool is not short, whatever made it so. | `TestAStopEvictsNoExtraImageWhileThePoolHasNotShownTheRoom`: a pool that shows the room a moment after the destroy, one that never does within the wait (against the old loop both evict a third image for nothing), and images that take less than they may hold (the same before and after). |
 | **Nit: a comment said no VM's end waits behind a destroy.** `kill` calls `vmGone` synchronously. | None does behind another VM's; every one does behind its own. The comments on `vmGone`, `kill`, the store's lock and the pacing say so. The retries stay synchronous, and why: done before `kill` returns, a VM's image is gone when the VM is. | `TestAVMsEndWaitsForItsOwnImagesAndForNoOthers`. |
 | **Nit: `ResumeMemory`'s fallback `RemoveRun` ran when the restore had cloned nothing.** A restore that failed before it asked for the clone went on to ask the pool to remove a volume that was never there, and a transient error there failed a resume that could have booted from the disk. | `restore` says whether it came as far as cloning, and the fallback runs only then. | `TestAResumeThatClonedNothingAsksThePoolToRemoveNothing` (against the old code: "remove the clone the restore left"). |
@@ -5042,3 +5042,103 @@ median of 6.3 s (4.2 to 11.5 s), against 5.5, 6.4 and 6.6 s in the three
 runs of the reviews' tree; a resume from memory at 3.8 s, against 3.6 to
 3.9 s. The putting back of the room, now inside the pause, does not show
 in the length of a stop.
+
+### M1 leftovers (2026-11-27, after #18)
+
+What the review of #18 left open, in one change.
+
+- **A test for the open of an image this daemon's life never opened.**
+  `open` makes such an image known; one whose open fails after asking
+  the pool for its key, and whose undo the pool refuses, owes its close
+  and must stay known (`!img.unclosed` in open's forget), or the sweep,
+  the next open and the run's release reach another image of its name
+  and the owed close is never ended. Nothing tested it: dropping that
+  condition passed every test. `TestAFailedOpenOfAnImageThisLifeNeverOpened`
+  (the store: the sweep closes it, the release destroys it and leaves
+  nothing owed, an undo that went through forgets it) and
+  `TestAResumeWhoseOpenLeavesAnUntouchedImageOpenBootsFromTheDiskAndOwesTheClose`
+  (the same through `ResumeMemory`: the run boots from its disk, says
+  why, and the image stays owed until the release) fail without it.
+- **Two guards no state reached.** `closeOwed` stood aside for an image
+  a VM maps; no image that owes its close is ever mapped (the open that
+  hands an image to its VM ends the owing before it names the mapper,
+  nothing makes a mapped image owe a close again, and a second open of a
+  mapped image is refused before it asks the pool for anything), and
+  removing the check failed nothing. It is removed, and the invariant is
+  written where it stood, with the tests that pin the order
+  (`TestAResumeEndsWhatTheCloseOwed`,
+  `TestARestoreUnderWayIsLeftAloneByTheRetryOfAClose`). `MapsFile`'s own
+  size-zero check could not be reached either (`verifyImage` requires the
+  memory file to hold the guest's memory before any restore), and it was
+  the only thing keeping `mapsFile` from taking any reading for a whole
+  mapping of an empty file: it moved into `mapsFile`, where
+  `TestMapsFileSeesOnlyAWholeMappingOfTheMemoryFile` reaches it on
+  readings and on a real empty file.
+- **The `memory.max` window is asserted live, not logged.** `watchStop`
+  (`vm_memory_window_integration_test.go`) reads, every half millisecond
+  across a stop: `memory.max` before and after the rest of the reading,
+  `memory.current`, `oom_kill`, whether a vCPU thread of the hypervisor
+  is inside `KVM_RUN` (its `/proc/<pid>/task/<tid>/syscall` is ioctl; a
+  paused VM parks every vCPU in futex, an idle one halts inside
+  `KVM_RUN`), and whether the stop's image is bound into the jail. It
+  asserts that the guest never runs with the limit raised, that the
+  limit is raised with the image in the jail's reach, that it is never
+  the VM's own again while the image is still bound (put back after the
+  seal), and that while the put-back's write is still reclaiming (the
+  group over the limit it was just given) the guest does not run (put
+  back before the resume). The last is the one reading that tells "put
+  back, then resumed" from "resumed, then put back" however close they
+  come, and it is seen only where there is something to reclaim; where
+  there is not, the test says so. `TestVMMemoryResume` asserts it for
+  both its stops.
+- **Is the extra charge reclaimable? Yes; measured.** From the code and
+  the kernel: `memory_max_write` (6.12, read) sets the new limit, then
+  reclaims for as long as the group is over it, giving up after
+  sixteen rounds that free nothing (`MAX_RECLAIM_RETRIES`; the comment on
+  `cgroups.memoryLimit` and this entry said five in a row, the count of
+  kernels before 5.9 — corrected) and only then kills. The group's
+  anonymous memory cannot go (`memory.swap.max` 0), but it is the
+  guest's memory and the hypervisor's, which fits the VM's own limit as
+  it always does; and what the stop adds is not the new image (Cloud
+  Hypervisor writes it with `write` to ZFS, which keeps file data in the
+  ARC, not in the group's page cache) but, for a VM restored from an
+  image, the pages of the previous image that the snapshot reads in
+  through the VM's private mapping of it: clean file pages, dropped
+  without I/O. Live, on the laptop, a 768 MiB guest (the largest whose
+  raised limit leaves the host 640 MiB: it has 3.7 GiB, 2.5 GiB
+  available), 460 MiB of it held by a process that wrote every page
+  (`TestVMMemoryLimitIsPutBackOnALargeGuest`; the booted stop in four runs, the restored one in the two that got that far, agreeing):
+  - booted and stopped: the group held 740 MiB (anon 736, file 0)
+    against its 840 MiB limit before, and 740 MiB at its peak in the
+    window: nothing was added, nothing to reclaim. Paused 12-21 s (the
+    snapshot's writing of 768 MiB of random pages to an encrypted
+    dataset on this disk), the limit raised 3-5 ms after the pause and
+    put back 8-20 ms before the resume;
+  - restored, the process rewriting every page (each a copy beside the
+    file's), and stopped: 840 MiB before (anon 487-505, file 330-347:
+    the group at its limit, as a restored VM sits), **1095-1097 MiB at
+    the peak** in the window (anon 487-505, file 586-602, of it mapped
+    263-286), the put-back seen reclaiming in 70-71 readings over
+    **103-104 ms**, with no vCPU in `KVM_RUN` in any of them, then the
+    resume 109-157 ms after it; `oom_kill` 0 in the group and no OOM kill
+    in the host's kernel log; paused 26-33 s in all; the guest whole
+    after (restored from the image, its process alive, rewriting again).
+  The 512 MiB guests of `TestVMMemoryResume`: booted, peak 511 MiB
+  (anon 508); restored and idle, peak 540 MiB (anon 24, file 512),
+  under the 584 MiB limit, nothing to reclaim. So the room is given
+  back in about a tenth of a second, inside the pause, without a kill;
+  nothing to fix. What does stall is the pause itself, the length of
+  the snapshot's write (seconds per hundred MiB on this host), as
+  before.
+- **The laptop's golden, with this release's agent.** Built with
+  `scripts/build-golden.sh` as `sbx/golden-guestd-v3@v1` (agent protocol
+  v3, the `restored` handshake op), beside the old
+  `sbx/golden-guestd@v1`, which is untouched (the suite takes the golden
+  from `SBX_VM_GOLDEN`; nothing needs the old name). With it:
+  `TestVMMemoryResume` (the window asserted for both stops; reseeds 0
+  then 1 at the restore; a stop with memory at a median of 5.2 s, a
+  resume from memory to the first exec at 3.7 s, from the disk at
+  4.7 s), `TestVMMemoryRestoresOfOneImageReadTwoRandomStreams`,
+  `TestVMMemoryLimitIsPutBackOnALargeGuest` and, as root,
+  `TestVMMemoryImagesOnARealPool` passed.
+

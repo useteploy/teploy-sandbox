@@ -552,10 +552,11 @@ func TestVMMemoryResume(t *testing.T) {
 	guestStarts(t, r, id)
 	reseedsBefore := forkReseeds(t, r, id)
 	// While the image is written the VM's memory limit covers it: the
-	// image goes through the page cache of the VM's own memory group,
-	// which killed a hypervisor mid-snapshot once (465 MiB resident
-	// against the 584 MiB allowed, the new image's pages on top). The limit
-	// is watched while the stop runs, and is the VM's own again after.
+	// snapshot of a restored VM reads its last image's pages into the
+	// page cache of the VM's own memory group, which killed a hypervisor
+	// mid-snapshot once (465 MiB resident against the 584 MiB allowed).
+	// The limit is watched while the stop runs, and is the VM's own again
+	// after.
 	// The window is asserted, not only its widths: the guest never runs
 	// with the limit raised, and the limit is raised with the image in
 	// the jail's reach and put back once it is out of it (watchStop).

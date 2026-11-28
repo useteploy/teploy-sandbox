@@ -812,3 +812,28 @@ func TestAFailedOpenOfAnImageThisLifeNeverOpened(t *testing.T) {
 		s.drop(bg, opened)
 	})
 }
+
+// The retry of an owed close never touches an image a VM maps. No path
+// reaches that state today (closeOwed's comment says why), so it is set
+// up by hand: this pins the reference count as the guard, so a change
+// that broke the order cannot unmount an image under a running VM.
+func TestTheRetryOfACloseLeavesAMappedImageAlone(t *testing.T) {
+	busy, s, img, _ := owedStore(t)
+	busy.held = false
+	s.now = func() time.Time { return time.Unix(1700000000, 0).Add(s.retryAfter) }
+	s.mu.Lock()
+	if img.mappers == nil {
+		img.mappers = map[string]bool{}
+	}
+	img.mappers["teploy-sbx-vm"] = true
+	s.mu.Unlock()
+	if err := s.closeOwed(bg, img); err != nil {
+		t.Fatal(err)
+	}
+	if busy.tried() != 1 {
+		t.Fatalf("the close of a mapped image was tried again: %d tries", busy.tried())
+	}
+	if mounted, loaded := busy.openState(img.dataset); !mounted || !loaded {
+		t.Fatalf("a mapped image was closed: mounted %t, key loaded %t", mounted, loaded)
+	}
+}

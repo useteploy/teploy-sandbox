@@ -5064,10 +5064,13 @@ What the review of #18 left open, in one change.
   hands an image to its VM ends the owing before it names the mapper,
   nothing makes a mapped image owe a close again, and a second open of a
   mapped image is refused before it asks the pool for anything), and
-  removing the check failed nothing. It is removed, and the invariant is
-  written where it stood, with the tests that pin the order
-  (`TestAResumeEndsWhatTheCloseOwed`,
-  `TestARestoreUnderWayIsLeftAloneByTheRetryOfAClose`). `MapsFile`'s own
+  removing the check failed nothing. It is kept on review as the guard
+  (it is the reference count M0 made the only thing between a mapped
+  image and its unmount), with the invariant written beside it and the
+  tests that pin the order (`TestAResumeEndsWhatTheCloseOwed`,
+  `TestARestoreUnderWayIsLeftAloneByTheRetryOfAClose`);
+  `TestTheRetryOfACloseLeavesAMappedImageAlone` sets the state up by hand
+  and fails without it. `MapsFile`'s own
   size-zero check could not be reached either (`verifyImage` requires the
   memory file to hold the guest's memory before any restore), and it was
   the only thing keeping `mapsFile` from taking any reading for a whole

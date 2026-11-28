@@ -139,3 +139,121 @@ func TestLiveConditionalPut(t *testing.T) {
 		t.Fatalf("the object is %q (%v), want the winner's %q", got, err, winner)
 	}
 }
+
+// W2 (key custody K0): `If-Match` on PUT, which re-keying a snapshot
+// needs. A write conditional on the ETag of the bytes read lands only
+// while those are still the object; one that lost a race to another
+// write is refused and changes nothing.
+func TestLiveConditionalPutIfMatch(t *testing.T) {
+	client := liveClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	key := fmt.Sprintf("live-%d/cas", time.Now().UnixNano())
+	defer client.Delete(context.Background(), key)
+
+	if err := client.Put(ctx, key, []byte("v1"), PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	_, etag, err := client.GetWithETag(ctx, key, 64)
+	if err != nil || etag == "" {
+		t.Fatalf("GetWithETag = ETag %q, %v: a service that answers no ETag has no write conditional on one", etag, err)
+	}
+	// The probe and the store make their conditions of what a GET
+	// answers; a HEAD that answers another is worth knowing.
+	if info, err := client.Head(ctx, key); err != nil || info.ETag != etag {
+		t.Logf("HEAD answers ETag %q (%v) where GET answers %q", info.ETag, err, etag)
+	}
+	// Another ETag: refused, and the object is as it was.
+	if err := client.Put(ctx, key, []byte("lost"), PutOptions{IfMatch: `"no-such-etag"`}); !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("a write with If-Match naming another ETag = %v, want ErrPreconditionFailed: this service does not honour If-Match on PUT", err)
+	}
+	if got, err := client.Get(ctx, key, 64); err != nil || string(got) != "v1" {
+		t.Fatalf("after the refused write the object is %q (%v): the service answered 412 and wrote anyway", got, err)
+	}
+	// The ETag read with the bytes: the write lands, and moves it on.
+	if err := client.Put(ctx, key, []byte("v2"), PutOptions{IfMatch: etag}); err != nil {
+		t.Fatalf("a write with If-Match naming the object's ETag = %v", err)
+	}
+	got, next, err := client.GetWithETag(ctx, key, 64)
+	if err != nil || string(got) != "v2" || next == "" || next == etag {
+		t.Fatalf("after the write: %q, ETag %q (was %q), %v: an ETag that does not move with the bytes tells no version from another", got, next, etag, err)
+	}
+	// An object that is not there matches nothing: refused, 404 on some
+	// services and 412 on others, and not created.
+	if err := client.Put(ctx, key+"-missing", []byte("x"), PutOptions{IfMatch: next}); !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("a write with If-Match on a missing object = %v, want ErrNotFound or ErrPreconditionFailed", err)
+	}
+	if _, err := client.Head(ctx, key+"-missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a write with If-Match on a missing object created it: %v", err)
+	}
+
+	// The race compare-and-swap is for: every writer read the same ETag,
+	// and exactly one lands.
+	const writers = 16
+	var wg sync.WaitGroup
+	results := make([]error, writers)
+	for i := range results {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = client.Put(ctx, key, []byte(fmt.Sprintf("writer-%d", i)), PutOptions{IfMatch: next})
+		}()
+	}
+	wg.Wait()
+	won, lost := 0, 0
+	winner := ""
+	for i, err := range results {
+		switch {
+		case err == nil:
+			won++
+			winner = fmt.Sprintf("writer-%d", i)
+		case errors.Is(err, ErrPreconditionFailed):
+			lost++
+		default:
+			t.Errorf("writer %d: %v", i, err)
+		}
+	}
+	t.Logf("conditional put with If-Match: %d won, %d refused", won, lost)
+	if won != 1 || lost != writers-1 {
+		t.Fatalf("%d of %d writers landed on one ETag, %d refused; want exactly 1: this service does not honour If-Match on PUT", won, writers, lost)
+	}
+	if got, err := client.Get(ctx, key, 64); err != nil || string(got) != winner {
+		t.Fatalf("the object is %q (%v), want the winner's %q", got, err, winner)
+	}
+}
+
+// W2 (key custody K0): `If-Match` on DELETE, which the collector's
+// conditional delete needs. A delete naming the ETag of the bytes that
+// were copied removes the object only while those are still it.
+func TestLiveConditionalDeleteIfMatch(t *testing.T) {
+	client := liveClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	key := fmt.Sprintf("live-%d/conditional-delete", time.Now().UnixNano())
+
+	if err := client.Put(ctx, key, []byte("v"), PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	_, etag, err := client.GetWithETag(ctx, key, 64)
+	if err != nil || etag == "" {
+		t.Fatalf("GetWithETag = ETag %q, %v", etag, err)
+	}
+	// Another ETag: refused, and the object is as it was.
+	if err := client.DeleteIfMatch(ctx, key, `"no-such-etag"`); !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("a delete with If-Match naming another ETag = %v, want ErrPreconditionFailed: this service does not honour If-Match on DELETE", err)
+	}
+	if got, err := client.Get(ctx, key, 64); err != nil || string(got) != "v" {
+		t.Fatalf("after the refused delete the object is %q (%v): the service answered 412 and deleted anyway", got, err)
+	}
+	// The object's ETag: gone.
+	if err := client.DeleteIfMatch(ctx, key, etag); err != nil {
+		t.Fatalf("a delete with If-Match naming the object's ETag = %v", err)
+	}
+	if _, err := client.Get(ctx, key, 64); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("after the delete: %v, want ErrNotFound: the service answered success and removed nothing", err)
+	}
+	// What is gone is reported, where an unconditional delete succeeds.
+	if err := client.DeleteIfMatch(ctx, key, etag); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a conditional delete of a missing object = %v, want ErrNotFound", err)
+	}
+}

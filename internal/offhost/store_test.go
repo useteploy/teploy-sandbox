@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy-sandbox/internal/offhost/offhosttest"
+	"github.com/useteploy/teploy-sandbox/internal/s3"
 )
 
 var bg = context.Background()
@@ -43,6 +44,9 @@ func testStore(t *testing.T) (*Store, *offhosttest.Memory) {
 	}
 	if !store.Conditional() {
 		t.Fatal("the in-memory bucket has conditional writes")
+	}
+	if !store.ConditionalPutMatch() || !store.ConditionalDeleteMatch() {
+		t.Fatal("the in-memory bucket honours If-Match on a write and on a delete")
 	}
 	if left := bucket.Keys(""); len(left) != 0 {
 		t.Fatalf("the probe left %v", left)
@@ -402,6 +406,310 @@ func TestProbeFindsAServiceWithoutConditionalWrites(t *testing.T) {
 	bucket.SetFail(func(string, string) error { return errors.New("no route to host") })
 	if err := store.Probe(bg); err == nil {
 		t.Fatal("a probe of unreachable storage succeeded")
+	}
+}
+
+// Key custody K0. The probe finds each of the three conditions on its
+// own: a service can have any of them and not the others.
+func TestProbeFindsEachConditionOnItsOwn(t *testing.T) {
+	cases := []struct {
+		name                               string
+		setUp                              func(*offhosttest.Memory)
+		conditional, putMatch, deleteMatch bool
+	}{
+		{"all three", func(*offhosttest.Memory) {}, true, true, true},
+		{"If-None-Match ignored", func(m *offhosttest.Memory) { m.Unconditional = true }, false, true, true},
+		{"If-Match ignored on a write", func(m *offhosttest.Memory) { m.NoIfMatchPut = true }, true, false, true},
+		{"If-Match ignored on a delete", func(m *offhosttest.Memory) { m.NoIfMatchDelete = true }, true, true, false},
+		{"all three ignored", func(m *offhosttest.Memory) { m.Unconditional, m.NoIfMatchPut, m.NoIfMatchDelete = true, true, true }, false, false, false},
+	}
+	for _, each := range cases {
+		t.Run(each.name, func(t *testing.T) {
+			bucket := offhosttest.NewMemory()
+			each.setUp(bucket)
+			store := NewStore(bucket, "fleet", testKeyring(t, 1), quiet())
+			if err := store.Probe(bg); err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			if store.Conditional() != each.conditional || store.ConditionalPutMatch() != each.putMatch || store.ConditionalDeleteMatch() != each.deleteMatch {
+				t.Fatalf("found If-None-Match %t, If-Match on a write %t and on a delete %t; want %t, %t, %t",
+					store.Conditional(), store.ConditionalPutMatch(), store.ConditionalDeleteMatch(), each.conditional, each.putMatch, each.deleteMatch)
+			}
+			if left := bucket.Keys(""); len(left) != 0 {
+				t.Fatalf("the probe left %v", left)
+			}
+		})
+	}
+}
+
+// ifMatchService is the in-memory bucket with the answers to `If-Match` a
+// test chooses. A hook answers in the bucket's place: put for a write
+// that carries the header, remove for a conditional delete. etag rewrites
+// the ETag a read answers. The bucket is the hooks' to act on.
+type ifMatchService struct {
+	*offhosttest.Memory
+	put    func(m *offhosttest.Memory, key string, body []byte, opts putOptions) error
+	remove func(m *offhosttest.Memory, key, etag string) error
+	etag   func(string) string
+}
+
+func (s *ifMatchService) Put(ctx context.Context, key string, body []byte, opts putOptions) error {
+	if opts.IfMatch != "" && s.put != nil {
+		return s.put(s.Memory, key, body, opts)
+	}
+	return s.Memory.Put(ctx, key, body, opts)
+}
+
+func (s *ifMatchService) DeleteIfMatch(ctx context.Context, key, etag string) error {
+	if s.remove != nil {
+		return s.remove(s.Memory, key, etag)
+	}
+	return s.Memory.DeleteIfMatch(ctx, key, etag)
+}
+
+func (s *ifMatchService) GetWithETag(ctx context.Context, key string, limit int64) ([]byte, string, error) {
+	body, etag, err := s.Memory.GetWithETag(ctx, key, limit)
+	if err == nil && s.etag != nil {
+		etag = s.etag(etag)
+	}
+	return body, etag, err
+}
+
+// Key custody K0. A 412 is believed only as far as the object confirms
+// it. A service that refuses the `If-Match` header itself (400 or 501),
+// ignores it, or fails on it has the condition out of use, and the probe
+// is no error: nothing else the daemon does needs it. One that answers as
+// if it honoured the condition and does otherwise has it out of use too.
+func TestProbeBelievesIfMatchOnlyAsFarAsItCanCheck(t *testing.T) {
+	// A service that refuses the header does nothing it asked for.
+	refusePut := func(status int) func(*offhosttest.Memory, string, []byte, putOptions) error {
+		return func(*offhosttest.Memory, string, []byte, putOptions) error {
+			return &s3.Error{Status: status, Code: "NotImplemented"}
+		}
+	}
+	refuseRemove := func(status int) func(*offhosttest.Memory, string, string) error {
+		return func(*offhosttest.Memory, string, string) error {
+			return &s3.Error{Status: status, Code: "NotImplemented"}
+		}
+	}
+	lying := &s3.Error{Status: 412, Code: "PreconditionFailed"}
+	cases := []ifMatchCase{
+		{
+			name: "the write refuses the header, 400",
+			put:  refusePut(400), putMatch: false, deleteMatch: true,
+		},
+		{
+			name: "the write refuses the header, 501",
+			put:  refusePut(501), putMatch: false, deleteMatch: true,
+		},
+		{
+			name:   "the delete refuses the header, 400",
+			remove: refuseRemove(400), putMatch: true, deleteMatch: false,
+		},
+		{
+			name:   "the delete refuses the header, 501",
+			remove: refuseRemove(501), putMatch: true, deleteMatch: false,
+		},
+		{
+			name: "both refuse the header, 501",
+			put:  refusePut(501), remove: refuseRemove(501), putMatch: false, deleteMatch: false,
+		},
+		judgedOnce(),
+		{
+			// It deletes whatever it is asked to, and answers by what
+			// was there: 412 for another ETag, success for the object's
+			// and for an object that is gone.
+			name: "the delete answers 412 and deletes anyway",
+			remove: func(m *offhosttest.Memory, key, etag string) error {
+				_, real, err := m.GetWithETag(bg, key, probeLimit)
+				_ = m.Delete(bg, key)
+				if err == nil && etag != real {
+					return lying
+				}
+				return nil
+			},
+			putMatch: true, deleteMatch: false,
+		},
+		{
+			name: "the write answers success and writes nothing",
+			put: func(m *offhosttest.Memory, key string, body []byte, opts putOptions) error {
+				if opts.IfMatch == wrongETag {
+					return m.Put(bg, key, body, opts)
+				}
+				return nil
+			},
+			putMatch: false, deleteMatch: true,
+		},
+		{
+			// A write that lands as something else than what was sent:
+			// only reading it back tells.
+			name: "the write lands as other bytes than it was given",
+			put: func(m *offhosttest.Memory, key string, body []byte, opts putOptions) error {
+				if opts.IfMatch == wrongETag {
+					return m.Put(bg, key, body, opts)
+				}
+				return m.Put(bg, key, append(bytes.Clone(body), '!'), putOptions{})
+			},
+			putMatch: false, deleteMatch: true,
+		},
+		{
+			name: "the delete answers success and removes nothing",
+			remove: func(m *offhosttest.Memory, key, etag string) error {
+				if etag == wrongETag {
+					return m.DeleteIfMatch(bg, key, etag)
+				}
+				return nil
+			},
+			putMatch: true, deleteMatch: false,
+		},
+		{
+			// It does nothing on another ETag, and says success. That is
+			// no refusal: a caller could not tell a write that lost a
+			// race from one that landed, and only the answer says.
+			name: "the write is silently not done on another ETag",
+			put: func(m *offhosttest.Memory, key string, body []byte, opts putOptions) error {
+				if opts.IfMatch == wrongETag {
+					return nil
+				}
+				return m.Put(bg, key, body, opts)
+			},
+			putMatch: false, deleteMatch: true,
+		},
+		{
+			name: "the delete is silently not done on another ETag",
+			remove: func(m *offhosttest.Memory, key, etag string) error {
+				if etag == wrongETag {
+					return nil
+				}
+				return m.DeleteIfMatch(bg, key, etag)
+			},
+			putMatch: true, deleteMatch: false,
+		},
+		{
+			// The same ETag for every version of an object: a number
+			// that names nothing cannot tell what was read from what
+			// replaced it.
+			name: "the ETag does not move with the bytes",
+			etag: func(string) string { return `"fixed"` },
+			put: func(m *offhosttest.Memory, key string, body []byte, opts putOptions) error {
+				if opts.IfMatch == `"fixed"` {
+					_, real, _ := m.GetWithETag(bg, key, probeLimit)
+					opts.IfMatch = real
+				}
+				return m.Put(bg, key, body, opts)
+			},
+			remove: func(m *offhosttest.Memory, key, etag string) error {
+				if etag == `"fixed"` {
+					_, real, _ := m.GetWithETag(bg, key, probeLimit)
+					etag = real
+				}
+				return m.DeleteIfMatch(bg, key, etag)
+			},
+			putMatch: false, deleteMatch: true,
+		},
+		answersNoETag(),
+		{
+			name: "the write fails, 500", put: refusePut(500), putMatch: false, deleteMatch: true,
+		},
+		{
+			name: "the delete fails, 500", remove: refuseRemove(500), putMatch: true, deleteMatch: false,
+		},
+	}
+	for _, each := range cases {
+		t.Run(each.name, func(t *testing.T) {
+			bucket := offhosttest.NewMemory()
+			store := NewStore(&ifMatchService{Memory: bucket, put: each.put, remove: each.remove, etag: each.etag}, "fleet", testKeyring(t, 1), quiet())
+			if err := store.Probe(bg); err != nil {
+				t.Fatalf("a service without a condition is no error to start against: %v", err)
+			}
+			// If-None-Match is not in question in any of these.
+			if !store.Conditional() {
+				t.Fatal("the probe lost sight of a condition it was not misled about")
+			}
+			if store.ConditionalPutMatch() != each.putMatch || store.ConditionalDeleteMatch() != each.deleteMatch {
+				t.Fatalf("found If-Match on a write %t and on a delete %t; want %t, %t",
+					store.ConditionalPutMatch(), store.ConditionalDeleteMatch(), each.putMatch, each.deleteMatch)
+			}
+			if each.sent != nil && *each.sent != 0 {
+				t.Fatalf("%d conditional requests were sent to a service that answers no ETag", *each.sent)
+			}
+			if left := bucket.Keys(""); len(left) != 0 {
+				t.Fatalf("the probe left %v", left)
+			}
+		})
+	}
+}
+
+// ifMatchCase is a service's answers to `If-Match`, and what the probe is
+// to make of them.
+type ifMatchCase struct {
+	name                  string
+	put                   func(m *offhosttest.Memory, key string, body []byte, opts putOptions) error
+	remove                func(m *offhosttest.Memory, key, etag string) error
+	etag                  func(string) string
+	sent                  *int
+	putMatch, deleteMatch bool
+}
+
+// judgedOnce is a service that judged the condition once, by the first
+// ETag it ever answered for the object, and never again: it writes
+// whatever it is given, answers 412 for any other ETag and success for
+// that one, whatever has happened to the object since. Reading the object
+// back after the refusal is the only way to see that the refused write
+// landed.
+func judgedOnce() ifMatchCase {
+	var view *string
+	lying := &s3.Error{Status: 412, Code: "PreconditionFailed"}
+	return ifMatchCase{
+		name: "the write answers 412 and lands anyway",
+		put: func(m *offhosttest.Memory, key string, body []byte, opts putOptions) error {
+			_ = m.Put(bg, key, body, putOptions{})
+			if view == nil || opts.IfMatch != *view {
+				return lying
+			}
+			return nil
+		},
+		etag: func(real string) string {
+			if view == nil {
+				view = &real
+			}
+			return real
+		},
+		putMatch: false, deleteMatch: true,
+	}
+}
+
+// answersNoETag is a service that answers no ETag for an object it reads.
+// There is no condition to make of that, and none may be sent: `If-Match`
+// with no value is no condition, and the write would be unconditional.
+func answersNoETag() ifMatchCase {
+	sent := 0
+	answer := func() error { sent++; return nil }
+	return ifMatchCase{
+		name:     "the service answers no ETag",
+		etag:     func(string) string { return "" },
+		put:      func(*offhosttest.Memory, string, []byte, putOptions) error { return answer() },
+		remove:   func(*offhosttest.Memory, string, string) error { return answer() },
+		sent:     &sent,
+		putMatch: false, deleteMatch: false,
+	}
+}
+
+// A probe whose own context ended did not finish, and says so. It still
+// takes its object with it.
+func TestAProbeCutShortFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(bg)
+	bucket := offhosttest.NewMemory()
+	service := &ifMatchService{Memory: bucket, put: func(*offhosttest.Memory, string, []byte, putOptions) error {
+		cancel()
+		return ctx.Err()
+	}}
+	store := NewStore(service, "fleet", testKeyring(t, 1), quiet())
+	if err := store.Probe(ctx); err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("a probe cut short = %v, want the context's error", err)
+	}
+	if left := bucket.Keys(""); len(left) != 0 {
+		t.Fatalf("the probe left %v", left)
 	}
 }
 

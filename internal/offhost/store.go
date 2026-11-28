@@ -23,8 +23,15 @@ import (
 type Objects interface {
 	Put(ctx context.Context, key string, body []byte, opts s3.PutOptions) error
 	Get(ctx context.Context, key string, limit int64) ([]byte, error)
+	// GetWithETag is Get, answering with the bytes the ETag the service
+	// gives them, of the one response that carried both.
+	GetWithETag(ctx context.Context, key string, limit int64) ([]byte, string, error)
 	Head(ctx context.Context, key string) (s3.Object, error)
 	Delete(ctx context.Context, key string) error
+	// DeleteIfMatch removes an object only while its ETag is etag:
+	// ErrPreconditionFailed when it is another, ErrNotFound when the
+	// object is gone (Delete succeeds there).
+	DeleteIfMatch(ctx context.Context, key, etag string) error
 	// Walk calls each for every object under prefix, without holding
 	// the listing: a bucket has as many objects as it has. It must
 	// never hand over a key that is not under prefix.
@@ -174,6 +181,11 @@ type Store struct {
 	// conditional is whether the service honours conditional writes
 	// (Probe).
 	conditional bool
+	// conditionalPutMatch and conditionalDeleteMatch are whether it
+	// honours `If-Match` on a write and on a delete, each found out on
+	// its own (Probe): a service can have one condition and not another.
+	conditionalPutMatch    bool
+	conditionalDeleteMatch bool
 
 	// unreferenced is when Collect first saw each snapshot with nothing
 	// referring to it; garbage is the same for each upload attempt whose
@@ -234,11 +246,50 @@ func (s *Store) Keys() *Keyring { return s.keys }
 // writes.
 func (s *Store) Conditional() bool { return s.conditional }
 
+// ConditionalPutMatch reports whether the service was found to honour
+// `If-Match` on a write: one made conditional on the ETag of bytes read
+// lands only while those are still the object.
+func (s *Store) ConditionalPutMatch() bool { return s.conditionalPutMatch }
+
+// ConditionalDeleteMatch reports whether the service was found to honour
+// `If-Match` on a delete.
+func (s *Store) ConditionalDeleteMatch() bool { return s.conditionalDeleteMatch }
+
+const (
+	// probeLimit bounds the reads of the probe object, whose bodies are
+	// a few bytes.
+	probeLimit = 64
+	// wrongETag is a well-formed ETag that is no object's.
+	wrongETag = `"00000000000000000000000000000000"`
+)
+
+// errDisagrees is a service that answered a request as if it honoured
+// the condition and did otherwise: the one answer not to be trusted.
+var errDisagrees = errors.New("the service answered as if it honoured the condition and did otherwise")
+
 // Probe checks that the bucket can be written, read and deleted from, and
-// finds out whether the service honours `If-None-Match: *`: it writes one
-// object twice under a name of its own and requires the second write to
-// be refused. A service that accepts it (or does not know the header) has
-// no conditional writes, and Conditional says so from then on.
+// finds out which of three conditions the service honours, each on its
+// own and all on one object under a random name of the probe's own:
+//
+//   - `If-None-Match: *` on a write (Conditional): the object is written
+//     twice and the second write must be refused. A service that accepts
+//     it (or does not know the header) has no conditional writes.
+//   - `If-Match` on a write (ConditionalPutMatch): a write naming another
+//     ETag must be refused and change nothing, and one naming the
+//     object's ETag must land and be read back with a new ETag.
+//   - `If-Match` on a delete (ConditionalDeleteMatch): a delete naming
+//     another ETag must be refused and leave the object, and one naming
+//     the object's ETag must remove it.
+//
+// A condition is honoured only when both of its checks pass: a service
+// that answers 412 and writes anyway, or 204 and deletes nothing, has
+// none. The `If-Match` conditions are no error to be without: a service
+// that refuses the header itself (400 or 501), ignores it, answers no
+// ETag, or fails in any other way, has them out of use and the daemon
+// starts all the same (what it saw is logged). What fails the probe is
+// storage that cannot be written to or read from, or a probe that did
+// not run to the end because its context ended; a probe object that
+// cannot be deleted afterwards is logged and left.
 func (s *Store) Probe(ctx context.Context) error {
 	token := make([]byte, 12)
 	if _, err := rand.Read(token); err != nil {
@@ -262,6 +313,8 @@ func (s *Store) Probe(ctx context.Context) error {
 	defer func() {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
+		// Unconditional, and so right whatever the checks below found:
+		// the object is gone already where a delete was honoured.
 		if err := s.objects.Delete(cleanup, key); err != nil {
 			s.log.Warn("remote storage probe object not deleted", "key", key, "error", err)
 		}
@@ -288,6 +341,177 @@ func (s *Store) Probe(ctx context.Context) error {
 		// It answered 412 and overwrote anyway: not to be trusted.
 		s.conditional = false
 	}
+	if err := s.probePutIfMatch(ctx, key); err != nil {
+		return err
+	}
+	return s.probeDeleteIfMatch(ctx, key)
+}
+
+// headerRefused reports whether err is the service refusing a
+// conditional header itself (400 or 501) rather than answering it: it
+// does not have the condition.
+func headerRefused(err error) bool {
+	var failure *s3.Error
+	return errors.As(err, &failure) && (failure.Status == 400 || failure.Status == 501)
+}
+
+// probeNote says a condition was not found to be honoured, and why. With
+// an error it is a warning: the service failed in a way that is no
+// answer at all, or answered as if it honoured the condition and did
+// otherwise. Without one the service merely does not have it.
+func (s *Store) probeNote(condition, why string, err error) {
+	if err != nil {
+		s.log.Warn("remote storage probe: a condition is not used", "condition", condition, "why", why, "error", err)
+		return
+	}
+	s.log.Info("remote storage probe: a condition is not used", "condition", condition, "why", why)
+}
+
+// probeFailed is a request of the `If-Match` checks that failed in a way
+// that is no answer to its condition. The condition is not used and the
+// probe goes on, unless the probe's own context ended: it did not finish
+// then, and the error is returned.
+func (s *Store) probeFailed(ctx context.Context, condition, why string, err error) error {
+	if ctx.Err() != nil {
+		if err == nil {
+			err = ctx.Err()
+		}
+		return fmt.Errorf("remote storage probe: %s: %w", why, err)
+	}
+	s.probeNote(condition, why, err)
+	return nil
+}
+
+// probeObject reads the probe object at key with its ETag. ok is false,
+// with nothing to return, when there is no ETag to make a condition of.
+func (s *Store) probeObject(ctx context.Context, condition, key string) (body []byte, etag string, ok bool, err error) {
+	body, etag, err = s.objects.GetWithETag(ctx, key, probeLimit)
+	if err != nil {
+		return nil, "", false, s.probeFailed(ctx, condition, "the probe object could not be read with its ETag", err)
+	}
+	if etag == "" {
+		s.probeNote(condition, "the service answers no ETag for an object it reads", nil)
+		return nil, "", false, nil
+	}
+	return body, etag, true, nil
+}
+
+// mustRefuse runs a request the service must refuse: a write or a delete
+// with `If-Match` naming another ETag. ok is false when it does not have
+// the condition, whether it went ahead anyway or refused the header
+// itself; err is set only when the probe cannot go on.
+func (s *Store) mustRefuse(ctx context.Context, condition, what string, request func() error) (bool, error) {
+	switch err := request(); {
+	case errors.Is(err, s3.ErrPreconditionFailed):
+		return true, nil
+	case err == nil:
+		s.probeNote(condition, what+" went ahead", nil)
+	case headerRefused(err):
+		s.probeNote(condition, what+": the service refuses the header", nil)
+	default:
+		return false, s.probeFailed(ctx, condition, what+" could not be judged", err)
+	}
+	return false, nil
+}
+
+// mustDo runs a request the service must carry out: a write or a delete
+// with `If-Match` naming the object's ETag.
+func (s *Store) mustDo(ctx context.Context, condition, what string, request func() error) (bool, error) {
+	switch err := request(); {
+	case err == nil:
+		return true, nil
+	case headerRefused(err):
+		s.probeNote(condition, what+": the service refuses the header", nil)
+	default:
+		// Refused what it should have done, or failed.
+		return false, s.probeFailed(ctx, condition, what+" was not done", err)
+	}
+	return false, nil
+}
+
+// probePutIfMatch finds out whether `If-Match` on a write is honoured, on
+// the probe object at key: conditionalPutMatch only when it is. The
+// error is returned only when the probe cannot go on.
+func (s *Store) probePutIfMatch(ctx context.Context, key string) error {
+	const condition = "If-Match on a write"
+	s.conditionalPutMatch = false
+	standing, etag, ok, err := s.probeObject(ctx, condition, key)
+	if !ok {
+		return err
+	}
+	if ok, err := s.mustRefuse(ctx, condition, "a write naming another ETag", func() error {
+		return s.objects.Put(ctx, key, []byte("not written"), s3.PutOptions{IfMatch: wrongETag})
+	}); !ok {
+		return err
+	}
+	now, nowETag, err := s.objects.GetWithETag(ctx, key, probeLimit)
+	switch {
+	case err != nil:
+		return s.probeFailed(ctx, condition, "a write naming another ETag could not be read back", err)
+	case string(now) != string(standing) || nowETag != etag:
+		s.probeNote(condition, "a write naming another ETag answered 412 and was written anyway", errDisagrees)
+		return nil
+	}
+	if ok, err := s.mustDo(ctx, condition, "a write naming the object's ETag", func() error {
+		return s.objects.Put(ctx, key, []byte("updated"), s3.PutOptions{IfMatch: etag})
+	}); !ok {
+		return err
+	}
+	written, next, err := s.objects.GetWithETag(ctx, key, probeLimit)
+	if err != nil {
+		return s.probeFailed(ctx, condition, "a write naming the object's ETag could not be read back", err)
+	}
+	// The ETag has moved on with the bytes: were it the same for other
+	// bytes, no write could be made conditional on what was read.
+	if string(written) != "updated" || next == "" || next == etag {
+		s.probeNote(condition, "a write naming the object's ETag did not land as it was read back", errDisagrees)
+		return nil
+	}
+	s.conditionalPutMatch = true
+	return nil
+}
+
+// probeDeleteIfMatch finds out whether `If-Match` on a delete is
+// honoured, on the probe object at key: conditionalDeleteMatch only when
+// it is. Where it is, the object is gone at the end; whatever else
+// happened, Probe's cleanup deletes it.
+func (s *Store) probeDeleteIfMatch(ctx context.Context, key string) error {
+	const condition = "If-Match on a delete"
+	s.conditionalDeleteMatch = false
+	_, etag, ok, err := s.probeObject(ctx, condition, key)
+	if !ok {
+		return err
+	}
+	if ok, err := s.mustRefuse(ctx, condition, "a delete naming another ETag", func() error {
+		return s.objects.DeleteIfMatch(ctx, key, wrongETag)
+	}); !ok {
+		return err
+	}
+	// The object is still there, as it was. A delete that was refused
+	// and went through leaves nothing to read.
+	switch _, _, err := s.objects.GetWithETag(ctx, key, probeLimit); {
+	case errors.Is(err, s3.ErrNotFound):
+		s.probeNote(condition, "a delete naming another ETag answered 412 and deleted anyway", errDisagrees)
+		return nil
+	case err != nil:
+		return s.probeFailed(ctx, condition, "a delete naming another ETag could not be read back", err)
+	}
+	if ok, err := s.mustDo(ctx, condition, "a delete naming the object's ETag", func() error {
+		return s.objects.DeleteIfMatch(ctx, key, etag)
+	}); !ok {
+		return err
+	}
+	// Only a read that finds nothing proves it: a delete that answered
+	// success and left the object is not to be trusted.
+	switch _, _, err := s.objects.GetWithETag(ctx, key, probeLimit); {
+	case errors.Is(err, s3.ErrNotFound):
+	case err != nil:
+		return s.probeFailed(ctx, condition, "the object could not be read back after the delete", err)
+	default:
+		s.probeNote(condition, "a delete naming the object's ETag did not remove it", errDisagrees)
+		return nil
+	}
+	s.conditionalDeleteMatch = true
 	return nil
 }
 

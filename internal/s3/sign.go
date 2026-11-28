@@ -3,9 +3,11 @@
 // object calls the daemon needs, and retries.
 //
 // It deliberately speaks plain S3 and nothing a single provider adds. The
-// one feature beyond the 2006 API is the conditional write
-// (`If-None-Match: *`), and a caller can ask whether the service honours
-// it (see Client.Put and ErrPreconditionFailed).
+// features beyond the 2006 API are the conditional write (`If-None-Match`
+// on PUT) and, where a service has them, a write or a delete made
+// conditional on the object's ETag (`If-Match`). A caller can ask whether
+// the service honours each (see Client.Put, Client.DeleteIfMatch and
+// ErrPreconditionFailed).
 package s3
 
 import (

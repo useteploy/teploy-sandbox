@@ -5,6 +5,9 @@ package offhosttest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -15,13 +18,23 @@ import (
 
 // Memory is a bucket in memory, with the semantics the daemon relies on:
 // a conditional write that exactly one of many writers wins, listings in
-// key order that show every write, and modification times.
+// key order that show every write, and modification times. Every object
+// has an ETag of its bytes, and the conditions of a real service are
+// answered: `If-None-Match: *`, `If-Match` on a write and `If-Match` on
+// a delete, 412 where the condition is not met.
 type Memory struct {
 	mu      sync.Mutex
 	objects map[string]memoryObject
 	// Unconditional makes the bucket ignore `If-None-Match`, like a
 	// service that does not know it: every write succeeds.
 	Unconditional bool
+	// NoIfMatchPut makes the bucket ignore `If-Match` on a write, and
+	// NoIfMatchDelete on a delete: a service that does not know the
+	// header writes over whatever is there and deletes whatever is
+	// named. Either can be set with or without Unconditional; a service
+	// can have one condition and not another.
+	NoIfMatchPut    bool
+	NoIfMatchDelete bool
 	// Now is the bucket's clock.
 	Now func() time.Time
 	// Fail, when set, is asked before every call (op is "put", "get",
@@ -32,8 +45,18 @@ type Memory struct {
 }
 
 type memoryObject struct {
-	data     []byte
+	data []byte
+	// etag is of the data as stored, quoted as a service answers it.
+	etag     string
 	modified time.Time
+}
+
+// etagOf is the ETag of an object's bytes: the same bytes always have
+// the same ETag, and other bytes another, which is what a write
+// conditional on one needs to tell two versions apart.
+func etagOf(data []byte) string {
+	digest := sha256.Sum256(data)
+	return `"` + hex.EncodeToString(digest[:]) + `"`
 }
 
 // NewMemory is an empty bucket.
@@ -59,33 +82,45 @@ func (m *Memory) SetFail(fail func(op, key string) error) {
 }
 
 func (m *Memory) Put(_ context.Context, key string, body []byte, opts s3.PutOptions) error {
+	if opts.IfAbsent && opts.IfMatch != "" {
+		return errors.New("a write cannot be conditional on the object being absent and on its ETag at once")
+	}
 	if err := m.fail("put", key); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, exists := m.objects[key]; exists && opts.IfAbsent && !m.Unconditional {
+	object, exists := m.objects[key]
+	switch {
+	case opts.IfAbsent && exists && !m.Unconditional,
+		opts.IfMatch != "" && !m.NoIfMatchPut && (!exists || object.etag != opts.IfMatch):
 		return &s3.Error{Status: 412, Code: "PreconditionFailed"}
 	}
-	m.objects[key] = memoryObject{data: bytes.Clone(body), modified: m.Now()}
+	m.objects[key] = memoryObject{data: bytes.Clone(body), etag: etagOf(body), modified: m.Now()}
 	m.PutBytes += int64(len(body))
 	return nil
 }
 
-func (m *Memory) Get(_ context.Context, key string, limit int64) ([]byte, error) {
+func (m *Memory) Get(ctx context.Context, key string, limit int64) ([]byte, error) {
+	data, _, err := m.GetWithETag(ctx, key, limit)
+	return data, err
+}
+
+// GetWithETag is Get and answers the object's ETag with its bytes.
+func (m *Memory) GetWithETag(_ context.Context, key string, limit int64) ([]byte, string, error) {
 	if err := m.fail("get", key); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	object, ok := m.objects[key]
 	if !ok {
-		return nil, &s3.Error{Status: 404, Code: "NoSuchKey"}
+		return nil, "", &s3.Error{Status: 404, Code: "NoSuchKey"}
 	}
 	if int64(len(object.data)) > limit {
-		return nil, &s3.Error{Status: 200, Code: "ResponseTooLarge"}
+		return nil, "", &s3.Error{Status: 200, Code: "ResponseTooLarge"}
 	}
-	return bytes.Clone(object.data), nil
+	return bytes.Clone(object.data), object.etag, nil
 }
 
 func (m *Memory) Head(_ context.Context, key string) (s3.Object, error) {
@@ -101,7 +136,7 @@ func (m *Memory) Head(_ context.Context, key string) (s3.Object, error) {
 	// An HTTP date: whole seconds, where a listing has milliseconds
 	// (what real services answer, and what a comparison of the two must
 	// survive).
-	return s3.Object{Key: key, Size: int64(len(object.data)), LastModified: object.modified.Truncate(time.Second)}, nil
+	return s3.Object{Key: key, Size: int64(len(object.data)), LastModified: object.modified.Truncate(time.Second), ETag: object.etag}, nil
 }
 
 func (m *Memory) Delete(_ context.Context, key string) error {
@@ -110,6 +145,31 @@ func (m *Memory) Delete(_ context.Context, key string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	delete(m.objects, key)
+	return nil
+}
+
+// DeleteIfMatch removes the object only while its ETag is etag: 404 when
+// there is no such object, 412 when its ETag is another, and either way
+// the object is left as it was.
+func (m *Memory) DeleteIfMatch(_ context.Context, key, etag string) error {
+	if etag == "" {
+		return errors.New("a delete conditional on an ETag needs the ETag")
+	}
+	if err := m.fail("delete", key); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	object, exists := m.objects[key]
+	if !m.NoIfMatchDelete {
+		if !exists {
+			return &s3.Error{Status: 404, Code: "NoSuchKey"}
+		}
+		if object.etag != etag {
+			return &s3.Error{Status: 412, Code: "PreconditionFailed"}
+		}
+	}
 	delete(m.objects, key)
 	return nil
 }
@@ -124,7 +184,7 @@ func (m *Memory) ListAll(_ context.Context, prefix string) ([]s3.Object, error) 
 	var listed []s3.Object
 	for key, object := range m.objects {
 		if strings.HasPrefix(key, prefix) {
-			listed = append(listed, s3.Object{Key: key, Size: int64(len(object.data)), LastModified: object.modified.Truncate(time.Millisecond)})
+			listed = append(listed, s3.Object{Key: key, Size: int64(len(object.data)), LastModified: object.modified.Truncate(time.Millisecond), ETag: object.etag})
 		}
 	}
 	sort.Slice(listed, func(i, j int) bool { return listed[i].Key < listed[j].Key })
@@ -168,11 +228,13 @@ func (m *Memory) Raw(key string) []byte {
 }
 
 // SetRaw replaces an object's bytes without touching its time: tampering.
+// The ETag is the new bytes', as it would be of a write.
 func (m *Memory) SetRaw(key string, data []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	object := m.objects[key]
 	object.data = bytes.Clone(data)
+	object.etag = etagOf(data)
 	m.objects[key] = object
 }
 
@@ -206,15 +268,16 @@ type Faulty struct {
 	// the caller gets (a write whose answer was lost).
 	AfterPut func(key string) error
 	// GetErr, when it returns an error, is the answer to a read (a 404
-	// for an object that is there).
+	// for an object that is there): of Get and of GetWithETag alike.
 	GetErr func(key string) error
-	// AfterGet runs after a read that succeeded.
+	// AfterGet runs after a read that succeeded, of either kind.
 	AfterGet func(key string)
 	// Listed rewrites a listing before the caller sees it: stale, cut
 	// short, without times, or ignoring the prefix.
 	Listed func(prefix string, listed []s3.Object) []s3.Object
 	// BeforeDelete and AfterDelete run around a delete reaching the
-	// bucket: a race ordered by hand at one exact request.
+	// bucket, conditional or not: a race ordered by hand at one exact
+	// request. AfterDelete runs only when the bucket deleted.
 	BeforeDelete func(key string)
 	AfterDelete  func(key string)
 	// Headed rewrites the answer to a HEAD (a service that reports a
@@ -234,13 +297,23 @@ func (f *Faulty) Head(ctx context.Context, key string) (s3.Object, error) {
 }
 
 func (f *Faulty) Delete(ctx context.Context, key string) error {
+	return f.aroundDelete(key, func() error { return f.Memory.Delete(ctx, key) })
+}
+
+// DeleteIfMatch is Memory.DeleteIfMatch behind the delete hooks.
+func (f *Faulty) DeleteIfMatch(ctx context.Context, key, etag string) error {
+	return f.aroundDelete(key, func() error { return f.Memory.DeleteIfMatch(ctx, key, etag) })
+}
+
+// aroundDelete runs the delete hooks around a delete reaching the bucket.
+func (f *Faulty) aroundDelete(key string, remove func() error) error {
 	f.mu.Lock()
 	before, after := f.BeforeDelete, f.AfterDelete
 	f.mu.Unlock()
 	if before != nil {
 		before(key)
 	}
-	if err := f.Memory.Delete(ctx, key); err != nil {
+	if err := remove(); err != nil {
 		return err
 	}
 	if after != nil {
@@ -299,19 +372,25 @@ func (f *Faulty) Put(ctx context.Context, key string, body []byte, opts s3.PutOp
 }
 
 func (f *Faulty) Get(ctx context.Context, key string, limit int64) ([]byte, error) {
+	data, _, err := f.GetWithETag(ctx, key, limit)
+	return data, err
+}
+
+// GetWithETag is Memory.GetWithETag behind the read hooks.
+func (f *Faulty) GetWithETag(ctx context.Context, key string, limit int64) ([]byte, string, error) {
 	f.mu.Lock()
 	getErr, after := f.GetErr, f.AfterGet
 	f.mu.Unlock()
 	if getErr != nil {
 		if err := getErr(key); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 	}
-	data, err := f.Memory.Get(ctx, key, limit)
+	data, etag, err := f.Memory.GetWithETag(ctx, key, limit)
 	if err == nil && after != nil {
 		after(key)
 	}
-	return data, err
+	return data, etag, err
 }
 
 func (f *Faulty) Walk(ctx context.Context, prefix string, each func(s3.Object) error) error {

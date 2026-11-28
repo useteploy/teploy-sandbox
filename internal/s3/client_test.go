@@ -110,8 +110,13 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status := f.fail[0]
 		f.fail = f.fail[1:]
 		code := "InternalError"
-		if status == http.StatusForbidden {
+		switch status {
+		case http.StatusForbidden:
 			code = "AccessDenied"
+		case http.StatusNotFound:
+			code = "NoSuchKey"
+		case http.StatusPreconditionFailed:
+			code = "PreconditionFailed"
 		}
 		fail(w, status, code)
 		return
@@ -142,8 +147,8 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && key == "":
 		f.list(w, query.Get("prefix"), query.Get("continuation-token"))
 	case r.Method == http.MethodPut:
-		if _, exists := f.objects[key]; exists && r.Header.Get("If-None-Match") == "*" {
-			fail(w, http.StatusPreconditionFailed, "PreconditionFailed")
+		if status, code := f.precondition(r, key); status != 0 {
+			fail(w, status, code)
 			return
 		}
 		f.objects[key] = body
@@ -154,16 +159,47 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Length", strconv.Itoa(len(object)))
+		w.Header().Set("ETag", fakeETag(object))
 		w.Header().Set("Last-Modified", time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC).Format(http.TimeFormat))
 		if r.Method == http.MethodGet {
 			_, _ = w.Write(object)
 		}
 	case r.Method == http.MethodDelete:
+		if status, code := f.precondition(r, key); status != 0 {
+			fail(w, status, code)
+			return
+		}
 		delete(f.objects, key)
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		fail(w, http.StatusMethodNotAllowed, "MethodNotAllowed")
 	}
+}
+
+// fakeETag is the ETag the fake service answers for an object's bytes.
+func fakeETag(body []byte) string {
+	digest := sha256.Sum256(body)
+	return `"` + hex.EncodeToString(digest[:]) + `"`
+}
+
+// precondition judges the conditions of a write or a delete as a service
+// that honours them does: 0 when the request goes on. `If-Match` on an
+// object that is not there is answered 404; services differ on that
+// (some answer 412), and the client reports whichever it gets.
+func (f *fakeService) precondition(r *http.Request, key string) (int, string) {
+	object, exists := f.objects[key]
+	if exists && r.Header.Get("If-None-Match") == "*" {
+		return http.StatusPreconditionFailed, "PreconditionFailed"
+	}
+	if match := r.Header.Get("If-Match"); match != "" {
+		switch {
+		case !exists:
+			return http.StatusNotFound, "NoSuchKey"
+		case match != fakeETag(object):
+			return http.StatusPreconditionFailed, "PreconditionFailed"
+		}
+	}
+	return 0, ""
 }
 
 func (f *fakeService) list(w http.ResponseWriter, prefix, token string) {
@@ -241,6 +277,250 @@ func TestClientConditionalPut(t *testing.T) {
 	defer service.mu.Unlock()
 	if count := len(service.requests); count != 3 {
 		t.Fatalf("%d requests, want 3: %v", count, service.requests)
+	}
+}
+
+// Key custody K0. A write conditional on the ETag of the bytes that were
+// read (compare-and-swap), on a service that has it.
+func TestClientPutIfMatch(t *testing.T) {
+	service, server := newFakeService(t)
+	client := service.client(t, server.URL)
+	ctx := context.Background()
+	if err := client.Put(ctx, "k", []byte("v1"), PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	body, etag, err := client.GetWithETag(ctx, "k", 16)
+	if err != nil || string(body) != "v1" || etag == "" {
+		t.Fatalf("GetWithETag = %q, ETag %q, %v", body, etag, err)
+	}
+	if got, _ := client.Head(ctx, "k"); got.ETag != etag {
+		t.Fatalf("Head answers ETag %q where GetWithETag answers %q", got.ETag, etag)
+	}
+	// Another ETag: refused, and the object is as it was.
+	err = client.Put(ctx, "k", []byte("lost"), PutOptions{IfMatch: `"another"`})
+	if !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("a write naming another ETag = %v, want ErrPreconditionFailed", err)
+	}
+	if got, _ := client.Get(ctx, "k", 16); string(got) != "v1" {
+		t.Fatalf("the refused write landed: %q", got)
+	}
+	// The ETag read with the bytes: the write lands, and moves it on.
+	if err := client.Put(ctx, "k", []byte("v2"), PutOptions{IfMatch: etag}); err != nil {
+		t.Fatal(err)
+	}
+	got, next, err := client.GetWithETag(ctx, "k", 16)
+	if err != nil || string(got) != "v2" || next == "" || next == etag {
+		t.Fatalf("after the write: %q, ETag %q (was %q), %v", got, next, etag, err)
+	}
+	// So one still naming the ETag of what was replaced is refused: the
+	// write that has lost the race.
+	if err := client.Put(ctx, "k", []byte("late"), PutOptions{IfMatch: etag}); !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("a write naming a replaced ETag = %v, want ErrPreconditionFailed", err)
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	// Three writes, three reads, one HEAD and two refusals, one request
+	// each. A 412 is an answer, not a fault, and is not retried.
+	if count := len(service.requests); count != 8 {
+		t.Fatalf("%d requests, want 8: %v", count, service.requests)
+	}
+}
+
+// An object that is not there matches no ETag: nothing is written,
+// whichever way the service says so (404 on some, 412 on others).
+func TestClientPutIfMatchOnAMissingObject(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusPreconditionFailed} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			service, server := newFakeService(t)
+			client := service.client(t, server.URL)
+			ctx := context.Background()
+			want := ErrNotFound
+			if status != http.StatusNotFound {
+				// The fake answers 404 by itself; another answer is put in its place.
+				service.mu.Lock()
+				service.fail = []int{status}
+				service.mu.Unlock()
+				want = ErrPreconditionFailed
+			}
+			err := client.Put(ctx, "k", []byte("v"), PutOptions{IfMatch: `"etag"`})
+			if !errors.Is(err, want) {
+				t.Fatalf("a write with If-Match on a missing object = %v, want %v", err, want)
+			}
+			if _, err := client.Head(ctx, "k"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("the object was written: %v", err)
+			}
+		})
+	}
+}
+
+// Key custody K0. A delete conditional on the object's ETag: what has
+// changed is left alone, and what is gone is reported, where Delete
+// succeeds.
+func TestClientDeleteIfMatch(t *testing.T) {
+	service, server := newFakeService(t)
+	client := service.client(t, server.URL)
+	ctx := context.Background()
+	if err := client.Put(ctx, "k", []byte("v"), PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	_, etag, err := client.GetWithETag(ctx, "k", 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.DeleteIfMatch(ctx, "k", `"another"`)
+	if !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("a delete naming another ETag = %v, want ErrPreconditionFailed", err)
+	}
+	if got, err := client.Get(ctx, "k", 16); err != nil || string(got) != "v" {
+		t.Fatalf("after the refused delete: %q, %v", got, err)
+	}
+	service.mu.Lock()
+	service.requests = nil
+	service.mu.Unlock()
+	if err := client.DeleteIfMatch(ctx, "k", etag); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Get(ctx, "k", 16); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("after the delete: %v, want ErrNotFound", err)
+	}
+	if err := client.DeleteIfMatch(ctx, "k", etag); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a conditional delete of a missing object = %v, want ErrNotFound", err)
+	}
+	if err := client.Delete(ctx, "k"); err != nil {
+		t.Fatalf("deleting a missing object: %v", err)
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	// The delete that did it, a read, one refused by what is gone, and
+	// Delete on it: one request each. A 404 is not retried either.
+	if count := len(service.requests); count != 4 {
+		t.Fatalf("%d requests, want 4: %v", count, service.requests)
+	}
+}
+
+// Key custody K0 (review A8, for the second condition): `If-Match` is
+// signed on a write and on a delete.
+func TestIfMatchIsSigned(t *testing.T) {
+	requests := ifMatchRequests()
+	for name, request := range requests {
+		t.Run(name, func(t *testing.T) {
+			var authorization, condition string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				authorization, condition = r.Header.Get("Authorization"), r.Header.Get("If-Match")
+				_, _ = io.Copy(io.Discard, r.Body)
+			}))
+			t.Cleanup(server.Close)
+			client, err := New(Config{Endpoint: server.URL, Bucket: "b", PathStyle: true, Credentials: Credentials{AccessKey: "a", SecretKey: "s"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := request(context.Background(), client); err != nil {
+				t.Fatal(err)
+			}
+			if condition != `"e"` {
+				t.Fatalf("If-Match = %q", condition)
+			}
+			_, list, _ := strings.Cut(authorization, "SignedHeaders=")
+			list, _, _ = strings.Cut(list, ",")
+			if !strings.Contains(";"+list+";", ";if-match;") {
+				t.Fatalf("if-match is not among the signed headers: %s", list)
+			}
+		})
+	}
+}
+
+// ifMatchRequests is one conditional write and one conditional delete,
+// each with `If-Match` set.
+func ifMatchRequests() map[string]func(ctx context.Context, client *Client) error {
+	return map[string]func(ctx context.Context, client *Client) error{
+		"PUT": func(ctx context.Context, client *Client) error {
+			return client.Put(ctx, "k", []byte("changed"), PutOptions{IfMatch: `"e"`})
+		},
+		"DELETE": func(ctx context.Context, client *Client) error {
+			return client.DeleteIfMatch(ctx, "k", `"e"`)
+		},
+	}
+}
+
+// And the fake service, which recomputes every signature from the
+// request as received, refuses a conditional write or delete whose
+// `If-Match` was removed on the way. Unsigned, anything between the
+// daemon and the service could turn "replace only what was read" into
+// "replace", and "remove only what was condemned" into "remove".
+func TestAStrippedIfMatchBreaksTheSignature(t *testing.T) {
+	requests := ifMatchRequests()
+	for name, request := range requests {
+		t.Run(name, func(t *testing.T) {
+			service, server := newFakeService(t)
+			service.mu.Lock()
+			service.objects["k"] = []byte("v")
+			service.mu.Unlock()
+			stripped := 0
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				forward, _ := http.NewRequest(r.Method, server.URL+r.URL.RequestURI(), bytes.NewReader(body))
+				forward.Header = r.Header.Clone()
+				forward.Host = r.Host
+				if forward.Header.Get("If-Match") != "" {
+					forward.Header.Del("If-Match")
+					stripped++
+				}
+				recorder := httptest.NewRecorder()
+				service.quiet = true
+				service.ServeHTTP(recorder, forward)
+				w.WriteHeader(recorder.Code)
+				_, _ = w.Write(recorder.Body.Bytes())
+			}))
+			t.Cleanup(proxy.Close)
+			client := service.client(t, proxy.URL)
+			err := request(context.Background(), client)
+			if err == nil || stripped == 0 {
+				t.Fatalf("a conditional request whose If-Match was stripped on the way was accepted (stripped %d): %v", stripped, err)
+			}
+			service.mu.Lock()
+			defer service.mu.Unlock()
+			if string(service.objects["k"]) != "v" {
+				t.Fatal("the unconditional form of a conditional request reached the bucket")
+			}
+		})
+	}
+}
+
+// Key custody K0. The two conditions cannot both hold; a conditional
+// delete with no ETag would be unconditional. The client refuses both
+// itself: nothing is sent, for a service that does not know one of the
+// headers would go ahead without it.
+func TestPutRefusesBothConditions(t *testing.T) {
+	service, server := newFakeService(t)
+	client := service.client(t, server.URL)
+	err := client.Put(context.Background(), "k", []byte("v"), PutOptions{IfAbsent: true, IfMatch: `"e"`})
+	if err == nil {
+		t.Fatal("a write conditional on the object being absent and on its ETag was accepted")
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if len(service.requests) != 0 || len(service.objects) != 0 {
+		t.Fatalf("the write was sent: %v", service.requests)
+	}
+}
+
+func TestDeleteIfMatchRefusesAnEmptyETag(t *testing.T) {
+	service, server := newFakeService(t)
+	client := service.client(t, server.URL)
+	ctx := context.Background()
+	if err := client.Put(ctx, "k", []byte("v"), PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	service.mu.Lock()
+	service.requests = nil
+	service.mu.Unlock()
+	if err := client.DeleteIfMatch(ctx, "k", ""); err == nil {
+		t.Fatal("a delete conditional on no ETag was accepted")
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if len(service.requests) != 0 || string(service.objects["k"]) != "v" {
+		t.Fatalf("the delete was sent: %v", service.requests)
 	}
 }
 

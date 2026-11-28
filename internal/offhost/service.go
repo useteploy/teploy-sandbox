@@ -1827,7 +1827,10 @@ func (s *Service) Rotate(ctx context.Context) (run.RotateStats, error) {
 		Records: stats.Records, RecordsCurrent: stats.RecordsCurrent, RecordsRunning: stats.RecordsRunning,
 		RecordsConflicted: stats.RecordsConflicted, RecordsUnfenced: stats.RecordsUnfenced, RecordsDestroyed: stats.RecordsDestroyed,
 		RecordsRunningPrevious: stats.RecordsRunningPrevious, RecordsDestroyedPrevious: stats.RecordsDestroyedPrevious,
-		RecordsNeedKey: stats.RecordsNeedKey, PreviousKeyNeeded: stats.PreviousKeyNeeded,
+		RecordsNeedKey: stats.RecordsNeedKey, OldKeysRemaining: stats.OldKeysRemaining, PreviousKeyNeeded: stats.PreviousKeyNeeded,
+	}
+	if stats.OldKeysRemaining > 0 {
+		out.PreviousKeyNeededFor = append(out.PreviousKeyNeededFor, fmt.Sprintf("%d objects still wrap a hold key under a previous root key version; run the rotation again once they settle", stats.OldKeysRemaining))
 	}
 	if stats.Records > 0 {
 		out.PreviousKeyNeededFor = append(out.PreviousKeyNeededFor, fmt.Sprintf("%d records were rewritten; the generations they replaced are under the previous master until a collection has pruned them", stats.Records))
@@ -1851,6 +1854,9 @@ func (s *Service) Rotate(ctx context.Context) (run.RotateStats, error) {
 		out.PreviousKeyNeededFor = append(out.PreviousKeyNeededFor, fmt.Sprintf("%d manifests name chunks that are not there and were not rewritten", stats.ManifestsSkipped))
 	}
 	if err != nil {
+		if errors.Is(err, ErrConditionalRequired) {
+			return out, fmt.Errorf("%w: %v", run.ErrBadRequest, err)
+		}
 		return out, err
 	}
 	s.log.Info("remote storage keys rotated", "manifestsRewrapped", stats.Manifests, "manifestsCurrent", stats.ManifestsCurrent, "manifestsSkipped", stats.ManifestsSkipped,

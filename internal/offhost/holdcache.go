@@ -94,6 +94,10 @@ type cacheFile struct {
 	// only this host's secret opens.
 	Header  string                     `json:"header"`
 	Entries map[string]json.RawMessage `json:"entries"`
+	// Staged holds an incoming replacement hold key per run during an
+	// in-flight running-run key push or re-key, side-by-side with Entries
+	// until Commit promotes it or DropStaged removes it.
+	Staged map[string]json.RawMessage `json:"staged,omitempty"`
 }
 
 // cacheHeader is the header's plaintext: a fixed magic and the format.
@@ -112,13 +116,19 @@ type HoldCache struct {
 	// one's entry as it is on disk, sealed once when it was put.
 	entries map[string]HoldKey
 	sealed  map[string]string
+	// staged holds an in-flight replacement hold key per run during re-key
+	// or running-run key rotation, alongside entries until Commit/DropStaged.
+	staged       map[string]HoldKey
+	stagedSealed map[string]string
 	// runs is which run each kid is the key of: a kid is one run's.
 	runs map[string]string
-	// damaged holds the raw JSON of runs whose entry did not open or was
-	// not valid, preserved across unrelated writes until repaired by Put
-	// or removed by Delete.
-	damaged map[string]json.RawMessage
-	closed  bool
+	// damaged holds the raw JSON of runs whose primary entry did not open or
+	// was not valid, preserved across unrelated writes until repaired by Put
+	// or removed by Delete. stagedDamaged tracks unreadable staged entries
+	// separately so they never hide a healthy primary key.
+	damaged       map[string]json.RawMessage
+	stagedDamaged map[string]json.RawMessage
+	closed        bool
 }
 
 // OpenHoldCache opens the cache at path under the host's secret. A
@@ -136,12 +146,15 @@ func OpenHoldCache(path string, hostSecret []byte) (*HoldCache, error) {
 		return nil, err
 	}
 	cache := &HoldCache{
-		path:    path,
-		aead:    aead,
-		entries: make(map[string]HoldKey),
-		sealed:  make(map[string]string),
-		runs:    make(map[string]string),
-		damaged: make(map[string]json.RawMessage),
+		path:          path,
+		aead:          aead,
+		entries:       make(map[string]HoldKey),
+		sealed:        make(map[string]string),
+		staged:        make(map[string]HoldKey),
+		stagedSealed:  make(map[string]string),
+		runs:          make(map[string]string),
+		damaged:       make(map[string]json.RawMessage),
+		stagedDamaged: make(map[string]json.RawMessage),
 	}
 	info, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -252,6 +265,40 @@ func (c *HoldCache) load(data []byte) error {
 				raw = json.RawMessage("null")
 			}
 			c.damaged[run] = raw
+		}
+	}
+	if len(file.Staged) > 0 {
+		stagedRuns := make([]string, 0, len(file.Staged))
+		for run := range file.Staged {
+			stagedRuns = append(stagedRuns, run)
+		}
+		sort.Strings(stagedRuns)
+		for _, run := range stagedRuns {
+			var entry cachedEntry
+			err := oneJSONDocument(file.Staged[run])
+			if err == nil {
+				err = decodeJSON(file.Staged[run], &entry, true)
+			}
+			if err == nil {
+				var key HoldKey
+				if key, err = c.openEntry(run, entry); err == nil {
+					if other, ok := c.runs[key.KID]; ok && other != run {
+						key.Zero()
+						err = fmt.Errorf("staged key %s is also the key of run %s", key.KID, other)
+					} else {
+						c.staged[run] = key
+						c.stagedSealed[run] = entry.Sealed
+						c.runs[key.KID] = run
+					}
+				}
+			}
+			if err != nil {
+				raw := bytes.Clone(file.Staged[run])
+				if len(raw) == 0 {
+					raw = json.RawMessage("null")
+				}
+				c.stagedDamaged[run] = raw
+			}
 		}
 	}
 	return nil
@@ -462,15 +509,16 @@ func (c *HoldCache) DamagedRuns() []string {
 	return runs
 }
 
-// All returns clones of every intact hold key in the cache, sorted by run ID.
-// Callers must Zero each returned HoldKey once supplied.
+// All returns clones of every intact hold key in the cache (current and any
+// staged replacement keys), sorted by run ID. Callers must Zero each returned
+// HoldKey once supplied.
 func (c *HoldCache) All() ([]HoldKey, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return nil, errHoldCacheClosed
 	}
-	if len(c.entries) == 0 {
+	if len(c.entries) == 0 && len(c.staged) == 0 {
 		return nil, nil
 	}
 	runs := make([]string, 0, len(c.entries))
@@ -478,7 +526,7 @@ func (c *HoldCache) All() ([]HoldKey, error) {
 		runs = append(runs, run)
 	}
 	sort.Strings(runs)
-	out := make([]HoldKey, 0, len(runs))
+	out := make([]HoldKey, 0, len(c.entries)+len(c.staged))
 	for _, run := range runs {
 		clone, err := c.entries[run].clone()
 		if err != nil {
@@ -489,7 +537,163 @@ func (c *HoldCache) All() ([]HoldKey, error) {
 		}
 		out = append(out, clone)
 	}
+	if len(c.staged) > 0 {
+		stagedRuns := make([]string, 0, len(c.staged))
+		for run := range c.staged {
+			stagedRuns = append(stagedRuns, run)
+		}
+		sort.Strings(stagedRuns)
+		for _, run := range stagedRuns {
+			if cur, ok := c.entries[run]; ok && cur.KID == c.staged[run].KID {
+				continue
+			}
+			clone, err := c.staged[run].clone()
+			if err != nil {
+				for i := range out {
+					out[i].Zero()
+				}
+				return nil, fmt.Errorf("clone staged hold key for run %s: %w", run, err)
+			}
+			out = append(out, clone)
+		}
+	}
 	return out, nil
+}
+
+// Stage persists a replacement hold key for key.Run alongside its existing
+// primary entry (so both old and new keys survive a crash during re-key or
+// running-run key rotation until Commit promotes it or DropStaged removes it).
+func (c *HoldCache) Stage(key HoldKey) error {
+	stored, err := key.clone()
+	if err != nil {
+		return err
+	}
+	kept := false
+	defer func() {
+		if !kept {
+			stored.Zero()
+		}
+	}()
+	sealed, err := c.sealEntry(stored)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return errHoldCacheClosed
+	}
+	if other, ok := c.runs[stored.KID]; ok && other != stored.Run {
+		return fmt.Errorf("%w: hold key %s is already the key of run %s, and is staged for run %s",
+			ErrCorrupt, stored.KID, other, stored.Run)
+	}
+	prev, hadPrev := c.staged[stored.Run]
+	prevSealed := c.stagedSealed[stored.Run]
+	prevStagedDamaged, hadStagedDamaged := c.stagedDamaged[stored.Run]
+	c.staged[stored.Run] = stored
+	c.stagedSealed[stored.Run] = sealed
+	delete(c.stagedDamaged, stored.Run)
+	if err := c.persist(); err != nil {
+		if hadPrev {
+			c.staged[stored.Run] = prev
+			c.stagedSealed[stored.Run] = prevSealed
+		} else {
+			delete(c.staged, stored.Run)
+			delete(c.stagedSealed, stored.Run)
+		}
+		if hadStagedDamaged {
+			c.stagedDamaged[stored.Run] = prevStagedDamaged
+		}
+		return err
+	}
+	if hadPrev {
+		if cur, ok := c.entries[stored.Run]; !ok || cur.KID != prev.KID {
+			delete(c.runs, prev.KID)
+		}
+		prev.Zero()
+	}
+	c.runs[stored.KID] = stored.Run
+	kept = true
+	return nil
+}
+
+// Commit promotes runID's staged hold key (matching kid) to its primary entry,
+// wiping and removing the superseded primary key from disk and memory.
+func (c *HoldCache) Commit(runID, kid string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return errHoldCacheClosed
+	}
+	staged, ok := c.staged[runID]
+	if !ok || (kid != "" && staged.KID != kid) {
+		return fmt.Errorf("no staged hold key %s for run %s", kid, runID)
+	}
+	stagedSealed := c.stagedSealed[runID]
+	old, hadOld := c.entries[runID]
+	oldSealed := c.sealed[runID]
+	oldDamaged, hadDamaged := c.damaged[runID]
+	oldStagedDamaged, hadStagedDamaged := c.stagedDamaged[runID]
+	c.entries[runID] = staged
+	c.sealed[runID] = stagedSealed
+	delete(c.staged, runID)
+	delete(c.stagedSealed, runID)
+	delete(c.damaged, runID)
+	delete(c.stagedDamaged, runID)
+	if err := c.persist(); err != nil {
+		if hadOld {
+			c.entries[runID] = old
+			c.sealed[runID] = oldSealed
+		} else {
+			delete(c.entries, runID)
+			delete(c.sealed, runID)
+		}
+		if hadDamaged {
+			c.damaged[runID] = oldDamaged
+		}
+		if hadStagedDamaged {
+			c.stagedDamaged[runID] = oldStagedDamaged
+		}
+		c.staged[runID] = staged
+		c.stagedSealed[runID] = stagedSealed
+		return err
+	}
+	if hadOld {
+		if old.KID != staged.KID {
+			delete(c.runs, old.KID)
+		}
+		old.Zero()
+	}
+	c.runs[staged.KID] = runID
+	return nil
+}
+
+// DropStaged removes an uncommitted staged hold key for runID without touching
+// its primary entry.
+func (c *HoldCache) DropStaged(runID, kid string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return errHoldCacheClosed
+	}
+	staged, ok := c.staged[runID]
+	_, hadDamaged := c.stagedDamaged[runID]
+	if !ok && !hadDamaged {
+		return nil
+	}
+	if ok && kid != "" && staged.KID != kid {
+		return nil
+	}
+	if ok {
+		delete(c.staged, runID)
+		delete(c.stagedSealed, runID)
+		if cur, hasCur := c.entries[runID]; !hasCur || cur.KID != staged.KID {
+			delete(c.runs, staged.KID)
+		}
+		staged.Zero()
+	}
+	delete(c.stagedDamaged, runID)
+	return c.persist()
 }
 
 // Delete removes a run's key: its bytes are wiped, its entry and its
@@ -504,8 +708,10 @@ func (c *HoldCache) Delete(runID string) error {
 		return errHoldCacheClosed
 	}
 	old, held := c.entries[runID]
+	staged, hasStaged := c.staged[runID]
 	_, damaged := c.damaged[runID]
-	if !held && !damaged {
+	_, stagedDamaged := c.stagedDamaged[runID]
+	if !held && !hasStaged && !damaged && !stagedDamaged {
 		return nil
 	}
 	if held {
@@ -514,7 +720,14 @@ func (c *HoldCache) Delete(runID string) error {
 		delete(c.sealed, runID)
 		delete(c.runs, old.KID)
 	}
+	if hasStaged {
+		staged.Zero()
+		delete(c.staged, runID)
+		delete(c.stagedSealed, runID)
+		delete(c.runs, staged.KID)
+	}
 	delete(c.damaged, runID)
+	delete(c.stagedDamaged, runID)
 	return c.persist()
 }
 
@@ -559,6 +772,22 @@ func (c *HoldCache) marshalOverlay(add *HoldKey, addSealed string) ([]byte, erro
 		}
 		file.Entries[add.Run] = entry
 	}
+	if len(c.staged) > 0 || len(c.stagedDamaged) > 0 {
+		file.Staged = make(map[string]json.RawMessage, len(c.staged)+len(c.stagedDamaged))
+		for run, raw := range c.stagedDamaged {
+			if _, ok := c.staged[run]; ok {
+				continue
+			}
+			file.Staged[run] = raw
+		}
+		for run, key := range c.staged {
+			entry, err := json.Marshal(cachedEntry{Tenant: key.Tenant, KID: key.KID, Wrapped: key.Wrapped, Sealed: c.stagedSealed[run]})
+			if err != nil {
+				return nil, err
+			}
+			file.Staged[run] = entry
+		}
+	}
 	return json.Marshal(file)
 }
 
@@ -590,6 +819,22 @@ func writeFileInPlace(path string, data []byte) error {
 	return f.Close()
 }
 
+// StagedRuns returns a map of runID -> staged KID for any uncommitted staged
+// hold keys currently on disk (for startup reconciliation after a crash during
+// running-run key rotation).
+func (c *HoldCache) StagedRuns() map[string]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.staged) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(c.staged))
+	for run, key := range c.staged {
+		out[run] = key.KID
+	}
+	return out
+}
+
 // Close wipes every key the cache holds in memory and empties it. The
 // file is left as it is. Copies handed out by Get are their holders'.
 func (c *HoldCache) Close() {
@@ -599,9 +844,15 @@ func (c *HoldCache) Close() {
 		key.Zero()
 		delete(c.entries, run)
 	}
+	for run, key := range c.staged {
+		key.Zero()
+		delete(c.staged, run)
+	}
 	clear(c.sealed)
+	clear(c.stagedSealed)
 	clear(c.runs)
 	clear(c.damaged)
+	clear(c.stagedDamaged)
 	c.closed = true
 }
 

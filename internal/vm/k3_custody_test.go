@@ -1187,9 +1187,9 @@ func TestK3ReviewFixesS1ToS6(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		// Running run -> refused with ErrRunning!
-		if _, err := a.manager.PushRunKeys(bg, runID, run.PushKeysRequest{Hold: copyKey(k1)}); !errors.Is(err, run.ErrRunning) {
-			t.Fatalf("PushRunKeys on running run: got %v, want ErrRunning", err)
+		// Running run with mode="repair" -> refused with ErrRunning!
+		if _, err := a.manager.PushRunKeys(bg, runID, run.PushKeysRequest{Hold: copyKey(k1), Mode: "repair"}); !errors.Is(err, run.ErrRunning) {
+			t.Fatalf("PushRunKeys repair on running run: got %v, want ErrRunning", err)
 		}
 		if _, err := a.manager.Stop(bg, runID); err != nil {
 			t.Fatal(err)

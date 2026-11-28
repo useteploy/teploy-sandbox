@@ -29,6 +29,9 @@ type scrubOnly struct{ run.OffHost }
 func (scrubOnly) ScrubContent(context.Context, []string, int64) (run.ContentScrub, error) {
 	return run.ContentScrub{ReadBytes: 1234, Snapshots: 2, Complete: true}, nil
 }
+func (scrubOnly) Rotate(context.Context) (run.RotateStats, error) {
+	return run.RotateStats{}, nil
+}
 
 // POST /v1/remote/scrub answers with what the scrub found, the scrub
 // that reads included (2026-11-21); the three fields it had are as they
@@ -145,6 +148,23 @@ func (f *fakePushedCustody) HoldKeyStatus(runID string) (bool, bool) {
 	return ok, false
 }
 func (f *fakePushedCustody) ForgetHoldKeyMemory(string) {}
+func (f *fakePushedCustody) StageHoldKey(tenant, runID string, key run.PushedKey) (string, string, error) {
+	return f.PutHoldKey(tenant, runID, key)
+}
+func (f *fakePushedCustody) CommitHoldKey(string, string, string) error               { return nil }
+func (f *fakePushedCustody) DropStagedHoldKey(string, string) error                   { return nil }
+func (f *fakePushedCustody) StagedHoldKeys() map[string]string                        { return nil }
+func (f *fakePushedCustody) UpdateHoldKeyWrapped(string, string, string) error        { return nil }
+func (f *fakePushedCustody) DeleteOlderRecords(context.Context, string, uint64) error { return nil }
+func (f *fakePushedCustody) RekeySnapshot(context.Context, string, run.RekeySnapshotRequest) (run.RekeySnapshotResult, error) {
+	return run.RekeySnapshotResult{Status: offhost.RekeyDone}, nil
+}
+func (f *fakePushedCustody) RekeyBulk(context.Context, run.RekeyBulkRequest) (run.RekeyBulkStats, error) {
+	return run.RekeyBulkStats{Reasons: []string{}, Results: []run.RekeySnapshotResult{}}, nil
+}
+func (f *fakePushedCustody) RewrapRemote(context.Context, run.RotateRequest) (run.RewrapStats, error) {
+	return run.RewrapStats{Reasons: []string{}}, nil
+}
 
 func mintTestPushedKey(t *testing.T, tenant, runID string) (key run.PushedKey, raw []byte) {
 	t.Helper()
@@ -479,5 +499,123 @@ func TestCustodyOffRefusesCustodyFieldsAndKeepsWireShape(t *testing.T) {
 		if strings.Contains(string(raw), field) {
 			t.Errorf("flags-off response leaked custody field %s: %s", field, raw)
 		}
+	}
+}
+
+// K4 HTTP routes: POST /v1/remote/snapshots/{id}/rekey, POST /v1/remote/rekey,
+// POST /v1/remote/rotate {"mode":"rewrap"}, flags-off rotate byte-identity,
+// listener-guard enforcement, and raw key scrubbing on K4 routes.
+func TestK4RekeyAndRewrapHTTPRoutes(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	rt := newFakeRuntime()
+	manager := run.NewManager(rt, logger)
+	manager.OffHost = &fakePushedCustody{}
+
+	srv := &Server{Manager: manager, Token: "test-token", Version: "test", Log: logger, ServerName: "box"}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	runID := run.NewULID(time.Now())
+	kHold, rawHold := mintTestPushedKey(t, "org-alpha", runID)
+	kHold.Run = runID
+	kOpen, rawOpen := mintTestPushedKey(t, "org-alpha", runID)
+	kOpen.Run = runID
+
+	// 1. Single-snapshot rekey succeeds and scrubs raw keys.
+	rekeySnapBody, _ := json.Marshal(map[string]any{
+		"tenant": "org-alpha",
+		"keys":   map[string]any{"hold": kHold, "open": []any{kOpen}},
+	})
+	resp := request(t, ts, "POST", "/v1/remote/snapshots/snap-abc/rekey", "test-token", string(rekeySnapBody))
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/remote/snapshots/{id}/rekey: %d %s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), `"status":"rekeyed"`) {
+		t.Fatalf("unexpected rekey snapshot body: %s", raw)
+	}
+
+	// 2. Bulk rekey succeeds and scrubs raw keys.
+	rekeyBulkBody, _ := json.Marshal(map[string]any{
+		"legacy":  true,
+		"tenants": map[string]string{runID: "org-alpha"},
+		"runKeys": map[string]any{runID: kHold},
+	})
+	resp = request(t, ts, "POST", "/v1/remote/rekey", "test-token", string(rekeyBulkBody))
+	raw, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/remote/rekey: %d %s", resp.StatusCode, raw)
+	}
+
+	// 3. Rotate in rewrap mode succeeds; unknown mode is 400.
+	rewrapBody, _ := json.Marshal(map[string]any{
+		"mode":             "rewrap",
+		"rewrapped":        map[string]string{kHold.KID: kHold.Wrapped},
+		"retireTkVersions": []int{1},
+	})
+	resp = request(t, ts, "POST", "/v1/remote/rotate", "test-token", string(rewrapBody))
+	raw, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/remote/rotate rewrap: %d %s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), `"manifestsRewrapped":0`) || !strings.Contains(string(raw), `"oldKeysRemaining":0`) {
+		t.Fatalf("unexpected rewrap body: %s", raw)
+	}
+	resp = request(t, ts, "POST", "/v1/remote/rotate", "test-token", `{"mode":"bogus"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST /v1/remote/rotate bogus mode: %d, want 400", resp.StatusCode)
+	}
+
+	// 4. Verify raw keys from K4 requests never appeared in logs.
+	for i, secret := range [][]byte{rawHold, rawOpen} {
+		for _, needle := range []string{base64.StdEncoding.EncodeToString(secret), hex.EncodeToString(secret)} {
+			if strings.Contains(logBuf.String(), needle) {
+				t.Fatalf("RAW KEY #%d LEAKED into logs during K4 routes", i)
+			}
+		}
+	}
+
+	// 5. Listener guard refuses K4 rekey requests with raw keys over non-TLS/non-overlay.
+	unsafeSrv := &Server{Manager: manager, Token: "test-token", Version: "test", Log: logger, ServerName: "box", ListenAddr: "10.0.0.5:7439", TLS: false}
+	unsafeTS := httptest.NewServer(unsafeSrv.Handler())
+	defer unsafeTS.Close()
+	for _, path := range []string{"/v1/remote/snapshots/snap-abc/rekey", "/v1/remote/rekey"} {
+		body := string(rekeySnapBody)
+		if path == "/v1/remote/rekey" {
+			body = string(rekeyBulkBody)
+		}
+		resp = request(t, unsafeTS, "POST", path, "test-token", body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("unsafe listener on %s: got %d, want 400", path, resp.StatusCode)
+		}
+	}
+
+	// 6. Flags-off: rekey routes return 400, and POST /v1/remote/rotate keeps
+	// exact pre-K4 behavior (ignores body without parsing JSON, omits oldKeysRemaining).
+	offTS, _, offManager := newTestServer(t)
+	offManager.OffHost = scrubOnly{}
+	for _, tc := range []struct{ path, body string }{
+		{"/v1/remote/snapshots/snap-abc/rekey", `{}`},
+		{"/v1/remote/rekey", `{}`},
+	} {
+		resp = request(t, offTS, "POST", tc.path, "test-token", tc.body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("flags-off %s: got %d, want 400", tc.path, resp.StatusCode)
+		}
+	}
+	// Non-JSON body on POST /v1/remote/rotate with custody off is NOT rejected
+	// as "Body must be JSON" (S15: pre-K4 ignored the body) and omits oldKeysRemaining.
+	resp = request(t, offTS, "POST", "/v1/remote/rotate", "test-token", "not-json")
+	raw, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || strings.Contains(string(raw), "oldKeysRemaining") {
+		t.Fatalf("flags-off rotate parsed body or leaked oldKeysRemaining: %d %s", resp.StatusCode, raw)
 	}
 }

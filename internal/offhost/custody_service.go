@@ -506,3 +506,341 @@ func bridgeNeedKey(err error) error {
 	}
 	return err
 }
+
+// StageHoldKey validates, persists into HoldCache.Stage (beside any existing
+// key), and supplies a replacement hold key to PushedKeySource.
+func (s *Service) StageHoldKey(tenant, runID string, key run.PushedKey) (string, string, error) {
+	ps := s.pushedSource()
+	if ps == nil || !s.store.Pushed() {
+		return "", "", fmt.Errorf("%w: host is not in pushed key-custody mode", run.ErrBadRequest)
+	}
+	hk, err := parsePushedHoldKey(tenant, runID, key)
+	if err != nil {
+		return "", "", err
+	}
+	defer hk.Zero()
+	if s.config.HoldCache != nil {
+		if err := s.config.HoldCache.Stage(hk); err != nil {
+			return "", "", fmt.Errorf("stage hold key for run %s: %w", runID, err)
+		}
+	}
+	if err := ps.Supply(hk); err != nil {
+		if s.config.HoldCache != nil {
+			_ = s.config.HoldCache.DropStaged(runID, hk.KID)
+		}
+		return "", "", fmt.Errorf("%w: %v", run.ErrBadRequest, err)
+	}
+	return hk.KID, hk.Wrapped, nil
+}
+
+// StagedHoldKeys reports any uncommitted staged hold keys (runID -> staged KID)
+// present in HoldCache for startup crash reconciliation.
+func (s *Service) StagedHoldKeys() map[string]string {
+	if s.config.HoldCache == nil {
+		return nil
+	}
+	return s.config.HoldCache.StagedRuns()
+}
+
+// CommitHoldKey promotes runID's staged hold key to primary in HoldCache and
+// forgets oldKID from PushedKeySource in memory.
+func (s *Service) CommitHoldKey(runID, kid, oldKID string) error {
+	if s.config.HoldCache != nil {
+		if err := s.config.HoldCache.Commit(runID, kid); err != nil {
+			return err
+		}
+	}
+	if oldKID != "" && oldKID != kid {
+		if ps := s.pushedSource(); ps != nil {
+			ps.Forget(oldKID)
+		}
+	}
+	return nil
+}
+
+// DropStagedHoldKey aborts an uncommitted staged hold key on disk and forgets
+// it from PushedKeySource in memory (unless it is also the primary key).
+func (s *Service) DropStagedHoldKey(runID, kid string) error {
+	var err error
+	if s.config.HoldCache != nil {
+		err = s.config.HoldCache.DropStaged(runID, kid)
+	}
+	if ps := s.pushedSource(); ps != nil && kid != "" {
+		keep := false
+		if s.config.HoldCache != nil {
+			if cur, ok := s.config.HoldCache.Get(runID); ok {
+				keep = cur.KID == kid
+				cur.Zero()
+			}
+		}
+		if !keep {
+			ps.Forget(kid)
+		}
+	}
+	return err
+}
+
+// UpdateHoldKeyWrapped replaces a held run's wrapped blob spelling in
+// HoldCache and PushedKeySource after a TK re-wrap (same raw key bytes).
+func (s *Service) UpdateHoldKeyWrapped(runID, kid, newWrapped string) error {
+	if s.config.HoldCache == nil {
+		return nil
+	}
+	cur, ok := s.config.HoldCache.Get(runID)
+	if !ok {
+		return nil
+	}
+	defer cur.Zero()
+	if kid != "" && cur.KID != kid {
+		return nil
+	}
+	parsed, err := ParseWrappedHoldKey(newWrapped)
+	if err != nil {
+		return fmt.Errorf("%w: %v", run.ErrBadRequest, err)
+	}
+	if parsed.Tenant != cur.Tenant || parsed.KID != cur.KID {
+		return fmt.Errorf("%w: re-wrapped blob does not match run %s key %s", run.ErrBadRequest, runID, cur.KID)
+	}
+	updated, err := cur.withWrapped(newWrapped)
+	if err != nil {
+		return err
+	}
+	defer updated.Zero()
+	if err := s.config.HoldCache.Put(updated); err != nil {
+		return err
+	}
+	if ps := s.pushedSource(); ps != nil {
+		if err := ps.Supply(updated); err != nil {
+			_ = s.config.HoldCache.Put(cur)
+			return err
+		}
+	}
+	return nil
+}
+
+// DeleteOlderRecords removes all record generations < keepGen for runID.
+func (s *Service) DeleteOlderRecords(ctx context.Context, runID string, keepGen uint64) error {
+	err := s.store.DeleteOlderRecords(ctx, runID, keepGen)
+	if errors.Is(err, ErrConflict) {
+		return fmt.Errorf("%w: %v", run.ErrRemoteConflict, err)
+	}
+	return err
+}
+
+// RekeySnapshot bridges run.CustodyOffHost to Store.RekeySnapshot.
+func (s *Service) RekeySnapshot(ctx context.Context, id string, req run.RekeySnapshotRequest) (run.RekeySnapshotResult, error) {
+	if !validID(id) || IsBaseID(id) {
+		return run.RekeySnapshotResult{}, fmt.Errorf("%w: %q is not a re-keyable snapshot ID", run.ErrBadRequest, id)
+	}
+	var releaseOpen func()
+	if s.store.Pushed() && req.Keys != nil && len(req.Keys.Open) > 0 {
+		var err error
+		releaseOpen, err = s.SupplyOpenKeys(req.Tenant, "", req.Keys.Open)
+		if err != nil {
+			return run.RekeySnapshotResult{}, err
+		}
+		defer releaseOpen()
+	}
+	var newHold *HoldKey
+	var ownedHold HoldKey
+	hasOwned := false
+	defer func() {
+		if hasOwned {
+			ownedHold.Zero()
+		}
+	}()
+	if s.store.Pushed() {
+		if req.Keys == nil || req.Keys.Hold == nil {
+			return run.RekeySnapshotResult{}, fmt.Errorf("%w: keys.hold is required to re-key a snapshot in pushed mode", run.ErrBadRequest)
+		}
+		parsed, err := ParseWrappedHoldKey(req.Keys.Hold.Wrapped)
+		if err != nil {
+			return run.RekeySnapshotResult{}, fmt.Errorf("%w: %v", run.ErrBadRequest, err)
+		}
+		if req.Tenant != "" && parsed.Tenant != req.Tenant {
+			return run.RekeySnapshotResult{}, fmt.Errorf("%w: replacement key tenant %s does not match %s", run.ErrBadRequest, parsed.Tenant, req.Tenant)
+		}
+		targetRun := req.Keys.Hold.Run
+		if targetRun == "" {
+			if meta, found, mErr := s.SnapshotMeta(ctx, id, ""); mErr == nil && found && meta.Run != "" {
+				targetRun = meta.Run
+			} else if req.Legacy {
+				if legacyRun, lErr := s.store.legacySnapshotRun(ctx, id); lErr == nil && legacyRun != "" {
+					targetRun = legacyRun
+				}
+			}
+		}
+		if targetRun == "" {
+			return run.RekeySnapshotResult{}, fmt.Errorf("%w: keys.hold.run is required to re-key snapshot %s", run.ErrBadRequest, id)
+		}
+		ownedHold, err = parsePushedHoldKey(parsed.Tenant, targetRun, *req.Keys.Hold)
+		if err != nil {
+			return run.RekeySnapshotResult{}, err
+		}
+		hasOwned = true
+		newHold = &ownedHold
+	} else if req.Keys != nil && req.Keys.HasRaw() {
+		return run.RekeySnapshotResult{}, fmt.Errorf("%w: pushed keys are only accepted in pushed mode", run.ErrBadRequest)
+	}
+	res, err := s.store.RekeySnapshot(ctx, RekeySnapshotRequest{
+		ID:      id,
+		NewHold: newHold,
+		Tenant:  req.Tenant,
+		Legacy:  req.Legacy,
+		Bases:   req.Bases,
+		Grace:   s.config.GCGrace,
+	})
+	if err != nil {
+		if errors.Is(err, ErrConditionalRequired) {
+			return run.RekeySnapshotResult{}, fmt.Errorf("%w: %v", run.ErrBadRequest, err)
+		}
+		if errors.Is(err, ErrNoSnapshot) {
+			return run.RekeySnapshotResult{}, fmt.Errorf("%w: %v", run.ErrNotFound, err)
+		}
+		return run.RekeySnapshotResult{}, bridgeNeedKey(err)
+	}
+	return toRunRekeyResult(res), nil
+}
+
+// RekeyBulk bridges run.CustodyOffHost to Store.RekeyBulk.
+func (s *Service) RekeyBulk(ctx context.Context, req run.RekeyBulkRequest) (run.RekeyBulkStats, error) {
+	if s.store.Pushed() && req.Keys != nil && len(req.Keys.Open) > 0 {
+		releaseOpen, err := s.SupplyOpenKeys(req.Tenant, "", req.Keys.Open)
+		if err != nil {
+			return run.RekeyBulkStats{}, err
+		}
+		defer releaseOpen()
+	}
+	newKeys := map[string]HoldKey{}
+	defer func() {
+		for k, hk := range newKeys {
+			hk.Zero()
+			delete(newKeys, k)
+		}
+	}()
+	if s.store.Pushed() {
+		if req.Keys != nil && req.Keys.Hold != nil {
+			parsed, err := ParseWrappedHoldKey(req.Keys.Hold.Wrapped)
+			if err != nil {
+				return run.RekeyBulkStats{}, fmt.Errorf("%w: %v", run.ErrBadRequest, err)
+			}
+			if req.Keys.Hold.Run == "" {
+				return run.RekeyBulkStats{}, fmt.Errorf("%w: keys.hold.run is required", run.ErrBadRequest)
+			}
+			hk, err := parsePushedHoldKey(parsed.Tenant, req.Keys.Hold.Run, *req.Keys.Hold)
+			if err != nil {
+				return run.RekeyBulkStats{}, err
+			}
+			newKeys[hk.Run] = hk
+		}
+		if req.Keys != nil {
+			for _, pk := range req.Keys.Holds {
+				parsed, err := ParseWrappedHoldKey(pk.Wrapped)
+				if err != nil {
+					return run.RekeyBulkStats{}, fmt.Errorf("%w: %v", run.ErrBadRequest, err)
+				}
+				if pk.Run == "" {
+					return run.RekeyBulkStats{}, fmt.Errorf("%w: each keys.holds entry requires run", run.ErrBadRequest)
+				}
+				hk, err := parsePushedHoldKey(parsed.Tenant, pk.Run, pk)
+				if err != nil {
+					return run.RekeyBulkStats{}, err
+				}
+				newKeys[hk.Run] = hk
+			}
+		}
+		for key, pk := range req.RunKeys {
+			parsed, err := ParseWrappedHoldKey(pk.Wrapped)
+			if err != nil {
+				return run.RekeyBulkStats{}, fmt.Errorf("%w: %v", run.ErrBadRequest, err)
+			}
+			runID := pk.Run
+			if runID == "" {
+				runID = key
+			}
+			hk, err := parsePushedHoldKey(parsed.Tenant, runID, pk)
+			if err != nil {
+				return run.RekeyBulkStats{}, err
+			}
+			newKeys[key] = hk
+		}
+	} else if req.HasRaw() {
+		return run.RekeyBulkStats{}, fmt.Errorf("%w: pushed keys are only accepted in pushed mode", run.ErrBadRequest)
+	}
+	stats, err := s.store.RekeyBulk(ctx, RekeyBulkOptions{
+		Legacy:    req.Legacy,
+		Tenants:   req.Tenants,
+		Snapshots: req.Snapshots,
+		KIDs:      req.KIDs,
+		Tenant:    req.Tenant,
+		NewKeys:   newKeys,
+		Bases:     req.Bases,
+		Grace:     s.config.GCGrace,
+	})
+	if err != nil {
+		if errors.Is(err, ErrConditionalRequired) {
+			return run.RekeyBulkStats{}, fmt.Errorf("%w: %v", run.ErrBadRequest, err)
+		}
+		return run.RekeyBulkStats{}, bridgeNeedKey(err)
+	}
+	out := run.RekeyBulkStats{
+		Rekeyed:          stats.Rekeyed,
+		Already:          stats.Already,
+		Pending:          stats.Pending,
+		Conflicted:       stats.Conflicted,
+		RecordsRewritten: stats.RecordsRewritten,
+		LegacyRemaining:  stats.LegacyRemaining,
+		OldKeysRemaining: stats.OldKeysRemaining,
+		Reasons:          stats.Reasons,
+		Results:          make([]run.RekeySnapshotResult, len(stats.Results)),
+	}
+	for i, r := range stats.Results {
+		out.Results[i] = toRunRekeyResult(r)
+	}
+	return out, nil
+}
+
+// RewrapRemote bridges run.CustodyOffHost to Store.Rewrap.
+func (s *Service) RewrapRemote(ctx context.Context, req run.RotateRequest) (run.RewrapStats, error) {
+	stats, err := s.store.Rewrap(ctx, RewrapOptions{
+		Rewrapped:        req.Rewrapped,
+		RetireTKVersions: req.RetireTKVersions,
+		Daemon:           s.config.Daemon,
+		Unfenced:         s.config.Unfenced,
+	})
+	if err != nil {
+		if errors.Is(err, ErrConditionalRequired) {
+			return run.RewrapStats{}, fmt.Errorf("%w: %v", run.ErrBadRequest, err)
+		}
+		return run.RewrapStats{}, bridgeNeedKey(err)
+	}
+	return run.RewrapStats{
+		Manifests:         stats.Manifests,
+		ManifestsCurrent:  stats.ManifestsCurrent,
+		ManifestsSkipped:  stats.ManifestsSkipped,
+		Records:           stats.Records,
+		RecordsCurrent:    stats.RecordsCurrent,
+		RecordsRunning:    stats.RecordsRunning,
+		RecordsConflicted: stats.RecordsConflicted,
+		RecordsNeedKey:    stats.RecordsNeedKey,
+		OldKeysRemaining:  stats.OldKeysRemaining,
+		Reasons:           stats.Reasons,
+	}, nil
+}
+
+func toRunRekeyResult(r RekeySnapshotResult) run.RekeySnapshotResult {
+	return run.RekeySnapshotResult{
+		Snapshot:         r.Snapshot,
+		Run:              r.Run,
+		Tenant:           r.Tenant,
+		Status:           r.Status,
+		OldKID:           r.OldKID,
+		NewKID:           r.NewKID,
+		NewWrapped:       r.NewWrapped,
+		OldAttempt:       r.OldAttempt,
+		NewAttempt:       r.NewAttempt,
+		RecordGeneration: r.RecordGeneration,
+		OldKeysRemaining: r.OldKeysRemaining,
+		Reason:           r.Reason,
+	}
+}

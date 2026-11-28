@@ -9,6 +9,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 )
 
 // RemoteNeedsKey is a stopped run whose hold key is missing or damaged in
@@ -166,11 +167,15 @@ type RemoteExpect struct {
 
 // PushKeysRequest is the POST /v1/runs/{id}/keys body. Accepts either
 // {"hold": {kid, wrapped, raw}} or top-level {kid, wrapped, raw}.
+// Mode may be "" (default: repair when stopped, rotate when running), "repair",
+// or "rotate". Tenant is accepted for legacy v1 runs.
 type PushKeysRequest struct {
 	Hold    *PushedKey `json:"hold,omitempty"`
 	KID     string     `json:"kid,omitempty"`
 	Wrapped string     `json:"wrapped,omitempty"`
 	Raw     string     `json:"raw,omitempty"`
+	Mode    string     `json:"mode,omitempty"`
+	Tenant  string     `json:"tenant,omitempty"`
 }
 
 // Key resolves the single pushed key from the request.
@@ -234,6 +239,128 @@ type SnapshotMeta struct {
 	V2      bool
 }
 
+// RekeySnapshotRequest is the POST /v1/remote/snapshots/{id}/rekey body.
+type RekeySnapshotRequest struct {
+	Tenant string            `json:"tenant,omitempty"`
+	Legacy bool              `json:"legacy,omitempty"`
+	Keys   *KeyBundle        `json:"keys,omitempty"`
+	Bases  map[string]string `json:"bases,omitempty"`
+}
+
+func (r *RekeySnapshotRequest) Wipe() {
+	if r != nil {
+		r.Keys.Wipe()
+	}
+}
+func (r RekeySnapshotRequest) String() string {
+	return fmt.Sprintf("RekeySnapshotRequest{tenant:%q legacy:%t keys:%v}", r.Tenant, r.Legacy, r.Keys)
+}
+func (r RekeySnapshotRequest) GoString() string { return r.String() }
+func (r RekeySnapshotRequest) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("tenant", r.Tenant), slog.Bool("legacy", r.Legacy), slog.Any("keys", r.Keys))
+}
+
+// RekeySnapshotResult is the POST /v1/remote/snapshots/{id}/rekey answer.
+type RekeySnapshotResult struct {
+	Snapshot         string `json:"snapshot"`
+	Run              string `json:"run,omitempty"`
+	Tenant           string `json:"tenant,omitempty"`
+	Status           string `json:"status"`
+	OldKID           string `json:"oldKid,omitempty"`
+	NewKID           string `json:"newKid,omitempty"`
+	NewWrapped       string `json:"-"`
+	OldAttempt       string `json:"oldAttempt,omitempty"`
+	NewAttempt       string `json:"newAttempt,omitempty"`
+	RecordGeneration uint64 `json:"recordGeneration,omitempty"`
+	OldKeysRemaining int    `json:"oldKeysRemaining"`
+	Reason           string `json:"reason,omitempty"`
+}
+
+// RekeyBulkRequest is the POST /v1/remote/rekey body.
+type RekeyBulkRequest struct {
+	Legacy    bool                 `json:"legacy,omitempty"`
+	Tenants   map[string]string    `json:"tenants,omitempty"`
+	Snapshots []string             `json:"snapshots,omitempty"`
+	KIDs      []string             `json:"kids,omitempty"`
+	Tenant    string               `json:"tenant,omitempty"`
+	Keys      *KeyBundle           `json:"keys,omitempty"`
+	RunKeys   map[string]PushedKey `json:"runKeys,omitempty"`
+	Bases     map[string]string    `json:"bases,omitempty"`
+}
+
+func (r *RekeyBulkRequest) HasRaw() bool {
+	if r == nil {
+		return false
+	}
+	if r.Keys.HasRaw() {
+		return true
+	}
+	for _, k := range r.RunKeys {
+		if k.Raw != "" || k.Wrapped != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *RekeyBulkRequest) Wipe() {
+	if r == nil {
+		return
+	}
+	r.Keys.Wipe()
+	for id, k := range r.RunKeys {
+		k.Raw = ""
+		r.RunKeys[id] = k
+	}
+}
+func (r RekeyBulkRequest) String() string {
+	return fmt.Sprintf("RekeyBulkRequest{legacy:%t snapshots:%d kids:%d tenant:%q keys:%v runKeys:%d}",
+		r.Legacy, len(r.Snapshots), len(r.KIDs), r.Tenant, r.Keys, len(r.RunKeys))
+}
+func (r RekeyBulkRequest) GoString() string { return r.String() }
+func (r RekeyBulkRequest) LogValue() slog.Value {
+	return slog.GroupValue(slog.Bool("legacy", r.Legacy), slog.Int("snapshots", len(r.Snapshots)),
+		slog.Int("kids", len(r.KIDs)), slog.String("tenant", r.Tenant), slog.Any("keys", r.Keys), slog.Int("runKeys", len(r.RunKeys)))
+}
+
+// RekeyBulkStats is the POST /v1/remote/rekey answer.
+type RekeyBulkStats struct {
+	Rekeyed          int                   `json:"rekeyed"`
+	Already          int                   `json:"already"`
+	Pending          int                   `json:"pending"`
+	Conflicted       int                   `json:"conflicted"`
+	RecordsRewritten int                   `json:"recordsRewritten"`
+	LegacyRemaining  int                   `json:"legacyRemaining"`
+	OldKeysRemaining int                   `json:"oldKeysRemaining"`
+	Reasons          []string              `json:"reasons"`
+	Results          []RekeySnapshotResult `json:"results"`
+}
+
+// RotateRequest is the optional POST /v1/remote/rotate body. Empty or
+// mode "fmk" runs standard master/FMK rotation; mode "rewrap" re-wraps hold
+// key blobs under a new TK version without touching chunks.
+type RotateRequest struct {
+	Mode             string            `json:"mode,omitempty"`
+	Rewrapped        map[string]string `json:"rewrapped,omitempty"`
+	RetireTKVersions []int             `json:"retireTkVersions,omitempty"`
+}
+
+// RewrapStats is the POST /v1/remote/rotate {"mode":"rewrap"} answer.
+type RewrapStats struct {
+	Manifests         int      `json:"manifestsRewrapped"`
+	ManifestsCurrent  int      `json:"manifestsCurrent"`
+	ManifestsSkipped  int      `json:"manifestsSkipped"`
+	Records           int      `json:"recordsRewrapped"`
+	RecordsCurrent    int      `json:"recordsCurrent"`
+	RecordsRunning    int      `json:"recordsRunning"`
+	RecordsConflicted int      `json:"recordsConflicted"`
+	RecordsNeedKey    int      `json:"recordsNeedKey,omitempty"`
+	LocalKeys         int      `json:"localKeysRewrapped"`
+	LocalKeysFailed   int      `json:"localKeysFailed"`
+	OldKeysRemaining  int      `json:"oldKeysRemaining"`
+	Reasons           []string `json:"reasons"`
+}
+
 // CustodyOffHost is the key-custody extension of OffHost, implemented by
 // *offhost.Service. When Custody() is false, the daemon behaves identically
 // to v1.
@@ -246,12 +373,21 @@ type CustodyOffHost interface {
 	SnapshotMeta(ctx context.Context, ref, legacyRun string) (SnapshotMeta, bool, error)
 	VerifyHoldKey(ctx context.Context, tenant, runID, snapshotRef string, key PushedKey) error
 	PutHoldKey(tenant, runID string, key PushedKey) (kid, wrapped string, err error)
+	StageHoldKey(tenant, runID string, key PushedKey) (kid, wrapped string, err error)
+	CommitHoldKey(runID, kid, oldKID string) error
+	DropStagedHoldKey(runID, kid string) error
+	StagedHoldKeys() map[string]string
+	UpdateHoldKeyWrapped(runID, kid, newWrapped string) error
 	BackupHoldKey(runID string) (restore func(newKID string) error, discard func())
 	SupplyOpenKeys(tenant, defaultRun string, keys []PushedKey) (release func(), err error)
 	EraseHoldKey(runID, kid string) error
 	PruneHoldKeys(keepRuns map[string]bool) (int, error)
 	HoldKeyStatus(runID string) (present, damaged bool)
 	ForgetHoldKeyMemory(kid string)
+	DeleteOlderRecords(ctx context.Context, runID string, keepGen uint64) error
+	RekeySnapshot(ctx context.Context, id string, req RekeySnapshotRequest) (RekeySnapshotResult, error)
+	RekeyBulk(ctx context.Context, req RekeyBulkRequest) (RekeyBulkStats, error)
+	RewrapRemote(ctx context.Context, req RotateRequest) (RewrapStats, error)
 }
 
 // custody returns the OffHost's CustodyOffHost extension when key custody is
@@ -478,22 +614,96 @@ func (m *Manager) ReconcileHoldKeys() {
 	} else if pruned > 0 {
 		m.log.Info("pruned orphaned hold-key cache entries", "count", pruned)
 	}
+	// Reconcile any uncommitted staged hold keys left by a crash between
+	// Advance and CommitHoldKey during running-run key rotation (S7).
+	if staged := custody.StagedHoldKeys(); len(staged) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		for runID, stagedKID := range staged {
+			m.mu.Lock()
+			live, ok := m.runs[runID]
+			var localKID string
+			var localState string
+			if ok {
+				localKID = live.remoteKID
+				localState = live.State
+			}
+			m.mu.Unlock()
+			if !ok {
+				continue
+			}
+			if localKID == stagedKID {
+				if err := custody.CommitHoldKey(runID, stagedKID, ""); err != nil {
+					m.log.Warn("failed to commit already-active staged hold key on startup", "id", runID, "kid", stagedKID, "error", err)
+				}
+				continue
+			}
+			latest, err := custody.LatestPublicAs(ctx, runID, "")
+			if err != nil {
+				// Bucket unreachable or record missing: keep staged key on disk
+				// so both old and new keys remain available until online.
+				continue
+			}
+			if latest.KID == stagedKID {
+				if err := custody.CommitHoldKey(runID, stagedKID, localKID); err != nil {
+					m.log.Warn("failed to commit staged hold key matching remote record", "id", runID, "kid", stagedKID, "error", err)
+					continue
+				}
+				m.mu.Lock()
+				if r, ok := m.runs[runID]; ok {
+					r.remoteKID = stagedKID
+					if latest.Key != "" {
+						r.remoteKey = latest.Key
+					}
+					if latest.Generation > r.remoteGen {
+						r.remoteGen = latest.Generation
+						if r.Remote != nil {
+							setRemoteLocked(r, *r.Remote)
+						}
+					}
+					changed = true
+				}
+				m.mu.Unlock()
+				m.log.Info("reconciled staged hold key on startup: committed to match remote record", "id", runID, "kid", stagedKID, "generation", latest.Generation)
+			} else if localState == StateStopped {
+				if err := custody.DropStagedHoldKey(runID, stagedKID); err != nil {
+					m.log.Warn("failed to drop stale staged hold key on startup", "id", runID, "kid", stagedKID, "error", err)
+				} else {
+					m.log.Info("reconciled staged hold key on startup: dropped uncommitted key", "id", runID, "kid", stagedKID, "remoteKid", latest.KID)
+				}
+			}
+		}
+	}
 	if changed {
 		m.persist()
 	}
 }
 
-// PushRunKeys handles POST /v1/runs/{id}/keys in pushed mode (K3: stopped-run
-// hold-key repair): refuses running runs, takes run exclusivity, requires the
-// run's existing kid (or any kid when needs-key with no known kid), verifies
-// the raw key opens the run's remote record/manifest before acknowledging,
-// persists to HoldCache first, restores prior durable state without bumping
-// generation, and publishes any pending stop asynchronously.
+// PushRunKeys handles POST /v1/runs/{id}/keys in pushed mode:
+//
+//   - On a stopped run (repair): takes exclusivity, accepts only the run's
+//     existing kid (or any kid when needs-key with no known kid), verifies the
+//     raw key opens the remote record/manifest before persisting to HoldCache,
+//     restores prior durable state without bumping generation, and publishes
+//     any pending stop asynchronously.
+//   - On a running run (K4 §5 key rotation): takes exclusivity, stages the new
+//     hold key in HoldCache beside the old one, writes the next generation of
+//     the run's running/forked record under the new key (preserving its
+//     authenticated snapshot pin and access state), deletes earlier record
+//     generations, commits the staged key and forgets the old key.
 func (m *Manager) PushRunKeys(ctx context.Context, id string, req PushKeysRequest) (*Run, error) {
 	defer req.Wipe()
 	custody := m.custody()
 	if custody == nil || !m.OffHost.Pushed() {
 		return nil, fmt.Errorf("%w: key push requires --remote-kms pushed", ErrBadRequest)
+	}
+	switch req.Mode {
+	case "", "repair", "rotate":
+	default:
+		return nil, fmt.Errorf("%w: mode must be \"\", \"repair\", or \"rotate\", got %q", ErrBadRequest, req.Mode)
+	}
+	if req.Tenant != "" && !ValidTenant(req.Tenant) {
+		return nil, fmt.Errorf("%w: tenant %q must match [a-z0-9-]{1,64}", ErrBadRequest, req.Tenant)
 	}
 	pushedKey, err := req.Key()
 	if err != nil {
@@ -501,18 +711,48 @@ func (m *Manager) PushRunKeys(ctx context.Context, id string, req PushKeysReques
 	}
 	defer func() { pushedKey.Raw = "" }()
 
-	current, release, err := m.beginStopped(id)
-	if err != nil {
-		return nil, err
+	// Acquire exclusivity on the run, whether stopped or running.
+	m.mu.Lock()
+	live, ok := m.runs[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, ErrNotFound
 	}
+	if live.removing || live.exclusive {
+		m.mu.Unlock()
+		return nil, ErrBusy
+	}
+	live.exclusive = true
+	current := *live
+	m.mu.Unlock()
 	released := false
-	defer func() {
-		if !released {
-			release()
+	release := func() {
+		if released {
+			return
 		}
-	}()
+		released = true
+		m.mu.Lock()
+		if r, ok := m.runs[id]; ok {
+			r.exclusive = false
+		}
+		m.mu.Unlock()
+	}
+	defer release()
+
+	if current.State == StateRunning {
+		if req.Mode == "repair" {
+			return nil, fmt.Errorf("%w: run %s is running", ErrRunning, id)
+		}
+		return m.rotateRunningRunKey(ctx, id, current, pushedKey, req.Tenant, custody, release)
+	}
+	if req.Mode == "rotate" {
+		return nil, fmt.Errorf("%w: run %s is stopped; re-key stopped runs via POST /v1/remote/snapshots/{id}/rekey", ErrStopped, id)
+	}
 
 	tenant := current.tenant
+	if current.remoteLegacy && req.Tenant != "" {
+		tenant = req.Tenant
+	}
 	if tenant == "" {
 		tenant = DefaultTenant
 	}
@@ -541,7 +781,7 @@ func (m *Manager) PushRunKeys(ctx context.Context, id string, req PushKeysReques
 
 	shouldPublish := false
 	m.mu.Lock()
-	live, ok := m.runs[id]
+	live, ok = m.runs[id]
 	if !ok {
 		m.mu.Unlock()
 		_ = custody.EraseHoldKey(id, kid)
@@ -567,7 +807,6 @@ func (m *Manager) PushRunKeys(ctx context.Context, id string, req PushKeysReques
 	m.mu.Unlock()
 	m.persist()
 	release()
-	released = true
 	m.log.Info("run hold key pushed", "id", id, "tenant", tenant, "kid", kid, "repairedNeedsKey", wasNeedsKey, "publishAsync", shouldPublish)
 
 	if shouldPublish {
@@ -581,6 +820,537 @@ func (m *Manager) PushRunKeys(ctx context.Context, id string, req PushKeysReques
 		}()
 	}
 	return view, nil
+}
+
+// rotateRunningRunKey implements §5 ("A running run gets a new key by
+// POST /v1/runs/{id}/keys"): stages the new key beside the old one in
+// HoldCache, writes generation+1 of the running/forked record under the new
+// key, deletes earlier record generations, then commits the staged key and
+// forgets the old key. Caller holds exclusivity on id.
+func (m *Manager) rotateRunningRunKey(ctx context.Context, id string, current Run, pushedKey PushedKey, reqTenant string, custody CustodyOffHost, release func()) (*Run, error) {
+	tenant := current.tenant
+	if current.remoteLegacy && reqTenant != "" {
+		tenant = reqTenant
+	}
+	if tenant == "" {
+		tenant = DefaultTenant
+	}
+	if _, _, err := validatePushedKeyShape(pushedKey, tenant, id); err != nil {
+		return nil, err
+	}
+	if current.Remote != nil && current.Remote.State == RemoteSuperseded {
+		return nil, fmt.Errorf("%w: run %s was superseded by another daemon", ErrRemoteConflict, id)
+	}
+	// Refuse rotation while a caller snapshot of this run is actively uploading
+	// so no in-flight upload can land a manifest under oldKID after rotation (S8).
+	m.mu.Lock()
+	for _, note := range m.snapshotNotes {
+		if note.Run == id && note.State == noteUploading {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: a snapshot upload for run %s is in flight; retry shortly", ErrBusy, id)
+		}
+	}
+	m.mu.Unlock()
+	oldKID := current.remoteKID
+
+	// Stage new hold key beside the existing key on disk and in memory so a
+	// crash before Commit leaves both keys recoverable.
+	newKID, newWrapped, err := custody.StageHoldKey(tenant, id, pushedKey)
+	if err != nil {
+		return nil, err
+	}
+
+	nextGen := current.remoteGen
+	if current.remoteGen > 0 {
+		legacyRun := ""
+		if current.remoteLegacy {
+			legacyRun = id
+		}
+		latest, err := custody.LatestAs(ctx, id, legacyRun)
+		if err != nil {
+			_ = custody.DropStagedHoldKey(id, newKID)
+			return nil, remoteErr(err)
+		}
+		if !latest.Mine || latest.Generation != current.remoteGen {
+			_ = custody.DropStagedHoldKey(id, newKID)
+			return nil, fmt.Errorf("%w: run %s record moved (gen %d, owner %s)", ErrRemoteConflict, id, latest.Generation, latest.Owner)
+		}
+		if latest.State != RecordRunning && latest.State != RecordForked {
+			_ = custody.DropStagedHoldKey(id, newKID)
+			return nil, fmt.Errorf("%w: run %s record is %s, not running", ErrRemoteConflict, id, latest.State)
+		}
+		payload := latest.Payload
+		if latest.State == RecordRunning {
+			// Preserve the running record's authenticated snapshot pin, retention
+			// metadata, and other fields while carrying the latest access state
+			// (matching writeAccessHeld).
+			if len(latest.Payload) > 0 {
+				var stored stateRun
+				if uErr := json.Unmarshal(latest.Payload, &stored); uErr == nil {
+					m.mu.Lock()
+					if live := m.runs[id]; live != nil {
+						if live.accessEpoch > stored.AccessEpoch {
+							stored.AccessEpoch = live.accessEpoch
+						}
+						if len(live.accessPorts) > 0 || m.access != nil {
+							stored.AccessPorts = slices.Clone(live.accessPorts)
+						}
+						if stored.RemotePinKID == "" && live.remotePinKID != "" {
+							stored.RemotePinKID = live.remotePinKID
+							stored.RemotePinSHA256 = live.remotePinSHA256
+						}
+					}
+					m.mu.Unlock()
+					if encoded, mErr := json.Marshal(stored); mErr == nil {
+						payload = encoded
+					}
+				}
+			} else {
+				m.mu.Lock()
+				if live := m.runs[id]; live != nil {
+					payload = m.remotePayloadLocked(live)
+				}
+				m.mu.Unlock()
+			}
+		}
+		writtenKey, err := m.OffHost.Advance(ctx, RemoteRecord{
+			Run:        id,
+			Generation: latest.Generation + 1,
+			State:      latest.State,
+			Snapshot:   latest.Snapshot,
+			Payload:    payload,
+			Key:        newWrapped,
+			Tenant:     tenant,
+		})
+		if err != nil {
+			_ = custody.DropStagedHoldKey(id, newKID)
+			return nil, remoteErr(err)
+		}
+		newWrapped = writtenKey
+		nextGen = latest.Generation + 1
+		// Promptly delete earlier generations (sealed under oldKID) so nothing
+		// in the bucket remains openable under the old key (§5, Adversarial #14).
+		delCtx, delCancel := context.WithTimeout(ctx, 10*time.Second)
+		if err := custody.DeleteOlderRecords(delCtx, id, nextGen); err != nil {
+			m.log.Warn("earlier record generations of running run not deleted yet; collection will prune them", "id", id, "keepGen", nextGen, "error", err)
+		}
+		delCancel()
+	}
+
+	// Update the registry, re-point any waiting caller snapshot notes for this
+	// run to newWrapped, and persist runs.json BEFORE committing HoldCache and
+	// forgetting oldKID (must-fix #3 / S7+S8). A crash between persist() and
+	// CommitHoldKey is then cleanly healed on restart by ReconcileHoldKeys
+	// (localKID == stagedKID -> CommitHoldKey).
+	m.mu.Lock()
+	live, ok := m.runs[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, ErrNotFound
+	}
+	live.tenant = tenant
+	live.remoteKey = newWrapped
+	live.remoteKID = newKID
+	live.remoteLegacy = false
+	if nextGen > live.remoteGen {
+		live.remoteGen = nextGen
+		live.remoteHeld = true
+	}
+	for _, note := range m.snapshotNotes {
+		if note.Run == id && note.State == noteWaiting {
+			note.Key = newWrapped
+			note.Tenant = tenant
+		}
+	}
+	view := m.viewLocked(live)
+	m.mu.Unlock()
+	m.persist()
+
+	if err := custody.CommitHoldKey(id, newKID, oldKID); err != nil {
+		return nil, fmt.Errorf("commit rotated hold key for run %s: %w", id, err)
+	}
+	release()
+	m.log.Info("running run hold key rotated", "id", id, "tenant", tenant, "oldKid", oldKID, "newKid", newKID, "generation", nextGen)
+	return view, nil
+}
+
+// acquireLocalStoppedForSnapshot acquires exclusivity on any local stopped run
+// whose snapshot matches snapID (S11) so a concurrent resume cannot race re-key
+// step 7. Returns ("", noop, false) if no local stopped run owns snapID.
+func (m *Manager) acquireLocalStoppedForSnapshot(snapID string) (string, func(), bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, live := range m.runs {
+		if live.State != StateStopped {
+			continue
+		}
+		matches := (live.Remote != nil && live.Remote.Snapshot == snapID)
+		if !matches && live.snapshot != "" && m.OffHost != nil {
+			if rid, ok := m.OffHost.RemoteID(live.snapshot); ok && rid == snapID {
+				matches = true
+			}
+		}
+		if !matches {
+			continue
+		}
+		if live.removing || live.exclusive {
+			return id, func() {}, true
+		}
+		live.exclusive = true
+		runID := id
+		released := false
+		return runID, func() {
+			if released {
+				return
+			}
+			released = true
+			m.mu.Lock()
+			if r, ok := m.runs[runID]; ok {
+				r.exclusive = false
+			}
+			m.mu.Unlock()
+		}, false
+	}
+	return "", func() {}, false
+}
+
+// acquireLocalStoppedForBulk acquires exclusivity on all currently non-busy
+// local stopped runs that could be updated by req (S11) so a concurrent resume
+// cannot race a bulk re-key's step 7 and HoldCache update.
+func (m *Manager) acquireLocalStoppedForBulk(req RekeyBulkRequest) func() {
+	kidSet := make(map[string]bool, len(req.KIDs))
+	for _, k := range req.KIDs {
+		kidSet[k] = true
+	}
+	snapSet := make(map[string]bool, len(req.Snapshots))
+	for _, s := range req.Snapshots {
+		snapSet[s] = true
+	}
+	m.mu.Lock()
+	var locked []string
+	for id, live := range m.runs {
+		if live.State != StateStopped || live.removing || live.exclusive {
+			continue
+		}
+		match := false
+		if req.Legacy && live.remoteLegacy {
+			match = true
+		}
+		if len(kidSet) > 0 && kidSet[live.remoteKID] {
+			match = true
+		}
+		if req.Tenant != "" && live.tenant == req.Tenant {
+			match = true
+		}
+		if len(snapSet) > 0 {
+			if live.Remote != nil && snapSet[live.Remote.Snapshot] {
+				match = true
+			} else if live.snapshot != "" && m.OffHost != nil {
+				if rid, ok := m.OffHost.RemoteID(live.snapshot); ok && snapSet[rid] {
+					match = true
+				}
+			}
+		}
+		if !match {
+			continue
+		}
+		live.exclusive = true
+		locked = append(locked, id)
+	}
+	m.mu.Unlock()
+	released := false
+	return func() {
+		if released || len(locked) == 0 {
+			return
+		}
+		released = true
+		m.mu.Lock()
+		for _, id := range locked {
+			if r, ok := m.runs[id]; ok {
+				r.exclusive = false
+			}
+		}
+		m.mu.Unlock()
+	}
+}
+
+// RekeySnapshot handles POST /v1/remote/snapshots/{id}/rekey.
+func (m *Manager) RekeySnapshot(ctx context.Context, id string, req RekeySnapshotRequest) (RekeySnapshotResult, error) {
+	defer req.Wipe()
+	custody := m.custody()
+	if custody == nil {
+		return RekeySnapshotResult{}, fmt.Errorf("%w: re-key requires key custody (--remote-kms local or pushed)", ErrBadRequest)
+	}
+	if req.Tenant != "" && !ValidTenant(req.Tenant) {
+		return RekeySnapshotResult{}, fmt.Errorf("%w: tenant %q must match [a-z0-9-]{1,64}", ErrBadRequest, req.Tenant)
+	}
+	if err := validateBases(req.Bases); err != nil {
+		return RekeySnapshotResult{}, err
+	}
+	_, release, busy := m.acquireLocalStoppedForSnapshot(id)
+	if busy {
+		return RekeySnapshotResult{}, ErrBusy
+	}
+	defer release()
+	res, err := custody.RekeySnapshot(ctx, id, req)
+	if err != nil {
+		return RekeySnapshotResult{}, err
+	}
+	var pushed *PushedKey
+	if req.Keys != nil && req.Keys.Hold != nil {
+		k := *req.Keys.Hold
+		pushed = &k
+	}
+	m.applyRekeyResult(res, pushed, custody)
+	return res, nil
+}
+
+// RekeyBulk handles POST /v1/remote/rekey (bulk re-key and legacy migration).
+func (m *Manager) RekeyBulk(ctx context.Context, req RekeyBulkRequest) (RekeyBulkStats, error) {
+	defer req.Wipe()
+	custody := m.custody()
+	if custody == nil {
+		return RekeyBulkStats{}, fmt.Errorf("%w: re-key requires key custody (--remote-kms local or pushed)", ErrBadRequest)
+	}
+	if req.Tenant != "" && !ValidTenant(req.Tenant) {
+		return RekeyBulkStats{}, fmt.Errorf("%w: tenant %q must match [a-z0-9-]{1,64}", ErrBadRequest, req.Tenant)
+	}
+	for _, t := range req.Tenants {
+		if !ValidTenant(t) {
+			return RekeyBulkStats{}, fmt.Errorf("%w: tenant %q must match [a-z0-9-]{1,64}", ErrBadRequest, t)
+		}
+	}
+	if err := validateBases(req.Bases); err != nil {
+		return RekeyBulkStats{}, err
+	}
+	// Index every pushed replacement key by snapshot ID, run ID, and KID so
+	// applyRekeyResult always persists the exact matching key per run (S10).
+	byTarget := map[string]PushedKey{}
+	byKID := map[string]PushedKey{}
+	indexKey := func(target string, pk PushedKey) {
+		if target != "" {
+			byTarget[target] = pk
+		}
+		if pk.Run != "" {
+			byTarget[pk.Run] = pk
+		}
+		kid := pk.KID
+		if kid == "" {
+			kid = kidFromWrapped(pk.Wrapped)
+		}
+		if kid != "" {
+			byKID[kid] = pk
+		}
+	}
+	if req.Keys != nil {
+		if req.Keys.Hold != nil {
+			indexKey(req.Keys.Hold.Run, *req.Keys.Hold)
+		}
+		for _, pk := range req.Keys.Holds {
+			indexKey(pk.Run, pk)
+		}
+	}
+	for target, pk := range req.RunKeys {
+		indexKey(target, pk)
+	}
+	defer func() {
+		for k, pk := range byTarget {
+			pk.Raw = ""
+			byTarget[k] = pk
+		}
+		for k, pk := range byKID {
+			pk.Raw = ""
+			byKID[k] = pk
+		}
+	}()
+
+	// Acquire exclusivity on any non-busy local stopped runs that this bulk
+	// pass may re-key so a concurrent resume cannot race step 7 + HoldCache
+	// update (S11).
+	releaseBulk := m.acquireLocalStoppedForBulk(req)
+	defer releaseBulk()
+
+	stats, err := custody.RekeyBulk(ctx, req)
+	if err != nil {
+		return RekeyBulkStats{}, err
+	}
+	for _, res := range stats.Results {
+		var matched *PushedKey
+		if pk, ok := byTarget[res.Snapshot]; ok && (pk.KID == "" || pk.KID == res.NewKID || kidFromWrapped(pk.Wrapped) == res.NewKID) {
+			c := pk
+			matched = &c
+		} else if pk, ok := byTarget[res.Run]; ok && (pk.KID == "" || pk.KID == res.NewKID || kidFromWrapped(pk.Wrapped) == res.NewKID) {
+			c := pk
+			matched = &c
+		} else if pk, ok := byKID[res.NewKID]; ok {
+			c := pk
+			matched = &c
+		}
+		m.applyRekeyResult(res, matched, custody)
+	}
+	return stats, nil
+}
+
+// applyRekeyResult updates this host's local registry (and HoldCache if pushed
+// mode) when a stopped run held on this host had its record rewritten by rekey.
+// In pushed mode, HoldCache is updated FIRST; if PutHoldKey fails, the local
+// registry is NOT mutated so cache and registry never diverge (S10).
+func (m *Manager) applyRekeyResult(res RekeySnapshotResult, pushed *PushedKey, custody CustodyOffHost) {
+	if res.Run == "" || res.NewKID == "" || res.NewWrapped == "" {
+		return
+	}
+	m.mu.Lock()
+	live, ok := m.runs[res.Run]
+	if !ok || live.State != StateStopped || res.RecordGeneration <= live.remoteGen {
+		m.mu.Unlock()
+		return
+	}
+	oldKID := live.remoteKID
+	tenant := res.Tenant
+	if tenant == "" {
+		tenant = live.tenant
+	}
+	if tenant == "" {
+		tenant = DefaultTenant
+	}
+	m.mu.Unlock()
+
+	if m.OffHost.Pushed() {
+		if pushed == nil {
+			// Cannot update HoldCache without the replacement raw key; leave
+			// local registry untouched so reconcile/resume asks Cloud for it.
+			return
+		}
+		if _, _, err := custody.PutHoldKey(tenant, res.Run, *pushed); err != nil {
+			m.log.Warn("failed to persist re-keyed hold key into HoldCache; local registry left unchanged", "id", res.Run, "kid", res.NewKID, "error", err)
+			return
+		}
+		if oldKID != "" && oldKID != res.NewKID {
+			custody.ForgetHoldKeyMemory(oldKID)
+		}
+	}
+
+	changed := false
+	m.mu.Lock()
+	if live, ok := m.runs[res.Run]; ok && live.State == StateStopped && res.RecordGeneration > live.remoteGen {
+		live.remoteGen = res.RecordGeneration
+		live.remoteKey = res.NewWrapped
+		live.remoteKID = res.NewKID
+		live.remoteLegacy = false
+		if tenant != "" {
+			live.tenant = tenant
+		}
+		if live.Remote != nil {
+			state := *live.Remote
+			state.Generation = live.remoteGen
+			live.Remote = &state
+		}
+		changed = true
+	}
+	m.mu.Unlock()
+	if changed {
+		m.persist()
+	}
+}
+
+// RewrapRemote handles POST /v1/remote/rotate {"mode":"rewrap"}.
+func (m *Manager) RewrapRemote(ctx context.Context, req RotateRequest) (RewrapStats, error) {
+	custody := m.custody()
+	if custody == nil {
+		return RewrapStats{}, fmt.Errorf("%w: rotate mode \"rewrap\" requires key custody (--remote-kms local or pushed)", ErrBadRequest)
+	}
+	stats, err := custody.RewrapRemote(ctx, req)
+	if err != nil {
+		return stats, err
+	}
+	// Also update wrapped blobs in this daemon's registry, snapshot notes, and HoldCache.
+	type entry struct {
+		id, run, tenant, kid, key string
+	}
+	m.mu.Lock()
+	var runs []entry
+	for id, r := range m.runs {
+		if r.remoteKey != "" && strings.HasPrefix(r.remoteKey, "t2.") {
+			runs = append(runs, entry{id: id, run: id, tenant: r.tenant, kid: r.remoteKID, key: r.remoteKey})
+		}
+	}
+	var notes []entry
+	for ref, note := range m.snapshotNotes {
+		if note.Key != "" && strings.HasPrefix(note.Key, "t2.") {
+			owner := note.Run
+			if owner == "" {
+				owner = ref
+			}
+			notes = append(notes, entry{id: ref, run: owner, tenant: note.Tenant, kid: kidFromWrapped(note.Key), key: note.Key})
+		}
+	}
+	m.mu.Unlock()
+
+	resolveLocal := func(e entry) (string, bool) {
+		if !m.OffHost.Pushed() {
+			fresh, rErr := m.OffHost.Rewrap(e.run, e.key)
+			if rErr != nil {
+				stats.LocalKeysFailed++
+				stats.OldKeysRemaining++
+				return "", false
+			}
+			if fresh != e.key {
+				return fresh, true
+			}
+			return "", false
+		}
+		fresh := req.Rewrapped[e.key]
+		if fresh == "" {
+			fresh = req.Rewrapped[e.kid]
+		}
+		if fresh == "" || fresh == e.key {
+			return "", false
+		}
+		t, k, pErr := parseWrappedHeader(fresh)
+		if pErr != nil || (e.kid != "" && k != e.kid) || (e.tenant != "" && t != e.tenant) {
+			stats.LocalKeysFailed++
+			stats.OldKeysRemaining++
+			return "", false
+		}
+		return fresh, true
+	}
+
+	persisted := false
+	for _, e := range runs {
+		if fresh, ok := resolveLocal(e); ok {
+			if m.OffHost.Pushed() {
+				if err := custody.UpdateHoldKeyWrapped(e.id, e.kid, fresh); err != nil {
+					stats.LocalKeysFailed++
+					stats.OldKeysRemaining++
+					continue
+				}
+			}
+			m.mu.Lock()
+			if live, ok := m.runs[e.id]; ok && live.remoteKey == e.key {
+				live.remoteKey = fresh
+				stats.LocalKeys++
+				persisted = true
+			}
+			m.mu.Unlock()
+		}
+	}
+	for _, e := range notes {
+		if fresh, ok := resolveLocal(e); ok {
+			m.mu.Lock()
+			if note, ok := m.snapshotNotes[e.id]; ok && note.Key == e.key {
+				updated := *note
+				updated.Key = fresh
+				m.snapshotNotes[e.id] = &updated
+				stats.LocalKeys++
+				persisted = true
+			}
+			m.mu.Unlock()
+		}
+	}
+	if persisted {
+		m.persist()
+	}
+	return stats, nil
 }
 
 // eraseHoldKey removes a run's cached and in-memory hold key in pushed mode.

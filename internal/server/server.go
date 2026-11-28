@@ -174,6 +174,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/remote/sync", s.auth(s.handleRemoteSync))
 	mux.Handle("POST /v1/remote/collect", s.auth(s.handleRemoteCollect))
 	mux.Handle("POST /v1/remote/rotate", s.auth(s.handleRemoteRotate))
+	mux.Handle("POST /v1/remote/rekey", s.auth(s.handleRemoteRekey))
+	mux.Handle("POST /v1/remote/snapshots/{id}/rekey", s.auth(s.handleRemoteRekeySnapshot))
 	mux.Handle("POST /v1/remote/scrub", s.auth(s.handleRemoteScrub))
 	mux.Handle("GET /v1/remote/snapshots", s.auth(s.handleRemoteSnapshots))
 	mux.Handle("PUT /v1/runs/{id}/files/{path...}", s.auth(s.handlePutFile))
@@ -486,25 +488,115 @@ func (s *Server) handleRemoteCollect(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleRemoteRotate re-wraps remote storage's keys under the current
-// master now: the half of key rotation that is not a daemon's own
-// writes. The answer says whether the previous master is still needed.
+// master now (default / mode "fmk"), or re-wraps hold-key blobs under a new
+// tenant key version when mode is "rewrap" (key custody).
 func (s *Server) handleRemoteRotate(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.Manager.RotateRemote(r.Context())
+	var req run.RotateRequest
+	if s.Manager.CustodyEnabled() {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
+			return
+		}
+	}
+	switch req.Mode {
+	case "", "fmk":
+		stats, err := s.Manager.RotateRemote(r.Context())
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
+		body := map[string]any{
+			"manifestsRewrapped": stats.Manifests, "manifestsCurrent": stats.ManifestsCurrent, "manifestsSkipped": stats.ManifestsSkipped,
+			"recordsRewrapped": stats.Records, "recordsCurrent": stats.RecordsCurrent,
+			"recordsRunning": stats.RecordsRunning, "recordsConflicted": stats.RecordsConflicted,
+			"recordsUnfenced": stats.RecordsUnfenced, "recordsDestroyed": stats.RecordsDestroyed,
+			"recordsRunningPrevious": stats.RecordsRunningPrevious, "recordsDestroyedPrevious": stats.RecordsDestroyedPrevious,
+			"localKeysRewrapped": stats.LocalKeys, "localKeysFailed": stats.LocalKeysFailed,
+			// Whether the previous master key must stay configured, and in
+			// words why.
+			"previousKeyNeeded": stats.PreviousKeyNeeded, "previousKeyNeededFor": stats.PreviousKeyNeededFor,
+		}
+		if s.Manager.CustodyEnabled() {
+			body["oldKeysRemaining"] = stats.OldKeysRemaining
+		}
+		s.writeJSON(w, http.StatusOK, body)
+	case "rewrap":
+		stats, err := s.Manager.RewrapRemote(r.Context(), req)
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
+		s.writeJSON(w, http.StatusOK, map[string]any{
+			"manifestsRewrapped": stats.Manifests, "manifestsCurrent": stats.ManifestsCurrent, "manifestsSkipped": stats.ManifestsSkipped,
+			"recordsRewrapped": stats.Records, "recordsCurrent": stats.RecordsCurrent,
+			"recordsRunning": stats.RecordsRunning, "recordsConflicted": stats.RecordsConflicted,
+			"recordsNeedKey":     stats.RecordsNeedKey,
+			"localKeysRewrapped": stats.LocalKeys, "localKeysFailed": stats.LocalKeysFailed,
+			"oldKeysRemaining": stats.OldKeysRemaining, "reasons": stats.Reasons,
+		})
+	default:
+		s.writeProblem(w, problem(http.StatusBadRequest, fmt.Sprintf("rotate mode must be \"fmk\" or \"rewrap\", got %q", req.Mode)))
+	}
+}
+
+func (s *Server) handleRemoteRekeySnapshot(w http.ResponseWriter, r *http.Request) {
+	var req run.RekeySnapshotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
+		return
+	}
+	defer req.Wipe()
+	if req.Keys.HasRaw() {
+		if err := s.checkKeyListener(r); err != nil {
+			s.writeProblem(w, problem(http.StatusBadRequest, err.Error()))
+			return
+		}
+	}
+	res, err := s.Manager.RekeySnapshot(r.Context(), r.PathValue("id"), req)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
-		"manifestsRewrapped": stats.Manifests, "manifestsCurrent": stats.ManifestsCurrent, "manifestsSkipped": stats.ManifestsSkipped,
-		"recordsRewrapped": stats.Records, "recordsCurrent": stats.RecordsCurrent,
-		"recordsRunning": stats.RecordsRunning, "recordsConflicted": stats.RecordsConflicted,
-		"recordsUnfenced": stats.RecordsUnfenced, "recordsDestroyed": stats.RecordsDestroyed,
-		"recordsRunningPrevious": stats.RecordsRunningPrevious, "recordsDestroyedPrevious": stats.RecordsDestroyedPrevious,
-		"localKeysRewrapped": stats.LocalKeys, "localKeysFailed": stats.LocalKeysFailed,
-		// Whether the previous master key must stay configured, and in
-		// words why.
-		"previousKeyNeeded": stats.PreviousKeyNeeded, "previousKeyNeededFor": stats.PreviousKeyNeededFor,
-	})
+	encoded, err := json.Marshal(res)
+	body := map[string]any{}
+	if err == nil {
+		err = json.Unmarshal(encoded, &body)
+	}
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, body)
+}
+
+func (s *Server) handleRemoteRekey(w http.ResponseWriter, r *http.Request) {
+	var req run.RekeyBulkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
+		return
+	}
+	defer req.Wipe()
+	if req.HasRaw() {
+		if err := s.checkKeyListener(r); err != nil {
+			s.writeProblem(w, problem(http.StatusBadRequest, err.Error()))
+			return
+		}
+	}
+	stats, err := s.Manager.RekeyBulk(r.Context(), req)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	encoded, err := json.Marshal(stats)
+	body := map[string]any{}
+	if err == nil {
+		err = json.Unmarshal(encoded, &body)
+	}
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, body)
 }
 
 // handleRemoteScrub checks now, instead of at the next scheduled round,

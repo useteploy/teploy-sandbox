@@ -238,6 +238,12 @@ type Store struct {
 	badMu sync.Mutex
 	bad   map[string]badChunk
 
+	// rekeyMu guards rekeyLocks, which serializes concurrent in-process
+	// RekeySnapshot calls targeting the same snapshot ID (refcounted so idle
+	// entries are removed).
+	rekeyMu    sync.Mutex
+	rekeyLocks map[string]*rekeyLockEntry
+
 	// Key custody. With a key source the store is in the custody mode
 	// (v2, v2()): and none of the four is ever consulted without one:
 	// every path is then as it was.

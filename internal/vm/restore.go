@@ -312,7 +312,7 @@ func (d *Driver) SaveMemory(ctx context.Context, runID, containerID, snapshotRef
 	guid, err := d.volumes.zfs.Property(recordCtx, snapshotRef, "guid")
 	if err == nil {
 		var record run.MemoryImage
-		what := run.MemoryImage{Disk: guid, DiskNode: current.machine.Disk(), MAC: current.mac, CPUs: current.cpus, MemoryMB: current.memoryMB}
+		what := run.MemoryImage{Disk: guid, DiskNode: current.machine.Disk(), MAC: current.mac, ConfigMAC: instanceConfigMAC(current), CPUs: current.cpus, MemoryMB: current.memoryMB}
 		if record, err = d.images.handOver(runID, img, what); err == nil {
 			d.log.Info("vm memory image saved", "name", containerID, "image", img.id, "memoryMb", current.memoryMB)
 			return &record, "", nil
@@ -404,7 +404,7 @@ func (d *Driver) restoreOrBoot(ctx context.Context, runID string, spec run.Creat
 	cpus, memoryMB := vcpus(spec.CPUs), spec.MemoryMB
 	machine, guestNet, cloned, restoreErr := d.restore(ctx, runID, spec, image, proxyPort, fork)
 	if restoreErr == nil {
-		d.track(spec.Name, &instance{machine: machine, env: createEnv(spec, proxyPort), network: spec.Name, mac: macOf(guestNet), cpus: cpus, memoryMB: memoryMB})
+		d.track(spec.Name, &instance{machine: machine, env: createEnv(spec, proxyPort), network: spec.Name, mac: macOf(guestNet), configMAC: savedConfigMAC(image), cpus: cpus, memoryMB: memoryMB})
 		d.log.Info("vm restored from its memory image", "name", spec.Name, "run", runID, "image", image.ID, "fork", fork != nil, "memory", time.Since(began).String())
 		return spec.Name, run.ResumedFromMemory, "", nil
 	}
@@ -488,7 +488,7 @@ func (d *Driver) restoreOrBoot(ctx context.Context, runID string, spec run.Creat
 		}
 		return "", "", note, err
 	}
-	d.track(spec.Name, &instance{machine: machine, env: env, network: spec.Name, mac: mac, cpus: cpus, memoryMB: memoryMB})
+	d.track(spec.Name, &instance{machine: machine, env: env, network: spec.Name, mac: mac, configMAC: mac, cpus: cpus, memoryMB: memoryMB})
 	d.log.Info("vm booted from the disk after its memory image was not used", "name", spec.Name, "run", runID, "memory", time.Since(began).String())
 	return spec.Name, run.ResumedFromDisk, note, nil
 }
@@ -576,7 +576,7 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 		ImageDir:      img.dir,
 		SavedDisk:     image.DiskNode,
 		Networked:     networked,
-		SavedMAC:      image.MAC,
+		SavedMAC:      savedConfigMAC(image),
 	})
 	step("hypervisor", began)
 	if result != nil {
@@ -691,4 +691,25 @@ func macOf(network *GuestNetwork) string {
 		return ""
 	}
 	return network.MAC
+}
+
+// savedConfigMAC is the MAC the saved hypervisor's VmConfig holds for
+// image: ConfigMAC when recorded, else MAC (for records written before
+// ConfigMAC existed).
+func savedConfigMAC(image *run.MemoryImage) string {
+	if image == nil {
+		return ""
+	}
+	if image.ConfigMAC != "" {
+		return image.ConfigMAC
+	}
+	return image.MAC
+}
+
+// instanceConfigMAC is the MAC the running VM's hypervisor VmConfig holds.
+func instanceConfigMAC(current *instance) string {
+	if current.configMAC != "" {
+		return current.configMAC
+	}
+	return current.mac
 }

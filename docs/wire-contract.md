@@ -153,8 +153,9 @@ resumed on another daemon from remote storage starts at zero there, as
 | `POST /v1/runs/{id}/resume` | `{ttlSec?, takeover?}` | 200, the run | 400, 404, 409, 503 |
 | `POST /v1/runs/{id}/fork` | `{ttlSec?, labels?, onExpire?, count?, force?}` | 201, the new run; with `count` > 1, `{runs: [run, ...]}` | 400, 404, 409, 500, 503 |
 
-Fork's `count` (1 to 16, default 1) and `force` need a daemon that keeps
-memory images (`--vm-memory-snapshots`); any other answers 400 to them.
+Fork's `count` (> 1; 1 to 16, default 1) and `force: true` need a daemon
+that keeps memory images (`--vm-memory-snapshots`); any other answers 400
+to them.
 `count` children come from one capture and it is all or nothing: if one
 cannot be made, those made before it are destroyed and the fork fails.
 `force: true` lets a fork of a running run go on while recoverable execs

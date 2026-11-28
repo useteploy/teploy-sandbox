@@ -82,7 +82,7 @@ func TestAForkOfARunningRunRestoresItsChildFromTheSourcesMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fork: %v", err)
 	}
-	if child.Fork == nil || child.Fork.From != run.ForkFromMemory || child.Fork.Error != "" || child.Fork.ParentPauseMs < 0 || child.ForkedFrom != source.ID {
+	if child.Fork == nil || child.Fork.From != run.ForkFromMemory || child.Fork.Error != "" || child.Fork.ParentPauseMs == nil || *child.Fork.ParentPauseMs < 0 || child.ForkedFrom != source.ID {
 		t.Fatalf("the child: %+v fork %+v", child, child.Fork)
 	}
 	// One pause: flushed outside it; paused, given the room, snapshot,
@@ -163,7 +163,7 @@ func TestAForkOfNChildrenIsOnePauseAndNRestores(t *testing.T) {
 	var entropy [][]byte
 	ids := map[string]bool{}
 	for _, child := range children {
-		if child.Fork == nil || child.Fork.From != run.ForkFromMemory || child.Fork.ParentPauseMs != children[0].Fork.ParentPauseMs {
+		if child.Fork == nil || child.Fork.From != run.ForkFromMemory || child.Fork.ParentPauseMs == nil || *child.Fork.ParentPauseMs != *children[0].Fork.ParentPauseMs {
 			t.Fatalf("child %s: %+v", child.ID, child.Fork)
 		}
 		ids[child.ID] = true
@@ -379,11 +379,7 @@ func TestAForkWhoseSourceCannotBeResumedFailsAndLeavesNothing(t *testing.T) {
 // it 409, as an exec in flight always did without force.
 func TestForceForksPastRecoverableExecsOnly(t *testing.T) {
 	rig, source := forkRig(t)
-	session, err := rig.manager.BeginExec(source.ID, run.LeaseCredential{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	record, err := rig.manager.RecordExec(source.ID)
+	session, record, err := rig.manager.BeginRecoverableExec(source.ID, run.LeaseCredential{})
 	if err != nil {
 		t.Fatal(err)
 	}

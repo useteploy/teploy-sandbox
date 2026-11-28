@@ -5225,9 +5225,37 @@ Departures and decisions:
   restore had already ended the inherited exec through the agent's
   "connection gone" path (M0 U6). The explicit kill is the guarantee;
   the reset is how it happened first.
-- `force` counts running recoverable execs before the manager's lock (the
-  exec registry's lock is never taken under it); one that ends in between
-  may let a plain exec pass for it, whose process the children end anyway.
+- `force` tracks `recoverableExecs` atomically alongside `execs` under
+  `Manager.mu` (`BeginRecoverableExec` / `finishExec`), so a finishing
+  recoverable exec never opens a window for an in-flight `WriteFile` or
+  plain exec to slip past `force: true`.
+- **Review fixes (PR #21, post-rebase onto #22):**
+  - atomic `recoverableExecs` accounting (`BeginRecoverableExec`) closing
+    the `force: true` window against `WriteFile` and plain execs;
+  - ambiguous `Pause` failure followed by failed recovery `Resume` now
+    wraps `ErrParentPaused` (while explicit hypervisor refusal on pause
+    does not);
+  - non-refusal `vm.snapshot` failures restore `memory.max` before
+    resuming the running parent, and a failed `RestoreMemoryLimit` leaves
+    the parent paused with `ErrParentPaused` rather than resuming it over
+    its limit;
+  - `MemoryImage.ConfigMAC` / `instance.configMAC` preserve the
+    hypervisor `VmConfig` MAC separately from the guest NIC MAC so
+    networked fork-of-a-fork (`A -> B -> C`) and stop/resume of forked
+    children pass `rewriteMemoryConfig`;
+  - `ForkMany` calls `makeMemoryRoom` before `SaveForkMemory` and pins
+    the fork snapshot and inherited base across child creation;
+  - `beginFork` rejects empty lineage, publishes `fork`/`lineage`/`tenant`
+    with wiped raw key before inserting into `s.known`, and `release`
+    reads `img.fork` under `s.mu`;
+  - `rewriteMemoryConfig` rejects reserved vsock CIDs (`< 3` or
+    `0xffffffff`);
+  - guest `killSessions` atomically drains `s.sessions` and waits for
+    killed process groups to exit before hooks start, and `runHooks`
+    enforces a 20 s total budget (`DefaultHooksBudget`) inside
+    `restoreHandshakeTimeout` (30 s);
+  - `ForkView.ParentPauseMs` is `*int64` so sub-millisecond running
+    pauses serialize `0` while stopped parents omit it.
 
 ### Measured (x86-64 test laptop, not representative)
 

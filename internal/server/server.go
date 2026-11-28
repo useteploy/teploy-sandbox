@@ -618,19 +618,22 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	// is a 409 problem, not an SSE stream that dies mid-flight. The
 	// admission and the in-flight mark are atomic in the manager, so a
 	// lease cannot be granted under this exec either.
-	session, err := s.Manager.BeginExec(current.ID, run.LeaseCredential{Owner: req.Owner, Generation: req.Generation})
-	if err != nil {
-		s.writeError(w, err)
-		return
-	}
+	cred := run.LeaseCredential{Owner: req.Owner, Generation: req.Generation}
+	var session *run.ExecSession
 	var record *run.ExecRecord
 	if req.Recoverable {
-		if record, err = s.Manager.RecordExec(current.ID); err != nil {
-			session.Abandon()
+		session, record, err = s.Manager.BeginRecoverableExec(current.ID, cred)
+		if err != nil {
 			s.writeError(w, err)
 			return
 		}
 		w.Header().Set(ExecIDHeader, record.ID())
+	} else {
+		session, err = s.Manager.BeginExec(current.ID, cred)
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")

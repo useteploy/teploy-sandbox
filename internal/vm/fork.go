@@ -140,21 +140,29 @@ func (d *Driver) SaveForkMemory(ctx context.Context, parentID, containerID, snap
 		img = nil
 	}
 
-	// The room for the image in the VM's memory limit, exactly as a
-	// stop's (SaveMemory): asked for once the VM is paused and the image
-	// is in reach of its hypervisor, given back before the VM runs again,
-	// save after a snapshot that did not answer.
+	// The room for the image in the VM's memory limit, as for a stop
+	// (SaveMemory): asked for once the VM is paused and the image is in
+	// reach of its hypervisor, and always given back before the running
+	// parent resumes. Unlike a stop whose VM is destroyed immediately, a
+	// fork's parent runs on: lowering memory.max under a running guest
+	// risks an OOM kill, and swallowing a failed RestoreMemoryLimit would
+	// leave the parent permanently over-provisioned. So putBack runs
+	// before Resume on every path (refusal or timeout), and a limit that
+	// cannot be put back leaves the parent paused and fails the fork with
+	// ErrParentPaused rather than resuming an over-limit VM.
 	var raised bool
-	putBack := func() {
+	putBack := func() error {
 		if !raised {
-			return
+			return nil
+		}
+		if err := current.machine.RestoreMemoryLimit(); err != nil {
+			d.log.Error("the fork's parent memory limit could not be put back", "name", containerID, "error", err)
+			return fmt.Errorf("restore parent memory limit: %w", err)
 		}
 		raised = false
-		if err := current.machine.RestoreMemoryLimit(); err != nil {
-			d.log.Warn("the VM's memory limit was not put back; it goes with the VM's group", "name", containerID, "error", err)
-		}
+		return nil
 	}
-	defer putBack()
+	defer func() { _ = putBack() }()
 
 	syncCtx, cancelSync := context.WithTimeout(ctx, syncTimeout)
 	err := current.machine.Agent().Sync(syncCtx)
@@ -172,7 +180,6 @@ func (d *Driver) SaveForkMemory(ctx context.Context, parentID, containerID, snap
 	// paused is a hung run. One that fails twice is the fork's hard
 	// error (ErrParentPaused): nothing of the fork is made.
 	resume := func() error {
-		defer putBack()
 		try := func() error {
 			resumeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resumeWait)
 			defer cancel()
@@ -190,13 +197,32 @@ func (d *Driver) SaveForkMemory(ctx context.Context, parentID, containerID, snap
 		saved.Pause = time.Since(paused)
 		return nil
 	}
+	restoreLimitAndResume := func() error {
+		if err := putBack(); err != nil {
+			giveBack()
+			return fmt.Errorf("%w: %w", run.ErrParentPaused, err)
+		}
+		return resume()
+	}
 	err = d.volumes.Capture(ctx, containerID, snapshotRef, func() (func() error, error) {
 		pauseCtx, cancel := context.WithTimeout(ctx, pauseTimeout)
 		defer cancel()
 		paused = time.Now()
 		if err := current.machine.Pause(pauseCtx); err != nil {
-			// A pause that reports failure may still have happened.
-			_ = resume()
+			// A pause that reports failure may still have happened unless
+			// the hypervisor explicitly refused it. If recovery resume
+			// also fails (without a hypervisor refusal saying it wasn't
+			// paused), surface ErrParentPaused so the caller knows the
+			// parent may still be paused.
+			var refused *hypervisorRefusal
+			if !errors.As(err, &refused) {
+				if resumeErr := resume(); resumeErr != nil {
+					var resumeRefused *hypervisorRefusal
+					if !errors.As(resumeErr, &resumeRefused) {
+						return nil, errors.Join(fmt.Errorf("pause vm: %w", err), resumeErr)
+					}
+				}
+			}
 			return nil, fmt.Errorf("pause vm: %w", err)
 		}
 		if img == nil {
@@ -220,18 +246,15 @@ func (d *Driver) SaveForkMemory(ctx context.Context, parentID, containerID, snap
 			saved.Note = "the hypervisor's snapshot: " + err.Error()
 			giveBack()
 			var refused *hypervisorRefusal
-			if errors.As(err, &refused) {
-				// It answered: nothing writes the image any more, and the
-				// room is the VM's own again before it runs.
-				return func() error {
-					putBack()
-					return resume()
-				}, nil
+			if !errors.As(err, &refused) {
+				// It did not answer, and may still be finishing its write
+				// on its API thread: give the queued resume snapshotTimeout
+				// to outwait it, but restore memory.max first while the
+				// guest is still paused so it is never lowered under a
+				// running guest.
+				resumeWait = snapshotTimeout(current.memoryMB)
 			}
-			// It did not answer, and may go on writing: the resume waits
-			// behind it, and the room stays until then.
-			resumeWait = snapshotTimeout(current.memoryMB)
-			return resume, nil
+			return restoreLimitAndResume, nil
 		}
 		return func() error {
 			// Out of the outbox before the VM runs again: its hypervisor
@@ -244,8 +267,7 @@ func (d *Driver) SaveForkMemory(ctx context.Context, parentID, containerID, snap
 				saved.Note = "the image is still mounted in the VM's jail"
 				giveBack()
 			}
-			putBack()
-			return resume()
+			return restoreLimitAndResume()
 		}, nil
 	})
 	if err != nil {
@@ -282,7 +304,7 @@ func (d *Driver) SaveForkMemory(ctx context.Context, parentID, containerID, snap
 	d.images.mu.Unlock()
 	forked := &run.ForkImage{
 		MemoryImage: run.MemoryImage{
-			ID: img.id, Disk: guid, DiskNode: current.machine.Disk(), MAC: current.mac, CPUs: current.cpus, MemoryMB: current.memoryMB,
+			ID: img.id, Disk: guid, DiskNode: current.machine.Disk(), MAC: current.mac, ConfigMAC: instanceConfigMAC(current), CPUs: current.cpus, MemoryMB: current.memoryMB,
 			Class: class.id, Hypervisor: class.hypervisor, Kernel: class.kernel,
 		},
 		Parent: parentID,

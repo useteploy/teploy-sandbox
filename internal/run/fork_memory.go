@@ -46,7 +46,7 @@ type ForkView struct {
 	// ParentPauseMs is how long the source's VM was paused for the fork:
 	// from its pause to its resume, its memory and its disk saved in
 	// between. Absent for a source that was stopped.
-	ParentPauseMs int64 `json:"parentPauseMs,omitempty"`
+	ParentPauseMs *int64 `json:"parentPauseMs,omitempty"`
 	// Error says why the child was not restored from memory, when it
 	// was not.
 	Error string `json:"error,omitempty"`

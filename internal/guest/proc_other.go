@@ -19,4 +19,6 @@ func killGroup(cmd *exec.Cmd) {
 	}
 }
 
+func groupGone(cmd *exec.Cmd) bool { return cmd.Process == nil }
+
 func exitCode(state *os.ProcessState) int { return state.ExitCode() }

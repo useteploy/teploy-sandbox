@@ -157,13 +157,16 @@ type Run struct {
 
 	// leaseGen is the run's monotonic lease generation counter — it only
 	// grows, so credentials from any earlier lease stay dead forever.
-	// execs counts in-flight execs/writes, which fence lease takeovers.
+	// execs counts in-flight execs/writes, which fence lease takeovers;
+	// recoverableExecs counts the subset admitted as recoverable execs so
+	// a forced fork admits only those and never a plain exec or write.
 	// Both guarded by Manager.mu.
-	leaseGen       uint64
-	execs          int
-	exclusive      bool
-	removing       bool
-	pendingCleanup bool
+	leaseGen         uint64
+	execs            int
+	recoverableExecs int
+	exclusive        bool
+	removing         bool
+	pendingCleanup   bool
 
 	// What it takes to recreate the container on resume or fork. Guarded
 	// by Manager.mu and never mutated in place (the maps and slices are
@@ -1076,16 +1079,14 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 // those run on in the source, and its children end the sessions they
 // inherit. Writes and plain execs in flight still refuse it.
 //
-// The running recoverable execs are counted before the manager's lock
-// is taken (the exec registry's lock is never taken under it). A
-// recoverable exec that ends in between is still counted, and may let a
-// plain exec in flight pass for it: what that costs is the plain exec's
-// process in the children, which end every session they inherit.
+// Both execs and recoverableExecs are maintained atomically under
+// Manager.mu by BeginExec / BeginRecoverableExec / WriteFile / finishExec,
+// so there is no window in which a finishing recoverable exec can let a
+// plain exec or WriteFile slip past force.
 func (m *Manager) beginCaptureFor(id string, force bool) (*Run, func(), error) {
 	if !force {
 		return m.beginCapture(id)
 	}
-	recoverable := len(m.execLog.running(id))
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	current, ok := m.runs[id]
@@ -1095,7 +1096,7 @@ func (m *Manager) beginCaptureFor(id string, force bool) (*Run, func(), error) {
 	if current.State == StateStopped {
 		return nil, nil, stoppedErr(id)
 	}
-	if current.pendingCleanup || current.exclusive || current.removing || current.execs > recoverable {
+	if current.pendingCleanup || current.exclusive || current.removing || current.execs > current.recoverableExecs {
 		return nil, nil, ErrBusy
 	}
 	current.exclusive = true

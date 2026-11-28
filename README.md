@@ -473,11 +473,11 @@ the handshake). Each child answers with
   that seeded its own generator before the fork (OpenSSL's DRBG, a
   language's PRNG, a UUID library) can produce the same stream in the
   parent and in every child, and two signers producing the same ECDSA
-  nonce leak their key. So after every restore the agent writes the
-  restore's generation (a counter) to `/run/teploy/generation` and runs
-  the executables in `/etc/teploy/on-restore.d/` in name order, as root,
-  each for at most 10 s, with `TEPLOY_GENERATION` and `TEPLOY_FORK=1` in
-  its environment. **Put a hook there that restarts anything that signs
+  nonce leak their key. So after every memory fork restore the agent
+  writes the restore's generation (a counter) to `/run/teploy/generation`
+  and runs the executables in `/etc/teploy/on-restore.d/` in name order,
+  as root, each for at most 10 s (20 s total budget across all hooks),
+  with `TEPLOY_GENERATION` and `TEPLOY_FORK=1` in its environment. **Put a hook there that restarts anything that signs
   or makes nonces** (an SSH agent, a signing daemon, a token minter).
   A hook that fails is logged and does not fail the fork. The parent
   runs no hook: one of each pair diverging is enough, and every child

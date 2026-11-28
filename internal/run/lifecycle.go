@@ -529,34 +529,55 @@ func (m *Manager) ForkMany(ctx context.Context, id string, req ForkRequest) ([]*
 	source, release, err := m.beginCaptureFor(id, req.Force)
 	switch {
 	case err == nil && forker != nil:
+		// Make room for the fork's memory image by evicting oldest stopped
+		// runs' cached memory images if the pool is below its reserve, as
+		// Stop does.
+		if err := m.makeMemoryRoom(ctx, m.MemoryImages.MemoryNeedsBytes(source.limits.MemoryMB)); err != nil {
+			m.log.Error("the pool's space could not be read before a fork memory image was saved", "id", id, "error", err)
+		}
 		// One pause saves the source's memory beside its disk: the
 		// children are restored from the one and fall back to the other.
 		image = m.newSnapshotRef()
 		var saved ForkSaved
 		forkImage, saved, err = forker.SaveForkMemory(ctx, id, source.ContainerID, image)
+		var unpin func()
+		if err == nil {
+			base = source.base
+			// Pin both the fork's disk snapshot and any inherited remote
+			// base before releasing the source so a concurrent delete of
+			// an earlier child (for count > 1) or of the source cannot
+			// remove them while later children are still starting.
+			unpin = m.pin(image, base)
+		}
 		release()
 		if err != nil {
 			return nil, err
 		}
-		made = &ForkView{ParentPauseMs: saved.Pause.Milliseconds(), Error: saved.Note}
+		defer unpin()
+		pauseMs := saved.Pause.Milliseconds()
+		made = &ForkView{ParentPauseMs: &pauseMs, Error: saved.Note}
 		if forkImage != nil {
 			// Held until every child has been made; each child restored
 			// from it holds it for as long as it lives.
 			defer forker.ReleaseFork(context.WithoutCancel(ctx), forkImage)
 		}
 		m.log.Info("fork saved its source", "from", id, "memory", forkImage != nil, "parentPause", saved.Pause.String(), "seal", saved.Seal.String(), "memoryWhy", saved.Note)
-		base = source.base
 	case err == nil:
 		// Capture exclusivity covers the capture only: the source goes
 		// back to work while the child boots.
 		image, err = m.capture(ctx, source)
+		var unpin func()
+		if err == nil {
+			// What the source's next upload would be sent against, the
+			// child's first can be too.
+			base = source.base
+			unpin = m.pin(image, base)
+		}
 		release()
 		if err != nil {
 			return nil, err
 		}
-		// What the source's next upload would be sent against, the
-		// child's first can be too.
-		base = source.base
+		defer unpin()
 	case errors.Is(err, ErrStopped):
 		// Held across the child's boot, so the source cannot be resumed
 		// or deleted (and its snapshot with it) underneath the child.
@@ -618,6 +639,9 @@ func (m *Manager) ForkMany(ctx context.Context, id string, req ForkRequest) ([]*
 		}
 		if len(left) > 0 {
 			return nil, fmt.Errorf("fork of %s: child %d of %d did not come up, and %d of the %d made before it could not be destroyed (%s): %w", id, n+1, count, len(left), len(children), strings.Join(left, ", "), err)
+		}
+		if len(children) == 0 {
+			return nil, fmt.Errorf("fork of %s: child %d of %d did not come up: %w", id, n+1, count, err)
 		}
 		return nil, fmt.Errorf("fork of %s: child %d of %d did not come up, and the %d made before it were destroyed: %w", id, n+1, count, len(children), err)
 	}
@@ -719,8 +743,12 @@ func (m *Manager) forkChild(ctx context.Context, id string, source *Run, image, 
 		return nil, err
 	}
 	if created.Fork != nil {
-		m.log.Info("run forked", "id", created.ID, "from", id, "sourceStopped", fromStopped, "image", image, "expiresAt", created.ExpiresAt,
-			"forkFrom", created.Fork.From, "parentPauseMs", created.Fork.ParentPauseMs, "memoryWhy", created.Fork.Error)
+		attrs := []any{"id", created.ID, "from", id, "sourceStopped", fromStopped, "image", image, "expiresAt", created.ExpiresAt,
+			"forkFrom", created.Fork.From, "memoryWhy", created.Fork.Error}
+		if created.Fork.ParentPauseMs != nil {
+			attrs = append(attrs, "parentPauseMs", *created.Fork.ParentPauseMs)
+		}
+		m.log.Info("run forked", attrs...)
 	} else {
 		m.log.Info("run forked", "id", created.ID, "from", id, "sourceStopped", fromStopped, "image", image, "expiresAt", created.ExpiresAt)
 	}

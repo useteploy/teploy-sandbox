@@ -3,6 +3,7 @@
 package guest
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"syscall"
@@ -22,6 +23,14 @@ func signalGroup(cmd *exec.Cmd, sig syscall.Signal) {
 		// Negative pid: the group the command leads.
 		_ = syscall.Kill(-cmd.Process.Pid, sig)
 	}
+}
+
+// groupGone reports whether no process remains in cmd's process group.
+func groupGone(cmd *exec.Cmd) bool {
+	if cmd.Process == nil {
+		return true
+	}
+	return errors.Is(syscall.Kill(-cmd.Process.Pid, 0), syscall.ESRCH)
 }
 
 // exitCode is the shell's view of how a process ended: its exit status, or

@@ -59,6 +59,12 @@ type MemoryImage struct {
 	// MAC is the address of the network device the guest had, by which
 	// the handshake finds it and moves it to its new address.
 	MAC string `json:"mac,omitempty"`
+	// ConfigMAC is the MAC recorded in the hypervisor's VmConfig, which
+	// the hypervisor writes into config.json on snapshot. On a booted VM
+	// it equals MAC; on a restored or forked VM whose guest device moved
+	// to a new address, the hypervisor's VmConfig still holds the earlier
+	// MAC. Empty means MAC (records written before this field existed).
+	ConfigMAC string `json:"configMac,omitempty"`
 	// CPUs and MemoryMB are the VM's size: an image restores only into
 	// a VM of the size it was saved from.
 	CPUs     int `json:"cpus"`

@@ -369,10 +369,17 @@ func (s *memoryImages) logger() *slog.Logger {
 // image as itself until it is sealed. The caller holds it: the hold
 // passes to the run's record (handOver) or is given up (abandon).
 func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid uint32) (*image, error) {
+	return s.beginImage(ctx, vm, memoryMB, uid, false, "", "")
+}
+
+func (s *memoryImages) beginImage(ctx context.Context, vm string, memoryMB int, uid uint32, fork bool, lineage, tenant string) (*image, error) {
 	s.mu.Lock()
 	id := s.newID()
 	s.mu.Unlock()
-	img := &image{id: id, memoryMB: memoryMB, uid: uid, writer: vm, held: true}
+	img := &image{
+		id: id, memoryMB: memoryMB, uid: uid, writer: vm, held: true,
+		fork: fork, lineage: lineage, tenant: tenant,
+	}
 	img.key = make([]byte, 32)
 	if _, err := rand.Read(img.key); err != nil {
 		clear(img.key)
@@ -397,6 +404,11 @@ func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid u
 	if err := s.zfs.CreateFilesystem(ctx, img.dataset, props, img.key); err != nil {
 		img.forgetKey()
 		return nil, fmt.Errorf("create the image dataset: %w", err)
+	}
+	if fork {
+		// A fork's image is never closed or reopened; wipe its raw key
+		// before publishing it in s.known.
+		img.forgetKey()
 	}
 	err := s.chown(img.dir, uid, uid)
 	if err == nil {
@@ -423,15 +435,10 @@ func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid u
 // does. So its key is not kept past the dataset's creation: nothing
 // will ever load it again.
 func (s *memoryImages) beginFork(ctx context.Context, vm, lineage string, memoryMB int, uid uint32) (*image, error) {
-	img, err := s.begin(ctx, vm, memoryMB, uid)
-	if err != nil {
-		return nil, err
+	if lineage == "" {
+		return nil, errors.New("a fork image requires a non-empty parent lineage")
 	}
-	s.mu.Lock()
-	img.fork, img.lineage, img.tenant = true, lineage, memoryTenant
-	img.forgetKey()
-	s.mu.Unlock()
-	return img, nil
+	return s.beginImage(ctx, vm, memoryMB, uid, true, lineage, memoryTenant)
 }
 
 // forkOpen holds a fork's image for the restore of one of its children,
@@ -597,8 +604,9 @@ func (s *memoryImages) release(ctx context.Context, id string) error {
 	}
 	s.mu.Lock()
 	img, known := s.known[id]
+	isFork := known && img.fork
 	s.mu.Unlock()
-	if known && img.fork {
+	if isFork {
 		// No record names a fork's image: its fork lets it go
 		// (ReleaseFork), and its children's going does the rest.
 		return fmt.Errorf("the image %s is a fork's, not a stopped run's", id)

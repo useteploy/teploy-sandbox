@@ -230,11 +230,11 @@ for i in $(seq 1 50); do python3 -c 'import socket; socket.create_connection(("1
 	parentGetrandom := inGuest(t, r, parent.ID, getrandomSample)
 	t.Logf("random streams, first 32 bytes hashed: child urandom %s getrandom %s (read %s after the fork answered), parent urandom %s getrandom %s",
 		childURandom, childGetrandom, (readAt.Sub(began) - forkTook + readTook).Round(time.Millisecond), parentURandom, parentGetrandom)
-	if child.Fork == nil || child.Fork.From != run.ForkFromMemory || child.Fork.ParentPauseMs <= 0 {
+	if child.Fork == nil || child.Fork.From != run.ForkFromMemory || child.Fork.ParentPauseMs == nil || *child.Fork.ParentPauseMs <= 0 {
 		t.Fatalf("the child: %+v\n%s", child.Fork, r.log.String())
 	}
 	t.Logf("FORK parent paused %d ms; fork answered in %s; the child read its random stream within %s of the answer",
-		child.Fork.ParentPauseMs, forkTook.Round(time.Millisecond), readTook.Round(time.Millisecond))
+		*child.Fork.ParentPauseMs, forkTook.Round(time.Millisecond), readTook.Round(time.Millisecond))
 	for _, line := range r.says("vm memory saved for a fork") {
 		t.Log(line)
 	}

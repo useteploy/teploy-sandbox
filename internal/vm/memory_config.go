@@ -376,6 +376,9 @@ func (c chConfig) check(want memoryConfigWant) error {
 	if err := savedVMDir(c.Vsock.Socket, c.LandlockRules[0].Path, want.runtimeRoot); err != nil {
 		return err
 	}
+	if c.Vsock.CID < 3 || c.Vsock.CID == 0xffffffff {
+		return fmt.Errorf("the saved VM's vsock CID %d is reserved", c.Vsock.CID)
+	}
 	return c.Vsock.plain(chVsockID)
 }
 

@@ -80,26 +80,38 @@ type Server struct {
 	// GenerationFile is where a version 4 "restored" writes the
 	// restore's generation; "" is DefaultGenerationFile. HooksDir holds
 	// the executables it runs; "" is DefaultHooksDir. HookTimeout bounds
-	// each; zero is DefaultHookTimeout.
+	// each hook (zero is DefaultHookTimeout); HooksBudget bounds all hooks
+	// together so hanging hooks never outlast the host's restore handshake
+	// deadline (zero is DefaultHooksBudget).
 	GenerationFile string
 	HooksDir       string
 	HookTimeout    time.Duration
+	HooksBudget    time.Duration
 
 	connectsMu sync.Mutex
 	connects   int
 
-	// sessions are the exec sessions under way, by the command each
-	// runs: what a fork's KillSessions ends.
+	// sessions are the exec sessions under way: what a fork's KillSessions
+	// ends.
 	sessionsMu sync.Mutex
-	sessions   map[*exec.Cmd]struct{}
+	sessions   map[*execSession]struct{}
+}
+
+type execSession struct {
+	cmd  *exec.Cmd
+	done chan struct{}
 }
 
 // Where a restore's generation is written and its hooks are found, and
-// how long each hook may run (protocol version 4).
+// how long each hook and all hooks together may run (protocol version 4).
 const (
 	DefaultGenerationFile = "/run/teploy/generation"
 	DefaultHooksDir       = "/etc/teploy/on-restore.d"
 	DefaultHookTimeout    = 10 * time.Second
+	DefaultHooksBudget    = 20 * time.Second
+	// killSessionsWait bounds how long killSessions waits for killed
+	// session process groups to exit before hooks start.
+	killSessionsWait = 2 * time.Second
 	// maxHooks bounds how many hooks one restore runs.
 	maxHooks = 32
 )
@@ -301,30 +313,66 @@ func (s *Server) restored(req Request) Result {
 }
 
 // killSessions ends every exec session under way, each command's whole
-// process group, and says how many there were. In a fork these are the
-// parent's sessions, inherited with its memory: their callers are the
-// parent's, and are not connected to the fork. A process that left its
-// session's group (setsid, a daemon) is not a session and keeps running.
+// process group, waits until the killed process groups have exited, and
+// says how many there were. Draining s.sessions atomically before
+// signaling ensures a second RestoredFork never re-signals an already
+// killed session, even if a detached background process kept its stdout
+// pipe open past process exit. In a fork these are the parent's
+// sessions, inherited with its memory: their callers are the parent's,
+// and are not connected to the fork. A process that left its session's
+// group (setsid, a daemon) is not a session and keeps running.
 func (s *Server) killSessions() int {
 	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
-	for cmd := range s.sessions {
-		killGroup(cmd)
+	killed := make([]*execSession, 0, len(s.sessions))
+	for sess := range s.sessions {
+		killed = append(killed, sess)
+		delete(s.sessions, sess)
 	}
-	return len(s.sessions)
+	s.sessionsMu.Unlock()
+	for _, sess := range killed {
+		select {
+		case <-sess.done:
+		default:
+			killGroup(sess.cmd)
+		}
+	}
+	if len(killed) == 0 {
+		return 0
+	}
+	deadline := time.Now().Add(killSessionsWait)
+	for _, sess := range killed {
+		for {
+			select {
+			case <-sess.done:
+				goto next
+			default:
+			}
+			if groupGone(sess.cmd) || !time.Now().Before(deadline) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	next:
+	}
+	return len(killed)
 }
 
-func (s *Server) track(cmd *exec.Cmd) func() {
+func (s *Server) track(cmd *exec.Cmd) (*execSession, func()) {
+	sess := &execSession{cmd: cmd, done: make(chan struct{})}
 	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
 	if s.sessions == nil {
-		s.sessions = map[*exec.Cmd]struct{}{}
+		s.sessions = map[*execSession]struct{}{}
 	}
-	s.sessions[cmd] = struct{}{}
-	return func() {
-		s.sessionsMu.Lock()
-		delete(s.sessions, cmd)
-		s.sessionsMu.Unlock()
+	s.sessions[sess] = struct{}{}
+	s.sessionsMu.Unlock()
+	var once sync.Once
+	return sess, func() {
+		once.Do(func() {
+			s.sessionsMu.Lock()
+			delete(s.sessions, sess)
+			s.sessionsMu.Unlock()
+			close(sess.done)
+		})
 	}
 }
 
@@ -385,6 +433,11 @@ func (s *Server) runHooks(generation uint64, fork bool) (ran, failed []string) {
 	if timeout <= 0 {
 		timeout = DefaultHookTimeout
 	}
+	budget := s.HooksBudget
+	if budget <= 0 {
+		budget = DefaultHooksBudget
+	}
+	deadline := time.Now().Add(budget)
 	forked := "0"
 	if fork {
 		forked = "1"
@@ -400,7 +453,13 @@ func (s *Server) runHooks(generation uint64, fork bool) (ran, failed []string) {
 			continue
 		}
 		ran = append(ran, name)
-		if !s.runHook(filepath.Join(dir, name), env, timeout) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			s.logf("on-restore hook %s: skipped, hooks ran out of their %s total budget", filepath.Join(dir, name), budget)
+			failed = append(failed, name)
+			continue
+		}
+		if !s.runHook(filepath.Join(dir, name), env, min(timeout, remaining)) {
 			failed = append(failed, name)
 		}
 	}
@@ -617,10 +676,15 @@ func (s *Server) exec(conn io.Reader, out *frameWriter, req Request) Result {
 	if err := cmd.Start(); err != nil {
 		return failure(CodeBadRequest, "start command: %v", err)
 	}
-	defer s.track(cmd)()
+	_, untrack := s.track(cmd)
+	defer untrack()
 
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	go func() {
+		err := cmd.Wait()
+		untrack()
+		done <- err
+	}()
 	// The client sends nothing after an exec request, so the only thing
 	// this read can see is the connection ending: the caller gave up, and
 	// the command must not outlive it.

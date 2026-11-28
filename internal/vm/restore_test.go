@@ -1591,3 +1591,44 @@ func TestAStopEvictsNoImageForANewOneThePoolHasNoRoomFor(t *testing.T) {
 	must(t, rig.manager.Destroy(bg, third.ID))
 	assertPool(t, rig.zfs, memoryPristine...)
 }
+
+// The same through a resume (restore → open): a daemon's next life, which
+// has not touched the image, resumes its run; the open asks the pool for
+// the image's key, fails at the mount, and the pool refuses to unload
+// the key again. The run boots from its disk and says why; the image
+// stays known with its close owed, and goes when the run lets it go.
+func TestAResumeWhoseOpenLeavesAnUntouchedImageOpenBootsFromTheDiskAndOwesTheClose(t *testing.T) {
+	first := newMemoryRig(t, nil)
+	speaksV3(first)
+	spec, record := savedForResume(t, first, 1)
+	rig := newMemoryRig(t, first)
+	speaksV3(rig)
+	if len(rig.driver.images.known) != 0 {
+		t.Fatalf("the set-up: the next life knows images already: %v", rig.imageIDs())
+	}
+	stubborn := &undoRefused{fakeZFS: rig.zfs, held: true}
+	rig.driver.images.zfs = stubborn
+	id, from, note, err := rig.driver.ResumeMemory(bg, "run-"+spec.Name, spec, &record)
+	if err != nil || from != run.ResumedFromDisk || id != spec.Name {
+		t.Fatalf("resume: id %q from %q err %v", id, from, err)
+	}
+	if !strings.Contains(note, "resumed from the disk: ") || !strings.Contains(note, "left open") {
+		t.Fatalf("note %q", note)
+	}
+	dataset := imageDataset(record.ID)
+	if mounted, loaded := rig.zfs.openState(dataset); mounted || !loaded {
+		t.Fatalf("the image after the failed open: mounted %t, key loaded %t", mounted, loaded)
+	}
+	images := rig.driver.images
+	owed, known := images.known[record.ID]
+	if !known || len(images.unclosed) != 1 || images.unclosed[0] != owed {
+		t.Fatalf("the image left open is not known with its close owed: known %t, %d owed", known, len(images.unclosed))
+	}
+	// The run lets its image go once it runs from its disk.
+	stubborn.held = false
+	must(t, rig.driver.ReleaseMemory(bg, &record))
+	if len(images.unclosed) != 0 || len(images.owed) != 0 {
+		t.Fatalf("after the release: %d owed a close, %d owed a destroy", len(images.unclosed), len(images.owed))
+	}
+	assertBootedFromDisk(t, rig, spec)
+}

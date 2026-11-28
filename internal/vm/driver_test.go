@@ -20,6 +20,9 @@ type testRig struct {
 	hypervisor *fakeHypervisor
 	driver     *Driver
 	manager    *run.Manager
+	// stateDir is the registry's directory, for a test that loaded one
+	// and reads it.
+	stateDir string
 }
 
 // newRig is a manager on the VM driver with every host dependency faked.

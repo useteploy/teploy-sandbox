@@ -49,7 +49,7 @@ func (c *Client) open(ctx context.Context, req Request) (*call, error) {
 	// agent sees it end and kills the command it was running for it.
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	opened := &call{ctx: ctx, conn: conn, stop: stop}
-	req.V = requestVersion(req.Op)
+	req.V = versionOf(req)
 	if err := writeJSONFrame(conn, frameRequest, req); err != nil {
 		opened.close()
 		return nil, opened.wrap(err)
@@ -290,7 +290,30 @@ func (c *Client) Connect(ctx context.Context, port int) (net.Conn, error) {
 // was saved with, so both are replaced before the guest is handed back.
 // An agent older than version 3 answers CodeUnsupportedVersion.
 func (c *Client) Restored(ctx context.Context, nowNs int64, entropy []byte) (RestoredResult, error) {
-	result, err := c.simple(ctx, Request{Op: OpRestored, NowNs: nowNs, Entropy: entropy})
+	return c.restored(ctx, Request{Op: OpRestored, NowNs: nowNs, Entropy: entropy})
+}
+
+// RestoredFork is Restored for a VM that is a fork of a running one
+// (version 4): the agent also ends the exec sessions it had, which are
+// the parent's (killSessions), writes the restore's generation and runs
+// the guest's on-restore hooks. An agent older than version 4 answers
+// CodeUnsupportedVersion, and has done none of it.
+func (c *Client) RestoredFork(ctx context.Context, nowNs int64, entropy []byte, killSessions bool) (RestoredResult, error) {
+	return c.restored(ctx, Request{Op: OpRestored, NowNs: nowNs, Entropy: entropy, Fork: true, KillSessions: killSessions})
+}
+
+// Version is the protocol version the agent speaks, as its answer to a
+// ping says.
+func (c *Client) Version(ctx context.Context) (int, error) {
+	result, err := c.simple(ctx, Request{Op: OpPing})
+	if err != nil {
+		return 0, err
+	}
+	return result.V, nil
+}
+
+func (c *Client) restored(ctx context.Context, req Request) (RestoredResult, error) {
+	result, err := c.simple(ctx, req)
 	if err != nil || result.Restored == nil {
 		if err == nil {
 			err = errors.New("guest agent sent no restored result")

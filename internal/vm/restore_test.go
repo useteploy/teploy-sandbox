@@ -37,6 +37,14 @@ import (
 func newMemoryRig(t *testing.T, previous *testRig) *testRig {
 	t.Helper()
 	rig := newRig(t, previous)
+	keepMemoryImages(t, rig, previous)
+	return rig
+}
+
+// keepMemoryImages makes rig's driver keep memory images, as
+// newMemoryRig does: previous, when given, is the life before.
+func keepMemoryImages(t *testing.T, rig, previous *testRig) {
+	t.Helper()
 	rig.driver.restoreReady = 200 * time.Millisecond
 	rig.driver.reservePercent = 10
 	mountDir := t.TempDir()
@@ -53,7 +61,6 @@ func newMemoryRig(t *testing.T, previous *testRig) *testRig {
 	rig.zfs.mu.Unlock()
 	rig.hypervisor.outboxes = true
 	rig.hypervisor.outboxRoot = t.TempDir()
-	return rig
 }
 
 // jailSeeingMounts makes every bind reach the fake VMs' jails, as the

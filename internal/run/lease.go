@@ -178,6 +178,7 @@ type ExecSession struct {
 	manager     *Manager
 	runID       string
 	containerID string
+	recoverable bool
 	used        atomic.Bool
 }
 
@@ -189,6 +190,26 @@ type ExecSession struct {
 // between the fence check and the runtime call, and never under a
 // running exec.
 func (m *Manager) BeginExec(runID string, cred LeaseCredential) (*ExecSession, error) {
+	return m.beginExec(runID, cred, false)
+}
+
+// BeginRecoverableExec is BeginExec for a recoverable exec: it reserves
+// both the in-flight slot (marked recoverable so a forced fork may proceed
+// past it, and only past it) and the exec log record.
+func (m *Manager) BeginRecoverableExec(runID string, cred LeaseCredential) (*ExecSession, *ExecRecord, error) {
+	session, err := m.beginExec(runID, cred, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	record, err := m.execLog.start(runID)
+	if err != nil {
+		session.Abandon()
+		return nil, nil, err
+	}
+	return session, record, nil
+}
+
+func (m *Manager) beginExec(runID string, cred LeaseCredential, recoverable bool) (*ExecSession, error) {
 	m.mu.Lock()
 	current, ok := m.runs[runID]
 	if !ok {
@@ -208,9 +229,12 @@ func (m *Manager) BeginExec(runID string, cred LeaseCredential) (*ExecSession, e
 		return nil, err
 	}
 	current.execs++
+	if recoverable {
+		current.recoverableExecs++
+	}
 	containerID := current.ContainerID
 	m.mu.Unlock()
-	return &ExecSession{manager: m, runID: runID, containerID: containerID}, nil
+	return &ExecSession{manager: m, runID: runID, containerID: containerID, recoverable: recoverable}, nil
 }
 
 // Exec runs the admitted command and releases the in-flight reservation
@@ -219,7 +243,7 @@ func (s *ExecSession) Exec(ctx context.Context, cmd, cwd string, env map[string]
 	if !s.used.CompareAndSwap(false, true) {
 		return -1, false, ErrBusy
 	}
-	defer s.manager.finishExec(s.runID)
+	defer s.manager.finishExec(s.runID, s.recoverable)
 	code, timedOut, err := s.manager.runtime.Exec(ctx, s.containerID, cmd, cwd, env, timeout, stdout, stderr)
 	return code, timedOut, err
 }
@@ -227,16 +251,21 @@ func (s *ExecSession) Exec(ctx context.Context, cmd, cwd string, env map[string]
 // Abandon releases the reservation without running.
 func (s *ExecSession) Abandon() {
 	if s.used.CompareAndSwap(false, true) {
-		s.manager.finishExec(s.runID)
+		s.manager.finishExec(s.runID, s.recoverable)
 	}
 }
 
 // finishExec releases an in-flight slot. A run destroyed mid-exec took
 // its counter with it — there is nothing to release.
-func (m *Manager) finishExec(runID string) {
+func (m *Manager) finishExec(runID string, recoverable bool) {
 	m.mu.Lock()
-	if current, ok := m.runs[runID]; ok && current.execs > 0 {
-		current.execs--
+	if current, ok := m.runs[runID]; ok {
+		if current.execs > 0 {
+			current.execs--
+		}
+		if recoverable && current.recoverableExecs > 0 {
+			current.recoverableExecs--
+		}
 	}
 	m.mu.Unlock()
 }
@@ -268,7 +297,7 @@ func (m *Manager) WriteFile(ctx context.Context, runID string, cred LeaseCredent
 	containerID := current.ContainerID
 	m.mu.Unlock()
 	err := m.runtime.WriteFile(ctx, containerID, path, data)
-	m.finishExec(runID)
+	m.finishExec(runID, false)
 	return err
 }
 

@@ -150,16 +150,23 @@ type Run struct {
 	// memory images.
 	Memory      *MemoryView `json:"memory,omitempty"`
 	ResumedFrom string      `json:"resumedFrom,omitempty"`
+	// Fork is how a fork's child was made (fork_memory.go): on the
+	// copies Get and List hand out, only when the driver keeps memory
+	// images, and only for a child this daemon life made.
+	Fork *ForkView `json:"fork,omitempty"`
 
 	// leaseGen is the run's monotonic lease generation counter — it only
 	// grows, so credentials from any earlier lease stay dead forever.
-	// execs counts in-flight execs/writes, which fence lease takeovers.
+	// execs counts in-flight execs/writes, which fence lease takeovers;
+	// recoverableExecs counts the subset admitted as recoverable execs so
+	// a forced fork admits only those and never a plain exec or write.
 	// Both guarded by Manager.mu.
-	leaseGen       uint64
-	execs          int
-	exclusive      bool
-	removing       bool
-	pendingCleanup bool
+	leaseGen         uint64
+	execs            int
+	recoverableExecs int
+	exclusive        bool
+	removing         bool
+	pendingCleanup   bool
 
 	// What it takes to recreate the container on resume or fork. Guarded
 	// by Manager.mu and never mutated in place (the maps and slices are
@@ -227,6 +234,10 @@ type Run struct {
 	memory      *MemoryImage
 	memoryNote  *memoryNote
 	resumedFrom string
+	// forkView is how this run was made, when it is a fork's child made
+	// by a driver that keeps memory images (fork_memory.go). Guarded by
+	// Manager.mu, set before the run is registered and never mutated.
+	forkView *ForkView
 }
 
 // RunUsage is what a run has consumed so far.
@@ -664,6 +675,12 @@ type bootRequest struct {
 	// memory is the stopped run's memory image, for a resume that has
 	// one (nil otherwise).
 	memory *MemoryImage
+	// fork is the memory image of the fork whose child this is, and
+	// forkParent the run it is a fork of, for a child of a fork of a
+	// running run by a driver that forks from memory (nil otherwise).
+	// forked says the boot is a fork's child's at all.
+	fork       *ForkImage
+	forkParent string
 }
 
 // bootResult is what a boot produced. It is filled in as far as the boot
@@ -768,6 +785,23 @@ func (m *Manager) boot(ctx context.Context, b bootRequest) (res bootResult, left
 		spec.ProxyURL = proxyURL
 	}
 
+	if forker := m.memoryForker(); forker != nil && b.forkParent != "" {
+		// A fork's child, with a driver that forks from memory: the
+		// fork's image is tried (none at all boots the fork's snapshot),
+		// and the disk is booted if it is not used. What a create does
+		// is done around it, as for a resume below.
+		res.containerID, res.resumedFrom, res.memoryNote, err = forker.RestoreFork(ctx, b.id, b.forkParent, spec, b.fork)
+		if errors.Is(err, ErrNoSuchUser) && res.containerID == "" {
+			m.log.Warn("image has no sandbox user; running as root", "id", b.id, "image", b.image, "user", spec.User)
+			spec.User = RootUser
+			res.containerID, res.resumedFrom, res.memoryNote, err = forker.RestoreFork(ctx, b.id, b.forkParent, spec, b.fork)
+		}
+		res.user = spec.User
+		if err != nil {
+			m.closeEgress(b.id)
+		}
+		return res, res.containerID, err
+	}
 	if b.memory != nil && m.MemoryImages != nil {
 		// The image is tried, and the disk booted if it is not used
 		// (MemoryKeeper.ResumeMemory). Exactly what a create does is done
@@ -843,6 +877,21 @@ func (m *Manager) launch(ctx context.Context, b bootRequest, run *Run) (*Run, er
 	run.ID = b.id
 	run.Network = b.network
 	run.User = res.user
+	if run.forkView != nil && res.resumedFrom != "" {
+		// How the fork's child came up: what the boot says of it, beside
+		// what the fork's save said (its pause, and why it saved no
+		// memory, if it did not).
+		view := *run.forkView
+		view.From = res.resumedFrom
+		if res.memoryNote != "" {
+			view.Error = res.memoryNote
+		}
+		run.forkView = &view
+	} else if run.forkView != nil {
+		view := *run.forkView
+		view.From = ForkFromDisk
+		run.forkView = &view
+	}
 	run.ContainerID = res.containerID
 	if run.Warm == nil {
 		run.Warm = res.warm
@@ -1023,6 +1072,36 @@ func (m *Manager) destroyIf(ctx context.Context, id string, due func(*Run) bool)
 		m.flushTombstones(attempt)
 	}
 	return nil
+}
+
+// beginCaptureFor is beginCapture, and with force it also admits a run
+// whose only work in flight is recoverable execs (a fork's `force`):
+// those run on in the source, and its children end the sessions they
+// inherit. Writes and plain execs in flight still refuse it.
+//
+// Both execs and recoverableExecs are maintained atomically under
+// Manager.mu by BeginExec / BeginRecoverableExec / WriteFile / finishExec,
+// so there is no window in which a finishing recoverable exec can let a
+// plain exec or WriteFile slip past force.
+func (m *Manager) beginCaptureFor(id string, force bool) (*Run, func(), error) {
+	if !force {
+		return m.beginCapture(id)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.runs[id]
+	if !ok {
+		return nil, nil, ErrNotFound
+	}
+	if current.State == StateStopped {
+		return nil, nil, stoppedErr(id)
+	}
+	if current.pendingCleanup || current.exclusive || current.removing || current.execs > current.recoverableExecs {
+		return nil, nil, ErrBusy
+	}
+	current.exclusive = true
+	snapshot := *current
+	return &snapshot, func() { m.mu.Lock(); current.exclusive = false; m.mu.Unlock() }, nil
 }
 
 // beginCapture excludes mutable admissions, lease takeover and teardown.

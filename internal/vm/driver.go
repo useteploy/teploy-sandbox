@@ -180,9 +180,13 @@ type instance struct {
 	// run's own container name, which is the VM's name unless the VM came
 	// from the warm pool.
 	network string
-	// mac is the address of the VM's network device ("" with none), and
-	// cpus and memoryMB its size: what a memory image of it records.
+	// mac is the address of the VM's network device inside the guest (""
+	// with none), configMAC is the MAC held in the hypervisor's VmConfig
+	// (which equals mac for a booted VM and keeps the saved VmConfig MAC
+	// across memory restores/forks), and cpus and memoryMB its size: what
+	// a memory image of it records.
 	mac            string
+	configMAC      string
 	cpus, memoryMB int
 }
 
@@ -387,7 +391,7 @@ func (d *Driver) Create(ctx context.Context, spec run.CreateSpec) (string, error
 			if source == sourcePool {
 				pool.claimed()
 			}
-			d.track(name, &instance{machine: machine, env: env, network: spec.Name, mac: mac, cpus: cpus, memoryMB: spec.MemoryMB})
+			d.track(name, &instance{machine: machine, env: env, network: spec.Name, mac: mac, configMAC: mac, cpus: cpus, memoryMB: spec.MemoryMB})
 			d.log.Info("vm handed to its run", "name", name, "run", spec.Name, "from", source, "tier", spec.Network,
 				"vm", booted.String(), "total", time.Since(start).String())
 			return name, nil

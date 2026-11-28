@@ -227,12 +227,36 @@ func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
 		return
 	}
-	forked, err := s.Manager.Fork(r.Context(), r.PathValue("id"), req)
+	if req.Count <= 1 {
+		forked, err := s.Manager.Fork(r.Context(), r.PathValue("id"), req)
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
+		s.writeRun(w, http.StatusCreated, forked)
+		return
+	}
+	// count > 1: every child, each the run object a single fork answers
+	// with, in the order they were made.
+	children, err := s.Manager.ForkMany(r.Context(), r.PathValue("id"), req)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	s.writeRun(w, http.StatusCreated, forked)
+	runs := make([]map[string]any, 0, len(children))
+	for _, child := range children {
+		encoded, err := json.Marshal(child)
+		body := map[string]any{}
+		if err == nil {
+			err = json.Unmarshal(encoded, &body)
+		}
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
+		runs = append(runs, body)
+	}
+	s.writeJSON(w, http.StatusCreated, map[string]any{"runs": runs})
 }
 
 // capacityDiskTimeout bounds the storage probe of GET /v1/capacity: a
@@ -594,19 +618,22 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	// is a 409 problem, not an SSE stream that dies mid-flight. The
 	// admission and the in-flight mark are atomic in the manager, so a
 	// lease cannot be granted under this exec either.
-	session, err := s.Manager.BeginExec(current.ID, run.LeaseCredential{Owner: req.Owner, Generation: req.Generation})
-	if err != nil {
-		s.writeError(w, err)
-		return
-	}
+	cred := run.LeaseCredential{Owner: req.Owner, Generation: req.Generation}
+	var session *run.ExecSession
 	var record *run.ExecRecord
 	if req.Recoverable {
-		if record, err = s.Manager.RecordExec(current.ID); err != nil {
-			session.Abandon()
+		session, record, err = s.Manager.BeginRecoverableExec(current.ID, cred)
+		if err != nil {
 			s.writeError(w, err)
 			return
 		}
 		w.Header().Set(ExecIDHeader, record.ID())
+	} else {
+		session, err = s.Manager.BeginExec(current.ID, cred)
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")

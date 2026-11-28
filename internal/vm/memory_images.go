@@ -225,6 +225,16 @@ type image struct {
 	// again: an open of the image waits for it to end (see open), and
 	// another retry stands aside.
 	closing chan struct{}
+
+	// fork: the image a fork of a running run made (beginFork), which
+	// is in no record and is never closed: it is held by the fork while
+	// its children are restored, and mapped by each of them for as long
+	// as it lives. lineage is the run whose VM wrote it and tenant the
+	// tenant that run is under: only forks of that run, under that
+	// tenant, map it (forkOpen). Set once, by beginFork, before the
+	// image is reachable from anything else.
+	fork            bool
+	lineage, tenant string
 }
 
 // wanted says whether something still wants the image: then it is not
@@ -359,10 +369,17 @@ func (s *memoryImages) logger() *slog.Logger {
 // image as itself until it is sealed. The caller holds it: the hold
 // passes to the run's record (handOver) or is given up (abandon).
 func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid uint32) (*image, error) {
+	return s.beginImage(ctx, vm, memoryMB, uid, false, "", "")
+}
+
+func (s *memoryImages) beginImage(ctx context.Context, vm string, memoryMB int, uid uint32, fork bool, lineage, tenant string) (*image, error) {
 	s.mu.Lock()
 	id := s.newID()
 	s.mu.Unlock()
-	img := &image{id: id, memoryMB: memoryMB, uid: uid, writer: vm, held: true}
+	img := &image{
+		id: id, memoryMB: memoryMB, uid: uid, writer: vm, held: true,
+		fork: fork, lineage: lineage, tenant: tenant,
+	}
 	img.key = make([]byte, 32)
 	if _, err := rand.Read(img.key); err != nil {
 		clear(img.key)
@@ -388,6 +405,11 @@ func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid u
 		img.forgetKey()
 		return nil, fmt.Errorf("create the image dataset: %w", err)
 	}
+	if fork {
+		// A fork's image is never closed or reopened; wipe its raw key
+		// before publishing it in s.known.
+		img.forgetKey()
+	}
 	err := s.chown(img.dir, uid, uid)
 	if err == nil {
 		err = os.Chmod(img.dir, 0o700)
@@ -402,6 +424,70 @@ func (s *memoryImages) begin(ctx context.Context, vm string, memoryMB int, uid u
 	s.known[img.id] = img
 	s.mu.Unlock()
 	return img, nil
+}
+
+// beginFork is begin for the image of a fork of the running run
+// lineage, whose VM is vm. Such an image is shared by the fork's
+// children, every one a fork of lineage under the same tenant, and by
+// nothing else (forkOpen). It is in no record and never closed: it
+// stays as begin left it, mounted with its key loaded, for as long as
+// the fork holds it or a child maps it, and is destroyed when neither
+// does. So its key is not kept past the dataset's creation: nothing
+// will ever load it again.
+func (s *memoryImages) beginFork(ctx context.Context, vm, lineage string, memoryMB int, uid uint32) (*image, error) {
+	if lineage == "" {
+		return nil, errors.New("a fork image requires a non-empty parent lineage")
+	}
+	return s.beginImage(ctx, vm, memoryMB, uid, true, lineage, memoryTenant)
+}
+
+// forkOpen holds a fork's image for the restore of one of its children,
+// as open does a stopped run's: the caller ends with mapping (the child
+// was restored from it) or drop (it was not). Unlike a stopped run's
+// image, a fork's is mapped by every child of the fork at once; and
+// only by them. The image's lineage and tenant must be the ones the
+// child's fork names: the daemon never maps an image of one run, or of
+// one tenant, into a VM of another, even of the same daemon. It must be
+// sealed, and still held by the fork that made it: a fork that has let
+// its image go restores no more children from it. Its files are looked
+// at again, as open does, before any VM is given them.
+func (s *memoryImages) forkOpen(img *image, lineage, tenant string) error {
+	s.mu.Lock()
+	switch {
+	case img == nil:
+		s.mu.Unlock()
+		return errors.New("the fork has no memory image")
+	case !img.fork:
+		s.mu.Unlock()
+		return fmt.Errorf("the image %s is a stopped run's, not a fork's", img.id)
+	case img.lineage != lineage || img.tenant != tenant:
+		s.mu.Unlock()
+		return fmt.Errorf("the image %s was written by run %s of tenant %s, and is never mapped into a fork of run %s of tenant %s", img.id, img.lineage, img.tenant, lineage, tenant)
+	case !img.sealed:
+		s.mu.Unlock()
+		return fmt.Errorf("the image %s is not sealed", img.id)
+	case !img.held || img.settling:
+		s.mu.Unlock()
+		return fmt.Errorf("the fork that made the image %s has let it go", img.id)
+	}
+	img.opening++
+	s.mu.Unlock()
+	if err := verifyImage(img.dir, img.memoryMB, s.sealedUID); err != nil {
+		s.drop(context.Background(), img)
+		return err
+	}
+	return nil
+}
+
+// forkImage is the fork's image of that name this daemon holds, nil
+// when it holds none.
+func (s *memoryImages) forkImage(id string) *image {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if img := s.known[id]; img != nil && img.fork {
+		return img
+	}
+	return nil
 }
 
 // bind mounts the image below a VM's outbox, where its jail's slave
@@ -518,7 +604,13 @@ func (s *memoryImages) release(ctx context.Context, id string) error {
 	}
 	s.mu.Lock()
 	img, known := s.known[id]
+	isFork := known && img.fork
 	s.mu.Unlock()
+	if isFork {
+		// No record names a fork's image: its fork lets it go
+		// (ReleaseFork), and its children's going does the rest.
+		return fmt.Errorf("the image %s is a fork's, not a stopped run's", id)
+	}
 	if !known {
 		// Nothing has touched it since the daemon started. Its dataset
 		// may still be on the host, and is only destroyed if it is an
@@ -559,6 +651,12 @@ func (s *memoryImages) open(ctx context.Context, runID string, rec *run.MemoryIm
 		return nil, fmt.Errorf("saved under another host class (%s)", s.changedSince(rec))
 	}
 	img, known := s.known[rec.ID]
+	if known && img.fork {
+		// A fork's image is in no record: a record that names one was not
+		// written by this daemon, and a fork's image is its children's.
+		s.mu.Unlock()
+		return nil, fmt.Errorf("the image %s is a fork's, and is restored only into its children", rec.ID)
+	}
 	if !known {
 		img = &image{id: rec.ID, dataset: s.root + "/" + rec.ID, dir: filepath.Join(s.mountDir, rec.ID), sealed: true}
 		// Known from now on, so that a second restore of this image,

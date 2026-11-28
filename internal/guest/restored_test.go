@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"reflect"
 	"testing"
 )
 
@@ -34,7 +35,7 @@ func TestRestoredStepsTheClockAddsTheEntropyAndReportsWhatItDid(t *testing.T) {
 	if !bytes.Equal(added, entropy) {
 		t.Errorf("the entropy added is %d bytes, want the %d the daemon sent, unchanged", len(added), len(entropy))
 	}
-	if want := (RestoredResult{VMGenIDSeen: true, Reseeded: true, ClockNs: now + 7}); got != want {
+	if want := (RestoredResult{VMGenIDSeen: true, Reseeded: true, ClockNs: now + 7}); !reflect.DeepEqual(got, want) {
 		t.Errorf("answer %+v, want %+v", got, want)
 	}
 

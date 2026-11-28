@@ -5160,3 +5160,154 @@ What the review of #18 left open, in one change.
   `TestVMMemoryLimitIsPutBackOnALargeGuest` and, as root,
   `TestVMMemoryImagesOnARealPool` passed.
 
+## 2026-11-27 — VM driver: memory fork (F1 of the fast-resume design), off by default
+
+With `--vm-memory-snapshots`, a fork of a **running** run forks it from
+its memory: one pause of the parent saves its memory into a new image
+and its disk into the fork's snapshot, the parent resumes, the image is
+sealed, and each child is restored copy-on-write from it as a new run.
+The design is `FAST_RESUME_FORK_DESIGN_2026-11-21.md` §3 (fork), §4.4,
+§5 and §7 (F1); M0's results override it where they conflict, and M1's
+machinery (image datasets, sealing, the restore, the rewritten
+configuration, the handshake) is reused, not copied. Flag off: no code
+of this section runs, and a request without `count`/`force` is main's
+byte for byte; `count`/`force` are refused (400) rather than ignored.
+
+### What is done
+
+| Design requirement | Code | Tests (unit, fakes) | Live |
+|---|---|---|---|
+| Idle rule: 409 while an exec, write, capture or removal is in flight | `beginCaptureFor` (manager.go) = `beginCapture` without `force` | `TestForceForksPastRecoverableExecsOnly` | `TestVMMemoryFork`: a fork with an exec in flight and no force is 409 |
+| `force: true` admits recoverable execs in flight (only those); children end them | `beginCaptureFor` (`execs <= running recoverable`) | same test (a plain exec beside one is still 409) | `TestVMMemoryFork`: the exec in flight runs on in the parent and is dead in the child |
+| Agent sync outside the pause; pause → `vm.snapshot` into the parent's outbox → ZFS snapshot → resume | `Driver.SaveForkMemory` (fork.go) inside `Volumes.Capture` | `TestAForkOfARunningRunRestoresItsChildFromTheSourcesMemory` (`sync, pause, raise-limit, snapshot, restore-limit, resume`) | parent pause logged and returned |
+| Parent pause recorded | `ForkSaved.Pause` → child `fork.parentPauseMs`, log `vm memory saved for a fork` / `fork saved its source` | same | 6.2 s and 5.9 s (512 MiB, below) |
+| Seal the image | `memoryImages.seal`, after the resume (below, "Departures") | the fallback cases "a planted extra file", "a planted link", "kept its image open for writing" | seal 87–93 ms |
+| Clone the zvol; restore CoW with `net_fds` for a tap in the child's netns; resume | `RestoreFork` → `restoreOrBoot` → `restore(…, fork)` (restore.go), unchanged M1 path with `forkOpen` | `TestAForkOfARunningRun…` (the restore's config, the clone, the mapping) | child on its own netns, tap and address |
+| Handshake `restored {fork, killSessions}`; protocol bumped | guest protocol **v4** (`internal/guest`: `Request.Fork/KillSessions`, only in a v4 request; `RestoredFork`, `Version`); `restoreForkGuest` | `internal/guest/restored_fork_test.go` (v3 agent refuses a v4 request; v4 agent refuses fork fields at v3; sessions ended, `setsid`-style processes kept; generation; hooks) | `fork's child brought up to date … generation=1 hooks=1` |
+| Old agent: fail cleanly or fall back — **chosen: fall back to the disk fork** | parent's agent version asked before the pause (`Agent.Version`); a v3 child agent is a backstop refusal | fallback cases "an agent older than protocol 4" (the parent's pause is a disk fork's: `sync, pause, resume`), "a child whose agent cannot do a fork's handshake" | not run live (the f1 golden is v4) |
+| New MAC/address via handshake; vsock CID kept; hostname, machine-id, SSH keys unchanged | `restoreNetwork` (M1); documented in README | `TestAForkOfARunningRun…` | parent `10.209.0.2 02:54:0a:d1:00:02` kept, child `10.209.0.3 02:54:0a:d1:00:03`; child reaches the network |
+| Kernel RNG reseed: VMGenID (required) + host entropy + `RNDRESEEDCRNG` | `restoreForkGuest` requires `VMGenIDSeen` | fallback case "no VM Generation ID driver"; `TestAForkOfNChildren…` (each child given its own entropy) | child urandom/getrandom differ from parent's, read 188 ms after the fork answered; siblings of one image differ from each other and from the parent; child's kernel reseed count = parent's + 1, parent's unchanged |
+| Inherited exec sessions killed; background processes keep running | agent `killSessions` (process groups of tracked sessions) | guest test | inherited exec dead in the child; ticker and echo server alive in the child |
+| `count: N`: one snapshot, N restores; partial failure explicit | `ForkMany` (lifecycle.go): **all or nothing** | `TestAForkOfNChildrenIsOnePauseAndNRestores`, `TestAForkWhoseChildComesUpNeitherWayDestroysItsSiblings`, `TestForkAnswersEveryChildOfACount` (server) | `count: 1` live through `ForkMany`; N=2 from one image live through the driver, one child at a time (`TestVMMemoryForkSiblings…`) |
+| Image sharing scope: only the writer's forks, same tenant; refuse otherwise | `image.lineage/tenant`, `forkOpen`; `open` and `release` refuse fork images | `TestAForksImageIsMappedOnlyByForksOfTheRunThatWroteIt` | — |
+| Refcount survives killing the parent first | children are mappers; the fork's hold is released after the last child | `TestAForkOfARunningRun…`, `TestAForkOfNChildren…` (goes with the last) | parent destroyed first, image kept, child still reads its memory; image gone with the child |
+| Fallback to the disk fork on any memory failure; never a half child | `SaveForkMemory` notes; `restoreOrBoot` boots the fork's snapshot on a fresh clone | `TestAForkWhoseMemoryCannotBeUsedForksFromTheDisk` (14 cases) | — |
+| Parent resume failure is a hard error | resume tried twice, then `ErrParentPaused` (500); disk snapshot and image abandoned | `TestAForkWhoseSourceCannotBeResumedFailsAndLeavesNothing` | not run live |
+| A memory fork is a new run with its own hold key, as a disk fork | `forkChild` is the old fork's child code, unchanged | `TestAMemoryForksChildrenAreNewRunsWithRecordsOfTheirOwn` | off-host not run live |
+| Userspace RNG risk (5.5) | agent writes `/run/teploy/generation`, runs `/etc/teploy/on-restore.d/*` (10 s each, `TEPLOY_GENERATION`, `TEPLOY_FORK`); README tells users to restart signers there | guest test | child ran the hook (`1 1`), parent did not |
+| Child gets its own UID/jail/cgroup/netns | unchanged create path | — | child hypervisor: uid 1879048193 vs 1879048192, own cgroup, mnt and net namespaces; no mergeable mapping |
+
+Departures and decisions:
+
+- **Seal after the resume** (design §3.1 step 4; a stop seals inside its
+  pause). The image is unbound from the outbox and the memory limit put
+  back *before* the resume; only the chown/`readonly=on`/verify come
+  after. Measured on the laptop (probe, `f1/probe-readonly{,2}.log`):
+  `zfs set readonly=on` **fails (exit 255) while anything holds the
+  dataset open for writing** — an O_RDWR descriptor, or a writable
+  mapping, shared or private, even with the descriptor closed — and a
+  shared writable mapping kept across the change goes on writing into
+  the file. The seal takes the failure as a refused image, so a
+  hypervisor that kept a writer has its image refused (fake case "kept
+  its image open for writing"), and one that kept none cannot change it.
+  Note for M1 too: its seal has the same property; it was not measured
+  before.
+- **Old agents fall back to the disk fork**, chosen over failing the
+  fork: the flag must not make a fork fail that works without it, and
+  the version is asked before the pause, so it costs a disk fork's
+  pause and no more. A v3 agent refuses a v4 request outright (a v3
+  request carrying fork fields would have been read as a resume's).
+- **All or nothing for `count`**: a fork is not idempotent, and a partial
+  answer invites a retry that makes more. A child from the disk is not a
+  failure; a child that comes up neither way is, and the ones made
+  before it are destroyed (any that cannot be are named in the error).
+- `sessionsKilled` was 0 live: the hypervisor's vsock reset at the
+  restore had already ended the inherited exec through the agent's
+  "connection gone" path (M0 U6). The explicit kill is the guarantee;
+  the reset is how it happened first.
+- `force` tracks `recoverableExecs` atomically alongside `execs` under
+  `Manager.mu` (`BeginRecoverableExec` / `finishExec`), so a finishing
+  recoverable exec never opens a window for an in-flight `WriteFile` or
+  plain exec to slip past `force: true`.
+- **Review fixes (PR #21, post-rebase onto #22):**
+  - atomic `recoverableExecs` accounting (`BeginRecoverableExec`) closing
+    the `force: true` window against `WriteFile` and plain execs;
+  - ambiguous `Pause` failure followed by failed recovery `Resume` now
+    wraps `ErrParentPaused` (while explicit hypervisor refusal on pause
+    does not);
+  - non-refusal `vm.snapshot` failures restore `memory.max` before
+    resuming the running parent, and a failed `RestoreMemoryLimit` leaves
+    the parent paused with `ErrParentPaused` rather than resuming it over
+    its limit;
+  - `MemoryImage.ConfigMAC` / `instance.configMAC` preserve the
+    hypervisor `VmConfig` MAC separately from the guest NIC MAC so
+    networked fork-of-a-fork (`A -> B -> C`) and stop/resume of forked
+    children pass `rewriteMemoryConfig`;
+  - `ForkMany` calls `makeMemoryRoom` before `SaveForkMemory` and pins
+    the fork snapshot and inherited base across child creation;
+  - `beginFork` rejects empty lineage, publishes `fork`/`lineage`/`tenant`
+    with wiped raw key before inserting into `s.known`, and `release`
+    reads `img.fork` under `s.mu`;
+  - `rewriteMemoryConfig` rejects reserved vsock CIDs (`< 3` or
+    `0xffffffff`);
+  - guest `killSessions` atomically drains `s.sessions` and waits for
+    killed process groups to exit before hooks start, and `runHooks`
+    enforces a 20 s total budget (`DefaultHooksBudget`) inside
+    `restoreHandshakeTimeout` (30 s);
+  - `ForkView.ParentPauseMs` is `*int64` so sub-millisecond running
+    pauses serialize `0` while stopped parents omit it.
+
+### Measured (x86-64 test laptop, not representative)
+
+Pentium N5000, eMMC, ZFS 2.3.9, CH v54.1, guest kernel 7.2.8, golden
+`sbx/golden-guestd-f1@v1` (this branch's agent, protocol 4). Parent and
+child 512 MiB, 1 vCPU, open tier; two VMs at most.
+
+- **Parent pause**: 6.19 s, 8.11 s (two runs of `TestVMMemoryFork`) and
+  5.92 s (the siblings test) (encrypted image, all of guest RAM
+  written; M0 5.1 s median unencrypted). Seal after the resume: 87 and
+  93 ms. The design's ≤150 ms/GiB budget is not met here (M0's B7).
+- **Fork answered** in 12.9 s and 15.1 s (pause, seal, then the child's restore:
+  hypervisor 61 ms, `vm.restore` 136 ms, `vm.resume` 2 ms, first agent
+  answer 4.3 s — page faults from the encrypted image, as M1 found —
+  clock 0.48 s, network 0.13 s).
+- **Memory** (smaps_rollup, after the child's first execs): parent Rss
+  511 / Pss 508 / Private_Dirty 506 MiB; child Rss 167 / Pss 164 /
+  Private_Dirty 26 MiB (second run: 516/514/511 and 181/179/31). The
+  child's random stream was read 188 and 112 ms after the fork answered. The parent is a booted VM (its RAM is
+  anonymous); the child maps the image and is charged for what it
+  touched.
+- **Density for 4 and 16 children: not possible on the laptop** (two VMs
+  at most); `count: N` > 1 is unit-tested only, and N = 2 from one image
+  was run live one child at a time.
+- `primarycache=metadata` against `all` for fork images: **unmeasured
+  for F1** (images are created with M1's `metadata`; M0's 725 vs 664 ms
+  stands).
+
+Also run on the laptop with this branch: the vm driver's whole unit
+binary as root (CI's vm-root parity): 347 pass, none skipped or failed;
+`TestVMMemoryResume` with the f1 golden (regression: resume still uses
+the v3 op, which a v4 agent serves): pass, memory resume to first exec
+3.9 s median against 4.6 s from the disk. Logs: `~/teploy-validate/f1/`
+on the test host (`fork-1`, `fork-2`, `siblings-1`, `vmunit-1`,
+`resume-1`).
+
+### Security invariants
+
+Jail, per-run UID, both seccomp filters (**no new allowed syscall**: the
+daemon's denylist and the jail helper are unchanged), Landlock (the
+child's from the rewritten configuration, as M1), cgroups, KSM off. Live:
+no `type=1326` and no Landlock line in the kernel log over the fork
+tests; the child has no mergeable mapping. `config.json` from the image
+goes through M1's strict reading and rewrite unchanged.
+
+### Not done, and open
+
+- Off-host memory images (R1), M2 grace, `identity: "fresh"`,
+  cross-host: out of scope.
+- Not run live: the parent-resume hard error, old-agent fallback, the
+  rollback of `count` > 1, off-host children (unit-tested only).
+- Allowlist-tier children's inherited processes keep the parent's proxy
+  settings (as M1's restored processes do).
+- The parent's pause grows with guest RAM; a dirty-tracking pre-copy or
+  sparse snapshot upstream (M0 B7) is what would shorten it.

@@ -437,7 +437,79 @@ What it costs, and what it does not do:
   memory in use otherwise has its hypervisor killed by that limit in
   the middle of the snapshot (seen live). What the room holds is page
   cache, which the host can reclaim.
-- Fork is not memory fork: a forked run boots its disk, as before.
+
+#### Memory fork (same flag)
+
+With `--vm-memory-snapshots`, `POST /v1/runs/{id}/fork` of a **running**
+run forks it from its memory: the child gets the parent's processes,
+page cache and listening servers, not a fresh boot of its disk. The
+parent is paused once; in that pause the hypervisor writes its memory
+into a new image and the daemon takes the fork's disk snapshot, then the
+parent runs again. The image is sealed after the parent resumes, and
+every child is restored from it copy-on-write, on a clone of the disk
+snapshot, as a new run: its own ID, VM, UID, jail, cgroup, network
+namespace, tap, address and MAC (the guest's device is moved to them by
+the handshake). Each child answers with
+`fork: {from: "memory"|"disk", parentPauseMs, error?}`.
+
+- **`count`** (1 to 16) makes that many children from the one pause. It
+  is all or nothing: a child that comes up neither from the memory nor
+  from the disk fails the fork, and the children made before it are
+  destroyed before the answer (any that cannot be are named in the
+  error). `count` over 1 answers `{runs: [...]}`; without it the answer
+  is the run object, as always.
+- **`force: true`** lets a fork go on while recoverable execs are in
+  flight in the parent (otherwise 409 busy, as for any capture): the
+  parent keeps running them, and the children end the ones they
+  inherited. A plain exec or a write in flight is still 409.
+- **Inherited execs are ended in the child; background processes keep
+  running.** The child's agent ends every exec session it had at the
+  restore (they are the parent's: their callers are the parent's).
+  Processes that left their session's process group (`setsid`, a
+  daemon, a server) run on.
+- **The child's kernel random generator is reseeded** at the restore
+  (VM Generation ID, checked as for a resume), with host entropy and
+  `RNDRESEEDCRNG` on top. **Userspace generators are not**: a process
+  that seeded its own generator before the fork (OpenSSL's DRBG, a
+  language's PRNG, a UUID library) can produce the same stream in the
+  parent and in every child, and two signers producing the same ECDSA
+  nonce leak their key. So after every memory fork restore the agent
+  writes the restore's generation (a counter) to `/run/teploy/generation`
+  and runs the executables in `/etc/teploy/on-restore.d/` in name order,
+  as root, each for at most 10 s (20 s total budget across all hooks),
+  with `TEPLOY_GENERATION` and `TEPLOY_FORK=1` in its environment. **Put a hook there that restarts anything that signs
+  or makes nonces** (an SSH agent, a signing daemon, a token minter).
+  A hook that fails is logged and does not fail the fork. The parent
+  runs no hook: one of each pair diverging is enough, and every child
+  diverges from the parent and from its siblings.
+- **Unchanged in the child, as for a disk fork:** hostname,
+  `/etc/machine-id`, SSH host keys, and the vsock CID (a per-VM socket,
+  not a host-wide number). Everything that was in the parent's memory is
+  in the child's: environment, tokens, keys, open files' contents. ASLR
+  layout, stack canaries and pointer guards are the same in parent and
+  children, so a pointer or canary leaked from one is valid in the
+  others. A fork is of one tenant's run into the same tenant.
+- **The image is shared by the fork's children and nothing else.** The
+  daemon maps it only into forks of the run that wrote it, under that
+  run's tenant, and only while the fork holds it; it is never named in
+  a record. Each child's mapping holds it: it outlives the parent and
+  every child but the last, and goes with the last. KSM stays off: no
+  page is shared with another tenant's VM.
+- **Every failure of the memory forks from the disk instead**, from the
+  disk snapshot of the same pause: the child's `fork.from` is `disk`
+  and `fork.error` says why. An agent older than guest protocol 4 is
+  asked before the parent is paused, and costs it no longer a pause
+  than a disk fork's (rebuild the golden image with this release's
+  `teploy-guestd` to fork from memory). If the parent cannot be resumed
+  after the pause (tried twice), the fork fails (500), nothing of it is
+  left, and the parent is left as the hypervisor left it: destroy it.
+- **Same host, running parents only.** A stopped parent is forked from
+  its disk as before. `count` and `force` need the flag: a daemon
+  without it answers 400 to them rather than make one child of N.
+- **The parent's pause grows with its memory** (the hypervisor writes
+  all of guest RAM, as at a stop). Allowlist-tier children's processes
+  keep the parent's proxy settings, which the child's own proxy does
+  not answer (as after a resume from memory; see AUDIT_OPEN.md).
 
 ### Host sizing
 

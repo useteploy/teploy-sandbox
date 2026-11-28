@@ -30,6 +30,21 @@
 // whether the agent's own reseed worked, and the guest's clock just after
 // it was set, so the daemon can check the step took.
 //
+// Version 4 extends "restored" for a VM that is a fork of a running one:
+// Request.Fork and Request.KillSessions, which only a version 4 request
+// may carry (an agent of version 3 or older refuses the request for its
+// version, rather than ignore fields it does not know and leave the
+// fork's inherited sessions running). On a version 4 "restored" the agent
+// also, after the clock and the entropy: ends every exec session it had
+// when the request came (KillSessions), which in a fork are the
+// parent's, inherited with its memory; writes the restore's generation
+// to GenerationFile (/run/teploy/generation); and runs the executables
+// of HooksDir (/etc/teploy/on-restore.d) in name order, each with
+// TEPLOY_GENERATION and TEPLOY_FORK in its environment, so that daemons
+// that seeded a generator of their own before the fork can be restarted
+// there. Restored then says how many sessions it ended, the generation,
+// and which hooks ran and failed.
+//
 // Request.V names the protocol version. A server answers a version it
 // does not speak with CodeUnsupportedVersion and its own version, so
 // either side can be upgraded first. A version 3 server still answers
@@ -51,12 +66,14 @@ import (
 // ProtocolVersion is the newest version this package speaks. Requests of
 // version 1 are still sent for, and answered for, every op version 1 had,
 // so a daemon with this package drives an agent built before version 2.
-const ProtocolVersion = 3
+const ProtocolVersion = 4
 
 // requestVersion is the version a request for op is sent as: the oldest
 // version that has the op.
 func requestVersion(op string) int {
 	switch op {
+	case opRestoredFork:
+		return 4
 	case OpConnect:
 		return 2
 	case OpRestored:
@@ -111,9 +128,22 @@ const (
 	OpSync  = "sync"
 	// OpConnect is version 2.
 	OpConnect = "connect"
-	// OpRestored is version 3.
+	// OpRestored is version 3; with Fork or KillSessions, version 4.
 	OpRestored = "restored"
+
+	// opRestoredFork is not an op on the wire: it is how a "restored"
+	// request with the fields of version 4 is versioned (versionOf).
+	opRestoredFork = "restored+fork"
 )
+
+// versionOf is the version req is sent as: the oldest that has its op
+// and every field it carries.
+func versionOf(req Request) int {
+	if req.Op == OpRestored && (req.Fork || req.KillSessions) {
+		return requestVersion(opRestoredFork)
+	}
+	return requestVersion(req.Op)
+}
 
 // Request is the first frame of every connection.
 type Request struct {
@@ -138,6 +168,11 @@ type Request struct {
 	// base64).
 	NowNs   int64  `json:"nowNs,omitempty"`
 	Entropy []byte `json:"entropy,omitempty"`
+	// restored, version 4: the VM is a fork of a running one (Fork), and
+	// the exec sessions the agent had when the request came are the
+	// parent's and are ended (KillSessions).
+	Fork         bool `json:"fork,omitempty"`
+	KillSessions bool `json:"killSessions,omitempty"`
 }
 
 // Error codes carried in Result.Code.
@@ -189,6 +224,16 @@ type RestoredResult struct {
 	Reseeded bool `json:"reseeded"`
 	// ClockNs is the guest's wall clock just after it was set.
 	ClockNs int64 `json:"clockNs"`
+
+	// Version 4 only. SessionsKilled is how many exec sessions the agent
+	// ended for KillSessions. Generation is what it wrote to its
+	// generation file: one more than the file held. Hooks are the
+	// on-restore executables it ran, by name, and HooksFailed those of
+	// them that failed or ran out of time.
+	SessionsKilled int      `json:"sessionsKilled,omitempty"`
+	Generation     uint64   `json:"generation,omitempty"`
+	Hooks          []string `json:"hooks,omitempty"`
+	HooksFailed    []string `json:"hooksFailed,omitempty"`
 }
 
 // Error is a failure the agent reported (as opposed to a broken stream).

@@ -215,6 +215,7 @@ func (m *Manager) memoryViewLocked(run *Run, view *Run) {
 		return
 	}
 	view.ResumedFrom = run.resumedFrom
+	view.Fork = run.forkView
 	switch {
 	case run.State != StateStopped:
 	case run.memory != nil:

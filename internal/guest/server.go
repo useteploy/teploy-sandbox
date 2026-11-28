@@ -77,9 +77,32 @@ type Server struct {
 	// linger overrides pipeLinger in tests.
 	linger time.Duration
 
+	// GenerationFile is where a version 4 "restored" writes the
+	// restore's generation; "" is DefaultGenerationFile. HooksDir holds
+	// the executables it runs; "" is DefaultHooksDir. HookTimeout bounds
+	// each; zero is DefaultHookTimeout.
+	GenerationFile string
+	HooksDir       string
+	HookTimeout    time.Duration
+
 	connectsMu sync.Mutex
 	connects   int
+
+	// sessions are the exec sessions under way, by the command each
+	// runs: what a fork's KillSessions ends.
+	sessionsMu sync.Mutex
+	sessions   map[*exec.Cmd]struct{}
 }
+
+// Where a restore's generation is written and its hooks are found, and
+// how long each hook may run (protocol version 4).
+const (
+	DefaultGenerationFile = "/run/teploy/generation"
+	DefaultHooksDir       = "/etc/teploy/on-restore.d"
+	DefaultHookTimeout    = 10 * time.Second
+	// maxHooks bounds how many hooks one restore runs.
+	maxHooks = 32
+)
 
 // DefaultMaxConnects is how many connect streams the agent keeps open at
 // once: twice the daemon's own per-run cap.
@@ -198,8 +221,8 @@ func (s *Server) handle(conn io.Reader, out *frameWriter) (Result, net.Conn) {
 	if req.V < 1 || req.V > ProtocolVersion {
 		return failure(CodeUnsupportedVersion, "protocol version %d is not supported; this agent speaks 1 to %d", req.V, ProtocolVersion), nil
 	}
-	if req.V < requestVersion(req.Op) {
-		return failure(CodeUnsupportedVersion, "op %q needs protocol version %d", req.Op, requestVersion(req.Op)), nil
+	if need := versionOf(req); req.V < need {
+		return failure(CodeUnsupportedVersion, "op %q with these fields needs protocol version %d", req.Op, need), nil
 	}
 	switch req.Op {
 	case OpPing:
@@ -259,7 +282,158 @@ func (s *Server) restored(req Request) Result {
 	if clock == nil {
 		clock = func() int64 { return time.Now().UnixNano() }
 	}
-	return Result{Restored: &RestoredResult{VMGenIDSeen: seen(), Reseeded: reseeded, ClockNs: clock()}}
+	result := &RestoredResult{VMGenIDSeen: seen(), Reseeded: reseeded, ClockNs: clock()}
+	if req.V < 4 {
+		return Result{Restored: result}
+	}
+	// Version 4: the sessions first, so that nothing of the parent's
+	// exec is still running when the hooks start.
+	if req.KillSessions {
+		result.SessionsKilled = s.killSessions()
+	}
+	generation, err := s.nextGeneration()
+	if err != nil {
+		return failure(CodeInternal, "write the restore's generation: %v", err)
+	}
+	result.Generation = generation
+	result.Hooks, result.HooksFailed = s.runHooks(generation, req.Fork)
+	return Result{Restored: result}
+}
+
+// killSessions ends every exec session under way, each command's whole
+// process group, and says how many there were. In a fork these are the
+// parent's sessions, inherited with its memory: their callers are the
+// parent's, and are not connected to the fork. A process that left its
+// session's group (setsid, a daemon) is not a session and keeps running.
+func (s *Server) killSessions() int {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	for cmd := range s.sessions {
+		killGroup(cmd)
+	}
+	return len(s.sessions)
+}
+
+func (s *Server) track(cmd *exec.Cmd) func() {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	if s.sessions == nil {
+		s.sessions = map[*exec.Cmd]struct{}{}
+	}
+	s.sessions[cmd] = struct{}{}
+	return func() {
+		s.sessionsMu.Lock()
+		delete(s.sessions, cmd)
+		s.sessionsMu.Unlock()
+	}
+}
+
+// nextGeneration writes one more than the generation file holds (zero
+// for a file that is not there or not a number), through a rename so
+// that a reader never sees half a number.
+func (s *Server) nextGeneration() (uint64, error) {
+	path := s.GenerationFile
+	if path == "" {
+		path = DefaultGenerationFile
+	}
+	var generation uint64
+	if raw, err := os.ReadFile(path); err == nil {
+		generation, _ = strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+	}
+	generation++
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return 0, err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), ".generation-*")
+	if err != nil {
+		return 0, err
+	}
+	_, err = fmt.Fprintf(temp, "%d\n", generation)
+	if err == nil {
+		err = temp.Chmod(0o644)
+	}
+	if closeErr := temp.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(temp.Name(), path)
+	}
+	if err != nil {
+		_ = os.Remove(temp.Name())
+		return 0, err
+	}
+	return generation, nil
+}
+
+// runHooks runs the executables of the hooks directory in name order,
+// each in a process group of its own and for at most the hook timeout,
+// with the generation and whether this restore is a fork in its
+// environment. A hook that fails, or runs out of time (its group is
+// killed), is said in failed and does not stop the others: they are the
+// guest's own, for restarting what holds generator state of its own,
+// and the restore is no less done for one of them.
+func (s *Server) runHooks(generation uint64, fork bool) (ran, failed []string) {
+	dir := s.HooksDir
+	if dir == "" {
+		dir = DefaultHooksDir
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil
+	}
+	timeout := s.HookTimeout
+	if timeout <= 0 {
+		timeout = DefaultHookTimeout
+	}
+	forked := "0"
+	if fork {
+		forked = "1"
+	}
+	env := mergeEnv(s.Env, map[string]string{"TEPLOY_GENERATION": strconv.FormatUint(generation, 10), "TEPLOY_FORK": forked})
+	for _, entry := range entries {
+		if len(ran) == maxHooks {
+			break
+		}
+		name := entry.Name()
+		info, err := entry.Info()
+		if strings.HasPrefix(name, ".") || err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			continue
+		}
+		ran = append(ran, name)
+		if !s.runHook(filepath.Join(dir, name), env, timeout) {
+			failed = append(failed, name)
+		}
+	}
+	return ran, failed
+}
+
+func (s *Server) runHook(path string, env []string, timeout time.Duration) bool {
+	cmd := exec.Command(path)
+	cmd.Dir = "/"
+	cmd.Env = env
+	cmd.WaitDelay = pipeGrace
+	ownProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		s.logf("on-restore hook %s: %v", path, err)
+		return false
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			s.logf("on-restore hook %s: %v", path, err)
+			return false
+		}
+		return true
+	case <-timer.C:
+		killGroup(cmd)
+		<-done
+		s.logf("on-restore hook %s: ran out of its %s", path, timeout)
+		return false
+	}
 }
 
 // connect dials the guest port: 127.0.0.1 first (where dev servers bind),
@@ -443,6 +617,7 @@ func (s *Server) exec(conn io.Reader, out *frameWriter, req Request) Result {
 	if err := cmd.Start(); err != nil {
 		return failure(CodeBadRequest, "start command: %v", err)
 	}
+	defer s.track(cmd)()
 
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()

@@ -835,6 +835,14 @@ type fakeMachine struct {
 	restoredOp func(nowNs int64, entropy []byte) (guest.RestoredResult, error)
 	// entropySeen is what the restored op was given, in order.
 	entropySeen [][]byte
+	// forkOp answers a fork's "restored" handshake (guest protocol v4);
+	// nil is an agent older than v4. forkKills records each one's
+	// killSessions. agentVersion is the protocol version the agent says
+	// it speaks; zero is version 4.
+	forkOp       func(nowNs int64, entropy []byte, killSessions bool) (guest.RestoredResult, error)
+	forkKills    []bool
+	agentVersion int
+	versionErr   error
 	// handshake is each guest command the driver ran to bring a
 	// restored guest up to date (its clock and its network device).
 	handshake []string
@@ -1174,6 +1182,41 @@ func (a *fakeAgent) Restored(_ context.Context, nowNs int64, entropy []byte) (gu
 		return guest.RestoredResult{}, &guest.Error{Code: guest.CodeUnsupportedVersion, Message: "protocol version 3 is not supported; this agent speaks 1 to 2"}
 	}
 	return op(nowNs, entropy)
+}
+
+// RestoredFork answers a fork's "restored" handshake (guest protocol
+// v4). The machine's forkOp says what the guest did; nil is an agent
+// built before version 4.
+func (a *fakeAgent) RestoredFork(_ context.Context, nowNs int64, entropy []byte, killSessions bool) (guest.RestoredResult, error) {
+	if err := a.alive(); err != nil {
+		return guest.RestoredResult{}, err
+	}
+	m := (*fakeMachine)(a)
+	m.mu.Lock()
+	op := m.forkOp
+	a.entropySeen = append(a.entropySeen, bytes.Clone(entropy))
+	a.forkKills = append(a.forkKills, killSessions)
+	m.mu.Unlock()
+	if op == nil {
+		return guest.RestoredResult{}, &guest.Error{Code: guest.CodeUnsupportedVersion, Message: "protocol version 4 is not supported; this agent speaks 1 to 3"}
+	}
+	return op(nowNs, entropy, killSessions)
+}
+
+func (a *fakeAgent) Version(context.Context) (int, error) {
+	if err := a.alive(); err != nil {
+		return 0, err
+	}
+	m := (*fakeMachine)(a)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.versionErr != nil {
+		return 0, m.versionErr
+	}
+	if m.agentVersion == 0 {
+		return forkProtocol, nil
+	}
+	return m.agentVersion, nil
 }
 
 func (a *fakeAgent) Sync(context.Context) error {

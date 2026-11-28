@@ -390,13 +390,22 @@ func (d *Driver) ResumeMemory(ctx context.Context, runID string, spec run.Create
 		return "", "", "", fmt.Errorf("%w: %w", run.ErrMemoryNotTried, err)
 	}
 	defer admitted()
+	return d.restoreOrBoot(ctx, runID, spec, image, proxyPort, nil)
+}
 
+// restoreOrBoot is ResumeMemory once the create is admitted, and
+// RestoreFork's whole work with a fork's image (fork, non-nil): the
+// image is tried first, and on any failure the snapshot spec.Image
+// names is booted, on a fresh clone. Everything said of ResumeMemory
+// holds of a fork's child too: its image's failure is never its error,
+// and a clone a restored guest wrote to is never booted.
+func (d *Driver) restoreOrBoot(ctx context.Context, runID string, spec run.CreateSpec, image *run.MemoryImage, proxyPort int, fork *forkSource) (string, string, string, error) {
 	began := time.Now()
 	cpus, memoryMB := vcpus(spec.CPUs), spec.MemoryMB
-	machine, guestNet, cloned, restoreErr := d.restore(ctx, runID, spec, image, proxyPort)
+	machine, guestNet, cloned, restoreErr := d.restore(ctx, runID, spec, image, proxyPort, fork)
 	if restoreErr == nil {
 		d.track(spec.Name, &instance{machine: machine, env: createEnv(spec, proxyPort), network: spec.Name, mac: macOf(guestNet), cpus: cpus, memoryMB: memoryMB})
-		d.log.Info("vm restored from its memory image", "name", spec.Name, "run", runID, "image", image.ID, "memory", time.Since(began).String())
+		d.log.Info("vm restored from its memory image", "name", spec.Name, "run", runID, "image", image.ID, "fork", fork != nil, "memory", time.Since(began).String())
 		return spec.Name, run.ResumedFromMemory, "", nil
 	}
 
@@ -405,7 +414,10 @@ func (d *Driver) ResumeMemory(ctx context.Context, runID string, spec run.Create
 	// and neither clears nor is charged to the snapshot's failed boots:
 	// it read nothing from the disk.
 	note := "resumed from the disk: " + restoreErr.Error()
-	d.log.Warn("vm memory image not used; booting from the disk", "name", spec.Name, "run", runID, "image", image.ID, "error", restoreErr)
+	if fork != nil {
+		note = "forked from the disk: " + restoreErr.Error()
+	}
+	d.log.Warn("vm memory image not used; booting from the disk", "name", spec.Name, "run", runID, "image", image.ID, "fork", fork != nil, "error", restoreErr)
 	// Every rollback under a deadline of its own, starting where the
 	// rollback does: the one before it may have spent a whole one.
 	rollback := func() (context.Context, context.CancelFunc) {
@@ -492,7 +504,13 @@ func (d *Driver) ResumeMemory(ctx context.Context, runID string, spec run.Create
 // alone. cloned says whether the restore came as far as asking for the
 // run's clone: until then nothing of the run's is on the pool, and the
 // caller has nothing to remove before it boots the disk.
-func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec, image *run.MemoryImage, proxyPort int) (result Machine, network *GuestNetwork, cloned bool, err error) {
+//
+// fork is the image a fork of a running run made, for a child of that
+// fork; nil restores a stopped run from its record's image. A fork's
+// image is mapped only by forks of the run that wrote it, under the
+// same tenant (memoryImages.forkOpen), and its guest's handshake also
+// ends the exec sessions the child inherited (restoreForkGuest).
+func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec, image *run.MemoryImage, proxyPort int, fork *forkSource) (result Machine, network *GuestNetwork, cloned bool, err error) {
 	if d.images == nil {
 		return nil, nil, false, errors.New("this daemon keeps no memory images")
 	}
@@ -514,7 +532,7 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 	if guid != image.Disk {
 		return nil, nil, false, fmt.Errorf("saved beside disk snapshot %s, and this run's stop snapshot is %s", image.Disk, guid)
 	}
-	img, err := d.images.open(ctx, runID, image)
+	img, err := d.openImage(ctx, runID, image, fork)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -618,7 +636,12 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 	}
 	step("agent", began)
 	began = time.Now()
-	if err = d.restoreClock(ctx, result); err != nil {
+	if fork != nil {
+		err = d.restoreForkGuest(ctx, result)
+	} else {
+		err = d.restoreClock(ctx, result)
+	}
+	if err != nil {
 		return result, network, cloned, err
 	}
 	step("clock", began)
@@ -641,6 +664,18 @@ func (d *Driver) restore(ctx context.Context, runID string, spec run.CreateSpec,
 	}
 	d.log.Info("vm restore steps", attrs...)
 	return result, network, cloned, nil
+}
+
+// openImage holds the image a restore is from: a stopped run's, opened
+// from its record, or a fork's, for one of that fork's children.
+func (d *Driver) openImage(ctx context.Context, runID string, rec *run.MemoryImage, fork *forkSource) (*image, error) {
+	if fork == nil {
+		return d.images.open(ctx, runID, rec)
+	}
+	if err := d.images.forkOpen(fork.img, fork.lineage, fork.tenant); err != nil {
+		return nil, err
+	}
+	return fork.img, nil
 }
 
 // poolName is the ZFS pool the run volumes are in (the first component

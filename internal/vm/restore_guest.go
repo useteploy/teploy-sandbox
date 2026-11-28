@@ -95,6 +95,61 @@ func (d *Driver) restoreClock(ctx context.Context, machine Machine) error {
 	return fmt.Errorf("restored handshake: %w", err)
 }
 
+// restoreForkGuest is restoreClock for a child of a fork of a running
+// run (guest protocol version 4): the clock and the random state as for
+// any restore, checked the same way, and in the same request the agent
+// ends every exec session it had (the parent's, inherited with its
+// memory: their callers are the parent's), writes the restore's
+// generation and runs the guest's on-restore hooks (design 5.5: what
+// seeded a generator of its own before the fork is restarted there).
+//
+// An agent older than version 4 cannot be asked for that, and the
+// script older agents get for a resume does none of it: such a guest
+// is not served from the image, and the child boots from the fork's
+// disk snapshot instead, as a fork did before memory forks existed.
+// (Its inherited sessions would in fact die anyway: the hypervisor
+// resets every vsock connection at a restore and the agent ends the
+// process group of a connection that is gone (M0, U6). But the hooks
+// would not run, and "anyway" is not what a fork is promised on.) The
+// driver asks the parent's agent its version before it pauses the
+// parent (SaveForkMemory), so this is a backstop, not the usual way an
+// old agent is found out.
+func (d *Driver) restoreForkGuest(ctx context.Context, machine Machine) error {
+	ctx, cancel := context.WithTimeout(ctx, restoreHandshakeTimeout)
+	defer cancel()
+	entropy := make([]byte, guest.RestoredEntropyBytes)
+	if _, err := rand.Read(entropy); err != nil {
+		return err
+	}
+	sent := time.Now()
+	result, err := machine.Agent().RestoredFork(ctx, sent.UnixNano(), entropy, true)
+	var agentErr *guest.Error
+	switch {
+	case err == nil:
+	case !errors.As(err, &agentErr):
+		return &vmUnreachable{fmt.Errorf("restored handshake: %w", err)}
+	case agentErr.Code == guest.CodeUnsupportedVersion:
+		return fmt.Errorf("the guest's agent is older than protocol version %d: it cannot end the sessions a fork inherits or run the guest's on-restore hooks", forkProtocol)
+	default:
+		return fmt.Errorf("restored handshake: %w", err)
+	}
+	if err := clockStepped(result.ClockNs, sent, time.Now()); err != nil {
+		return err
+	}
+	if !result.VMGenIDSeen {
+		return errors.New("the guest's kernel has no driver bound to the VM Generation ID device, so nothing reseeded its random state at the restore")
+	}
+	attrs := []any{"sessionsKilled", result.SessionsKilled, "generation", result.Generation, "hooks", len(result.Hooks)}
+	if len(result.HooksFailed) > 0 {
+		attrs = append(attrs, "hooksFailed", strings.Join(result.HooksFailed, ","))
+	}
+	if !result.Reseeded {
+		attrs = append(attrs, "agentReseed", "refused or unknown to the kernel; the kernel's own reseed at the restore is what counts")
+	}
+	d.log.Info("fork's child brought up to date", attrs...)
+	return nil
+}
+
 func (d *Driver) restoreClockScript(ctx context.Context, machine Machine) error {
 	now := time.Now()
 	// The clock to the nanosecond, and read back; then whether the

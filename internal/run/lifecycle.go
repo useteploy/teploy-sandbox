@@ -7,6 +7,7 @@ import (
 	"maps"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 	"unicode"
 
@@ -445,13 +446,46 @@ type ForkRequest struct {
 	TTLSec   int               `json:"ttlSec,omitempty"`
 	Labels   map[string]string `json:"labels,omitempty"`
 	OnExpire string            `json:"onExpire,omitempty"`
+	// Count is how many children the fork makes, 1 (absent) to
+	// MaxForkCount, from one capture of the source. Force lets a fork of
+	// a running source go on while recoverable execs are in flight in it
+	// (otherwise 409 busy, as for any capture): the source keeps running
+	// them, and the children end the ones they inherit. Both need a
+	// driver that keeps memory images (--vm-memory-snapshots); a daemon
+	// without one refuses them (400) rather than make one child.
+	Count int  `json:"count,omitempty"`
+	Force bool `json:"force,omitempty"`
 }
 
 // Fork starts a new run from the source's filesystem with the source's
 // settings. A running source is captured (it must be idle, as for
 // Snapshot) and keeps running; a stopped source lends its stop snapshot,
 // which stays the source's.
+//
+// With a driver that keeps memory images, a running source is forked
+// from its memory as well (fork_memory.go): one pause saves both, and
+// the child is restored from the memory, or booted from the disk when it
+// cannot be.
 func (m *Manager) Fork(ctx context.Context, id string, req ForkRequest) (*Run, error) {
+	children, err := m.ForkMany(ctx, id, req)
+	if err != nil {
+		return nil, err
+	}
+	return children[0], nil
+}
+
+// ForkMany is Fork for req.Count children (one when absent), all from
+// one capture of the source.
+//
+// It is all or nothing. A child that could not be restored from memory
+// is booted from the disk, which is no failure; a child that comes up
+// neither way fails the fork, and the children it made before are
+// destroyed before it answers: a caller is handed every child it asked
+// for, or none, and never a run it was not told of (a fork is not
+// idempotent, and a retry after a partial answer would make more). A
+// child that could not be destroyed in that rollback is named in the
+// error, and is a run like any other, for the caller to destroy.
+func (m *Manager) ForkMany(ctx context.Context, id string, req ForkRequest) ([]*Run, error) {
 	ttl, err := resolveTTL(req.TTLSec)
 	if err != nil {
 		return nil, err
@@ -465,6 +499,19 @@ func (m *Manager) Fork(ctx context.Context, id string, req ForkRequest) (*Run, e
 			return nil, err
 		}
 	}
+	count := req.Count
+	if count == 0 {
+		count = 1
+	}
+	if count < 1 || count > MaxForkCount {
+		return nil, fmt.Errorf("%w: count must be 1-%d, got %d", ErrBadRequest, MaxForkCount, req.Count)
+	}
+	if (count > 1 || req.Force) && m.MemoryImages == nil {
+		// Without memory images a daemon forks as it always did, one
+		// child of an idle source; it says so rather than make one child
+		// of N, or 409 a fork it was told to force.
+		return nil, fmt.Errorf("%w: count and force need a driver that keeps memory images (--vm-memory-snapshots)", ErrBadRequest)
+	}
 
 	// A source stopped on another daemon is looked up; one this daemon
 	// knows is checked against remote storage when that can be reached.
@@ -474,8 +521,31 @@ func (m *Manager) Fork(ctx context.Context, id string, req ForkRequest) (*Run, e
 	var source *Run
 	var image, base string
 	fromStopped := false
-	source, release, err := m.beginCapture(id)
+	forker := m.memoryForker()
+	// What a child says of how it was made, with a driver that keeps
+	// memory images; the memory the fork saved for its children, if any.
+	var made *ForkView
+	var forkImage *ForkImage
+	source, release, err := m.beginCaptureFor(id, req.Force)
 	switch {
+	case err == nil && forker != nil:
+		// One pause saves the source's memory beside its disk: the
+		// children are restored from the one and fall back to the other.
+		image = m.newSnapshotRef()
+		var saved ForkSaved
+		forkImage, saved, err = forker.SaveForkMemory(ctx, id, source.ContainerID, image)
+		release()
+		if err != nil {
+			return nil, err
+		}
+		made = &ForkView{ParentPauseMs: saved.Pause.Milliseconds(), Error: saved.Note}
+		if forkImage != nil {
+			// Held until every child has been made; each child restored
+			// from it holds it for as long as it lives.
+			defer forker.ReleaseFork(context.WithoutCancel(ctx), forkImage)
+		}
+		m.log.Info("fork saved its source", "from", id, "memory", forkImage != nil, "parentPause", saved.Pause.String(), "seal", saved.Seal.String(), "memoryWhy", saved.Note)
+		base = source.base
 	case err == nil:
 		// Capture exclusivity covers the capture only: the source goes
 		// back to work while the child boots.
@@ -519,10 +589,47 @@ func (m *Manager) Fork(ctx context.Context, id string, req ForkRequest) (*Run, e
 		if source.Remote != nil && source.Remote.State == RemoteDurable {
 			base = image
 		}
+		if forker != nil {
+			made = &ForkView{Error: "the source is stopped: a fork from memory is of a running run"}
+		}
 	default:
 		return nil, err
 	}
 
+	children := make([]*Run, 0, count)
+	for n := range count {
+		created, err := m.forkChild(ctx, id, source, image, base, req, onExpire, ttl, forkImage, made, fromStopped)
+		if err == nil {
+			children = append(children, created)
+			continue
+		}
+		if count == 1 {
+			return nil, err
+		}
+		// All or nothing: the children made so far go.
+		var left []string
+		for _, child := range children {
+			attempt, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			if destroyErr := m.destroyIf(attempt, child.ID, nil); destroyErr != nil && !errors.Is(destroyErr, ErrNotFound) {
+				left = append(left, child.ID)
+				m.log.Error("a fork's child could not be destroyed after a sibling failed; it is left for its caller", "id", child.ID, "from", id, "error", destroyErr)
+			}
+			cancel()
+		}
+		if len(left) > 0 {
+			return nil, fmt.Errorf("fork of %s: child %d of %d did not come up, and %d of the %d made before it could not be destroyed (%s): %w", id, n+1, count, len(left), len(children), strings.Join(left, ", "), err)
+		}
+		return nil, fmt.Errorf("fork of %s: child %d of %d did not come up, and the %d made before it were destroyed: %w", id, n+1, count, len(children), err)
+	}
+	return children, nil
+}
+
+// forkChild makes one child of a fork of id: its record (and, with
+// remote storage, its first remote record and hold key, before it
+// boots), then its VM, from forkImage when the fork saved one and from
+// the snapshot image otherwise. made is what it says of how it was made,
+// nil without memory images.
+func (m *Manager) forkChild(ctx context.Context, id string, source *Run, image, base string, req ForkRequest, onExpire string, ttl time.Duration, forkImage *ForkImage, made *ForkView, fromStopped bool) (*Run, error) {
 	now := m.now()
 	child := &Run{
 		// Lineage, not the capture: the child is the same image's run.
@@ -539,6 +646,10 @@ func (m *Manager) Fork(ctx context.Context, id string, req ForkRequest) (*Run, e
 		// for this fork is the child's alone; a stopped source's
 		// snapshot is shared, and goes when both have let go.
 		images: []string{image},
+	}
+	if made != nil {
+		view := *made
+		child.forkView = &view
 	}
 	if req.Labels != nil {
 		child.Labels = maps.Clone(req.Labels)
@@ -585,14 +696,16 @@ func (m *Manager) Fork(ctx context.Context, id string, req ForkRequest) (*Run, e
 		}
 	}
 	created, err := m.launch(ctx, bootRequest{
-		id:      childID,
-		image:   image,
-		env:     source.env,
-		network: source.Network,
-		extra:   source.egressAllow,
-		limits:  source.limits,
-		user:    source.User,
-		warm:    source.warmReq,
+		id:         childID,
+		image:      image,
+		env:        source.env,
+		network:    source.Network,
+		extra:      source.egressAllow,
+		limits:     source.limits,
+		user:       source.User,
+		warm:       source.warmReq,
+		fork:       forkImage,
+		forkParent: id,
 	}, child)
 	// The registry file lists the image under the child (or under the
 	// rollback record of a child whose container could not be removed).
@@ -605,7 +718,12 @@ func (m *Manager) Fork(ctx context.Context, id string, req ForkRequest) (*Run, e
 		}
 		return nil, err
 	}
-	m.log.Info("run forked", "id", created.ID, "from", id, "sourceStopped", fromStopped, "image", image, "expiresAt", created.ExpiresAt)
+	if created.Fork != nil {
+		m.log.Info("run forked", "id", created.ID, "from", id, "sourceStopped", fromStopped, "image", image, "expiresAt", created.ExpiresAt,
+			"forkFrom", created.Fork.From, "parentPauseMs", created.Fork.ParentPauseMs, "memoryWhy", created.Fork.Error)
+	} else {
+		m.log.Info("run forked", "id", created.ID, "from", id, "sourceStopped", fromStopped, "image", image, "expiresAt", created.ExpiresAt)
+	}
 	return created, nil
 }
 

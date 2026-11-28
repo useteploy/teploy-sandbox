@@ -35,6 +35,14 @@ type Agent interface {
 	// (guest protocol version 3: the clock stepped, the random state
 	// replaced). An agent older than that answers CodeUnsupportedVersion.
 	Restored(ctx context.Context, nowNs int64, entropy []byte) (guest.RestoredResult, error)
+	// RestoredFork is Restored for a child of a fork of a running VM
+	// (guest protocol version 4): the agent also ends the exec sessions
+	// it had when asked (the parent's), writes the restore's generation
+	// and runs the guest's on-restore hooks. An agent older than that
+	// answers CodeUnsupportedVersion and has done none of it.
+	RestoredFork(ctx context.Context, nowNs int64, entropy []byte, killSessions bool) (guest.RestoredResult, error)
+	// Version is the guest protocol version the agent speaks.
+	Version(ctx context.Context) (int, error)
 }
 
 // MachineConfig is one VM to start.

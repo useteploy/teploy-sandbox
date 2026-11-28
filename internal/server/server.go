@@ -227,12 +227,36 @@ func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, problem(http.StatusBadRequest, "Body must be JSON."))
 		return
 	}
-	forked, err := s.Manager.Fork(r.Context(), r.PathValue("id"), req)
+	if req.Count <= 1 {
+		forked, err := s.Manager.Fork(r.Context(), r.PathValue("id"), req)
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
+		s.writeRun(w, http.StatusCreated, forked)
+		return
+	}
+	// count > 1: every child, each the run object a single fork answers
+	// with, in the order they were made.
+	children, err := s.Manager.ForkMany(r.Context(), r.PathValue("id"), req)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	s.writeRun(w, http.StatusCreated, forked)
+	runs := make([]map[string]any, 0, len(children))
+	for _, child := range children {
+		encoded, err := json.Marshal(child)
+		body := map[string]any{}
+		if err == nil {
+			err = json.Unmarshal(encoded, &body)
+		}
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
+		runs = append(runs, body)
+	}
+	s.writeJSON(w, http.StatusCreated, map[string]any{"runs": runs})
 }
 
 // capacityDiskTimeout bounds the storage probe of GET /v1/capacity: a

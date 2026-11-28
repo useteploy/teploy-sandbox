@@ -52,6 +52,9 @@ const retrySnapshotDeadline = 15 * time.Minute
 type snapshotNote struct {
 	Ref string `json:"ref"`
 	Run string `json:"run,omitempty"`
+	// Tenant and Bases are key custody's (additive; omitted when custody is off).
+	Tenant string            `json:"tenant,omitempty"`
+	Bases  map[string]string `json:"bases,omitempty"`
 	// Key is the wrapped data key the upload used, and Base the ref its
 	// stream was meant to build on. Both are best-effort: a base that is
 	// gone makes the retry a full upload, and a key is re-wrapped by
@@ -128,7 +131,7 @@ func (m *Manager) retrySnapshotNote(ctx context.Context, note snapshotNote) {
 	// go by its run while this one reads it.
 	unpin := m.pin(note.Base)
 	defer unpin()
-	uploaded, err := m.upload(attempt, UploadRequest{Run: note.Run, Ref: note.Ref, Base: note.Base, Key: note.Key, Purpose: PurposeSnapshot})
+	uploaded, err := m.upload(attempt, UploadRequest{Run: note.Run, Ref: note.Ref, Base: note.Base, Key: note.Key, Purpose: PurposeSnapshot, Tenant: note.Tenant, Bases: note.Bases})
 	m.noteUploadOutcome("snapshot:"+note.Ref, err)
 	if err != nil {
 		m.log.Error("a caller snapshot is still not durable off the host; retrying", "image", note.Ref, "run", note.Run, "error", err)

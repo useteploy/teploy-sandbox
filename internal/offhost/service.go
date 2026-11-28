@@ -112,6 +112,11 @@ type Config struct {
 	// ReservePercent is the share of the local pool to keep free: below
 	// it, Pressure reports true.
 	ReservePercent int
+	// HoldCache is the host-local encrypted hold-key cache in pushed mode
+	// (nil outside pushed mode or in unit tests without a cache).
+	HoldCache *HoldCache
+	// PushedSource is the pushed key source in pushed mode (nil otherwise).
+	PushedSource *PushedKeySource
 }
 
 // DefaultMaxChain bounds a restore to the base image, one stream against
@@ -160,7 +165,10 @@ type Service struct {
 	passStart func(n int) int
 }
 
-var _ run.OffHost = (*Service)(nil)
+var (
+	_ run.OffHost        = (*Service)(nil)
+	_ run.CustodyOffHost = (*Service)(nil)
+)
 
 // NewService joins a store and a driver.
 func NewService(store *Store, snaps Snapshots, config Config, log *slog.Logger) *Service {
@@ -237,7 +245,7 @@ func (s *Service) Upload(ctx context.Context, req run.UploadRequest) (run.Upload
 		}
 		s.log.Warn("an upload was not whole in remote storage when checked; starting it over", "snapshot", id, "try", try+1, "error", err)
 	}
-	return run.UploadResult{}, s.remoteError(last)
+	return run.UploadResult{}, bridgeNeedKey(s.remoteError(last))
 }
 
 // remoteError marks an error that says a snapshot is not whole as the
@@ -1018,6 +1026,15 @@ type EnsureOptions struct {
 	// "v1"): only its v1 envelopes are read on this restore, whatever the
 	// store marks.
 	LegacyRun string
+	// ExpectKID, when not "", holds the tip manifest of the restore to
+	// this hold key ID (or "v1" for a legacy run). Ancestors may use older
+	// kids reached through verified parent stream pins from the tip.
+	ExpectKID string
+	// ExpectStreamSHA256, when not "", holds the tip manifest's verified
+	// stream SHA-256 (and, when already local, this host's recorded stream
+	// hash) to this digest — used on takeover from a running record whose
+	// sealed payload pinned the resumed-from stop snapshot.
+	ExpectStreamSHA256 string
 }
 
 // Ensure makes sure this host has the snapshot ref, restoring it when it
@@ -1044,22 +1061,47 @@ func (s *Service) Ensure(ctx context.Context, ref string) error {
 // EnsureFor is Ensure told what to hold the chain to (EnsureOptions).
 // Without a key source the options are not looked at.
 func (s *Service) EnsureFor(ctx context.Context, ref string, opts EnsureOptions) error {
+	_, err := s.ensureFor(ctx, ref, opts)
+	return err
+}
+
+// ensureFor is EnsureFor returning the verified tip SnapshotPin from the exact
+// manifest checked/restored during this call (single read, no TOCTOU window).
+func (s *Service) ensureFor(ctx context.Context, ref string, opts EnsureOptions) (run.SnapshotPin, error) {
 	id, err := s.id(ref)
 	if err != nil {
-		return err
+		return run.SnapshotPin{}, err
 	}
 	if opts.Tenant != "" && !ValidTenant(opts.Tenant) {
-		return fmt.Errorf("%w: %q is not a tenant", run.ErrBadRequest, opts.Tenant)
+		return run.SnapshotPin{}, fmt.Errorf("%w: %q is not a tenant", run.ErrBadRequest, opts.Tenant)
 	}
-	if _, ok, err := s.snaps.Stat(ctx, id); err != nil || ok {
-		return err
+	if _, ok, err := s.snaps.Stat(ctx, id); err != nil {
+		return run.SnapshotPin{}, err
+	} else if ok {
+		if s.store.v2() && (opts.ExpectKID != "" || opts.ExpectStreamSHA256 != "" || opts.Run != "") {
+			pin, err := s.checkLocalTipExpect(ctx, id, opts)
+			if err != nil {
+				return run.SnapshotPin{}, bridgeNeedKey(err)
+			}
+			return pin, nil
+		}
+		return run.SnapshotPin{}, nil
 	}
 	if err := s.restoring.lock(ctx); err != nil {
-		return err
+		return run.SnapshotPin{}, err
 	}
 	defer s.restoring.unlock()
-	if _, ok, err := s.snaps.Stat(ctx, id); err != nil || ok {
-		return err
+	if _, ok, err := s.snaps.Stat(ctx, id); err != nil {
+		return run.SnapshotPin{}, err
+	} else if ok {
+		if s.store.v2() && (opts.ExpectKID != "" || opts.ExpectStreamSHA256 != "" || opts.Run != "") {
+			pin, err := s.checkLocalTipExpect(ctx, id, opts)
+			if err != nil {
+				return run.SnapshotPin{}, bridgeNeedKey(err)
+			}
+			return pin, nil
+		}
+		return run.SnapshotPin{}, nil
 	}
 	start := time.Now()
 	for tries := 0; ; tries++ {
@@ -1071,22 +1113,36 @@ func (s *Service) EnsureFor(ctx context.Context, ref string, opts EnsureOptions)
 			chain, streamBytes, err = s.walk(ctx, id)
 		}
 		if err != nil {
-			return err
+			return run.SnapshotPin{}, bridgeNeedKey(err)
 		}
-		defer zeroHolds(chain)
+		var tipPin run.SnapshotPin
+		if s.store.v2() && len(chain) > 0 {
+			tip := chain[0].manifest
+			tipKID := tip.KID
+			if !tip.v2 {
+				tipKID = run.LegacyKID
+			}
+			tipPin = run.SnapshotPin{KID: tipKID, StreamSHA256: tip.StreamSHA256}
+		}
 		err = s.pull(ctx, id, chain, streamBytes, start)
-		if err == nil || tries > 0 || ctx.Err() != nil || !errors.Is(err, ErrCorrupt) {
-			return err
+		if err == nil {
+			zeroHolds(chain)
+			return tipPin, nil
+		}
+		if tries > 0 || ctx.Err() != nil || !errors.Is(err, ErrCorrupt) {
+			zeroHolds(chain)
+			return run.SnapshotPin{}, bridgeNeedKey(err)
 		}
 		// Not whole as it was read. An upload attempt replaced since the
 		// chain was read would read exactly so; look once more before it
 		// is the snapshot's verdict.
 		swapped, lookErr := s.attemptsSwapped(ctx, chain)
+		zeroHolds(chain)
 		if lookErr != nil {
-			return errors.Join(err, lookErr)
+			return run.SnapshotPin{}, errors.Join(err, lookErr)
 		}
 		if !swapped {
-			return err
+			return run.SnapshotPin{}, err
 		}
 		s.log.Warn("an upload attempt changed while a snapshot was being restored; starting the restore over from the chain that stands now", "snapshot", id)
 	}
@@ -1192,6 +1248,11 @@ func (s *Service) walkCustody(ctx context.Context, id string, opts EnsureOptions
 		if current == id && opts.Run != "" && manifest.Run != opts.Run {
 			return nil, 0, fmt.Errorf("%w: snapshot %s is of run %s, and the run restored is %s", ErrCorrupt, id, manifest.Run, opts.Run)
 		}
+		if current == id && opts.ExpectKID != "" {
+			if err := checkTipExpectKID(id, manifest, opts.ExpectKID); err != nil {
+				return nil, 0, err
+			}
+		}
 		chain = append(chain, link{manifest: manifest, key: key})
 		streamBytes += manifest.StreamBytes
 		if manifest.Parent == "" {
@@ -1258,6 +1319,11 @@ func (s *Service) walkCustody(ctx context.Context, id string, opts EnsureOptions
 			zeroHolds(chain)
 			return nil, 0, fmt.Errorf("restore %s: snapshot %s: its sealed section does not open under the hold key it names, so its public section is not the one that was sealed: %w", id, manifest.ID, err)
 		}
+	}
+	if opts.ExpectStreamSHA256 != "" && chain[0].manifest.StreamSHA256 != opts.ExpectStreamSHA256 {
+		zeroHolds(chain)
+		return nil, 0, fmt.Errorf("%w: snapshot %s stream hash %s does not match pinned hash %s",
+			ErrCorrupt, chain[0].manifest.ID, chain[0].manifest.StreamSHA256, opts.ExpectStreamSHA256)
 	}
 
 	// Every base image in the chain must have no parent and match its
@@ -1590,12 +1656,17 @@ func (s *Service) record(record *Record, key Key) run.RemoteRecord {
 // given it — a record under a hold key minted after the run left here.
 // What the record says without its payload is LatestPublic.
 func (s *Service) Latest(ctx context.Context, id string) (run.RemoteRecord, error) {
-	record, key, err := s.store.Latest(ctx, id)
+	return s.LatestAs(ctx, id, "")
+}
+
+// LatestAs is Latest with an explicit per-call legacyRun (when expect.kid is "v1").
+func (s *Service) LatestAs(ctx context.Context, id, legacyRun string) (run.RemoteRecord, error) {
+	record, key, err := s.store.LatestAs(ctx, id, legacyRun)
 	if errors.Is(err, ErrNoRecord) {
 		return run.RemoteRecord{}, fmt.Errorf("%w: %v", run.ErrNotFound, err)
 	}
 	if errors.Is(err, ErrNeedKey) {
-		return run.RemoteRecord{}, fmt.Errorf("%w: %w", run.ErrRemoteNeedKey, err)
+		return run.RemoteRecord{}, bridgeNeedKey(err)
 	}
 	if err != nil {
 		return run.RemoteRecord{}, err
@@ -1609,7 +1680,12 @@ func (s *Service) Latest(ctx context.Context, id string) (run.RemoteRecord, erro
 // so it is what a sync fences and counts by where Latest would answer
 // run.ErrRemoteNeedKey. A destroyed record has no payload in any case.
 func (s *Service) LatestPublic(ctx context.Context, id string) (run.RemoteRecord, error) {
-	record, key, err := s.store.LatestPublic(ctx, id)
+	return s.LatestPublicAs(ctx, id, "")
+}
+
+// LatestPublicAs is LatestPublic with an explicit per-call legacyRun.
+func (s *Service) LatestPublicAs(ctx context.Context, id, legacyRun string) (run.RemoteRecord, error) {
+	record, key, err := s.store.LatestPublicAs(ctx, id, legacyRun)
 	if errors.Is(err, ErrNoRecord) {
 		return run.RemoteRecord{}, fmt.Errorf("%w: %v", run.ErrNotFound, err)
 	}
@@ -1696,7 +1772,7 @@ func (s *Service) advanceCustody(ctx context.Context, record run.RemoteRecord) (
 	if record.State != RecordDestroyed {
 		mine, err := s.holdKey(tenant, record.Run, record.Key)
 		if err != nil {
-			return "", err
+			return "", bridgeNeedKey(err)
 		}
 		defer mine.Zero()
 		hold = &mine

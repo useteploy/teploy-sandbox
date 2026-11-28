@@ -142,8 +142,12 @@ func (s *Store) newest(ctx context.Context, id string) (uint64, error) {
 }
 
 func (s *Store) readRecord(ctx context.Context, id string, generation uint64) (*Record, Key, error) {
+	return s.readRecordAs(ctx, id, generation, "")
+}
+
+func (s *Store) readRecordAs(ctx context.Context, id string, generation uint64, legacyRun string) (*Record, Key, error) {
 	if s.v2() {
-		opened, err := s.readRecordCustody(ctx, id, generation, true)
+		opened, err := s.readRecordCustodyAs(ctx, id, generation, true, legacyRun)
 		defer opened.hold.Zero()
 		return opened.record, opened.key, err
 	}
@@ -169,10 +173,14 @@ func (s *Store) readRecord(ctx context.Context, id string, generation uint64) (*
 // A v2 record's Payload is then nil (readRecord has it); a destroyed
 // record has none in any case.
 func (s *Store) readRecordPublic(ctx context.Context, id string, generation uint64) (*Record, Key, error) {
+	return s.readRecordPublicAs(ctx, id, generation, "")
+}
+
+func (s *Store) readRecordPublicAs(ctx context.Context, id string, generation uint64, legacyRun string) (*Record, Key, error) {
 	if !s.v2() {
 		return s.readRecord(ctx, id, generation)
 	}
-	opened, err := s.readRecordCustody(ctx, id, generation, false)
+	opened, err := s.readRecordCustodyAs(ctx, id, generation, false, legacyRun)
 	return opened.record, opened.key, err
 }
 
@@ -186,25 +194,16 @@ type openedRecord struct {
 	hold   HoldKey
 }
 
-// readRecordCustody is readRecord in the custody mode, and
-// readRecordPublic with sealed false. The envelope's version is looked at
-// first and nothing is decrypted before it is known: a v2 envelope's
-// public section is opened under the fleet key alone; a v1 envelope only
-// as far as the key custody policy allows, and by the run it is the
-// record of.
-//
-// With sealed, a live v2 record's sealed section is opened too, under the
-// hold key its envelope names, as the key source unwraps it for this
-// tenant and run: ErrNeedKey when this host was not given it, ErrCorrupt
-// when the blob is not this run's or the section does not open. Then
-// nothing of the record is returned, and a caller that needs no payload
-// has no business asking.
 func (s *Store) readRecordCustody(ctx context.Context, id string, generation uint64, sealed bool) (openedRecord, error) {
+	return s.readRecordCustodyAs(ctx, id, generation, sealed, "")
+}
+
+func (s *Store) readRecordCustodyAs(ctx context.Context, id string, generation uint64, sealed bool, legacyRun string) (openedRecord, error) {
 	stored, err := s.objects.Get(ctx, s.recordKey(id, generation), maxSmallObject)
 	if err != nil {
 		return openedRecord{}, err
 	}
-	record, key, err := s.openRecordAs(id, generation, stored)
+	record, key, err := s.openRecordAs(id, generation, stored, legacyRun)
 	if err != nil {
 		return openedRecord{}, err
 	}
@@ -230,7 +229,7 @@ func (s *Store) readRecordCustody(ctx context.Context, id string, generation uin
 // openRecordAs is a fetched generation of a run's record, opened: by the
 // v1 reader without a key source; in the custody mode by its envelope's
 // version, as openManifestAs does for a manifest.
-func (s *Store) openRecordAs(id string, generation uint64, stored []byte) (*Record, Key, error) {
+func (s *Store) openRecordAs(id string, generation uint64, stored []byte, legacyRun string) (*Record, Key, error) {
 	name := recordName(id, generation)
 	if !s.v2() {
 		document, key, err := s.keys.open("record", name, stored)
@@ -257,7 +256,7 @@ func (s *Store) openRecordAs(id string, generation uint64, stored []byte) (*Reco
 			WrappedKey: opened.WrappedKey, opened: &opened, fmk: opened.FMKID, v2: true,
 		}, Key{}, nil
 	case envelopeVersion:
-		document, key, err := OpenV1IfAllowed(s.keys, kindRecord, name, stored, s.v1Policy(stored, ""))
+		document, key, err := OpenV1IfAllowed(s.keys, kindRecord, name, stored, s.v1Policy(stored, legacyRun))
 		if err != nil {
 			return nil, Key{}, err
 		}
@@ -294,14 +293,28 @@ func recordOfDocument(id string, generation uint64, document []byte, key Key) (*
 // when this host was not given it. A caller that needs only what the
 // record says, and not the run it carries, has LatestPublic.
 func (s *Store) Latest(ctx context.Context, id string) (*Record, Key, error) {
-	return s.latest(ctx, id, s.readRecord)
+	return s.LatestAs(ctx, id, "")
+}
+
+// LatestAs is Latest with an explicit per-call legacyRun (when expect.kid is "v1").
+func (s *Store) LatestAs(ctx context.Context, id, legacyRun string) (*Record, Key, error) {
+	return s.latest(ctx, id, func(ctx context.Context, id string, gen uint64) (*Record, Key, error) {
+		return s.readRecordAs(ctx, id, gen, legacyRun)
+	})
 }
 
 // LatestPublic is Latest of the public section alone (readRecordPublic):
 // never a hold key, so never ErrNeedKey. The state, generation, owner,
 // snapshot, tenant and key ID are all there; the payload is not.
 func (s *Store) LatestPublic(ctx context.Context, id string) (*Record, Key, error) {
-	return s.latest(ctx, id, s.readRecordPublic)
+	return s.LatestPublicAs(ctx, id, "")
+}
+
+// LatestPublicAs is LatestPublic with an explicit per-call legacyRun.
+func (s *Store) LatestPublicAs(ctx context.Context, id, legacyRun string) (*Record, Key, error) {
+	return s.latest(ctx, id, func(ctx context.Context, id string, gen uint64) (*Record, Key, error) {
+		return s.readRecordPublicAs(ctx, id, gen, legacyRun)
+	})
 }
 
 func (s *Store) latest(ctx context.Context, id string, read func(context.Context, string, uint64) (*Record, Key, error)) (*Record, Key, error) {
@@ -486,8 +499,12 @@ func (s *Store) AdvanceV2(ctx context.Context, record Record, hold *HoldKey, dae
 	var sealedBytes []byte
 	if hold != nil {
 		public.KID, public.Snapshot = hold.KID, record.Snapshot
+		payload := record.Payload
+		if len(payload) == 0 && record.State == RecordForked {
+			payload = json.RawMessage("{}")
+		}
 		var err error
-		if sealedBytes, err = json.Marshal(RecordSealedV2{Payload: record.Payload}); err != nil {
+		if sealedBytes, err = json.Marshal(RecordSealedV2{Payload: payload}); err != nil {
 			return err
 		}
 	}

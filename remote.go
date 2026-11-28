@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/useteploy/teploy-sandbox/internal/hostsecret"
 	"github.com/useteploy/teploy-sandbox/internal/offhost"
 	"github.com/useteploy/teploy-sandbox/internal/run"
 	"github.com/useteploy/teploy-sandbox/internal/s3"
@@ -44,6 +45,8 @@ type remoteFlags struct {
 	transfers     *int
 	insecureHTTP  *bool
 	unfenced      *bool
+	kms           *string
+	legacyRead    *bool
 }
 
 func addRemoteFlags(flags *flag.FlagSet) *remoteFlags {
@@ -91,6 +94,10 @@ func addRemoteFlags(flags *flag.FlagSet) *remoteFlags {
 			"remote storage: allow a plain http:// endpoint on another host. Object names and sizes then cross the network in the clear and whatever is on the path can answer for the service; only for a network that is itself trusted"),
 		unfenced: flags.Bool("remote-unfenced", envBool("SBX_REMOTE_UNFENCED"),
 			"remote storage: on a service without conditional writes, still let this daemon resume and delete runs another daemon wrote last. Only when something else guarantees that one daemon at a time acts on a run"),
+		kms: flags.String("remote-kms", envOr("SBX_REMOTE_KMS", ""),
+			"remote storage key custody: \"\" (off, v1 format), \"local\" (v2 envelopes with per-tenant keys derived from --remote-key-file), or \"pushed\" (v2 envelopes with hold keys pushed by Cloud and cached under --remote-host-secret-file)"),
+		legacyRead: flags.Bool("remote-legacy-read", envBool("SBX_REMOTE_LEGACY_READ"),
+			"remote storage key custody (--remote-kms local only): continue reading pre-custody v1 envelopes while migrating; remove once migration completes"),
 	}
 }
 
@@ -271,6 +278,14 @@ func (f *remoteFlags) validate() error {
 	if *f.snapshotRetry >= *f.gcGrace {
 		return fmt.Errorf("remote-snapshot-retry (%s) must be shorter than remote-gc-grace (%s): a snapshot retried for longer is sent against a previous upload that collection may have deleted meanwhile", f.snapshotRetry, f.gcGrace)
 	}
+	switch *f.kms {
+	case "", "local", "pushed":
+	default:
+		return fmt.Errorf("remote-kms must be \"\", \"local\", or \"pushed\", got %q", *f.kms)
+	}
+	if *f.legacyRead && *f.kms != "local" {
+		return errors.New("remote-legacy-read is only allowed with --remote-kms local (in pushed mode per-run legacy is signalled via expect.kid: \"v1\")")
+	}
 	return nil
 }
 
@@ -280,36 +295,52 @@ func (f *remoteFlags) validate() error {
 // retention is --stopped-retention: the record of a destroyed run is
 // kept in the bucket for at least that long.
 func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, stateDir string, retention time.Duration, log *slog.Logger) (*offhost.Service, error) {
+	svc, _, err := f.openWithHostSecret(ctx, snapshots, stateDir, "", retention, log)
+	return svc, err
+}
+
+// openWithHostSecret is open with the host secret path used for pushed key
+// custody's HoldCache. The returned closeFn wipes cached keys on shutdown.
+func (f *remoteFlags) openWithHostSecret(ctx context.Context, snapshots offhost.Snapshots, stateDir, hostSecretFile string, retention time.Duration, log *slog.Logger) (*offhost.Service, func(), error) {
+	noop := func() {}
 	if *f.endpoint == "" {
-		return nil, nil
+		if *f.kms != "" {
+			return nil, noop, fmt.Errorf("remote-kms %q requires --remote-endpoint", *f.kms)
+		}
+		if *f.legacyRead {
+			return nil, noop, errors.New("remote-legacy-read requires --remote-endpoint and --remote-kms local")
+		}
+		return nil, noop, nil
 	}
 	if snapshots == nil {
-		return nil, errors.New("remote storage is the vm driver's (--driver vm): the docker driver's snapshots are images, which are not sent anywhere yet")
+		return nil, noop, errors.New("remote storage is the vm driver's (--driver vm): the docker driver's snapshots are images, which are not sent anywhere yet")
 	}
 	if stateDir == "" {
-		return nil, errors.New("remote storage needs a state directory (--state-dir): the daemon's identity and its runs' places in remote storage are kept there")
+		return nil, noop, errors.New("remote storage needs a state directory (--state-dir): the daemon's identity and its runs' places in remote storage are kept there")
 	}
 	if err := f.validate(); err != nil {
-		return nil, err
+		return nil, noop, err
 	}
 	secret, err := secretFrom(*f.secretKeyFile, "SBX_REMOTE_SECRET_KEY", "AWS_SECRET_ACCESS_KEY")
 	if err != nil {
-		return nil, fmt.Errorf("remote-secret-key-file: %w", err)
+		return nil, noop, fmt.Errorf("remote-secret-key-file: %w", err)
 	}
 	rawKey, err := secretFrom(*f.keyFile, "SBX_REMOTE_KEY")
 	if err != nil {
-		return nil, fmt.Errorf("remote-key-file: %w", err)
+		return nil, noop, fmt.Errorf("remote-key-file: %w", err)
 	}
 	if rawKey == nil {
-		return nil, errors.New("remote storage needs a master key (--remote-key-file or SBX_REMOTE_KEY): nothing is uploaded unencrypted")
+		return nil, noop, errors.New("remote storage needs a master key (--remote-key-file or SBX_REMOTE_KEY): nothing is uploaded unencrypted")
 	}
 	master, err := offhost.ParseMasterKey(rawKey)
+	clear(rawKey)
 	if err != nil {
-		return nil, fmt.Errorf("remote master key: %w", err)
+		return nil, noop, fmt.Errorf("remote master key: %w", err)
 	}
+	defer clear(master)
 	keys, err := offhost.NewKeyring(master)
 	if err != nil {
-		return nil, err
+		return nil, noop, err
 	}
 	// Master keys this daemon still opens but no longer wraps with: the
 	// state while a rotation runs. Given as files, comma-separated,
@@ -320,19 +351,26 @@ func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, sta
 		}
 		previous, err := secretFrom(path)
 		if err != nil {
-			return nil, fmt.Errorf("remote-previous-key-file: %w", err)
+			keys.Close()
+			return nil, noop, fmt.Errorf("remote-previous-key-file: %w", err)
 		}
-		master, err := offhost.ParseMasterKey(previous)
+		prevMaster, err := offhost.ParseMasterKey(previous)
+		clear(previous)
 		if err != nil {
-			return nil, fmt.Errorf("remote-previous-key-file %s: %w", path, err)
+			keys.Close()
+			return nil, noop, fmt.Errorf("remote-previous-key-file %s: %w", path, err)
 		}
-		if err := keys.AddPrevious(master); err != nil {
-			return nil, fmt.Errorf("remote-previous-key-file %s: %w", path, err)
+		err = keys.AddPrevious(prevMaster)
+		clear(prevMaster)
+		if err != nil {
+			keys.Close()
+			return nil, noop, fmt.Errorf("remote-previous-key-file %s: %w", path, err)
 		}
 	}
 	token, err := secretFrom("", "SBX_REMOTE_SESSION_TOKEN", "AWS_SESSION_TOKEN")
 	if err != nil {
-		return nil, err
+		keys.Close()
+		return nil, noop, err
 	}
 	sessionToken := strings.TrimSpace(string(token))
 	client, err := s3.New(s3.Config{
@@ -349,26 +387,91 @@ func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, sta
 		AllowInsecure: *f.insecureHTTP,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("remote storage: %w", err)
+		keys.Close()
+		return nil, noop, fmt.Errorf("remote storage: %w", err)
 	}
 	identity, err := daemonIdentity(stateDir)
 	if err != nil {
-		return nil, fmt.Errorf("daemon identity: %w", err)
+		keys.Close()
+		return nil, noop, fmt.Errorf("daemon identity: %w", err)
 	}
 	store := offhost.NewStore(client, *f.prefix, keys, log)
 	store.ChunkBytes = *f.chunkMB << 20
 	store.Parallel = *f.parallel
 	store.Tombstones = retention
+
+	var holdCache *offhost.HoldCache
+	var pushedSource *offhost.PushedKeySource
+	switch *f.kms {
+	case "local":
+		localSource, err := offhost.NewLocalKeySource(master)
+		if err != nil {
+			keys.Close()
+			return nil, noop, fmt.Errorf("remote-kms local: %w", err)
+		}
+		store.SetKeySource(localSource)
+		store.SetLegacyRead(*f.legacyRead)
+	case "pushed":
+		if hostSecretFile == "" {
+			keys.Close()
+			return nil, noop, errors.New("remote-kms pushed requires --remote-host-secret-file")
+		}
+		if err := hostsecret.Outside(hostSecretFile, stateDir); err != nil {
+			keys.Close()
+			return nil, noop, fmt.Errorf("remote-host-secret-file: %w", err)
+		}
+		hs, err := hostsecret.Load(hostSecretFile)
+		if err != nil {
+			keys.Close()
+			return nil, noop, fmt.Errorf("remote-host-secret-file: %w", err)
+		}
+		holdCache, err = offhost.OpenHoldCache(filepath.Join(stateDir, offhost.HoldCacheFileName), hs)
+		clear(hs)
+		if err != nil {
+			keys.Close()
+			return nil, noop, fmt.Errorf("hold-key cache: %w", err)
+		}
+		pushedSource = offhost.NewPushedKeySource()
+		cached, err := holdCache.All()
+		if err != nil {
+			holdCache.Close()
+			keys.Close()
+			return nil, noop, fmt.Errorf("load cached hold keys: %w", err)
+		}
+		if err := pushedSource.Supply(cached...); err != nil {
+			for i := range cached {
+				cached[i].Zero()
+			}
+			holdCache.Close()
+			keys.Close()
+			return nil, noop, fmt.Errorf("load cached hold keys: %w", err)
+		}
+		for i := range cached {
+			cached[i].Zero()
+		}
+		store.SetKeySource(pushedSource)
+		store.SetPushed(true)
+	}
+
+	closeFn := func() {
+		if holdCache != nil {
+			holdCache.Close()
+		}
+		keys.Close()
+	}
+
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	// A daemon that cannot reach its storage does not start: it could
 	// not tell whether a run is its to resume, and would report stops as
 	// not durable for as long as it ran.
 	if err := store.Probe(probeCtx); err != nil {
-		return nil, err
+		closeFn()
+		return nil, noop, err
 	}
 	if err := checkFleetIdentity(probeCtx, store, stateDir); err != nil {
-		return nil, fmt.Errorf("remote storage: %w", err)
+		closeFn()
+		return nil, noop, fmt.Errorf("remote storage: %w", err)
 	}
 	if !store.Conditional() {
 		if *f.unfenced {
@@ -378,7 +481,7 @@ func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, sta
 		}
 	}
 	log.Info("remote storage enabled", "endpoint", *f.endpoint, "bucket", *f.bucket, "prefix", *f.prefix, "daemon", identity,
-		"conditionalWrites", store.Conditional(), "conditionalPutIfMatch", store.ConditionalPutMatch(), "conditionalDeleteIfMatch", store.ConditionalDeleteMatch(),
+		"kms", *f.kms, "conditionalWrites", store.Conditional(), "conditionalPutIfMatch", store.ConditionalPutMatch(), "conditionalDeleteIfMatch", store.ConditionalDeleteMatch(),
 		"chunkMB", *f.chunkMB, "parallel", *f.parallel, "maxChain", *f.maxChain,
 		"local", *f.local, "poolReservePercent", *f.reserve, "gcGrace", f.gcGrace.String())
 	return offhost.NewService(store, snapshots, offhost.Config{
@@ -387,5 +490,7 @@ func (f *remoteFlags) open(ctx context.Context, snapshots offhost.Snapshots, sta
 		Unfenced:       *f.unfenced,
 		GCGrace:        *f.gcGrace,
 		ReservePercent: *f.reserve,
-	}, log), nil
+		HoldCache:      holdCache,
+		PushedSource:   pushedSource,
+	}, log), closeFn, nil
 }

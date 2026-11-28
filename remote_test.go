@@ -80,6 +80,89 @@ func TestRemoteFlagBounds(t *testing.T) {
 	}
 }
 
+func TestRemoteKMSFlagsValidationAndOpen(t *testing.T) {
+	// Invalid --remote-kms values and invalid --remote-legacy-read combinations.
+	for name, args := range map[string][]string{
+		"unknown kms":             {"--remote-kms", "vault"},
+		"legacy-read without kms": {"--remote-legacy-read"},
+		"legacy-read with pushed": {"--remote-kms", "pushed", "--remote-legacy-read"},
+	} {
+		if err := parseRemoteFlags(t, args...).validate(); err == nil {
+			t.Errorf("%s was accepted: %v", name, args)
+		}
+	}
+	for name, args := range map[string][]string{
+		"kms off":          {},
+		"kms local":        {"--remote-kms", "local"},
+		"kms local legacy": {"--remote-kms", "local", "--remote-legacy-read"},
+		"kms pushed":       {"--remote-kms", "pushed"},
+	} {
+		if err := parseRemoteFlags(t, args...).validate(); err != nil {
+			t.Errorf("%s was refused: %v", name, err)
+		}
+	}
+	// --remote-kms without --remote-endpoint is refused by open.
+	if _, _, err := parseRemoteFlags(t, "--remote-kms", "pushed").openWithHostSecret(context.Background(), noSnapshots{}, t.TempDir(), filepath.Join(t.TempDir(), "hs"), time.Hour, quietLogger()); err == nil {
+		t.Fatal("remote-kms without remote-endpoint was accepted")
+	}
+
+	// --remote-kms pushed refuses host secret inside state-dir and cloned HoldCache.
+	raw := make([]byte, offhost.KeySize)
+	_, _ = rand.Read(raw)
+	keyFile := filepath.Join(t.TempDir(), "remote.key")
+	if err := os.WriteFile(keyFile, []byte(hex.EncodeToString(raw)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s3srv := httptest.NewServer(&tinyS3{objects: map[string][]byte{}, conditional: true})
+	defer s3srv.Close()
+	t.Setenv("SBX_REMOTE_SECRET_KEY", "secret")
+	stateDir := t.TempDir()
+	flags := parseRemoteFlags(t, "--remote-endpoint", s3srv.URL, "--remote-bucket", "b", "--remote-path-style",
+		"--remote-access-key", "a", "--remote-key-file", keyFile, "--remote-kms", "pushed")
+	if _, _, err := flags.openWithHostSecret(context.Background(), noSnapshots{}, stateDir, filepath.Join(stateDir, "host-secret"), time.Hour, quietLogger()); err == nil || !strings.Contains(err.Error(), "inside the state directory") {
+		t.Fatalf("host secret inside state dir: got %v, want refused", err)
+	}
+	// Write a HoldCache sealed under secret A, then try to open with secret B -> ErrClonedCache!
+	secretA := make([]byte, 32)
+	secretB := make([]byte, 32)
+	_, _ = rand.Read(secretA)
+	_, _ = rand.Read(secretB)
+	cacheA, err := offhost.OpenHoldCache(filepath.Join(stateDir, offhost.HoldCacheFileName), secretA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Write at least one entry so hold-keys.json is created on disk.
+	tk := make([]byte, 32)
+	rawHK := make([]byte, 32)
+	_, _ = rand.Read(tk)
+	_, _ = rand.Read(rawHK)
+	kid := strings.Repeat("a", 32)
+	runID := run.NewULID(time.Now())
+	wrapped, err := offhost.WrapHoldKey(tk, rawHK, "org-1", runID, kid, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hk, err := offhost.NewHoldKey("org-1", runID, kid, wrapped, rawHK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cacheA.Put(hk); err != nil {
+		t.Fatal(err)
+	}
+	hk.Zero()
+	cacheA.Close()
+	secretBPath := filepath.Join(t.TempDir(), "secret-b")
+	if err := os.WriteFile(secretBPath, secretB, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SBX_REMOTE_SECRET_KEY", "secret")
+	flags2 := parseRemoteFlags(t, "--remote-endpoint", s3srv.URL, "--remote-bucket", "b", "--remote-path-style",
+		"--remote-access-key", "a", "--remote-key-file", keyFile, "--remote-kms", "pushed")
+	if _, _, err := flags2.openWithHostSecret(context.Background(), noSnapshots{}, stateDir, secretBPath, time.Hour, quietLogger()); !strings.Contains(err.Error(), "cloned") {
+		t.Fatalf("cloned hold cache: got %v, want cloned cache refusal", err)
+	}
+}
+
 // Review A10: a key file others can read is refused, and a secret taken
 // from the environment does not stay in it for children to inherit.
 func TestSecretsAreNotLeftLyingAbout(t *testing.T) {

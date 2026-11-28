@@ -75,6 +75,10 @@ type RemoteState struct {
 	// would otherwise find the snapshot whole by sizes and call the run
 	// durable again (and eviction could then drop the only whole copy).
 	Damage *RemoteDamage `json:"damage,omitempty"`
+	// Key custody fields (additive; omitted when --remote-kms is unset).
+	Tenant string `json:"tenant,omitempty"`
+	KID    string `json:"kid,omitempty"`
+	Legacy bool   `json:"legacy,omitempty"`
 }
 
 // RemoteDamage names one damaged chunk: the snapshot, the upload attempt

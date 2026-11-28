@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"regexp"
 	"slices"
@@ -205,6 +206,8 @@ func (m *Manager) stopIf(ctx context.Context, id string, due func(*Run) bool, pu
 	live.StoppedAt = &now
 	live.RetainUntil = &retainUntil
 	live.snapshot = ref
+	live.remotePinKID, live.remotePinSHA256 = "", ""
+	live.remoteWasDurable = false
 	// What the stop saved of the VM's memory, if anything (memory.go).
 	live.memory, live.memoryNote = image, memoryNote
 	live.resumedFrom = ""
@@ -258,6 +261,22 @@ type ResumeRequest struct {
 	// AccessEpoch is the caller's stored access epoch of the run (access
 	// on only; ignored otherwise): the run resumes with at least it.
 	AccessEpoch int64 `json:"accessEpoch,omitempty"`
+	// Key custody fields (additive; refused when --remote-kms is unset).
+	Keys   *KeyBundle        `json:"keys,omitempty"`
+	Bases  map[string]string `json:"bases,omitempty"`
+	Expect *RemoteExpect     `json:"expect,omitempty"`
+}
+
+func (r ResumeRequest) String() string {
+	return fmt.Sprintf("ResumeRequest{ttlSec:%d takeover:%t keys:%v}", r.TTLSec, r.Takeover, r.Keys)
+}
+func (r ResumeRequest) GoString() string { return r.String() }
+func (r ResumeRequest) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.Int("ttlSec", r.TTLSec),
+		slog.Bool("takeover", r.Takeover),
+		slog.Any("keys", r.Keys),
+	)
 }
 
 // ResumeWith is Resume with every option.
@@ -270,6 +289,7 @@ type ResumeRequest struct {
 // run is held (409). A run whose ownership cannot be checked because
 // storage is unreachable is not resumed.
 func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) (*Run, error) {
+	defer req.Keys.Wipe()
 	ttl, err := resolveTTL(req.TTLSec)
 	if err != nil {
 		return nil, err
@@ -283,14 +303,85 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 	if req.Takeover && m.OffHost == nil {
 		return nil, fmt.Errorf("%w: takeover needs remote storage, and this daemon has none", ErrBadRequest)
 	}
-	if err := m.refreshRemote(ctx, id, req.Takeover, true); err != nil {
+	custody := m.custody()
+	if custody == nil {
+		if req.Keys != nil || req.Bases != nil || req.Expect != nil {
+			return nil, fmt.Errorf("%w: key custody is not enabled on this daemon (--remote-kms)", ErrBadRequest)
+		}
+	}
+	if err := validateBases(req.Bases); err != nil {
 		return nil, err
+	}
+	if err := validateExpect(req.Expect, true, req.Takeover); err != nil {
+		return nil, err
+	}
+
+	m.mu.Lock()
+	localBefore, wasKnown := m.runs[id]
+	var localTenant string
+	var localRemoteGen uint64
+	if wasKnown {
+		localTenant = localBefore.tenant
+		localRemoteGen = localBefore.remoteGen
+	}
+	m.mu.Unlock()
+
+	var holdKey PushedKey
+	hasHoldKey := false
+	expectTenant := localTenant
+	if custody != nil && m.OffHost.Pushed() {
+		if req.Keys == nil || req.Keys.Hold == nil {
+			return nil, fmt.Errorf("%w: keys.hold is required to resume in pushed key-custody mode", ErrBadRequest)
+		}
+		holdKey = *req.Keys.Hold
+		defer func() { holdKey.Raw = "" }()
+		hasHoldKey = true
+		holdTenant, _, err := validatePushedKeyShape(holdKey, localTenant, id)
+		if err != nil {
+			return nil, err
+		}
+		expectTenant = holdTenant
+		if (!wasKnown || localRemoteGen > 0) && req.Expect == nil {
+			return nil, fmt.Errorf("%w: expect is required to resume a remote run in pushed mode", ErrBadRequest)
+		}
+		if len(req.Keys.Open) > 0 {
+			releaseOpen, err := custody.SupplyOpenKeys(expectTenant, id, req.Keys.Open)
+			if err != nil {
+				return nil, err
+			}
+			defer releaseOpen()
+		}
+	} else if custody != nil && req.Keys != nil && req.Keys.HasRaw() {
+		return nil, fmt.Errorf("%w: pushed keys are only accepted in pushed mode (--remote-kms pushed)", ErrBadRequest)
+	}
+
+	recInfo, err := m.refreshRemoteWithExpect(ctx, id, req.Takeover, true, req.Expect, expectTenant)
+	if err != nil {
+		return nil, err
+	}
+	// If this call freshly adopted an unknown run in pushed mode and fails
+	// with 428 (or expect/corrupt) before claiming, drop the transient entry
+	// so the retry sees a clean slate and unchanged S3 generation.
+	dropTransient := func() {
+		if wasKnown {
+			return
+		}
+		m.mu.Lock()
+		if live, ok := m.runs[id]; ok && live.State == StateStopped {
+			delete(m.runs, id)
+		}
+		m.mu.Unlock()
+		m.persist()
 	}
 	current, release, err := m.beginStopped(id)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
+	if custody != nil && !current.remoteLegacy && expectTenant != "" && current.tenant != "" && current.tenant != expectTenant {
+		dropTransient()
+		return nil, fmt.Errorf("%w: run %s belongs to tenant %s, not %s", ErrBadRequest, id, current.tenant, expectTenant)
+	}
 	if m.access != nil {
 		// Before the claim below, so that the run's record carries it:
 		// a run that moved here, or whose caller knows a later epoch,
@@ -301,32 +392,177 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 		m.persist()
 	}
 	durable := false
+	oldKID := current.remoteKID
+	newKID := ""
 	if m.OffHost != nil {
-		if err := m.claimHeld(ctx, current); err != nil {
-			return nil, err
+		durable = current.Remote != nil && current.Remote.State == RemoteDurable
+		ensureOpts := EnsureOptions{
+			Tenant:    expectTenant,
+			Run:       id,
+			Bases:     req.Bases,
+			LegacyRun: legacyRunOf(req.Expect, id),
 		}
-		if current.remoteHeld {
-			// The claim was made before this resume (a takeover, or a
-			// resume a crash or a failed give-back interrupted), so the
-			// record may still carry an epoch from before the move —
-			// whether or not this resume raised it (a retry raises
-			// nothing: the move is spent). Write the run's access state
-			// there before anything boots (a no-op when the record is
-			// in step): a daemon that takes the run over from that
-			// record next must land above every grant this one
-			// honours, not on the same epoch.
-			if err := m.writeAccessHeld(ctx, id); err != nil {
-				m.unclaimHeld(ctx, id)
-				return nil, remoteErr(fmt.Errorf("the run's raised access epoch: %w", err))
+		if ensureOpts.Tenant == "" {
+			ensureOpts.Tenant = current.tenant
+		}
+		if req.Expect != nil {
+			if req.Expect.KID == LegacyKID {
+				ensureOpts.ExpectKID = LegacyKID
+			} else if req.Takeover && recInfo.present && recInfo.state == RecordRunning {
+				// Takeover from an authenticated v2 RecordRunning: the running
+				// record's sealed section (authenticated under expect.kid)
+				// pins the exact hold key ID and stream SHA-256 of the stop
+				// snapshot it resumed from. Refuse if the pin is absent so an
+				// earlier holder's forged snapshot can never be substituted.
+				if recInfo.pinKID == "" || recInfo.pinSHA256 == "" {
+					dropTransient()
+					return nil, fmt.Errorf("%w: running record of run %s has no authenticated snapshot pin for takeover", ErrRemoteConflict, id)
+				}
+				ensureOpts.ExpectKID = recInfo.pinKID
+				ensureOpts.ExpectStreamSHA256 = recInfo.pinSHA256
+				if recInfo.pinKID == LegacyKID {
+					ensureOpts.LegacyRun = id
+				}
+			} else {
+				ensureOpts.ExpectKID = req.Expect.KID
 			}
 		}
-		// From here a failure gives the run back (unclaimHeld).
-		durable = current.Remote != nil && current.Remote.State == RemoteDurable
-		// The run's own snapshot: it holds the reference itself, so
-		// whether the fetch materialized it changes nothing.
-		if _, err := m.ensureLocal(ctx, current.snapshot); err != nil {
-			m.unclaimHeld(ctx, id)
-			return nil, err
+		if custody != nil && m.OffHost.Pushed() {
+			// In pushed mode, restore and verify the snapshot chain BEFORE
+			// persisting the new hold key or writing RecordRunning, so a 428
+			// (missing ancestor key) never mutates HoldCache or bumps S3
+			// generation (which would invalidate expect.generation on retry).
+			if current.Remote != nil && current.Remote.State == RemoteSuperseded {
+				return nil, fmt.Errorf("%w: run %s was taken over by another daemon; this copy can be forked or deleted, not resumed", ErrRemoteConflict, current.ID)
+			}
+			_, pin, err := m.ensureLocalFor(ctx, current.snapshot, ensureOpts)
+			if err != nil {
+				if !wasKnown {
+					dropTransient()
+				}
+				return nil, err
+			}
+			// Defensive invariant: the verified pin returned by the single
+			// EnsureCustody read MUST match ensureOpts (never a second read).
+			if ensureOpts.ExpectKID != "" && pin.KID != "" && pin.KID != ensureOpts.ExpectKID {
+				if !wasKnown {
+					dropTransient()
+				}
+				return nil, fmt.Errorf("%w: snapshot %s verified under key %s, expected %s", ErrRemoteConflict, current.snapshot, pin.KID, ensureOpts.ExpectKID)
+			}
+			if ensureOpts.ExpectStreamSHA256 != "" && pin.StreamSHA256 != ensureOpts.ExpectStreamSHA256 {
+				if !wasKnown {
+					dropTransient()
+				}
+				return nil, fmt.Errorf("%w: snapshot %s stream hash %s does not match pinned hash %s", ErrRemoteConflict, current.snapshot, pin.StreamSHA256, ensureOpts.ExpectStreamSHA256)
+			}
+			prevTenant, prevKey, prevKID, prevLegacy, prevBases := current.tenant, current.remoteKey, current.remoteKID, current.remoteLegacy, cloneBases(current.remoteBases)
+			restoreKey, discardBackup := custody.BackupHoldKey(id)
+			defer discardBackup()
+			rollbackHoldKey := func() {
+				if !wasKnown {
+					dropTransient()
+					if newKID != "" {
+						m.eraseHoldKey(id, newKID)
+					}
+					return
+				}
+				m.mu.Lock()
+				if live, ok := m.runs[id]; ok {
+					live.tenant = prevTenant
+					live.remoteKey = prevKey
+					live.remoteKID = prevKID
+					live.remoteLegacy = prevLegacy
+					live.remoteBases = prevBases
+				}
+				m.mu.Unlock()
+				if newKID != "" {
+					if rErr := restoreKey(newKID); rErr != nil {
+						m.log.Error("failed to roll back hold key after failed resume", "id", id, "error", rErr)
+					}
+				}
+			}
+			if hasHoldKey {
+				kid, wrapped, err := custody.PutHoldKey(expectTenant, id, holdKey)
+				if err != nil {
+					if !wasKnown {
+						dropTransient()
+					}
+					return nil, err
+				}
+				newKID = kid
+				m.mu.Lock()
+				live := m.runs[id]
+				live.tenant = expectTenant
+				live.remoteKey = wrapped
+				live.remoteKID = kid
+				live.remoteLegacy = false
+				live.remoteBases = cloneBases(req.Bases)
+				m.mu.Unlock()
+				current.tenant = expectTenant
+				current.remoteKey = wrapped
+				current.remoteKID = kid
+			}
+			wasHeld := current.remoteHeld
+			forceAdvance := wasHeld && hasHoldKey && prevKID != "" && newKID != "" && newKID != prevKID
+			if err := m.claimHeld(ctx, current, pin, forceAdvance); err != nil {
+				rollbackHoldKey()
+				return nil, err
+			}
+			if wasHeld && !forceAdvance {
+				if err := m.writeAccessHeld(ctx, id); err != nil {
+					rollbackHoldKey()
+					m.unclaimHeld(ctx, id)
+					return nil, remoteErr(fmt.Errorf("the run's raised access epoch: %w", err))
+				}
+			}
+		} else {
+			var pin SnapshotPin
+			if custody != nil && current.remoteGen > 0 {
+				var pinErr error
+				pin, pinErr = custody.SnapshotPin(ctx, current.snapshot, ensureOpts.LegacyRun)
+				if pinErr != nil {
+					return nil, pinErr
+				}
+				if ensureOpts.ExpectKID != "" && pin.KID != "" && pin.KID != ensureOpts.ExpectKID {
+					return nil, fmt.Errorf("%w: snapshot %s is under key %s, expected %s", ErrRemoteConflict, current.snapshot, pin.KID, ensureOpts.ExpectKID)
+				}
+				if ensureOpts.ExpectStreamSHA256 != "" && pin.StreamSHA256 != ensureOpts.ExpectStreamSHA256 {
+					return nil, fmt.Errorf("%w: snapshot %s stream hash %s does not match pinned hash %s", ErrRemoteConflict, current.snapshot, pin.StreamSHA256, ensureOpts.ExpectStreamSHA256)
+				}
+			}
+			if err := m.claimHeld(ctx, current, pin, false); err != nil {
+				return nil, err
+			}
+			if current.remoteHeld {
+				// The claim was made before this resume (a takeover, or a
+				// resume a crash or a failed give-back interrupted), so the
+				// record may still carry an epoch from before the move —
+				// whether or not this resume raised it (a retry raises
+				// nothing: the move is spent). Write the run's access state
+				// there before anything boots (a no-op when the record is
+				// in step): a daemon that takes the run over from that
+				// record next must land above every grant this one
+				// honours, not on the same epoch.
+				if err := m.writeAccessHeld(ctx, id); err != nil {
+					m.unclaimHeld(ctx, id)
+					return nil, remoteErr(fmt.Errorf("the run's raised access epoch: %w", err))
+				}
+			}
+			// From here a failure gives the run back (unclaimHeld).
+			// The run's own snapshot: it holds the reference itself, so
+			// whether the fetch materialized it changes nothing.
+			if _, _, err := m.ensureLocalFor(ctx, current.snapshot, ensureOpts); err != nil {
+				m.unclaimHeld(ctx, id)
+				return nil, err
+			}
+			if custody != nil && req.Bases != nil {
+				m.mu.Lock()
+				if live, ok := m.runs[id]; ok {
+					live.remoteBases = cloneBases(req.Bases)
+				}
+				m.mu.Unlock()
+			}
 		}
 	}
 	if err := m.clearLeftover(ctx, current); err != nil {
@@ -368,6 +604,10 @@ func (m *Manager) ResumeWith(ctx context.Context, id string, req ResumeRequest) 
 			m.unclaimHeld(ctx, id)
 		}
 		return nil, err
+	}
+
+	if custody != nil && oldKID != "" && newKID != "" && oldKID != newKID {
+		custody.ForgetHoldKeyMemory(oldKID)
 	}
 
 	m.mu.Lock()
@@ -455,6 +695,29 @@ type ForkRequest struct {
 	// without one refuses them (400) rather than make one child.
 	Count int  `json:"count,omitempty"`
 	Force bool `json:"force,omitempty"`
+	// ID (for count <= 1) or IDs (for count > 1) optionally supply child
+	// ULIDs (required in pushed key-custody mode so each child's wrapped
+	// hold key binds to its run ID).
+	ID  string   `json:"id,omitempty"`
+	IDs []string `json:"ids,omitempty"`
+	// Key custody fields (additive; refused when --remote-kms is unset).
+	Tenant string            `json:"tenant,omitempty"`
+	Keys   *KeyBundle        `json:"keys,omitempty"`
+	Bases  map[string]string `json:"bases,omitempty"`
+	Expect *RemoteExpect     `json:"expect,omitempty"`
+}
+
+func (r ForkRequest) String() string {
+	return fmt.Sprintf("ForkRequest{id:%q count:%d tenant:%q keys:%v}", r.ID, r.Count, r.Tenant, r.Keys)
+}
+func (r ForkRequest) GoString() string { return r.String() }
+func (r ForkRequest) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", r.ID),
+		slog.Int("count", r.Count),
+		slog.String("tenant", r.Tenant),
+		slog.Any("keys", r.Keys),
+	)
 }
 
 // Fork starts a new run from the source's filesystem with the source's
@@ -486,6 +749,7 @@ func (m *Manager) Fork(ctx context.Context, id string, req ForkRequest) (*Run, e
 // child that could not be destroyed in that rollback is named in the
 // error, and is a run like any other, for the caller to destroy.
 func (m *Manager) ForkMany(ctx context.Context, id string, req ForkRequest) ([]*Run, error) {
+	defer req.Keys.Wipe()
 	ttl, err := resolveTTL(req.TTLSec)
 	if err != nil {
 		return nil, err
@@ -512,11 +776,112 @@ func (m *Manager) ForkMany(ctx context.Context, id string, req ForkRequest) ([]*
 		// of N, or 409 a fork it was told to force.
 		return nil, fmt.Errorf("%w: count and force need a driver that keeps memory images (--vm-memory-snapshots)", ErrBadRequest)
 	}
+	custody := m.custody()
+	if custody == nil {
+		if req.ID != "" || len(req.IDs) > 0 || req.Tenant != "" || req.Keys != nil || req.Bases != nil || req.Expect != nil {
+			return nil, fmt.Errorf("%w: key custody is not enabled on this daemon (--remote-kms)", ErrBadRequest)
+		}
+	}
+	if req.Tenant != "" && !ValidTenant(req.Tenant) {
+		return nil, fmt.Errorf("%w: tenant %q must match [a-z0-9-]{1,64}", ErrBadRequest, req.Tenant)
+	}
+	if err := validateBases(req.Bases); err != nil {
+		return nil, err
+	}
+	if err := validateExpect(req.Expect, true, false); err != nil {
+		return nil, err
+	}
 
+	// Resolve and reserve requested child IDs (and in pushed mode, child hold keys).
+	var childIDs []string
+	if count == 1 && req.ID != "" {
+		childIDs = []string{req.ID}
+	} else if len(req.IDs) > 0 {
+		if len(req.IDs) != count {
+			return nil, fmt.Errorf("%w: ids has %d entries, expected %d", ErrBadRequest, len(req.IDs), count)
+		}
+		childIDs = req.IDs
+	}
+	releaseChildIDs, err := m.reserveIDs(childIDs...)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseChildIDs()
+
+	var childHoldKeys []PushedKey
+	defer func() {
+		for i := range childHoldKeys {
+			childHoldKeys[i].Raw = ""
+		}
+	}()
+	keyTenant := req.Tenant
+	if custody != nil && m.OffHost.Pushed() {
+		if len(childIDs) != count {
+			if count == 1 {
+				return nil, fmt.Errorf("%w: id is required for fork in pushed key-custody mode", ErrBadRequest)
+			}
+			return nil, fmt.Errorf("%w: ids (%d) are required for fork in pushed key-custody mode", ErrBadRequest, count)
+		}
+		if req.Keys == nil {
+			return nil, fmt.Errorf("%w: keys.hold is required for fork in pushed key-custody mode", ErrBadRequest)
+		}
+		if count == 1 {
+			if req.Keys.Hold == nil {
+				return nil, fmt.Errorf("%w: keys.hold is required for fork in pushed key-custody mode", ErrBadRequest)
+			}
+			childHoldKeys = []PushedKey{*req.Keys.Hold}
+		} else {
+			if len(req.Keys.Holds) != count {
+				return nil, fmt.Errorf("%w: keys.holds must provide %d distinct hold keys (got %d)", ErrBadRequest, count, len(req.Keys.Holds))
+			}
+			childHoldKeys = append([]PushedKey(nil), req.Keys.Holds...)
+		}
+		seenKID := make(map[string]bool, len(childHoldKeys))
+		for i, hk := range childHoldKeys {
+			t, kid, err := validatePushedKeyShape(hk, keyTenant, childIDs[i])
+			if err != nil {
+				return nil, err
+			}
+			if keyTenant == "" {
+				keyTenant = t
+			}
+			if seenKID[kid] {
+				return nil, fmt.Errorf("%w: each forked child must have its own distinct hold key (duplicate kid %s)", ErrBadRequest, kid)
+			}
+			seenKID[kid] = true
+		}
+		if len(req.Keys.Open) > 0 {
+			releaseOpen, err := custody.SupplyOpenKeys(keyTenant, id, req.Keys.Open)
+			if err != nil {
+				return nil, err
+			}
+			defer releaseOpen()
+		}
+	} else if custody != nil && req.Keys != nil && req.Keys.HasRaw() {
+		return nil, fmt.Errorf("%w: pushed keys are only accepted in pushed mode (--remote-kms pushed)", ErrBadRequest)
+	}
+
+	m.mu.Lock()
+	_, sourceWasKnown := m.runs[id]
+	m.mu.Unlock()
+	if custody != nil && m.OffHost.Pushed() && !sourceWasKnown && req.Expect == nil {
+		return nil, fmt.Errorf("%w: expect is required to fork a remote run in pushed mode", ErrBadRequest)
+	}
 	// A source stopped on another daemon is looked up; one this daemon
 	// knows is checked against remote storage when that can be reached.
-	if err := m.refreshRemote(ctx, id, false, false); err != nil {
+	if _, err := m.refreshRemoteWithExpect(ctx, id, false, false, req.Expect, keyTenant); err != nil {
 		return nil, err
+	}
+	dropTransientSource := func() {
+		if sourceWasKnown {
+			return
+		}
+		m.mu.Lock()
+		if live, ok := m.runs[id]; ok && live.State == StateStopped {
+			delete(m.runs, id)
+		}
+		m.mu.Unlock()
+		m.persist()
 	}
 	var source *Run
 	var image, base string
@@ -529,6 +894,10 @@ func (m *Manager) ForkMany(ctx context.Context, id string, req ForkRequest) ([]*
 	source, release, err := m.beginCaptureFor(id, req.Force)
 	switch {
 	case err == nil && forker != nil:
+		if err := checkForkTenant(custody != nil, source.tenant, req.Tenant, keyTenant); err != nil {
+			release()
+			return nil, err
+		}
 		// Make room for the fork's memory image by evicting oldest stopped
 		// runs' cached memory images if the pool is below its reserve, as
 		// Stop does.
@@ -563,6 +932,10 @@ func (m *Manager) ForkMany(ctx context.Context, id string, req ForkRequest) ([]*
 		}
 		m.log.Info("fork saved its source", "from", id, "memory", forkImage != nil, "parentPause", saved.Pause.String(), "seal", saved.Seal.String(), "memoryWhy", saved.Note)
 	case err == nil:
+		if err := checkForkTenant(custody != nil, source.tenant, req.Tenant, keyTenant); err != nil {
+			release()
+			return nil, err
+		}
 		// Capture exclusivity covers the capture only: the source goes
 		// back to work while the child boots.
 		image, err = m.capture(ctx, source)
@@ -590,11 +963,28 @@ func (m *Manager) ForkMany(ctx context.Context, id string, req ForkRequest) ([]*
 			return nil, err
 		}
 		defer release()
+		if err := checkForkTenant(custody != nil, source.tenant, req.Tenant, keyTenant); err != nil {
+			dropTransientSource()
+			return nil, err
+		}
 		image = source.snapshot
 		fromStopped = true
+		ensureOpts := EnsureOptions{
+			Tenant:    source.tenant,
+			Run:       id,
+			Bases:     req.Bases,
+			LegacyRun: legacyRunOf(req.Expect, id),
+		}
+		if ensureOpts.Tenant == "" && custody != nil {
+			ensureOpts.Tenant = keyTenant
+		}
+		if req.Expect != nil {
+			ensureOpts.ExpectKID = req.Expect.KID
+		}
 		// The child registers the image (below), so the fetch's
 		// materialization is the child's from the start.
-		if _, err := m.ensureLocal(ctx, image); err != nil {
+		if _, _, err := m.ensureLocalFor(ctx, image, ensureOpts); err != nil {
+			dropTransientSource()
 			return nil, err
 		}
 		if source.Remote != nil && !source.Remote.Local {
@@ -619,7 +1009,16 @@ func (m *Manager) ForkMany(ctx context.Context, id string, req ForkRequest) ([]*
 
 	children := make([]*Run, 0, count)
 	for n := range count {
-		created, err := m.forkChild(ctx, id, source, image, base, req, onExpire, ttl, forkImage, made, fromStopped)
+		var cid string
+		if len(childIDs) > n {
+			cid = childIDs[n]
+		}
+		var childKey *PushedKey
+		if len(childHoldKeys) > n {
+			k := childHoldKeys[n]
+			childKey = &k
+		}
+		created, err := m.forkChild(ctx, id, source, image, base, req, onExpire, ttl, forkImage, made, fromStopped, cid, childKey)
 		if err == nil {
 			children = append(children, created)
 			continue
@@ -648,13 +1047,44 @@ func (m *Manager) ForkMany(ctx context.Context, id string, req ForkRequest) ([]*
 	return children, nil
 }
 
+func checkForkTenant(custodyOn bool, sourceTenant, reqTenant, keyTenant string) error {
+	if !custodyOn {
+		return nil
+	}
+	effective := sourceTenant
+	if effective == "" {
+		effective = DefaultTenant
+	}
+	if reqTenant != "" && reqTenant != effective {
+		return fmt.Errorf("%w: cannot fork run of tenant %s into tenant %s", ErrBadRequest, effective, reqTenant)
+	}
+	if keyTenant != "" && keyTenant != effective {
+		return fmt.Errorf("%w: fork hold key tenant %s does not match source run tenant %s", ErrBadRequest, keyTenant, effective)
+	}
+	return nil
+}
+
 // forkChild makes one child of a fork of id: its record (and, with
 // remote storage, its first remote record and hold key, before it
 // boots), then its VM, from forkImage when the fork saved one and from
 // the snapshot image otherwise. made is what it says of how it was made,
 // nil without memory images.
-func (m *Manager) forkChild(ctx context.Context, id string, source *Run, image, base string, req ForkRequest, onExpire string, ttl time.Duration, forkImage *ForkImage, made *ForkView, fromStopped bool) (*Run, error) {
+func (m *Manager) forkChild(ctx context.Context, id string, source *Run, image, base string, req ForkRequest, onExpire string, ttl time.Duration, forkImage *ForkImage, made *ForkView, fromStopped bool, requestedID string, childHoldKey *PushedKey) (*Run, error) {
 	now := m.now()
+	custody := m.custody()
+	childTenant := ""
+	var childBases map[string]string
+	if custody != nil {
+		childTenant = source.tenant
+		if childTenant == "" {
+			childTenant = DefaultTenant
+		}
+		if req.Bases != nil {
+			childBases = cloneBases(req.Bases)
+		} else {
+			childBases = cloneBases(source.remoteBases)
+		}
+	}
 	child := &Run{
 		// Lineage, not the capture: the child is the same image's run.
 		Image:      source.Image,
@@ -669,7 +1099,9 @@ func (m *Manager) forkChild(ctx context.Context, id string, source *Run, image, 
 		// The child's container is created from image. A capture made
 		// for this fork is the child's alone; a stopped source's
 		// snapshot is shared, and goes when both have let go.
-		images: []string{image},
+		images:      []string{image},
+		tenant:      childTenant,
+		remoteBases: childBases,
 	}
 	if made != nil {
 		view := *made
@@ -682,6 +1114,17 @@ func (m *Manager) forkChild(ctx context.Context, id string, source *Run, image, 
 		child.OnExpire = onExpire
 	}
 	childID := NewULID(now)
+	if requestedID != "" {
+		childID = requestedID
+	}
+	if childHoldKey != nil && custody != nil {
+		kid, wrapped, err := custody.PutHoldKey(childTenant, childID, *childHoldKey)
+		if err != nil {
+			return nil, err
+		}
+		child.remoteKey = wrapped
+		child.remoteKID = kid
+	}
 	if m.OffHost != nil {
 		// From its record until it is in the registry (or given up) the
 		// child is a run remote storage lists and this daemon does not:
@@ -702,7 +1145,7 @@ func (m *Manager) forkChild(ctx context.Context, id string, source *Run, image, 
 		// child, written before it boots, is what keeps that snapshot
 		// from being collected when the other run lets go of it. If the
 		// record cannot be written the child simply builds on nothing.
-		key, err := m.OffHost.Advance(ctx, RemoteRecord{Run: childID, Generation: 1, State: RecordForked, Snapshot: base})
+		key, err := m.OffHost.Advance(ctx, RemoteRecord{Run: childID, Generation: 1, State: RecordForked, Snapshot: base, Tenant: childTenant, Key: child.remoteKey})
 		written := err == nil
 		has := false
 		if err == nil {
@@ -712,6 +1155,9 @@ func (m *Manager) forkChild(ctx context.Context, id string, source *Run, image, 
 			// The record is written: the child has one from here on,
 			// whatever becomes of the base.
 			child.remoteGen, child.remoteHeld, child.remoteKey = 1, true, key
+			if child.remoteKID == "" {
+				child.remoteKID = kidFromWrapped(key)
+			}
 		}
 		if err != nil || !has {
 			m.log.Warn("fork will upload in full: its source's snapshot could not be kept as a base", "from", id, "error", err)
@@ -738,7 +1184,15 @@ func (m *Manager) forkChild(ctx context.Context, id string, source *Run, image, 
 		if child.remoteGen > 0 {
 			// The child never ran; its record must not outlive it.
 			m.releaseImages([]string{child.base})
-			m.remoteGone(ctx, &Run{ID: childID, remoteGen: child.remoteGen})
+			m.remoteGone(ctx, &Run{ID: childID, remoteGen: child.remoteGen, tenant: childTenant})
+		}
+		if childHoldKey != nil {
+			m.mu.Lock()
+			_, tracked := m.runs[childID]
+			m.mu.Unlock()
+			if !tracked {
+				m.eraseHoldKey(childID, child.remoteKID)
+			}
 		}
 		return nil, err
 	}
@@ -788,7 +1242,7 @@ func (m *Manager) destroyStopped(ctx context.Context, current *Run) error {
 				m.mu.Unlock()
 				return fmt.Errorf("stopped run %s not deleted: %w", current.ID, err)
 			}
-			latest, err := m.OffHost.Latest(ctx, current.ID)
+			latest, err := m.remoteLatest(ctx, current.ID)
 			switch {
 			case errors.Is(err, ErrNotFound):
 				// Never landed: nothing there to destroy.
@@ -822,7 +1276,7 @@ func (m *Manager) destroyStopped(ctx context.Context, current *Run) error {
 		// it. Storage that cannot be reached fails the delete (the
 		// reaper tries again): the run would otherwise still exist
 		// there, for any daemon to resume.
-		_, err := m.OffHost.Advance(ctx, RemoteRecord{Run: current.ID, Generation: current.remoteGen + 1, State: RecordDestroyed})
+		_, err := m.OffHost.Advance(ctx, RemoteRecord{Run: current.ID, Generation: current.remoteGen + 1, State: RecordDestroyed, Tenant: current.tenant})
 		if err != nil {
 			m.mu.Lock()
 			if live, ok := m.runs[current.ID]; ok {
@@ -840,6 +1294,7 @@ func (m *Manager) destroyStopped(ctx context.Context, current *Run) error {
 	delete(m.runs, current.ID)
 	m.mu.Unlock()
 	m.execLog.dropRun(current.ID)
+	m.eraseHoldKey(current.ID, current.remoteKID)
 	m.releaseImages([]string{current.snapshot, current.base})
 	m.releaseMemory(current.memory)
 	m.persist()

@@ -462,6 +462,36 @@ func (c *HoldCache) DamagedRuns() []string {
 	return runs
 }
 
+// All returns clones of every intact hold key in the cache, sorted by run ID.
+// Callers must Zero each returned HoldKey once supplied.
+func (c *HoldCache) All() ([]HoldKey, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, errHoldCacheClosed
+	}
+	if len(c.entries) == 0 {
+		return nil, nil
+	}
+	runs := make([]string, 0, len(c.entries))
+	for run := range c.entries {
+		runs = append(runs, run)
+	}
+	sort.Strings(runs)
+	out := make([]HoldKey, 0, len(runs))
+	for _, run := range runs {
+		clone, err := c.entries[run].clone()
+		if err != nil {
+			for i := range out {
+				out[i].Zero()
+			}
+			return nil, fmt.Errorf("clone cached hold key for run %s: %w", run, err)
+		}
+		out = append(out, clone)
+	}
+	return out, nil
+}
+
 // Delete removes a run's key: its bytes are wiped, its entry and its
 // damaged mark are gone from the file. A run with neither is nothing,
 // and writes nothing. An error is that the file could not be replaced:

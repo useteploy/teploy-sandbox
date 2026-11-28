@@ -546,6 +546,13 @@ func (m *Manager) writeAccessHeld(ctx context.Context, id string) error {
 	next := latest
 	next.Generation = latest.Generation + 1
 	next.Payload = payload
+	if next.Tenant == "" {
+		m.mu.Lock()
+		if live, ok := m.runs[id]; ok {
+			next.Tenant = live.tenant
+		}
+		m.mu.Unlock()
+	}
 	key, err := m.OffHost.Advance(ctx, next)
 	if err != nil {
 		return remoteErr(err)
